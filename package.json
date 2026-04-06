@@ -1,0 +1,43 @@
+{
+  "name": "conductor-telegram",
+  "version": "0.1.0",
+  "description": "Telegram bot for remote oversight of Conductor workspaces",
+  "type": "module",
+  "main": "dist/bot/index.js",
+  "bin": {
+    "conductor-telegram": "dist/bot/index.js",
+    "conductor-telegram-mcp": "dist/mcp/server.js"
+  },
+  "scripts": {
+    "dev": "tsx src/bot/index.ts",
+    "dev:mcp": "tsx src/mcp/server.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/bot/index.js",
+    "start:mcp": "node dist/mcp/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.8.1",
+    "telegraf": "^4.16.3",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.13.14",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "tsup": {
+    "entry": {
+      "bot/index": "src/bot/index.ts",
+      "mcp/server": "src/mcp/server.ts"
+    },
+    "format": ["esm"],
+    "target": "node22",
+    "splitting": true,
+    "clean": true,
+    "dts": false
+  }
+}
