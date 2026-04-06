@@ -34,6 +34,8 @@ export function createWorkspace(opts: {
     telegramChatId: opts.telegramChatId,
     telegramMessageId: null,
     conductorWorkspaceName: null,
+    conductorSessionId: null,
+    lastForwardedMessageRowid: 0,
   };
 }
 
@@ -102,6 +104,55 @@ export function updateWorkspaceConductorName(
   ).run(conductorName, id);
 }
 
+export function updateWorkspaceConductorSession(
+  id: string,
+  sessionId: string
+): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE workspaces SET conductor_session_id = ? WHERE id = ?"
+  ).run(sessionId, id);
+}
+
+export function updateWorkspaceForwardCursor(
+  id: string,
+  rowid: number
+): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE workspaces SET last_forwarded_message_rowid = ? WHERE id = ?"
+  ).run(rowid, id);
+}
+
+export function linkTelegramMessage(
+  chatId: string,
+  telegramMessageId: string,
+  workspaceId: string
+): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR REPLACE INTO telegram_message_links
+      (chat_id, telegram_message_id, workspace_id)
+     VALUES (?, ?, ?)`
+  ).run(chatId, telegramMessageId, workspaceId);
+}
+
+export function getWorkspaceByTelegramMessage(
+  chatId: string,
+  telegramMessageId: string
+): Workspace | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT w.*
+       FROM telegram_message_links tml
+       JOIN workspaces w ON w.id = tml.workspace_id
+       WHERE tml.chat_id = ? AND tml.telegram_message_id = ?`
+    )
+    .get(chatId, telegramMessageId) as any;
+  return row ? mapWorkspaceRow(row) : undefined;
+}
+
 function mapWorkspaceRow(row: any): Workspace {
   return {
     id: row.id,
@@ -113,6 +164,8 @@ function mapWorkspaceRow(row: any): Workspace {
     telegramChatId: row.telegram_chat_id,
     telegramMessageId: row.telegram_message_id,
     conductorWorkspaceName: row.conductor_workspace_name,
+    conductorSessionId: row.conductor_session_id ?? null,
+    lastForwardedMessageRowid: Number(row.last_forwarded_message_rowid ?? 0),
   };
 }
 

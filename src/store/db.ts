@@ -35,6 +35,17 @@ const SCHEMA = `
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     answered_at TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS telegram_message_links (
+    chat_id TEXT NOT NULL,
+    telegram_message_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_id, telegram_message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_message_links_workspace
+    ON telegram_message_links(workspace_id, created_at);
 `;
 
 let _db: Database.Database | null = null;
@@ -55,6 +66,13 @@ export function getDb(dbPath?: string): Database.Database {
   _db.pragma("busy_timeout = 5000");
 
   _db.exec(SCHEMA);
+  ensureColumn(_db, "workspaces", "conductor_session_id", "TEXT");
+  ensureColumn(
+    _db,
+    "workspaces",
+    "last_forwarded_message_rowid",
+    "INTEGER NOT NULL DEFAULT 0"
+  );
   return _db;
 }
 
@@ -63,4 +81,19 @@ export function closeDb(): void {
     _db.close();
     _db = null;
   }
+}
+
+function ensureColumn(
+  db: Database.Database,
+  table: string,
+  column: string,
+  definition: string
+): void {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  if (rows.some((row) => row.name === column)) {
+    return;
+  }
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }

@@ -2,8 +2,20 @@ import { Telegraf } from "telegraf";
 import { getDb } from "../store/db.js";
 import { authGuard } from "./middleware.js";
 import { registerCommands } from "./commands.js";
-import { getSessionStatus, getSessionResult } from "./launcher.js";
-import { getActiveWorkspaces, updateWorkspaceStatus } from "../store/queries.js";
+import {
+  getMaxSessionMessageRowId,
+  getSessionMessagesAfter,
+  getSessionResult,
+  getWorkspaceSessionInfo,
+  type SessionMessage,
+} from "./launcher.js";
+import {
+  getAllWorkspaces,
+  linkTelegramMessage,
+  updateWorkspaceConductorSession,
+  updateWorkspaceForwardCursor,
+  updateWorkspaceStatus,
+} from "../store/queries.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
@@ -44,11 +56,51 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 function startSessionPoller(): void {
   pollTimer = setInterval(() => {
     try {
-      const active = getActiveWorkspaces();
-      for (const ws of active) {
+      const tracked = getAllWorkspaces(100);
+      for (const ws of tracked) {
         if (!ws.conductorWorkspaceName) continue;
-        const sessionStatus = getSessionStatus(ws.conductorWorkspaceName);
-        if (!sessionStatus) continue;
+        const sessionInfo = getWorkspaceSessionInfo(ws.conductorWorkspaceName);
+        if (!sessionInfo) continue;
+
+        if (ws.conductorSessionId !== sessionInfo.sessionId) {
+          updateWorkspaceConductorSession(ws.id, sessionInfo.sessionId);
+          const baselineRowId = getMaxSessionMessageRowId(sessionInfo.sessionId);
+          updateWorkspaceForwardCursor(ws.id, baselineRowId);
+          continue;
+        }
+
+        const newMessages = getSessionMessagesAfter(
+          sessionInfo.sessionId,
+          ws.lastForwardedMessageRowid
+        );
+        if (newMessages.length > 0) {
+          for (const message of newMessages) {
+            const forwarded = formatForwardedMessage(
+              ws.conductorWorkspaceName,
+              message
+            );
+            if (!forwarded) continue;
+            bot.telegram
+              .sendMessage(ws.telegramChatId, forwarded, { parse_mode: "HTML" })
+              .then((sent) => {
+                linkTelegramMessage(
+                  ws.telegramChatId,
+                  String(sent.message_id),
+                  ws.id
+                );
+              })
+              .catch((err) => console.error(`[poller] forward error:`, err));
+          }
+          updateWorkspaceForwardCursor(
+            ws.id,
+            newMessages[newMessages.length - 1].rowid
+          );
+        }
+
+        const sessionStatus = sessionInfo.status;
+        if (sessionStatus === "working" && ws.status !== "running") {
+          updateWorkspaceStatus(ws.id, "running");
+        }
 
         if (sessionStatus === "idle" && ws.status === "running") {
           updateWorkspaceStatus(ws.id, "done");
@@ -73,7 +125,7 @@ function startSessionPoller(): void {
           bot.telegram
             .sendMessage(ws.telegramChatId, msg, { parse_mode: "HTML" })
             .catch((err) => console.error(`[poller] notify error:`, err));
-        } else if (sessionStatus === "error" && ws.status === "running") {
+        } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
           const name = ws.conductorWorkspaceName ?? ws.name;
           bot.telegram
@@ -93,6 +145,77 @@ function startSessionPoller(): void {
 
 function escHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function formatForwardedMessage(
+  workspaceName: string,
+  message: SessionMessage
+): string | null {
+  if (message.role === "user") {
+    const text = extractUserText(message.content);
+    if (!text) return null;
+    return `💬 <b>${escHtml(workspaceName)}</b>\n\n<i>${escHtml(
+      truncate(text, 1200)
+    )}</i>`;
+  }
+
+  if (message.role !== "assistant") {
+    return null;
+  }
+
+  const text = extractAssistantText(message.content);
+  if (!text) return null;
+
+  return `🤖 <b>${escHtml(workspaceName)}</b>\n\n${escHtml(truncate(text, 1200))}`;
+}
+
+function extractUserText(content: string): string | null {
+  const trimmed = content.trim();
+  if (!trimmed) return null;
+
+  if (!trimmed.startsWith("{")) {
+    return trimmed;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const text = extractTextParts(parsed?.message?.content);
+    return text || null;
+  } catch {
+    return trimmed;
+  }
+}
+
+function extractAssistantText(content: string): string | null {
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed?.type === "result") {
+      return null;
+    }
+    return extractTextParts(parsed?.message?.content) || null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTextParts(content: unknown): string {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function truncate(s: string, maxLen: number): string {
+  return s.length > maxLen ? `${s.slice(0, maxLen - 3)}...` : s;
 }
 
 // ── Start ───────────────────────────────────────────────────
