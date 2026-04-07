@@ -1,7 +1,11 @@
 import { Telegraf, Markup } from "telegraf";
 import { getDb } from "../store/db.js";
 import { authGuard } from "./middleware.js";
-import { registerCommands, trackDecisionMessage } from "./commands.js";
+import {
+  getTelegramCommands,
+  registerCommands,
+  trackDecisionMessage,
+} from "./commands.js";
 import {
   getMaxSessionMessageRowId,
   getSessionMessagesAfter,
@@ -55,6 +59,19 @@ bot.use(authGuard(OWNER_CHAT_ID));
 
 // Register commands
 registerCommands(bot);
+
+async function syncTelegramCommands(): Promise<void> {
+  const commands = getTelegramCommands();
+
+  await bot.telegram.callApi("deleteMyCommands", {});
+  await bot.telegram.callApi("deleteMyCommands", {
+    scope: { type: "all_private_chats" },
+  });
+  await bot.telegram.callApi("deleteMyCommands", {
+    scope: { type: "chat", chat_id: OWNER_CHAT_ID! },
+  });
+  await bot.telegram.setMyCommands(commands);
+}
 
 // ── Conductor session status polling ─────────────────────────
 
@@ -121,12 +138,6 @@ function startSessionPoller(): void {
             if (result.numTurns) parts.push(`${result.numTurns} turns`);
             if (result.durationMs) parts.push(`${Math.round(result.durationMs / 1000)}s`);
             if (parts.length) msg += `\n${parts.join(" · ")}`;
-            if (result.resultText) {
-              const summary = result.resultText.length > 500
-                ? result.resultText.slice(0, 497) + "..."
-                : result.resultText;
-              msg += `\n\n<i>${escHtml(summary)}</i>`;
-            }
           }
 
           bot.telegram
@@ -205,14 +216,6 @@ function formatForwardedMessage(
   workspaceName: string,
   message: SessionMessage
 ): string | null {
-  if (message.role === "user") {
-    const text = extractUserText(message.content);
-    if (!text) return null;
-    return `💬 <b>${escHtml(workspaceName)}</b>\n\n<i>${escHtml(
-      truncate(text, 1200)
-    )}</i>`;
-  }
-
   if (message.role !== "assistant") {
     return null;
   }
@@ -221,57 +224,6 @@ function formatForwardedMessage(
   if (!text) return null;
 
   return `🤖 <b>${escHtml(workspaceName)}</b>\n\n${escHtml(truncate(text, 1200))}`;
-}
-
-function extractUserText(content: string): string | null {
-  const trimmed = content.trim();
-  if (!trimmed) return null;
-
-  // Filter out raw JSON arrays (tool_reference, tool_result responses)
-  if (trimmed.startsWith("[")) {
-    try {
-      const arr = JSON.parse(trimmed);
-      if (
-        Array.isArray(arr) &&
-        arr.every(
-          (item: any) =>
-            item?.type === "tool_reference" || item?.type === "tool_result"
-        )
-      ) {
-        return null;
-      }
-    } catch {
-      // Not valid JSON array, treat as text
-    }
-  }
-
-  // Filter out permission denial messages
-  if (trimmed.startsWith("Claude requested permissions")) return null;
-
-  if (!trimmed.startsWith("{")) {
-    return trimmed;
-  }
-
-  try {
-    const parsed = JSON.parse(trimmed);
-
-    // Filter out tool_result user messages
-    const msgContent = parsed?.message?.content;
-    if (
-      Array.isArray(msgContent) &&
-      msgContent.every(
-        (part: any) =>
-          part?.type === "tool_result" || part?.type === "tool_reference"
-      )
-    ) {
-      return null;
-    }
-
-    const text = extractTextParts(msgContent);
-    return text || null;
-  } catch {
-    return trimmed;
-  }
 }
 
 function extractAssistantText(content: string): string | null {
@@ -330,6 +282,7 @@ async function main(): Promise<void> {
     console.error("[bot] error:", err);
   });
 
+  await syncTelegramCommands();
   bot.launch();
   startSessionPoller();
   startEventPoller();

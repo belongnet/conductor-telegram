@@ -9,25 +9,38 @@ if [ ! -f "$PID_FILE" ]; then
   exit 0
 fi
 
-PID=$(cat "$PID_FILE")
+REF=$(cat "$PID_FILE")
 
-if kill -0 "$PID" 2>/dev/null; then
-  echo "Stopping bot (PID $PID)..."
-  kill "$PID"
-  # Wait up to 5s for graceful shutdown
-  for i in $(seq 1 10); do
-    if ! kill -0 "$PID" 2>/dev/null; then
-      break
-    fi
-    sleep 0.5
-  done
-  if kill -0 "$PID" 2>/dev/null; then
-    echo "Force killing..."
-    kill -9 "$PID"
+if [[ "$REF" == screen:* ]]; then
+  SESSION="${REF#screen:}"
+  if screen -ls | grep -q "[.]$SESSION[[:space:]]"; then
+    echo "Stopping bot (screen session $SESSION)..."
+    screen -S "$SESSION" -X quit || true
+    sleep 1
+    echo "Bot stopped."
+  else
+    echo "Bot not running (stale screen session $SESSION)."
   fi
-  echo "Bot stopped."
 else
-  echo "Bot not running (stale PID $PID)."
+  PID="$REF"
+  if kill -0 "$PID" 2>/dev/null; then
+    echo "Stopping bot (PID $PID)..."
+    kill "$PID"
+    # Wait up to 5s for graceful shutdown
+    for i in $(seq 1 10); do
+      if ! kill -0 "$PID" 2>/dev/null; then
+        break
+      fi
+      sleep 0.5
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+      echo "Force killing..."
+      kill -9 "$PID"
+    fi
+    echo "Bot stopped."
+  else
+    echo "Bot not running (stale PID $PID)."
+  fi
 fi
 
 rm -f "$PID_FILE"
