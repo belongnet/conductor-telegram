@@ -7,6 +7,7 @@ import {
   getSessionMessagesAfter,
   getSessionResult,
   getWorkspaceSessionInfo,
+  answerPendingStdinDecision,
   type SessionMessage,
 } from "./launcher.js";
 import {
@@ -226,13 +227,47 @@ function extractUserText(content: string): string | null {
   const trimmed = content.trim();
   if (!trimmed) return null;
 
+  // Filter out raw JSON arrays (tool_reference, tool_result responses)
+  if (trimmed.startsWith("[")) {
+    try {
+      const arr = JSON.parse(trimmed);
+      if (
+        Array.isArray(arr) &&
+        arr.every(
+          (item: any) =>
+            item?.type === "tool_reference" || item?.type === "tool_result"
+        )
+      ) {
+        return null;
+      }
+    } catch {
+      // Not valid JSON array, treat as text
+    }
+  }
+
+  // Filter out permission denial messages
+  if (trimmed.startsWith("Claude requested permissions")) return null;
+
   if (!trimmed.startsWith("{")) {
     return trimmed;
   }
 
   try {
     const parsed = JSON.parse(trimmed);
-    const text = extractTextParts(parsed?.message?.content);
+
+    // Filter out tool_result user messages
+    const msgContent = parsed?.message?.content;
+    if (
+      Array.isArray(msgContent) &&
+      msgContent.every(
+        (part: any) =>
+          part?.type === "tool_result" || part?.type === "tool_reference"
+      )
+    ) {
+      return null;
+    }
+
+    const text = extractTextParts(msgContent);
     return text || null;
   } catch {
     return trimmed;
@@ -245,7 +280,22 @@ function extractAssistantText(content: string): string | null {
     if (parsed?.type === "result") {
       return null;
     }
-    return extractTextParts(parsed?.message?.content) || null;
+
+    const msgContent = parsed?.message?.content;
+    // Extract text parts first
+    const text = extractTextParts(msgContent);
+
+    // Also check for AskUserQuestion tool_use (question text is forwarded via
+    // the decision/event system, so we just skip these to avoid double display)
+    if (!text && Array.isArray(msgContent)) {
+      const hasOnlyToolUse = msgContent.every(
+        (block: any) =>
+          block?.type === "tool_use" || block?.type === "thinking"
+      );
+      if (hasOnlyToolUse) return null;
+    }
+
+    return text || null;
   } catch {
     return null;
   }

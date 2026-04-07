@@ -3,6 +3,11 @@ import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
+import {
+  createDecision,
+  addEvent,
+  getWorkspaceByName as getTrackedWorkspaceByName,
+} from "../store/queries.js";
 
 const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
@@ -38,6 +43,10 @@ const CITY_NAMES = [
 // Track running agents by workspace name
 const runningAgents = new Map<string, ChildProcess>();
 const lastAssistantSdkMessageIds = new Map<string, string>();
+// Track seen tool_use IDs to avoid duplicate question forwarding
+const seenToolUseIds = new Set<string>();
+// Map decision IDs to workspace names for stdin piping
+const pendingStdinDecisions = new Map<number, string>();
 
 // ── Agent result interface ──────────────────────────────────
 
@@ -78,7 +87,7 @@ function spawnAgent(
 
   const child = spawn(CLAUDE_BIN, args, {
     cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, HOME: process.env.HOME },
   });
 
@@ -105,7 +114,7 @@ function spawnAgent(
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          processStreamMessage(sessionId, msg, model);
+          processStreamMessage(sessionId, msg, model, workspaceName);
 
           // Extract result info
           if (msg.type === "result") {
@@ -151,9 +160,30 @@ function spawnAgent(
 }
 
 /**
+ * Send text input to a running agent's stdin (for answering AskUserQuestion).
+ * Returns true if the write succeeded.
+ */
+export function sendInputToAgent(workspaceName: string, input: string): boolean {
+  const child = runningAgents.get(workspaceName);
+  if (!child?.stdin?.writable) return false;
+  child.stdin.write(input + "\n");
+  return true;
+}
+
+/**
+ * Check if a decision has a pending stdin answer and send it.
+ */
+export function answerPendingStdinDecision(decisionId: number, answer: string): boolean {
+  const workspaceName = pendingStdinDecisions.get(decisionId);
+  if (!workspaceName) return false;
+  pendingStdinDecisions.delete(decisionId);
+  return sendInputToAgent(workspaceName, answer);
+}
+
+/**
  * Process a streaming JSON message from Claude CLI and mirror to Conductor's DB.
  */
-function processStreamMessage(sessionId: string, msg: any, model: string): void {
+function processStreamMessage(sessionId: string, msg: any, model: string, workspaceName?: string): void {
   // Mirror the same message families Conductor persists for Claude sessions.
   if (
     msg.type !== "user" &&
@@ -212,6 +242,46 @@ function processStreamMessage(sessionId: string, msg: any, model: string): void 
     db.close();
   } catch (err) {
     console.error(`[db] Failed to insert message:`, err);
+  }
+
+  // Detect AskUserQuestion tool_use blocks and create Telegram decisions
+  if (msg.type === "assistant" && workspaceName) {
+    const contentBlocks = msg.message?.content;
+    if (Array.isArray(contentBlocks)) {
+      for (const block of contentBlocks) {
+        if (
+          block.type === "tool_use" &&
+          (block.name === "AskUserQuestion" ||
+            block.name === "mcp__conductor__AskUserQuestion") &&
+          block.id &&
+          !seenToolUseIds.has(block.id)
+        ) {
+          seenToolUseIds.add(block.id);
+          const question = block.input?.question ?? "Agent is asking a question";
+          const options: string[] | undefined = block.input?.options;
+
+          // Look up workspace in conductor-telegram DB
+          const trackedWs = getTrackedWorkspaceByName(workspaceName);
+          if (trackedWs) {
+            const decisionId = createDecision(
+              trackedWs.id,
+              question,
+              options ?? null
+            );
+            const eventPayload = JSON.stringify({
+              decisionId,
+              question,
+              options: options ?? [],
+            });
+            addEvent(trackedWs.id, "human_request", eventPayload);
+            pendingStdinDecisions.set(decisionId, workspaceName);
+            console.log(
+              `[agent] AskUserQuestion detected for ${workspaceName}: "${question.slice(0, 80)}..." → decision ${decisionId}`
+            );
+          }
+        }
+      }
+    }
   }
 }
 

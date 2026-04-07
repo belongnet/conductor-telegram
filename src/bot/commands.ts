@@ -1,6 +1,6 @@
 import type { Context, Telegraf } from "telegraf";
 import { Markup } from "telegraf";
-import { launchWorkspace, stopAgent, sendToSession, type AgentResult } from "./launcher.js";
+import { launchWorkspace, stopAgent, sendToSession, answerPendingStdinDecision, type AgentResult } from "./launcher.js";
 import {
   createWorkspace,
   getActiveWorkspaces,
@@ -341,6 +341,7 @@ async function tryAnswerDecisionReply(ctx: Context, answerText: string): Promise
   if (!decision || decision.answer) return false; // Already answered
 
   answerDecision(decisionId, answerText);
+  answerPendingStdinDecision(decisionId, answerText);
   messageToDecision.delete(replyTo);
   await ctx.reply(`Answered: ${truncate(answerText, 200)}`, {
     reply_parameters: { message_id: (ctx.message as any).message_id },
@@ -581,6 +582,7 @@ async function handleDecisionCallback(ctx: Context): Promise<void> {
   if (!answer) return;
 
   answerDecision(decisionId, answer);
+  answerPendingStdinDecision(decisionId, answer);
 
   await ctx.answerCbQuery(`Answered: ${answer}`);
   await ctx.editMessageReplyMarkup(undefined);
