@@ -15,15 +15,22 @@ import {
   getAllWorkspaces,
   getWorkspace,
   getWorkspaceByName,
+  getWorkspaceByThreadId,
   getDecision,
   updateWorkspaceStatus,
   updateWorkspaceTelegramMessage,
   updateWorkspaceConductorName,
+  updateWorkspaceThreadId,
   answerDecision,
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
   getWorkspaceByTelegramMessage,
 } from "../store/queries.js";
+import {
+  createWorkspaceTopic,
+  closeWorkspaceTopic,
+  reopenWorkspaceTopic,
+} from "./forum.js";
 import type { Decision, Workspace, WorkspaceStatus } from "../types/index.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -401,23 +408,39 @@ async function startWorkspaceFromMessage(
 ): Promise<void> {
   const repoPath = path.join(CONDUCTOR_REPOS_DIR, repoName);
   const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
-
-  // Send initial message
-  const msg = await ctx.reply(`Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`, {
-    parse_mode: "HTML",
-  });
+  const chatId = ctx.chat!.id;
+  const chatIdStr = chatId.toString();
 
   // Create record in our DB
   const workspace = createWorkspace({
     name: `${repoName}-${Date.now()}`,
     prompt,
     repoPath,
-    telegramChatId: ctx.chat!.id.toString(),
+    telegramChatId: chatIdStr,
   });
 
-  updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
+  // Try to create a forum topic for this workspace
+  const threadId = await createWorkspaceTopic(
+    ctx.telegram,
+    chatIdStr,
+    repoName,
+    workspace.name
+  );
+  if (threadId) {
+    updateWorkspaceThreadId(workspace.id, threadId);
+    workspace.telegramThreadId = threadId;
+  }
 
-  const chatId = ctx.chat!.id;
+  const threadOpts = threadId ? { message_thread_id: threadId } : {};
+
+  // Send initial message (into the topic if created)
+  const msg = await ctx.telegram.sendMessage(
+    chatId,
+    `Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    { parse_mode: "HTML", ...threadOpts }
+  );
+
+  updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
 
   // Launch the workspace and spawn the agent process.
   const result = await launchWorkspace(repoPath, prompt, (output) => {
@@ -538,6 +561,13 @@ async function handleStop(ctx: Context): Promise<void> {
     : false;
 
   updateWorkspaceStatus(workspace.id, "stopped");
+  if (workspace.telegramThreadId) {
+    await closeWorkspaceTopic(
+      ctx.telegram,
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  }
   await ctx.reply(
     `⏹ <b>${escHtml(wsName)}</b> stopped.${killed ? "" : "\n<i>Agent process was not running.</i>"}`,
     { parse_mode: "HTML" }
@@ -571,6 +601,17 @@ async function handleRepos(ctx: Context): Promise<void> {
 // Last selected repo per user (for two-step /run flow)
 const pendingRepoSelection = new Map<string, number>();
 
+function getPendingRepoSelectionKey(ctx: Context): string | null {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return null;
+
+  const msg = (ctx as any).msg;
+  const threadId =
+    typeof msg?.message_thread_id === "number" ? msg.message_thread_id : null;
+
+  return threadId ? `${chatId}:${threadId}` : chatId;
+}
+
 async function handleRunRepoCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
   const repoNum = parseInt(match?.[1], 10);
@@ -580,10 +621,10 @@ async function handleRunRepoCallback(ctx: Context): Promise<void> {
   const repoName = repos[repoNum - 1];
   if (!repoName) return;
 
-  const chatId = ctx.chat?.id?.toString();
-  if (!chatId) return;
+  const selectionKey = getPendingRepoSelectionKey(ctx);
+  if (!selectionKey) return;
 
-  pendingRepoSelection.set(chatId, repoNum);
+  pendingRepoSelection.set(selectionKey, repoNum);
 
   await ctx.answerCbQuery(`Selected: ${repoName}`);
   await ctx.reply(
@@ -676,6 +717,17 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     const message = caption || "The user sent a screenshot/image. Please review it.";
     await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
     return;
+  }
+
+  // If sent inside a forum topic, route to that workspace automatically
+  const threadId = (ctx.message as any)?.message_thread_id;
+  if (threadId) {
+    const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
+    if (threadWorkspace) {
+      const message = caption || "The user sent a screenshot/image. Please review it.";
+      await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      return;
+    }
   }
 
   await ctx.reply(
@@ -777,6 +829,17 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
+  // If sent inside a forum topic, route to that workspace automatically
+  const threadId = (ctx.message as any)?.message_thread_id;
+  if (threadId) {
+    const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
+    if (threadWorkspace) {
+      const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+      await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      return;
+    }
+  }
+
   await ctx.reply(
     "Got your voice message. Reply to a question from an agent, or use /send to forward to a workspace."
   );
@@ -787,6 +850,7 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
 async function handleTextMessage(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
   if (!chatId) return;
+  const selectionKey = getPendingRepoSelectionKey(ctx);
 
   const text = (ctx.message as any)?.text?.trim();
   if (!text || text.startsWith("/")) return;
@@ -800,13 +864,25 @@ async function handleTextMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  const repoNum = pendingRepoSelection.get(chatId);
+  // If sent inside a forum topic, route to that workspace automatically
+  const threadId = (ctx.message as any)?.message_thread_id;
+  if (threadId) {
+    const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
+    if (threadWorkspace) {
+      await sendMessageToWorkspace(ctx, threadWorkspace, text);
+      return;
+    }
+  }
+
+  if (!selectionKey) return;
+
+  const repoNum = pendingRepoSelection.get(selectionKey);
   if (!repoNum) return; // No pending selection, ignore
 
   const prompt = text;
 
   // Clear the pending selection
-  pendingRepoSelection.delete(chatId);
+  pendingRepoSelection.delete(selectionKey);
 
   const repos = getRepoList();
   const repoName = repos[repoNum - 1];
@@ -1092,6 +1168,13 @@ async function handleStopCallback(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
+  if (workspace?.telegramThreadId) {
+    await closeWorkspaceTopic(
+      ctx.telegram,
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  }
   await ctx.answerCbQuery("Agent stopped");
   await ctx.editMessageReplyMarkup(undefined);
 }
@@ -1175,6 +1258,18 @@ async function sendMessageToWorkspace(
 ): Promise<void> {
   const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
   const messagePreview = previewOutgoingText(message, attachmentSourcePaths);
+
+  // Reopen forum topic if the workspace was stopped/done/failed
+  if (
+    workspace.telegramThreadId &&
+    (workspace.status === "done" || workspace.status === "stopped" || workspace.status === "failed")
+  ) {
+    await reopenWorkspaceTopic(
+      ctx.telegram,
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  }
 
   await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(messagePreview, 200))}</i>`, {
     parse_mode: "HTML",
