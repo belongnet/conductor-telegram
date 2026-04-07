@@ -29,14 +29,19 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
 const POLL_INTERVAL_MS = 5000;
 
-if (!BOT_TOKEN) {
-  console.error("BOT_TOKEN environment variable is required");
-  process.exit(1);
-}
-
-if (!OWNER_CHAT_ID) {
-  console.error("OWNER_CHAT_ID environment variable is required");
-  process.exit(1);
+if (!BOT_TOKEN || !OWNER_CHAT_ID) {
+  // When launched via CLI, config is already validated. This guard is for
+  // direct `node dist/bot/index.js` invocations (legacy .env workflow).
+  const missing = [
+    !BOT_TOKEN && "BOT_TOKEN",
+    !OWNER_CHAT_ID && "OWNER_CHAT_ID",
+  ].filter(Boolean);
+  console.error(
+    `ERROR: Missing required environment variable(s): ${missing.join(", ")}\n` +
+    `CAUSE: Neither config.json nor env vars provide these values\n` +
+    `FIX:   Run 'conductor-telegram setup' or set ${missing.join(" and ")} in your environment`
+  );
+  process.exit(2);
 }
 
 // Initialize DB
@@ -260,8 +265,6 @@ function truncate(s: string, maxLen: number): string {
 // ── Start ───────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.log("Starting Conductor Telegram bot...");
-
   bot.catch((err: any) => {
     console.error("[bot] error:", err);
   });
@@ -270,7 +273,7 @@ async function main(): Promise<void> {
   bot.launch();
   startSessionPoller();
   startEventPoller();
-  console.log("Bot is running. Listening for messages...");
+  console.log("  Status: Connected · Polling every 5s");
 
   // Graceful shutdown
   const shutdown = () => {

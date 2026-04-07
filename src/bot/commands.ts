@@ -79,17 +79,6 @@ function fetchBuffer(url: string): Promise<Buffer> {
   });
 }
 
-// Map Telegram message IDs to decision IDs (for reply-based answering)
-const messageToDecision = new Map<number, number>();
-
-/**
- * Register a Telegram message ID as associated with a decision,
- * so that replies to that message can answer the decision.
- */
-export function trackDecisionMessage(messageId: number, decisionId: number): void {
-  messageToDecision.set(messageId, decisionId);
-}
-
 /**
  * Get a Telegram file URL for downloading.
  */
