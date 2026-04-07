@@ -128,10 +128,14 @@ async function handleRun(ctx: Context): Promise<void> {
     return;
   }
 
+  await startWorkspaceFromMessage(ctx, repoName, prompt);
+}
+
+async function startWorkspaceFromMessage(ctx: Context, repoName: string, prompt: string): Promise<void> {
   const repoPath = path.join(CONDUCTOR_REPOS_DIR, repoName);
 
   // Send initial message
-  const msg = await ctx.reply(`Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(prompt)}</i>`, {
+  const msg = await ctx.reply(`Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(prompt, 200))}</i>`, {
     parse_mode: "HTML",
   });
 
@@ -173,7 +177,7 @@ async function handleRun(ctx: Context): Promise<void> {
     chatId,
     msg.message_id,
     undefined,
-    `🟢 Agent <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(prompt)}</i>`,
+    `🟢 Agent <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(prompt, 200))}</i>`,
     {
       parse_mode: "HTML",
       ...Markup.inlineKeyboard([
@@ -358,6 +362,13 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   const photo = msg.photo[msg.photo.length - 1];
   const caption = msg.caption?.trim() ?? "";
 
+  // If caption contains a bot command, route it (Telegram doesn't fire bot.command for photo captions)
+  if (caption.startsWith("/")) {
+    const fileUrl = await getFileUrl(ctx, photo.file_id);
+    await handleCaptionCommand(ctx, caption, fileUrl);
+    return;
+  }
+
   // Check if this is a reply to a decision
   const fileUrl = await getFileUrl(ctx, photo.file_id);
   const answerText = caption
@@ -367,6 +378,76 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (await tryAnswerDecisionReply(ctx, answerText)) return;
 
   // Not a reply to a decision — treat as a standalone message
+  await ctx.reply(
+    "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
+  );
+}
+
+/**
+ * Handle a bot command sent as a photo/voice caption.
+ * Telegram doesn't fire bot.command() for captions, so we parse manually.
+ */
+async function handleCaptionCommand(
+  ctx: Context,
+  caption: string,
+  attachmentDescription: string
+): Promise<void> {
+  const runMatch = caption.match(/^\/run\s+(.+)/);
+  if (runMatch) {
+    const args = runMatch[1].trim();
+    const spaceIdx = args.indexOf(" ");
+    if (spaceIdx === -1) {
+      // Caption is "/run 3" with no prompt — use attachment as context
+      const repoInput = args;
+      const repoName = resolveRepo(repoInput);
+      if (!repoName) {
+        await ctx.reply(`Repo "${escHtml(repoInput)}" not found. Use /repos to see available repos.`, { parse_mode: "HTML" });
+        return;
+      }
+      await startWorkspaceFromMessage(ctx, repoName, `[Attached: ${attachmentDescription}]`);
+      return;
+    }
+
+    const repoInput = args.slice(0, spaceIdx);
+    const prompt = args.slice(spaceIdx + 1).trim();
+    const repoName = resolveRepo(repoInput);
+    if (!repoName) {
+      const repos = getRepoList();
+      const repoLines = repos.map((r, i) => `${i + 1}. <code>${escHtml(r)}</code>`).join("\n");
+      await ctx.reply(
+        `Repo "${escHtml(repoInput)}" not found.\n\nAvailable repos:\n${repoLines}`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    await startWorkspaceFromMessage(ctx, repoName, `${prompt}\n\n[Attached: ${attachmentDescription}]`);
+    return;
+  }
+
+  const sendMatch = caption.match(/^\/send\s+(.+)/);
+  if (sendMatch) {
+    const args = sendMatch[1].trim();
+    const spaceIdx = args.indexOf(" ");
+    const wsName = spaceIdx === -1 ? args : args.slice(0, spaceIdx);
+    const message = spaceIdx === -1 ? "" : args.slice(spaceIdx + 1).trim();
+    const fullMessage = message
+      ? `${message}\n\n[Attached: ${attachmentDescription}]`
+      : `[Attached: ${attachmentDescription}]`;
+
+    let workspace = getWorkspace(wsName);
+    if (!workspace) {
+      const all = getAllWorkspaces(50);
+      workspace = all.find((ws) => ws.conductorWorkspaceName === wsName);
+    }
+    if (workspace) {
+      await sendMessageToWorkspace(ctx, workspace, fullMessage);
+    } else {
+      await ctx.reply(`Workspace "${escHtml(wsName)}" not found.`, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // Unrecognized command in caption
   await ctx.reply(
     "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
   );
@@ -421,58 +502,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   const repoName = repos[repoNum - 1];
   if (!repoName) return;
 
-  // Reuse the run logic
-  const repoPath = path.join(CONDUCTOR_REPOS_DIR, repoName);
-
-  const msg = await ctx.reply(`Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(prompt)}</i>`, {
-    parse_mode: "HTML",
-  });
-
-  const workspace = createWorkspace({
-    name: `${repoName}-${Date.now()}`,
-    prompt,
-    repoPath,
-    telegramChatId: chatId,
-  });
-
-  updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
-
-  const result = await launchWorkspace(repoPath, prompt, (output) => {
-    console.log(`[${workspace.id}] ${output.slice(0, 200)}`);
-  });
-
-  if ("error" in result) {
-    updateWorkspaceStatus(workspace.id, "failed");
-    await ctx.telegram.editMessageText(
-      ctx.chat!.id,
-      msg.message_id,
-      undefined,
-      `Failed to start workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(result.error)}`,
-      { parse_mode: "HTML" }
-    );
-    return;
-  }
-
-  updateWorkspaceConductorName(workspace.id, result.workspaceName);
-  updateWorkspaceConductorSession(workspace.id, result.sessionId);
-  updateWorkspaceStatus(workspace.id, "running");
-
-  await ctx.telegram.editMessageText(
-    ctx.chat!.id,
-    msg.message_id,
-    undefined,
-    `🟢 Agent <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(prompt)}</i>`,
-    {
-      parse_mode: "HTML",
-      ...Markup.inlineKeyboard([
-        Markup.button.callback("Stop", `stop:${workspace.id}`),
-      ]),
-    }
-  );
-
-  result.done.then((agentResult) => {
-    notifyCompletion(_bot, chatId, workspace!.id, result.workspaceName, agentResult);
-  });
+  await startWorkspaceFromMessage(ctx, repoName, prompt);
 }
 
 // ── /send <workspace> <message> ──────────────────────────────
