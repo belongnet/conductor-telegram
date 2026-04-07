@@ -1,4 +1,5 @@
 import { exec, spawn, type ChildProcess } from "node:child_process";
+import { copyFileSync, mkdirSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -14,6 +15,16 @@ const CONDUCTOR_DB_PATH =
 const CLAUDE_BIN =
   process.env.CLAUDE_BIN ??
   `${process.env.HOME}/Library/Application Support/com.conductor.app/bin/claude`;
+
+const CODEX_BIN =
+  process.env.CODEX_BIN ??
+  `${process.env.HOME}/Library/Application Support/com.conductor.app/bin/codex`;
+
+const TELEGRAM_AGENT_PERMISSION_MODE =
+  process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? "bypassPermissions";
+
+const DEFAULT_CLAUDE_MODEL = "opus";
+const DEFAULT_CODEX_MODEL = "gpt-5.4";
 
 // City names for workspace directory naming (matches Conductor's convention)
 const CITY_NAMES = [
@@ -50,25 +61,285 @@ export interface AgentResult {
   exitCode: number | null;
 }
 
+export type AgentType = "claude" | "codex";
+type LaunchMode = "prompt" | "review";
+
+interface SessionLaunchOptions {
+  agentType?: AgentType;
+  model?: string | null;
+  title?: string | null;
+  launchMode?: LaunchMode;
+  reviewBaseBranch?: string | null;
+}
+
+interface ResolvedLaunchConfig {
+  agentType: AgentType;
+  model: string;
+  title: string;
+  launchMode: LaunchMode;
+  reviewBaseBranch: string | null;
+  codexThinkingLevel: string | null;
+}
+
+interface SessionCreateResult {
+  sessionId: string;
+  initialCursorRowid: number;
+  agentType: AgentType;
+  model: string;
+}
+
+function buildPromptWithAttachments(
+  prompt: string,
+  attachmentPaths: string[]
+): string {
+  const trimmedPrompt = prompt.trim();
+  if (attachmentPaths.length === 0) {
+    return trimmedPrompt;
+  }
+
+  const attachmentLines = attachmentPaths.map((filePath) => `[Attached: ${filePath}]`);
+  if (!trimmedPrompt) {
+    return attachmentLines.join("\n");
+  }
+
+  return `${trimmedPrompt}\n\n${attachmentLines.join("\n")}`;
+}
+
+export function stageAttachmentPaths(
+  workspaceDir: string,
+  sourcePaths: string[]
+): string[] {
+  if (sourcePaths.length === 0) {
+    return [];
+  }
+
+  const attachmentsDir = path.join(workspaceDir, ".context", "attachments");
+  mkdirSync(attachmentsDir, { recursive: true });
+
+  const timestamp = Date.now();
+  return sourcePaths.map((sourcePath, index) => {
+    const ext = path.extname(sourcePath) || ".bin";
+    const destPath = path.join(attachmentsDir, `${timestamp}-${index + 1}${ext}`);
+    copyFileSync(sourcePath, destPath);
+    return destPath;
+  });
+}
+
+function revealWorkspaceInConductor(workspaceDir: string): void {
+  const child = spawn("open", ["-g", "-a", "Conductor", workspaceDir], {
+    detached: true,
+    stdio: "ignore",
+  });
+
+  child.on("error", (err) => {
+    console.error(`[launcher] Failed to reveal workspace in Conductor:`, err);
+  });
+  child.unref();
+}
+
+function normalizeAgentType(value: string | null | undefined): AgentType | null {
+  if (value === "claude" || value === "codex") {
+    return value;
+  }
+  return null;
+}
+
+function getSettingValue(key: string): string | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = db.prepare(
+      "SELECT value FROM settings WHERE key = ?"
+    ).get(key) as { value?: string } | undefined;
+    db.close();
+    return typeof row?.value === "string" ? row.value : null;
+  } catch {
+    return null;
+  }
+}
+
+function getRecentModelForAgent(agentType: AgentType): string | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = db.prepare(
+      `SELECT model
+       FROM sessions
+       WHERE agent_type = ? AND model IS NOT NULL AND trim(model) != ''
+       ORDER BY created_at DESC
+       LIMIT 1`
+    ).get(agentType) as { model?: string } | undefined;
+    db.close();
+    return typeof row?.model === "string" ? row.model : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasAgentSessions(agentType: AgentType): boolean {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = db.prepare(
+      "SELECT 1 as present FROM sessions WHERE agent_type = ? LIMIT 1"
+    ).get(agentType) as { present?: number } | undefined;
+    db.close();
+    return row?.present === 1;
+  } catch {
+    return false;
+  }
+}
+
+function getDefaultAgentType(): AgentType {
+  return normalizeAgentType(process.env.TELEGRAM_DEFAULT_AGENT_TYPE) ?? "claude";
+}
+
+function getReviewAgentType(): AgentType {
+  const configured = normalizeAgentType(process.env.TELEGRAM_REVIEW_AGENT_TYPE);
+  if (configured) {
+    return configured;
+  }
+  if (hasAgentSessions("codex")) {
+    return "codex";
+  }
+  return getDefaultAgentType();
+}
+
+function resolveAgentModel(
+  agentType: AgentType,
+  launchMode: LaunchMode,
+  requestedModel?: string | null
+): string {
+  if (requestedModel?.trim()) {
+    return requestedModel.trim();
+  }
+
+  const envModel =
+    launchMode === "review"
+      ? process.env.TELEGRAM_REVIEW_MODEL
+      : process.env.TELEGRAM_DEFAULT_MODEL;
+  if (envModel?.trim()) {
+    return envModel.trim();
+  }
+
+  if (agentType === "claude") {
+    return (
+      getSettingValue("default_model") ??
+      getRecentModelForAgent("claude") ??
+      DEFAULT_CLAUDE_MODEL
+    );
+  }
+
+  return getRecentModelForAgent("codex") ?? DEFAULT_CODEX_MODEL;
+}
+
+function resolveCodexThinkingLevel(launchMode: LaunchMode): string | null {
+  const settingKey =
+    launchMode === "review"
+      ? "review_codex_thinking_level"
+      : "default_codex_thinking_level";
+  return getSettingValue(settingKey);
+}
+
+function deriveSessionTitle(
+  prompt: string,
+  fallback: string
+): string {
+  const firstLine = prompt
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && !line.startsWith("[Attached:"));
+  return truncateTitle(firstLine ?? fallback, 80);
+}
+
+function truncateTitle(value: string, maxLen: number): string {
+  return value.length > maxLen ? `${value.slice(0, maxLen - 3)}...` : value;
+}
+
+function resolveLaunchConfig(
+  options: SessionLaunchOptions
+): ResolvedLaunchConfig {
+  const launchMode = options.launchMode ?? "prompt";
+  const agentType =
+    options.agentType ??
+    (launchMode === "review" ? getReviewAgentType() : getDefaultAgentType());
+  const model = resolveAgentModel(agentType, launchMode, options.model);
+  const title =
+    options.title?.trim() ||
+    (launchMode === "review" ? "Review Changes" : "Untitled");
+
+  return {
+    agentType,
+    model,
+    title,
+    launchMode,
+    reviewBaseBranch: options.reviewBaseBranch ?? null,
+    codexThinkingLevel:
+      agentType === "codex" ? resolveCodexThinkingLevel(launchMode) : null,
+  };
+}
+
+function isImageAttachment(filePath: string): boolean {
+  return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].includes(
+    path.extname(filePath).toLowerCase()
+  );
+}
+
 // ── Core: spawn Claude CLI + mirror to DB ───────────────────
 
 function spawnAgent(
-  sessionId: string,
+  conductorSessionId: string,
+  workspaceDir: string,
+  prompt: string,
+  model: string,
+  agentType: AgentType,
+  workspaceName: string,
+  options: {
+    agentSessionId?: string | null;
+    isFollowUp?: boolean;
+    attachmentPaths?: string[];
+    launchMode?: LaunchMode;
+    reviewBaseBranch?: string | null;
+  } = {}
+): { child: ChildProcess; done: Promise<AgentResult> } {
+  if (agentType === "codex") {
+    return spawnCodexAgent(
+      conductorSessionId,
+      workspaceDir,
+      prompt,
+      model,
+      workspaceName,
+      options
+    );
+  }
+
+  return spawnClaudeAgent(
+    conductorSessionId,
+    workspaceDir,
+    prompt,
+    model,
+    workspaceName,
+    options
+  );
+}
+
+function spawnClaudeAgent(
+  conductorSessionId: string,
   workspaceDir: string,
   prompt: string,
   model: string,
   workspaceName: string,
-  isFollowUp: boolean = false
+  options: {
+    isFollowUp?: boolean;
+  } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
+  const isFollowUp = options.isFollowUp ?? false;
   const sessionFlag = isFollowUp ? "--resume" : "--session-id";
   const args = [
     "-p", prompt,
     "--output-format", "stream-json",
     "--verbose",
-    sessionFlag, sessionId,
+    sessionFlag, conductorSessionId,
     "--max-turns", "1000",
     "--model", model,
-    "--permission-mode", "default",
+    "--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE,
   ];
 
   console.log(`[agent] Spawning: claude ${args.join(" ").slice(0, 100)}...`);
@@ -87,7 +358,7 @@ function spawnAgent(
   runningAgents.set(workspaceName, child);
 
   // Mark session as working
-  updateSessionStatus(sessionId, "working");
+  updateSessionStatus(conductorSessionId, "working");
 
   const done = new Promise<AgentResult>((resolve) => {
     let result: AgentResult = { isError: false, exitCode: null };
@@ -105,7 +376,7 @@ function spawnAgent(
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          processStreamMessage(sessionId, msg, model);
+          processStreamMessage(conductorSessionId, msg, model);
 
           // Extract result info
           if (msg.type === "result") {
@@ -133,7 +404,7 @@ function spawnAgent(
         result.isError = true;
       }
       runningAgents.delete(workspaceName);
-      updateSessionStatus(sessionId, "idle");
+      updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
 
@@ -142,12 +413,303 @@ function spawnAgent(
       result.isError = true;
       result.exitCode = -1;
       runningAgents.delete(workspaceName);
-      updateSessionStatus(sessionId, "idle");
+      updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
   });
 
   return { child, done };
+}
+
+function spawnCodexAgent(
+  conductorSessionId: string,
+  workspaceDir: string,
+  prompt: string,
+  model: string,
+  workspaceName: string,
+  options: {
+    agentSessionId?: string | null;
+    isFollowUp?: boolean;
+    attachmentPaths?: string[];
+    launchMode?: LaunchMode;
+    reviewBaseBranch?: string | null;
+  } = {}
+): { child: ChildProcess; done: Promise<AgentResult> } {
+  const launchMode = options.launchMode ?? "prompt";
+  const agentSessionId = options.agentSessionId ?? null;
+  const args =
+    launchMode === "review"
+      ? buildCodexReviewArgs(model, prompt, options.reviewBaseBranch)
+      : buildCodexExecArgs(model, prompt, agentSessionId, options.attachmentPaths ?? []);
+
+  console.log(`[agent] Spawning: codex ${args.join(" ").slice(0, 120)}...`);
+  console.log(`[agent] CWD: ${workspaceDir}`);
+  console.log(`[agent] CODEX_BIN: ${CODEX_BIN}`);
+
+  const child = spawn(CODEX_BIN, args, {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, HOME: process.env.HOME },
+  });
+
+  console.log(`[agent] Spawned PID: ${child.pid}`);
+
+  runningAgents.set(workspaceName, child);
+  updateSessionStatus(conductorSessionId, "working");
+
+  const done = new Promise<AgentResult>((resolve) => {
+    let result: AgentResult = { isError: false, exitCode: null };
+    let buffer = "";
+    const startedAt = Date.now();
+    let turnCount = 0;
+    let latestAgentSessionId = agentSessionId;
+    let lastAssistantText = "";
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line);
+          const parsed = processCodexStreamMessage(
+            conductorSessionId,
+            msg,
+            latestAgentSessionId
+          );
+          if (parsed.agentSessionId) {
+            latestAgentSessionId = parsed.agentSessionId;
+          }
+          if (parsed.assistantText) {
+            lastAssistantText = parsed.assistantText;
+          }
+          if (msg.type === "turn.completed") {
+            turnCount += 1;
+          }
+        } catch {
+          console.log(`[agent] Non-JSON output: ${line.slice(0, 100)}`);
+        }
+      }
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString().trim();
+      if (text) console.log(`[agent:stderr] ${text.slice(0, 200)}`);
+    });
+
+    child.on("close", (code) => {
+      console.log(`[agent] Process exited with code ${code}`);
+      result.exitCode = code;
+      result.durationMs = Date.now() - startedAt;
+      result.numTurns = turnCount;
+      result.resultText = lastAssistantText || result.resultText;
+      if (code !== 0 && !result.resultText) {
+        result.isError = true;
+      }
+
+      if (lastAssistantText) {
+        insertCodexResultMessage(
+          conductorSessionId,
+          latestAgentSessionId ?? conductorSessionId,
+          lastAssistantText,
+          result.durationMs,
+          turnCount,
+          result.isError
+        );
+      }
+
+      runningAgents.delete(workspaceName);
+      updateSessionStatus(conductorSessionId, "idle");
+      resolve(result);
+    });
+
+    child.on("error", (err) => {
+      console.error(`[agent] Spawn error:`, err);
+      result.isError = true;
+      result.exitCode = -1;
+      result.durationMs = Date.now() - startedAt;
+      runningAgents.delete(workspaceName);
+      updateSessionStatus(conductorSessionId, "idle");
+      resolve(result);
+    });
+  });
+
+  return { child, done };
+}
+
+function buildCodexExecArgs(
+  model: string,
+  prompt: string,
+  agentSessionId: string | null,
+  attachmentPaths: string[]
+): string[] {
+  const imageArgs = attachmentPaths
+    .filter(isImageAttachment)
+    .flatMap((filePath) => ["--image", filePath]);
+
+  if (agentSessionId) {
+    return [
+      "exec",
+      "resume",
+      "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--model",
+      model,
+      ...imageArgs,
+      agentSessionId,
+      prompt,
+    ];
+  }
+
+  return [
+    "exec",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--model",
+    model,
+    ...imageArgs,
+    prompt,
+  ];
+}
+
+function buildCodexReviewArgs(
+  model: string,
+  prompt: string,
+  reviewBaseBranch: string | null | undefined
+): string[] {
+  const args = [
+    "exec",
+    "review",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--model",
+    model,
+  ];
+
+  if (reviewBaseBranch?.trim()) {
+    args.push("--base", reviewBaseBranch.trim());
+  }
+  if (prompt.trim()) {
+    args.push(prompt);
+  }
+  return args;
+}
+
+function processCodexStreamMessage(
+  conductorSessionId: string,
+  msg: any,
+  currentAgentSessionId: string | null
+): { agentSessionId?: string; assistantText?: string } {
+  if (msg.type === "thread.started" && typeof msg.thread_id === "string") {
+    updateAgentSessionId(conductorSessionId, msg.thread_id);
+    insertSessionMessage(
+      conductorSessionId,
+      "assistant",
+      JSON.stringify({
+        type: "system",
+        session_id: msg.thread_id,
+      }),
+      new Date().toISOString(),
+      null,
+      null,
+      null,
+      randomUUID()
+    );
+    return { agentSessionId: msg.thread_id };
+  }
+
+  if (
+    msg.type === "item.completed" &&
+    msg.item?.type === "agent_message" &&
+    typeof msg.item.text === "string"
+  ) {
+    const agentSessionId = currentAgentSessionId ?? conductorSessionId;
+    insertSessionMessage(
+      conductorSessionId,
+      "assistant",
+      JSON.stringify({
+        type: "assistant",
+        session_id: agentSessionId,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: msg.item.text }],
+        },
+      }),
+      new Date().toISOString(),
+      null,
+      null,
+      null,
+      randomUUID()
+    );
+    return { assistantText: msg.item.text };
+  }
+
+  return {};
+}
+
+function insertCodexResultMessage(
+  conductorSessionId: string,
+  agentSessionId: string,
+  resultText: string,
+  durationMs: number | undefined,
+  numTurns: number,
+  isError: boolean
+): void {
+  insertSessionMessage(
+    conductorSessionId,
+    "assistant",
+    JSON.stringify({
+      type: "result",
+      session_id: agentSessionId,
+      result: resultText,
+      duration_ms: durationMs ?? 0,
+      num_turns: numTurns,
+      is_error: isError,
+    }),
+    new Date().toISOString(),
+    null,
+    null,
+    null,
+    randomUUID()
+  );
+}
+
+function insertSessionMessage(
+  sessionId: string,
+  role: string,
+  content: string,
+  timestamp: string,
+  model: string | null,
+  sdkMessageId: string | null,
+  lastAssistantMessageId: string | null,
+  turnId: string
+): void {
+  const messageId = randomUUID();
+
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    db.prepare(
+      `INSERT OR IGNORE INTO session_messages
+       (id, session_id, role, content, created_at, sent_at, model, sdk_message_id, last_assistant_message_id, turn_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      messageId,
+      sessionId,
+      role,
+      content,
+      timestamp,
+      timestamp,
+      model,
+      sdkMessageId,
+      lastAssistantMessageId,
+      turnId
+    );
+    db.close();
+  } catch (err) {
+    console.error(`[db] Failed to insert message:`, err);
+  }
 }
 
 /**
@@ -170,12 +732,8 @@ function processStreamMessage(sessionId: string, msg: any, model: string): void 
     ...msg,
     session_id: msg.session_id ?? sessionId,
   };
-  const content =
-    role === "user" && isPlainUserPrompt(msg)
-      ? extractUserContent(msg)
-      : JSON.stringify(normalized);
-
-  const messageId = randomUUID();
+  const userContent = role === "user" ? extractUserContent(msg) : null;
+  const content = userContent ?? JSON.stringify(normalized);
   const turnId = msg.uuid ?? randomUUID();
   const sdkMessageId =
     role === "assistant" && typeof msg.message?.id === "string"
@@ -185,67 +743,96 @@ function processStreamMessage(sessionId: string, msg: any, model: string): void 
     lastAssistantSdkMessageIds.set(sessionId, sdkMessageId);
   }
   const lastAssistantMessageId =
-    role === "user" && isPlainUserPrompt(msg)
-      ? lastAssistantSdkMessageIds.get(sessionId) ?? null
-      : null;
+    role === "user" ? lastAssistantSdkMessageIds.get(sessionId) ?? null : null;
   const msgModel =
     role === "assistant" ? null : simplifyModel(msg.message?.model ?? model);
 
-  try {
-    const db = new Database(CONDUCTOR_DB_PATH);
-    db.prepare(
-      `INSERT OR IGNORE INTO session_messages
-       (id, session_id, role, content, created_at, sent_at, model, sdk_message_id, last_assistant_message_id, turn_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      messageId,
-      sessionId,
-      role,
-      content,
-      timestamp,
-      timestamp,
-      msgModel,
-      sdkMessageId,
-      lastAssistantMessageId,
-      turnId
-    );
-    db.close();
-  } catch (err) {
-    console.error(`[db] Failed to insert message:`, err);
-  }
-}
-
-function isPlainUserPrompt(msg: any): boolean {
-  const content = msg?.message?.content;
-  if (typeof content === "string") {
-    return true;
-  }
-  if (!Array.isArray(content) || content.length === 0) {
-    return false;
-  }
-  return content.every(
-    (part) => part?.type === "text" && typeof part.text === "string"
+  insertSessionMessage(
+    sessionId,
+    role,
+    content,
+    timestamp,
+    msgModel,
+    sdkMessageId,
+    lastAssistantMessageId,
+    turnId
   );
 }
 
-function extractUserContent(msg: any): string {
+function extractUserContent(msg: any): string | null {
   const content = msg?.message?.content;
   if (typeof content === "string") {
     return content;
   }
   if (Array.isArray(content)) {
-    const textParts = content
-      .filter((part) => part?.type === "text" && typeof part.text === "string")
-      .map((part) => part.text.trim())
-      .filter(Boolean);
-    if (textParts.length > 0) {
-      return textParts.join("\n\n");
+    const renderedParts = content
+      .map((part) => extractUserContentPart(part, msg))
+      .filter((part): part is string => Boolean(part));
+    if (renderedParts.length > 0) {
+      return renderedParts.join("\n\n");
     }
   }
-  return JSON.stringify({
-    type: msg.type,
-    ...(msg.message ? { message: msg.message } : {}),
-  });
+  return null;
+}
+
+function extractUserContentPart(part: any, msg: any): string | null {
+  if (part?.type === "text" && typeof part.text === "string") {
+    const text = part.text.trim();
+    return text || null;
+  }
+  if (part?.type === "tool_result") {
+    return extractToolResultContent(part, msg);
+  }
+  return null;
+}
+
+function extractToolResultContent(part: any, msg: any): string | null {
+  const text =
+    extractTextValue(part?.content) ??
+    extractTextValue(msg?.tool_use_result) ??
+    extractTextValue(msg?.result);
+
+  if (!text) {
+    return part?.is_error ? "Tool result error." : "Tool result received.";
+  }
+
+  return text;
+}
+
+function extractTextValue(value: any): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((entry) => extractTextValue(entry))
+      .filter((entry): entry is string => Boolean(entry));
+    return parts.length > 0 ? parts.join("\n\n") : null;
+  }
+
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  if (typeof value.text === "string") {
+    const trimmed = value.text.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+
+  for (const key of ["message", "error", "result"]) {
+    if (typeof value[key] === "string") {
+      const trimmed = value[key].trim();
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+  }
+
+  return JSON.stringify(value);
 }
 
 function simplifyModel(model: string | null | undefined): string | null {
@@ -263,13 +850,98 @@ function updateSessionStatus(sessionId: string, status: string): void {
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
     db.prepare(
-      `UPDATE sessions SET status = ?, claude_session_id = ?, updated_at = datetime('now') WHERE id = ?`
-    ).run(status, sessionId, sessionId);
+      `UPDATE sessions SET status = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(status, sessionId);
     db.close();
     console.log(`[db] Session ${sessionId} → ${status}`);
   } catch (err) {
     console.error(`[db] Failed to update session status:`, err);
   }
+}
+
+function updateAgentSessionId(sessionId: string, agentSessionId: string): void {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    db.prepare(
+      `UPDATE sessions
+       SET claude_session_id = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(agentSessionId, sessionId);
+    db.close();
+  } catch (err) {
+    console.error(`[db] Failed to update agent session id:`, err);
+  }
+}
+
+function buildDisplayPrompt(
+  prompt: string,
+  launchMode: LaunchMode,
+  reviewBaseBranch?: string | null
+): string {
+  const trimmedPrompt = prompt.trim();
+  if (trimmedPrompt) {
+    if (launchMode === "review" && reviewBaseBranch?.trim()) {
+      return `Review changes against ${reviewBaseBranch.trim()}.\n\n${trimmedPrompt}`;
+    }
+    return trimmedPrompt;
+  }
+
+  if (launchMode === "review") {
+    return reviewBaseBranch?.trim()
+      ? `Review changes against ${reviewBaseBranch.trim()}.`
+      : "Review changes in this workspace.";
+  }
+
+  return "(empty message)";
+}
+
+function finalizeLaunchConfig(
+  config: ResolvedLaunchConfig,
+  displayPrompt: string
+): ResolvedLaunchConfig {
+  return {
+    ...config,
+    title: deriveSessionTitle(displayPrompt, config.title),
+  };
+}
+
+function insertSessionForWorkspace(
+  db: Database.Database,
+  workspaceId: string,
+  sessionId: string,
+  displayPrompt: string,
+  config: ResolvedLaunchConfig
+): SessionCreateResult {
+  const agentSessionId = config.agentType === "claude" ? sessionId : null;
+  const promptMessageId = randomUUID();
+  const promptModel = simplifyModel(config.model) ?? config.model;
+
+  db.prepare(
+    `INSERT INTO sessions
+      (id, status, model, permission_mode, workspace_id, agent_type, claude_session_id, title, codex_thinking_level)
+     VALUES (?, 'idle', ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    sessionId,
+    config.model,
+    TELEGRAM_AGENT_PERMISSION_MODE,
+    workspaceId,
+    config.agentType,
+    agentSessionId,
+    config.title,
+    config.codexThinkingLevel
+  );
+
+  const promptInsert = db.prepare(
+    `INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, model, turn_id)
+     VALUES (?, ?, 'user', ?, datetime('now'), datetime('now'), ?, ?)`
+  ).run(promptMessageId, sessionId, displayPrompt, promptModel, randomUUID());
+
+  return {
+    sessionId,
+    initialCursorRowid: Number(promptInsert.lastInsertRowid ?? 0),
+    agentType: config.agentType,
+    model: config.model,
+  };
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -293,9 +965,18 @@ function pickCityName(existingDirs: Set<string>): string {
 export async function launchWorkspace(
   repoPath: string,
   prompt: string,
-  onOutput?: (data: string) => void
+  onOutput?: (data: string) => void,
+  attachmentSourcePaths: string[] = [],
+  options: SessionLaunchOptions = {}
 ): Promise<
-  { workspaceName: string; sessionId: string; done: Promise<AgentResult> } | { error: string }
+  {
+    workspaceName: string;
+    sessionId: string;
+    done: Promise<AgentResult>;
+    initialCursorRowid: number;
+    agentType: AgentType;
+    model: string;
+  } | { error: string }
 > {
   const repoName = path.basename(repoPath);
   const workspacesDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName);
@@ -337,42 +1018,71 @@ export async function launchWorkspace(
   }
   onOutput?.(`Workspace created: ${cityName}`);
 
+  const stagedAttachmentPaths = stageAttachmentPaths(
+    workspaceDir,
+    attachmentSourcePaths
+  );
+  const fullPrompt = buildPromptWithAttachments(prompt, stagedAttachmentPaths);
+  const launchConfig = finalizeLaunchConfig(
+    resolveLaunchConfig(options),
+    buildDisplayPrompt(fullPrompt, options.launchMode ?? "prompt")
+  );
+
   // 3. Insert workspace + session into Conductor's DB
   const workspaceId = randomUUID();
-  const sessionId = randomUUID();
+  let sessionCreateResult: SessionCreateResult;
 
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
     const defaultBranchName = repoInfo.defaultBranch ?? "main";
+    const sessionId = randomUUID();
     db.prepare(
       `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status, initialization_parent_branch, intended_target_branch, placeholder_branch_name, initialization_files_copied)
        VALUES (?, ?, ?, ?, ?, 'ready', 'in-progress', ?, ?, ?, 0)`
     ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId, defaultBranchName, defaultBranchName, branchName);
-
-    db.prepare(
-      `INSERT INTO sessions (id, status, model, permission_mode, workspace_id, agent_type, claude_session_id)
-       VALUES (?, 'idle', 'opus', 'default', ?, 'claude', ?)`
-    ).run(sessionId, workspaceId, sessionId);
-
-    // Insert the initial user prompt so Conductor UI shows it
-    const promptMessageId = randomUUID();
-    db.prepare(
-      `INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, model, turn_id)
-       VALUES (?, ?, 'user', ?, datetime('now'), datetime('now'), 'opus', ?)`
-    ).run(promptMessageId, sessionId, prompt, randomUUID());
+    sessionCreateResult = insertSessionForWorkspace(
+      db,
+      workspaceId,
+      sessionId,
+      buildDisplayPrompt(fullPrompt, launchConfig.launchMode),
+      launchConfig
+    );
 
     db.close();
-    console.log(`[launcher] DB records created: workspace=${workspaceId}, session=${sessionId}`);
+    console.log(
+      `[launcher] DB records created: workspace=${workspaceId}, session=${sessionCreateResult.sessionId}`
+    );
   } catch (err) {
     console.error(`[launcher] DB insert failed:`, err);
     return { error: `Failed to create DB records: ${err}` };
   }
 
-  // 4. Spawn Claude CLI
-  const { done } = spawnAgent(sessionId, workspaceDir, prompt, "opus", cityName);
+  revealWorkspaceInConductor(workspaceDir);
+
+  // 4. Spawn the configured agent
+  const { done } = spawnAgent(
+    sessionCreateResult.sessionId,
+    workspaceDir,
+    fullPrompt,
+    launchConfig.model,
+    launchConfig.agentType,
+    cityName,
+    {
+      attachmentPaths: stagedAttachmentPaths,
+      launchMode: launchConfig.launchMode,
+      reviewBaseBranch: launchConfig.reviewBaseBranch,
+    }
+  );
   onOutput?.("Agent is running.");
 
-  return { workspaceName: cityName, sessionId, done };
+  return {
+    workspaceName: cityName,
+    sessionId: sessionCreateResult.sessionId,
+    done,
+    initialCursorRowid: sessionCreateResult.initialCursorRowid,
+    agentType: launchConfig.agentType,
+    model: launchConfig.model,
+  };
 }
 
 /**
@@ -380,7 +1090,8 @@ export async function launchWorkspace(
  */
 export async function sendToSession(
   workspaceName: string,
-  prompt: string
+  prompt: string,
+  attachmentSourcePaths: string[] = []
 ): Promise<{ ok: true; done: Promise<AgentResult> } | { error: string }> {
   const wsInfo = getWorkspaceFromConductorDb(workspaceName);
   if (!wsInfo) {
@@ -389,11 +1100,112 @@ export async function sendToSession(
 
   const repoName = wsInfo.repoName ?? workspaceName;
   const workspaceDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
-  const model = wsInfo.model ?? "opus";
+  const stagedAttachmentPaths = stageAttachmentPaths(
+    workspaceDir,
+    attachmentSourcePaths
+  );
+  const fullPrompt = buildPromptWithAttachments(prompt, stagedAttachmentPaths);
 
-  const { done } = spawnAgent(wsInfo.sessionId, workspaceDir, prompt, model, workspaceName, true);
+  const { done } = spawnAgent(
+    wsInfo.sessionId,
+    workspaceDir,
+    fullPrompt,
+    wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt"),
+    wsInfo.agentType,
+    workspaceName,
+    {
+      agentSessionId: wsInfo.agentSessionId,
+      isFollowUp: true,
+      attachmentPaths: stagedAttachmentPaths,
+      launchMode: "prompt",
+    }
+  );
 
   return { ok: true, done };
+}
+
+export async function launchWorkspaceSession(
+  workspaceName: string,
+  prompt: string,
+  options: SessionLaunchOptions & {
+    attachmentSourcePaths?: string[];
+  } = {}
+): Promise<
+  {
+    sessionId: string;
+    done: Promise<AgentResult>;
+    initialCursorRowid: number;
+    agentType: AgentType;
+    model: string;
+  } | { error: string }
+> {
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  if (!wsInfo) {
+    return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
+  }
+
+  const repoName = wsInfo.repoName ?? workspaceName;
+  const workspaceDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
+  const stagedAttachmentPaths = stageAttachmentPaths(
+    workspaceDir,
+    options.attachmentSourcePaths ?? []
+  );
+  const fullPrompt = buildPromptWithAttachments(prompt, stagedAttachmentPaths);
+  const reviewBaseBranch =
+    options.launchMode === "review"
+      ? options.reviewBaseBranch ?? wsInfo.targetBranch
+      : options.reviewBaseBranch ?? null;
+  const launchConfig = finalizeLaunchConfig(
+    resolveLaunchConfig({
+      ...options,
+      reviewBaseBranch,
+    }),
+    buildDisplayPrompt(fullPrompt, options.launchMode ?? "prompt", reviewBaseBranch)
+  );
+  let sessionCreateResult: SessionCreateResult;
+
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    const sessionId = randomUUID();
+    sessionCreateResult = insertSessionForWorkspace(
+      db,
+      wsInfo.workspaceId,
+      sessionId,
+      buildDisplayPrompt(fullPrompt, launchConfig.launchMode, reviewBaseBranch),
+      launchConfig
+    );
+    db.prepare(
+      "UPDATE workspaces SET active_session_id = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(sessionId, wsInfo.workspaceId);
+    db.close();
+  } catch (err) {
+    console.error(`[launcher] Failed to create session for workspace ${workspaceName}:`, err);
+    return { error: `Failed to create session: ${err}` };
+  }
+
+  revealWorkspaceInConductor(workspaceDir);
+
+  const { done } = spawnAgent(
+    sessionCreateResult.sessionId,
+    workspaceDir,
+    fullPrompt,
+    launchConfig.model,
+    launchConfig.agentType,
+    workspaceName,
+    {
+      attachmentPaths: stagedAttachmentPaths,
+      launchMode: launchConfig.launchMode,
+      reviewBaseBranch,
+    }
+  );
+
+  return {
+    sessionId: sessionCreateResult.sessionId,
+    done,
+    initialCursorRowid: sessionCreateResult.initialCursorRowid,
+    agentType: launchConfig.agentType,
+    model: launchConfig.model,
+  };
 }
 
 /**
@@ -445,16 +1257,29 @@ function getRepoFromConductorDb(repoPath: string): ConductorRepoInfo | null {
 interface ConductorWorkspaceInfo {
   workspaceId: string;
   sessionId: string;
+  agentSessionId: string | null;
+  agentType: AgentType;
   model: string | null;
   repoName: string | null;
+  repoPath: string | null;
   status: string | null;
+  targetBranch: string | null;
 }
 
 function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const row = db.prepare(
-      `SELECT w.id as workspace_id, w.active_session_id as session_id, s.model, s.status, r.name as repo_name
+      `SELECT
+          w.id as workspace_id,
+          w.active_session_id as session_id,
+          s.model,
+          s.status,
+          s.agent_type,
+          s.claude_session_id as agent_session_id,
+          r.name as repo_name,
+          r.root_path as repo_path,
+          COALESCE(w.intended_target_branch, w.initialization_parent_branch, r.default_branch) as target_branch
        FROM workspaces w
        LEFT JOIN sessions s ON s.id = w.active_session_id
        LEFT JOIN repos r ON r.id = w.repository_id
@@ -466,9 +1291,13 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
     return {
       workspaceId: row.workspace_id,
       sessionId: row.session_id,
+      agentSessionId: row.agent_session_id ?? null,
+      agentType: normalizeAgentType(row.agent_type) ?? "claude",
       model: row.model,
       repoName: row.repo_name ?? null,
+      repoPath: row.repo_path ?? null,
       status: row.status ?? null,
+      targetBranch: row.target_branch ?? null,
     };
   } catch {
     return null;

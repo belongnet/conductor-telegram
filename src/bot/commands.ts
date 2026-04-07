@@ -1,6 +1,13 @@
 import type { Context, Telegraf } from "telegraf";
 import { Markup } from "telegraf";
-import { launchWorkspace, stopAgent, sendToSession, type AgentResult } from "./launcher.js";
+import {
+  getWorkspaceSessionInfo,
+  launchWorkspace,
+  launchWorkspaceSession,
+  sendToSession,
+  stageAttachmentPaths,
+  stopAgent,
+} from "./launcher.js";
 import {
   createWorkspace,
   getActiveWorkspaces,
@@ -13,10 +20,11 @@ import {
   updateWorkspaceConductorName,
   answerDecision,
   updateWorkspaceConductorSession,
+  updateWorkspaceForwardCursor,
   getWorkspaceByTelegramMessage,
 } from "../store/queries.js";
-import type { Workspace, WorkspaceStatus } from "../types/index.js";
-import { readdirSync, mkdirSync, writeFileSync } from "node:fs";
+import type { Decision, Workspace, WorkspaceStatus } from "../types/index.js";
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import https from "node:https";
 
@@ -36,8 +44,8 @@ const TELEGRAM_DOWNLOADS_DIR =
   `${process.env.HOME}/.conductor-telegram/downloads`;
 
 /**
- * Download a Telegram file locally and return the local path.
- * This avoids exposing the bot token in URLs and makes files accessible to agents.
+ * Download a Telegram file locally and return the temporary local path.
+ * The file is staged into the target workspace before the agent sees it.
  */
 async function downloadTelegramFile(ctx: Context, fileId: string, ext: string = ""): Promise<string> {
   const file = await ctx.telegram.getFile(fileId);
@@ -75,6 +83,10 @@ const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ??
   `${process.env.HOME}/conductor/repos`;
 
+const CONDUCTOR_WORKSPACES_DIR =
+  process.env.CONDUCTOR_WORKSPACES_DIR ??
+  `${process.env.HOME}/conductor/workspaces`;
+
 function getRepoList(): string[] {
   try {
     const entries = readdirSync(CONDUCTOR_REPOS_DIR, { withFileTypes: true });
@@ -99,16 +111,233 @@ function resolveRepo(input: string): string | null {
   return null;
 }
 
-let _bot: Telegraf<Context>;
+interface WorkspaceTarget {
+  conductorName: string;
+  trackedWorkspace: Workspace | null;
+  repoPath: string | null;
+  repoName: string | null;
+  targetBranch: string | null;
+}
+
+interface SkillRoute {
+  description: string;
+  skill: string;
+}
+
+export interface TelegramCommandDefinition {
+  command: string;
+  description: string;
+}
+
+const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
+  { command: "run", description: "Start a new workspace run" },
+  { command: "review", description: "Start a review session for a workspace" },
+  { command: "send", description: "Send a follow-up to a workspace" },
+  { command: "skills", description: "List workspace skill routes" },
+  { command: "skill", description: "Invoke a workspace skill by name" },
+  { command: "gstack", description: "Ask the agent to use the GStack workflow" },
+  { command: "workspaces", description: "List tracked workspaces" },
+  { command: "status", description: "Show active workspace status" },
+  { command: "stop", description: "Stop a running workspace" },
+  { command: "repos", description: "List available repos" },
+  { command: "help", description: "Show bot help" },
+];
+
+export function getTelegramCommands(): TelegramCommandDefinition[] {
+  return TELEGRAM_COMMANDS;
+}
+
+function findTrackedWorkspace(identifier: string): Workspace | undefined {
+  let workspace = getWorkspace(identifier);
+  if (workspace) {
+    return workspace;
+  }
+
+  const all = getAllWorkspaces(100);
+  return all.find((ws) => ws.conductorWorkspaceName === identifier);
+}
+
+function resolveWorkspaceTarget(identifier: string): WorkspaceTarget | null {
+  const trackedWorkspace = findTrackedWorkspace(identifier) ?? null;
+  const conductorName = trackedWorkspace?.conductorWorkspaceName ?? identifier;
+  const sessionInfo = getWorkspaceSessionInfo(conductorName);
+  if (!sessionInfo) {
+    return null;
+  }
+
+  return {
+    conductorName,
+    trackedWorkspace,
+    repoPath: sessionInfo.repoPath,
+    repoName: sessionInfo.repoName,
+    targetBranch: sessionInfo.targetBranch,
+  };
+}
+
+function splitHead(text: string): [string, string] {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return ["", ""];
+  }
+  const spaceIdx = trimmed.indexOf(" ");
+  if (spaceIdx === -1) {
+    return [trimmed, ""];
+  }
+  return [trimmed.slice(0, spaceIdx), trimmed.slice(spaceIdx + 1).trim()];
+}
+
+function getReplyWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) {
+    return null;
+  }
+  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
+  if (!repliedWorkspace?.conductorWorkspaceName) {
+    return null;
+  }
+  return resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName);
+}
+
+function getWorkspaceDirectory(target: WorkspaceTarget): string | null {
+  if (!target.repoName) {
+    return null;
+  }
+  return path.join(CONDUCTOR_WORKSPACES_DIR, target.repoName, target.conductorName);
+}
+
+function parseSkillRoutes(text: string): SkillRoute[] {
+  const matches = [...text.matchAll(/^- (.+?)\s+→\s+invoke\s+([a-z0-9._-]+)/gim)];
+  return matches.map((match) => ({
+    description: match[1].trim(),
+    skill: match[2].trim(),
+  }));
+}
+
+function getWorkspaceSkillRoutes(target: WorkspaceTarget): SkillRoute[] {
+  const workspaceDir = getWorkspaceDirectory(target);
+  if (!workspaceDir) {
+    return [];
+  }
+
+  for (const fileName of ["CLAUDE.md", "AGENTS.md"]) {
+    const filePath = path.join(workspaceDir, fileName);
+    if (!existsSync(filePath)) {
+      continue;
+    }
+
+    const routes = parseSkillRoutes(readFileSync(filePath, "utf8"));
+    if (routes.length > 0) {
+      return routes;
+    }
+  }
+
+  return [];
+}
+
+function buildReviewPrompt(extraInstructions: string): string {
+  const lines = [
+    "Prioritize concrete bugs, regressions, risky assumptions, and missing tests.",
+    "Present findings first with file references when possible.",
+    "Keep the summary brief after the findings.",
+  ];
+
+  if (extraInstructions.trim()) {
+    lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
+  }
+
+  return lines.join("\n");
+}
+
+function buildSkillPrompt(skill: string, extraInstructions: string): string {
+  const normalizedSkill = skill.trim();
+  if (normalizedSkill === "gstack") {
+    return buildGstackPrompt(extraInstructions);
+  }
+
+  const lines = [`Invoke the ${normalizedSkill} skill for this workspace.`];
+  if (extraInstructions.trim()) {
+    lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
+  }
+  return lines.join("\n");
+}
+
+function buildGstackPrompt(extraInstructions: string): string {
+  const lines = [
+    "Use the GStack or Graphite workflow in this workspace.",
+    "If `gstack`, `gt`, or the Graphite CLI is available, use it.",
+    "If the tooling is missing, explain exactly what is unavailable and stop.",
+  ];
+
+  if (extraInstructions.trim()) {
+    lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
+  }
+
+  return lines.join("\n");
+}
+
+function ensureTrackedWorkspace(
+  ctx: Context,
+  target: WorkspaceTarget,
+  prompt: string
+): Workspace | null {
+  if (target.trackedWorkspace) {
+    return target.trackedWorkspace;
+  }
+
+  const repoPath =
+    target.repoPath ??
+    (target.repoName ? path.join(CONDUCTOR_REPOS_DIR, target.repoName) : null);
+  if (!repoPath) {
+    return null;
+  }
+
+  const workspace = createWorkspace({
+    name: `${target.conductorName}-${Date.now()}`,
+    prompt,
+    repoPath,
+    telegramChatId: ctx.chat!.id.toString(),
+  });
+  updateWorkspaceConductorName(workspace.id, target.conductorName);
+  return workspace;
+}
+
+async function sendPromptToTarget(
+  ctx: Context,
+  target: WorkspaceTarget,
+  prompt: string
+): Promise<void> {
+  if (target.trackedWorkspace) {
+    await sendMessageToWorkspace(ctx, target.trackedWorkspace, prompt);
+    return;
+  }
+
+  await ctx.reply(`Sending message to <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(prompt, 200))}</i>`, {
+    parse_mode: "HTML",
+  });
+
+  const result = await sendToSession(target.conductorName, prompt);
+  if ("error" in result) {
+    await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
+    return;
+  }
+
+  await ctx.reply(
+    `📨 Message sent to <b>${escHtml(target.conductorName)}</b>:\n<i>${escHtml(truncate(prompt, 200))}</i>`,
+    { parse_mode: "HTML" }
+  );
+}
 
 export function registerCommands(bot: Telegraf<Context>): void {
-  _bot = bot;
   bot.command("run", handleRun);
   bot.command("workspaces", handleWorkspaces);
   bot.command("status", handleStatus);
   bot.command("stop", handleStop);
   bot.command("repos", handleRepos);
   bot.command("send", handleSend);
+  bot.command("review", handleReview);
+  bot.command("skills", handleSkills);
+  bot.command("skill", handleSkill);
+  bot.command("gstack", handleGstack);
   bot.command("help", handleHelp);
 
   // Inline button callbacks
@@ -163,11 +392,17 @@ async function handleRun(ctx: Context): Promise<void> {
   await startWorkspaceFromMessage(ctx, repoName, prompt);
 }
 
-async function startWorkspaceFromMessage(ctx: Context, repoName: string, prompt: string): Promise<void> {
+async function startWorkspaceFromMessage(
+  ctx: Context,
+  repoName: string,
+  prompt: string,
+  attachmentSourcePaths: string[] = []
+): Promise<void> {
   const repoPath = path.join(CONDUCTOR_REPOS_DIR, repoName);
+  const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
 
   // Send initial message
-  const msg = await ctx.reply(`Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(prompt, 200))}</i>`, {
+  const msg = await ctx.reply(`Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`, {
     parse_mode: "HTML",
   });
 
@@ -183,10 +418,10 @@ async function startWorkspaceFromMessage(ctx: Context, repoName: string, prompt:
 
   const chatId = ctx.chat!.id;
 
-  // Launch via deeplink + Claude CLI spawn (no sidecar socket)
+  // Launch the workspace and spawn the agent process.
   const result = await launchWorkspace(repoPath, prompt, (output) => {
     console.log(`[${workspace.id}] ${output.slice(0, 200)}`);
-  });
+  }, attachmentSourcePaths);
 
   if ("error" in result) {
     updateWorkspaceStatus(workspace.id, "failed");
@@ -203,13 +438,14 @@ async function startWorkspaceFromMessage(ctx: Context, repoName: string, prompt:
   // Workspace created and agent running
   updateWorkspaceConductorName(workspace.id, result.workspaceName);
   updateWorkspaceConductorSession(workspace.id, result.sessionId);
+  updateWorkspaceForwardCursor(workspace.id, result.initialCursorRowid);
   updateWorkspaceStatus(workspace.id, "running");
 
   await ctx.telegram.editMessageText(
     chatId,
     msg.message_id,
     undefined,
-    `🟢 Agent <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(prompt, 200))}</i>`,
+    `🟢 Agent <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
     {
       parse_mode: "HTML",
       ...Markup.inlineKeyboard([
@@ -217,11 +453,6 @@ async function startWorkspaceFromMessage(ctx: Context, repoName: string, prompt:
       ]),
     }
   );
-
-  // Wait for agent completion in background, notify via Telegram
-  result.done.then((agentResult) => {
-    notifyCompletion(_bot, chatId.toString(), workspace.id, result.workspaceName, agentResult);
-  });
 }
 
 // ── /workspaces ─────────────────────────────────────────────
@@ -384,6 +615,28 @@ async function tryAnswerDecisionReply(ctx: Context, answerText: string): Promise
   return true;
 }
 
+async function tryAnswerDecisionReplyWithFormatter(
+  ctx: Context,
+  formatAnswer: (decision: Decision) => string
+): Promise<boolean> {
+  const replyTo = (ctx.message as any)?.reply_to_message?.message_id;
+  if (!replyTo) return false;
+
+  const decisionId = messageToDecision.get(replyTo);
+  if (!decisionId) return false;
+
+  const decision = getDecision(decisionId);
+  if (!decision || decision.answer) return false;
+
+  const answerText = formatAnswer(decision);
+  answerDecision(decisionId, answerText);
+  messageToDecision.delete(replyTo);
+  await ctx.reply(`Answered: ${truncate(answerText, 200)}`, {
+    reply_parameters: { message_id: (ctx.message as any).message_id },
+  });
+  return true;
+}
+
 // ── Photo handler ────────────────────────────────────────────
 
 async function handlePhotoMessage(ctx: Context): Promise<void> {
@@ -401,13 +654,17 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // Check if this is a reply to a decision
   const localPath = await downloadTelegramFile(ctx, photo.file_id, ".jpg");
-  const answerText = caption
-    ? `[Image: ${localPath}]\n${caption}`
-    : `[Image: ${localPath}]`;
-
-  if (await tryAnswerDecisionReply(ctx, answerText)) return;
+  if (
+    await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
+      const stagedPath = stageDecisionAttachment(decision, localPath);
+      return caption
+        ? `[Image: ${stagedPath}]\n${caption}`
+        : `[Image: ${stagedPath}]`;
+    })
+  ) {
+    return;
+  }
 
   // Not a reply to a decision — treat as a standalone message
   await ctx.reply(
@@ -422,7 +679,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
 async function handleCaptionCommand(
   ctx: Context,
   caption: string,
-  attachmentDescription: string
+  attachmentPath: string
 ): Promise<void> {
   const runMatch = caption.match(/^\/run\s+(.+)/);
   if (runMatch) {
@@ -436,7 +693,7 @@ async function handleCaptionCommand(
         await ctx.reply(`Repo "${escHtml(repoInput)}" not found. Use /repos to see available repos.`, { parse_mode: "HTML" });
         return;
       }
-      await startWorkspaceFromMessage(ctx, repoName, `[Attached: ${attachmentDescription}]`);
+      await startWorkspaceFromMessage(ctx, repoName, "", [attachmentPath]);
       return;
     }
 
@@ -452,7 +709,7 @@ async function handleCaptionCommand(
       );
       return;
     }
-    await startWorkspaceFromMessage(ctx, repoName, `${prompt}\n\n[Attached: ${attachmentDescription}]`);
+    await startWorkspaceFromMessage(ctx, repoName, prompt, [attachmentPath]);
     return;
   }
 
@@ -462,9 +719,6 @@ async function handleCaptionCommand(
     const spaceIdx = args.indexOf(" ");
     const wsName = spaceIdx === -1 ? args : args.slice(0, spaceIdx);
     const message = spaceIdx === -1 ? "" : args.slice(spaceIdx + 1).trim();
-    const fullMessage = message
-      ? `${message}\n\n[Attached: ${attachmentDescription}]`
-      : `[Attached: ${attachmentDescription}]`;
 
     let workspace = getWorkspace(wsName);
     if (!workspace) {
@@ -472,7 +726,7 @@ async function handleCaptionCommand(
       workspace = all.find((ws) => ws.conductorWorkspaceName === wsName);
     }
     if (workspace) {
-      await sendMessageToWorkspace(ctx, workspace, fullMessage);
+      await sendMessageToWorkspace(ctx, workspace, message, [attachmentPath]);
     } else {
       await ctx.reply(`Workspace "${escHtml(wsName)}" not found.`, { parse_mode: "HTML" });
     }
@@ -493,10 +747,15 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
 
   const localPath = await downloadTelegramFile(ctx, msg.voice.file_id, ".ogg");
   const duration = msg.voice.duration ?? 0;
-  const answerText = `[Voice message (${duration}s): ${localPath}]`;
 
-  // Check if this is a reply to a decision
-  if (await tryAnswerDecisionReply(ctx, answerText)) return;
+  if (
+    await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
+      const stagedPath = stageDecisionAttachment(decision, localPath);
+      return `[Voice message (${duration}s): ${stagedPath}]`;
+    })
+  ) {
+    return;
+  }
 
   // Not a reply to a decision
   await ctx.reply(
@@ -566,7 +825,7 @@ async function handleSend(ctx: Context): Promise<void> {
 
   const conductorName = workspace?.conductorWorkspaceName ?? wsName;
   if (!workspace) {
-    await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...`, {
+    await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(message, 200))}</i>`, {
       parse_mode: "HTML",
     });
     const result = await sendToSession(conductorName, message);
@@ -584,6 +843,196 @@ async function handleSend(ctx: Context): Promise<void> {
   await sendMessageToWorkspace(ctx, workspace, message);
 }
 
+// ── /review <workspace> [instructions] ──────────────────────
+
+async function handleReview(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/review\s*/, "").trim();
+  const replyTarget = getReplyWorkspaceTarget(ctx);
+
+  let target: WorkspaceTarget | null = null;
+  let instructions = "";
+
+  if (!args) {
+    target = replyTarget;
+  } else {
+    const [head, tail] = splitHead(args);
+    const explicitTarget = resolveWorkspaceTarget(head);
+    if (explicitTarget) {
+      target = explicitTarget;
+      instructions = tail;
+    } else if (replyTarget) {
+      target = replyTarget;
+      instructions = args;
+    }
+  }
+
+  if (!target) {
+    await ctx.reply(
+      "Usage: /review <workspace-name> [instructions]\n\nYou can also reply to a workspace message with /review."
+    );
+    return;
+  }
+
+  const reviewPrompt = buildReviewPrompt(instructions);
+  const trackedWorkspace = ensureTrackedWorkspace(ctx, target, reviewPrompt);
+  if (!trackedWorkspace) {
+    await ctx.reply(`Could not resolve repo details for <b>${escHtml(target.conductorName)}</b>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const progress = await ctx.reply(
+    `Starting review for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(reviewPrompt, 200))}</i>`,
+    { parse_mode: "HTML" }
+  );
+  updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
+
+  const result = await launchWorkspaceSession(target.conductorName, reviewPrompt, {
+    launchMode: "review",
+    title: "Review Changes",
+    reviewBaseBranch: target.targetBranch,
+  });
+
+  if ("error" in result) {
+    updateWorkspaceStatus(trackedWorkspace.id, "failed");
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `Failed to start review for <b>${escHtml(target.conductorName)}</b>:\n${escHtml(result.error)}`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
+  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
+  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  updateWorkspaceStatus(trackedWorkspace.id, "running");
+
+  await ctx.telegram.editMessageText(
+    ctx.chat!.id,
+    progress.message_id,
+    undefined,
+    `🟢 Review running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
+    { parse_mode: "HTML" }
+  );
+}
+
+// ── /skills <workspace> ─────────────────────────────────────
+
+async function handleSkills(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/skills\s*/, "").trim();
+  const target =
+    (args ? resolveWorkspaceTarget(args) : null) ?? getReplyWorkspaceTarget(ctx);
+
+  if (!target) {
+    await ctx.reply(
+      "Usage: /skills <workspace-name>\n\nYou can also reply to a workspace message with /skills."
+    );
+    return;
+  }
+
+  const routes = getWorkspaceSkillRoutes(target);
+  if (routes.length === 0) {
+    await ctx.reply(
+      `No invoke-style skills were found for <b>${escHtml(target.conductorName)}</b>.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const lines = routes.map(
+    (route) => `<code>${escHtml(route.skill)}</code> — ${escHtml(route.description)}`
+  );
+  lines.push("");
+  lines.push(
+    `Use <code>/skill ${escHtml(target.conductorName)} ${escHtml(routes[0]!.skill)}</code> to invoke one.`
+  );
+  lines.push(
+    `Use <code>/gstack ${escHtml(target.conductorName)}</code> for the Graphite/GStack workflow.`
+  );
+
+  await ctx.reply(
+    `<b>Skills for ${escHtml(target.conductorName)}</b>\n\n${lines.join("\n")}`,
+    { parse_mode: "HTML" }
+  );
+}
+
+// ── /skill <workspace> <skill> [instructions] ──────────────
+
+async function handleSkill(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/skill\s*/, "").trim();
+  const replyTarget = getReplyWorkspaceTarget(ctx);
+
+  if (!args) {
+    await ctx.reply(
+      "Usage: /skill <workspace-name> <skill> [instructions]\n\nYou can also reply to a workspace message with /skill <skill>."
+    );
+    return;
+  }
+
+  const [head, tail] = splitHead(args);
+  let target = resolveWorkspaceTarget(head);
+  let skill = "";
+  let extraInstructions = "";
+
+  if (target) {
+    [skill, extraInstructions] = splitHead(tail);
+  } else if (replyTarget) {
+    target = replyTarget;
+    skill = head;
+    extraInstructions = tail;
+  }
+
+  if (!target || !skill) {
+    await ctx.reply(
+      "Usage: /skill <workspace-name> <skill> [instructions]\n\nYou can also reply to a workspace message with /skill <skill>."
+    );
+    return;
+  }
+
+  await sendPromptToTarget(ctx, target, buildSkillPrompt(skill, extraInstructions));
+}
+
+// ── /gstack <workspace> [instructions] ──────────────────────
+
+async function handleGstack(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/gstack\s*/, "").trim();
+  const replyTarget = getReplyWorkspaceTarget(ctx);
+
+  let target: WorkspaceTarget | null = null;
+  let extraInstructions = "";
+
+  if (!args) {
+    target = replyTarget;
+  } else {
+    const [head, tail] = splitHead(args);
+    const explicitTarget = resolveWorkspaceTarget(head);
+    if (explicitTarget) {
+      target = explicitTarget;
+      extraInstructions = tail;
+    } else if (replyTarget) {
+      target = replyTarget;
+      extraInstructions = args;
+    }
+  }
+
+  if (!target) {
+    await ctx.reply(
+      "Usage: /gstack <workspace-name> [instructions]\n\nYou can also reply to a workspace message with /gstack."
+    );
+    return;
+  }
+
+  await sendPromptToTarget(ctx, target, buildGstackPrompt(extraInstructions));
+}
+
 // ── /help ───────────────────────────────────────────────────
 
 async function handleHelp(ctx: Context): Promise<void> {
@@ -594,6 +1043,10 @@ Commands:
 /run &lt;repo&gt; &lt;prompt&gt; — Start a new workspace
 /run &lt;number&gt; &lt;prompt&gt; — Start using repo number
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
+/review &lt;workspace&gt; [instructions] — Start a review session
+/skills &lt;workspace&gt; — List invoke-style skills from the workspace
+/skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
+/gstack &lt;workspace&gt; [instructions] — Ask the agent to use the GStack/Graphite workflow
 /workspaces — List all tracked workspaces
 /status — Show active workspace summary
 /stop &lt;name&gt; — Stop a workspace
@@ -601,7 +1054,7 @@ Commands:
 /help — Show this message
 
 Tap a repo from /repos, then type your prompt.
-Reply to a forwarded workspace message to send a follow-up to that same workspace.`,
+Reply to a forwarded workspace message to target that workspace with /send, /review, /skills, /skill, or /gstack.`,
     { parse_mode: "HTML" }
   );
 }
@@ -646,35 +1099,6 @@ async function handleDecisionCallback(ctx: Context): Promise<void> {
 
   await ctx.answerCbQuery(`Answered: ${answer}`);
   await ctx.editMessageReplyMarkup(undefined);
-}
-
-// ── Agent completion notification ────────────────────────────
-
-function notifyCompletion(
-  bot: Telegraf<Context>,
-  chatId: string,
-  workspaceId: string,
-  workspaceName: string,
-  agentResult: AgentResult
-): void {
-  const status = agentResult.isError ? "failed" : "done";
-  updateWorkspaceStatus(workspaceId, status);
-
-  const icon = agentResult.isError ? "🔴" : "✅";
-  const parts: string[] = [];
-  if (agentResult.costUsd) parts.push(`$${agentResult.costUsd.toFixed(2)}`);
-  if (agentResult.numTurns) parts.push(`${agentResult.numTurns} turns`);
-  if (agentResult.durationMs) parts.push(`${Math.round(agentResult.durationMs / 1000)}s`);
-
-  let msg = `${icon} Agent <b>${escHtml(workspaceName)}</b> ${status}`;
-  if (parts.length) msg += `\n${parts.join(" · ")}`;
-  if (agentResult.resultText) {
-    msg += `\n\n<i>${escHtml(truncate(agentResult.resultText, 500))}</i>`;
-  }
-
-  bot.telegram
-    .sendMessage(chatId, msg, { parse_mode: "HTML" })
-    .catch((err) => console.error("[notify] error:", err));
 }
 
 function getReplyTargetWorkspace(
@@ -725,15 +1149,17 @@ function inferWorkspaceFromReply(reply: any): Workspace | undefined {
 async function sendMessageToWorkspace(
   ctx: Context,
   workspace: Workspace,
-  message: string
+  message: string,
+  attachmentSourcePaths: string[] = []
 ): Promise<void> {
   const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
+  const messagePreview = previewOutgoingText(message, attachmentSourcePaths);
 
-  await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...`, {
+  await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(messagePreview, 200))}</i>`, {
     parse_mode: "HTML",
   });
 
-  const result = await sendToSession(conductorName, message);
+  const result = await sendToSession(conductorName, message, attachmentSourcePaths);
 
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
@@ -742,18 +1168,52 @@ async function sendMessageToWorkspace(
 
   updateWorkspaceStatus(workspace.id, "running");
 
-  const chatId = ctx.chat!.id;
   await ctx.reply(
-    `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(message, 200))}</i>`,
+    `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(messagePreview, 200))}</i>`,
     { parse_mode: "HTML" }
   );
-
-  result.done.then((agentResult) => {
-    notifyCompletion(_bot, chatId.toString(), workspace.id, conductorName, agentResult);
-  });
 }
 
 // ── Helpers ─────────────────────────────────────────────────
+
+function previewOutgoingText(prompt: string, attachmentSourcePaths: string[]): string {
+  const trimmedPrompt = prompt.trim();
+  if (trimmedPrompt) {
+    return trimmedPrompt;
+  }
+
+  if (attachmentSourcePaths.length === 0) {
+    return "(empty message)";
+  }
+
+  if (attachmentSourcePaths.length === 1) {
+    return `[Attached: ${path.basename(attachmentSourcePaths[0])}]`;
+  }
+
+  return `[${attachmentSourcePaths.length} attached files]`;
+}
+
+function stageDecisionAttachment(decision: Decision, sourcePath: string): string {
+  const workspace = getWorkspace(decision.workspaceId);
+  if (!workspace?.conductorWorkspaceName) {
+    return sourcePath;
+  }
+
+  const repoName = path.basename(workspace.repoPath);
+  const workspaceDir = path.join(
+    CONDUCTOR_WORKSPACES_DIR,
+    repoName,
+    workspace.conductorWorkspaceName
+  );
+
+  try {
+    const [stagedPath] = stageAttachmentPaths(workspaceDir, [sourcePath]);
+    return stagedPath ?? sourcePath;
+  } catch (err) {
+    console.error("[attachments] Failed to stage decision attachment:", err);
+    return sourcePath;
+  }
+}
 
 function statusIcon(status: WorkspaceStatus): string {
   switch (status) {
