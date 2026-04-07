@@ -11,6 +11,7 @@ import {
   getSessionMessagesAfter,
   getSessionResult,
   getWorkspaceSessionInfo,
+  answerPendingStdinDecision,
   type SessionMessage,
 } from "./launcher.js";
 import {
@@ -231,7 +232,22 @@ function extractAssistantText(content: string): string | null {
     if (parsed?.type === "result") {
       return null;
     }
-    return extractTextParts(parsed?.message?.content) || null;
+
+    const msgContent = parsed?.message?.content;
+    // Extract text parts first
+    const text = extractTextParts(msgContent);
+
+    // Also check for AskUserQuestion tool_use (question text is forwarded via
+    // the decision/event system, so we just skip these to avoid double display)
+    if (!text && Array.isArray(msgContent)) {
+      const hasOnlyToolUse = msgContent.every(
+        (block: any) =>
+          block?.type === "tool_use" || block?.type === "thinking"
+      );
+      if (hasOnlyToolUse) return null;
+    }
+
+    return text || null;
   } catch {
     return null;
   }
