@@ -29,6 +29,7 @@ import {
   escHtml as esc,
   expandableQuote,
   formatStats,
+  markdownToTelegramHtml,
   styledButtons,
   truncate as trunc,
 } from "./format.js";
@@ -143,7 +144,7 @@ function startSessionPoller(): void {
             const stats = formatStats(result);
             if (stats) msg += `  <code>${stats}</code>`;
             if (result.resultText) {
-              msg += `\n\n${expandableQuote(esc(trunc(result.resultText, 800)))}`;
+              msg += `\n\n${expandableQuote(markdownToTelegramHtml(trunc(result.resultText, 800)))}`;
             }
           }
 
@@ -229,8 +230,8 @@ function formatForwardedMessage(
   const text = extractAssistantText(message.content);
   if (!text) return null;
 
-  const escaped = esc(trunc(text, 1200));
-  return `🤖 <b>${esc(workspaceName)}</b>\n\n${expandableQuote(escaped)}`;
+  const formatted = markdownToTelegramHtml(trunc(text, 1200));
+  return `🤖 <b>${esc(workspaceName)}</b>\n\n${expandableQuote(formatted)}`;
 }
 
 function extractAssistantText(content: string): string | null {

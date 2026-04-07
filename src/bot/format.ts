@@ -67,6 +67,58 @@ export function btn(
   return b;
 }
 
+// ── Markdown → Telegram HTML ─────────────────────────────────
+
+/**
+ * Convert markdown (as produced by Claude / LLMs) to Telegram-compatible HTML.
+ *
+ * Handles fenced code blocks, inline code, bold, italic, strikethrough,
+ * links, and headings.  Everything outside markdown syntax is HTML-escaped.
+ */
+export function markdownToTelegramHtml(md: string): string {
+  const placeholders: string[] = [];
+  const protect = (html: string): string => {
+    const i = placeholders.length;
+    placeholders.push(html);
+    return `\x00${i}\x00`;
+  };
+
+  let s = md;
+
+  // 1. Fenced code blocks  ```lang\n…\n```
+  s = s.replace(/```\w*\n([\s\S]*?)```/g, (_m, code: string) =>
+    protect(`<pre>${escHtml(code.trimEnd())}</pre>`)
+  );
+
+  // 2. Inline code  `…`
+  s = s.replace(/`([^`\n]+)`/g, (_m, code: string) =>
+    protect(`<code>${escHtml(code)}</code>`)
+  );
+
+  // 3. Escape remaining literal text
+  s = escHtml(s);
+
+  // 4. Bold  **…**
+  s = s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+
+  // 5. Italic  *…*  (only single, not adjacent to another *)
+  s = s.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "<i>$1</i>");
+
+  // 6. Strikethrough  ~~…~~
+  s = s.replace(/~~(.+?)~~/g, "<s>$1</s>");
+
+  // 7. Links  [text](url)
+  s = s.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+
+  // 8. Headings  # … → bold line
+  s = s.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+
+  // Restore protected regions
+  s = s.replace(/\x00(\d+)\x00/g, (_m, idx: string) => placeholders[Number(idx)]);
+
+  return s;
+}
+
 // ── Status formatting ────────────────────────────────────────
 
 export function statusIcon(status: string): string {
