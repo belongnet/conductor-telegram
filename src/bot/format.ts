@@ -26,6 +26,14 @@ export function expandableQuote(text: string, minLength = 120): string {
   return `<blockquote expandable>${text}</blockquote>`;
 }
 
+/**
+ * Telegram forbids nesting links and code/pre entities inside blockquotes.
+ * Fall back to plain HTML when those entities are present.
+ */
+export function maybeExpandableQuote(text: string, minLength = 120): string {
+  return /<(?:a|code|pre)\b/i.test(text) ? text : expandableQuote(text, minLength);
+}
+
 // ── Styled inline buttons ────────────────────────────────────
 //
 // Telegraf v4 doesn't expose the `style` field from Bot API 9.4.
@@ -108,7 +116,11 @@ export function markdownToTelegramHtml(md: string): string {
   s = s.replace(/~~(.+?)~~/g, "<s>$1</s>");
 
   // 7. Links  [text](url)
-  s = s.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+  s = s.replace(
+    /\[(.+?)\]\((.+?)\)/g,
+    (_m, label: string, href: string) =>
+      `<a href="${href.replace(/"/g, "&quot;")}">${label}</a>`
+  );
 
   // 8. Headings  # … → bold line
   s = s.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
