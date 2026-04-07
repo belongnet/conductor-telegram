@@ -5,7 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 
-const CONDUCTOR_WORKSPACES_DIR =
+export const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
 
 const CONDUCTOR_DB_PATH =
@@ -1420,6 +1420,16 @@ export function getSessionMessagesAfter(
   } catch {
     return [];
   }
+}
+
+/**
+ * Get the filesystem path for a workspace by its directory name.
+ * Looks up the repo name from Conductor's DB to build the full path.
+ */
+export function getWorkspaceDir(workspaceName: string): string | null {
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  if (!wsInfo?.repoName) return null;
+  return path.join(CONDUCTOR_WORKSPACES_DIR, wsInfo.repoName, workspaceName);
 }
 
 // ── Shell helpers ────────────────────────────────────────────

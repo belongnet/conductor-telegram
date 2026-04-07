@@ -79,26 +79,6 @@ function fetchBuffer(url: string): Promise<Buffer> {
   });
 }
 
-// Map Telegram message IDs to decision IDs (for reply-based answering)
-const messageToDecision = new Map<number, number>();
-
-/**
- * Register a Telegram message ID as associated with a decision,
- * so that replies to that message can answer the decision.
- */
-export function trackDecisionMessage(messageId: number, decisionId: number): void {
-  messageToDecision.set(messageId, decisionId);
-}
-
-/**
- * Get a Telegram file URL for downloading.
- */
-async function getFileUrl(ctx: Context, fileId: string): Promise<string> {
-  const file = await ctx.telegram.getFile(fileId);
-  const token = (ctx.telegram as any).token;
-  return `https://api.telegram.org/file/bot${token}/` + file.file_path;
-}
-
 const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ??
   `${process.env.HOME}/conductor/repos`;
@@ -656,9 +636,13 @@ async function tryAnswerDecisionReplyWithFormatter(
   });
   return true;
 }
+
 // ── Photo handler ────────────────────────────────────────────
 
 async function handlePhotoMessage(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return;
+
   const msg = ctx.message as any;
   if (!msg?.photo?.length) return;
 
@@ -685,7 +669,13 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // Not a reply to a decision — treat as a standalone message
+  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedWorkspace) {
+    const message = caption || "The user sent a screenshot/image. Please review it.";
+    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+    return;
+  }
+
   await ctx.reply(
     "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
   );
@@ -760,6 +750,9 @@ async function handleCaptionCommand(
 // ── Voice handler ────────────────────────────────────────────
 
 async function handleVoiceMessage(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return;
+
   const msg = ctx.message as any;
   if (!msg?.voice) return;
 
@@ -775,7 +768,13 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // Not a reply to a decision
+  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedWorkspace) {
+    const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+    return;
+  }
+
   await ctx.reply(
     "Got your voice message. Reply to a question from an agent, or use /send to forward to a workspace."
   );
@@ -1072,7 +1071,8 @@ Commands:
 /help — Show this message
 
 Tap a repo from /repos, then type your prompt.
-Reply to a forwarded workspace message to target that workspace with /send, /review, /skills, /skill, or /gstack.`,
+Reply to a forwarded workspace message to target that workspace with /send, /review, /skills, /skill, or /gstack.
+Reply with a photo, screenshot, or voice note to send it to the agent.`,
     { parse_mode: "HTML" }
   );
 }
