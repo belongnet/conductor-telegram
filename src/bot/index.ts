@@ -38,7 +38,9 @@ if (!BOT_TOKEN) {
 }
 
 if (!OWNER_CHAT_ID) {
-  console.error("OWNER_CHAT_ID environment variable is required");
+  console.error(
+    "OWNER_CHAT_ID environment variable is required. Set it to your private chat ID or supergroup ID, or use OWNER_CHAT_ID=0 temporarily and run /start or /setup to bootstrap ID discovery."
+  );
   process.exit(1);
 }
 
@@ -69,9 +71,11 @@ async function syncTelegramCommands(): Promise<void> {
   await bot.telegram.callApi("deleteMyCommands", {
     scope: { type: "all_private_chats" },
   });
-  await bot.telegram.callApi("deleteMyCommands", {
-    scope: { type: "chat", chat_id: OWNER_CHAT_ID! },
-  });
+  if (OWNER_CHAT_ID !== "0") {
+    await bot.telegram.callApi("deleteMyCommands", {
+      scope: { type: "chat", chat_id: OWNER_CHAT_ID! },
+    });
+  }
   await bot.telegram.setMyCommands(commands);
 }
 
@@ -297,6 +301,15 @@ function truncate(s: string, maxLen: number): string {
   return s.length > maxLen ? `${s.slice(0, maxLen - 3)}...` : s;
 }
 
+function logSetupHints(): void {
+  console.log("[setup] Use /setup for guided private-chat and forum-topic configuration.");
+  if (OWNER_CHAT_ID === "0") {
+    console.log(
+      "[setup] Bootstrap mode is enabled because OWNER_CHAT_ID=0. /start, /help, and /setup are temporarily allowed before auth so you can discover the correct chat and user IDs."
+    );
+  }
+}
+
 // ── Start ───────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -311,6 +324,7 @@ async function main(): Promise<void> {
   startSessionPoller();
   startEventPoller();
   console.log("Bot is running. Listening for messages...");
+  logSetupHints();
 
   // Graceful shutdown
   const shutdown = () => {
