@@ -1,4 +1,4 @@
-import { Telegraf, Markup } from "telegraf";
+import { Telegraf } from "telegraf";
 import { getDb } from "../store/db.js";
 import { authGuard } from "./middleware.js";
 import {
@@ -24,6 +24,14 @@ import {
   updateWorkspaceStatus,
 } from "../store/queries.js";
 import type { HumanRequestPayload } from "../types/index.js";
+import {
+  btn,
+  escHtml as esc,
+  expandableQuote,
+  formatStats,
+  styledButtons,
+  truncate as trunc,
+} from "./format.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
@@ -130,13 +138,13 @@ function startSessionPoller(): void {
           const name = ws.conductorWorkspaceName ?? ws.name;
           const result = getSessionResult(ws.conductorWorkspaceName!);
 
-          let msg = `✅ Agent <b>${escHtml(name)}</b> finished.`;
+          let msg = `✅ <b>${esc(name)}</b> finished`;
           if (result) {
-            const parts: string[] = [];
-            if (result.costUsd) parts.push(`$${result.costUsd.toFixed(2)}`);
-            if (result.numTurns) parts.push(`${result.numTurns} turns`);
-            if (result.durationMs) parts.push(`${Math.round(result.durationMs / 1000)}s`);
-            if (parts.length) msg += `\n${parts.join(" · ")}`;
+            const stats = formatStats(result);
+            if (stats) msg += `  <code>${stats}</code>`;
+            if (result.resultText) {
+              msg += `\n\n${expandableQuote(esc(trunc(result.resultText, 800)))}`;
+            }
           }
 
           bot.telegram
@@ -148,7 +156,7 @@ function startSessionPoller(): void {
           bot.telegram
             .sendMessage(
               ws.telegramChatId,
-              `🔴 Agent <b>${escHtml(name)}</b> encountered an error.`,
+              `🔴 <b>${esc(name)}</b> encountered an error.`,
               { parse_mode: "HTML" }
             )
             .catch((err) => console.error(`[poller] notify error:`, err));
@@ -180,16 +188,19 @@ function startEventPoller(): void {
           const chatId = ws?.telegramChatId ?? OWNER_CHAT_ID!;
           const wsName = ws?.conductorWorkspaceName ?? ws?.name ?? "unknown";
 
-          let text = `❓ <b>${escHtml(wsName)}</b> asks:\n\n${escHtml(payload.question)}`;
+          const questionHtml = esc(payload.question);
+          let text = `❓ <b>${esc(wsName)}</b> needs your input\n\n`;
+          text += expandableQuote(questionHtml, 300);
+
           if (!payload.options?.length) {
             text += `\n\n<i>Reply to this message with text, a photo, or a voice message.</i>`;
           }
 
           const buttons = payload.options?.length
-            ? Markup.inlineKeyboard(
-                payload.options.map((opt, i) => [
-                  Markup.button.callback(opt, `decide:${payload.decisionId}:${i}`),
-                ])
+            ? styledButtons(
+                payload.options.map((opt, i) =>
+                  btn(opt, `decide:${payload.decisionId}:${i}`, "primary")
+                )
               )
             : {};
 
@@ -207,10 +218,6 @@ function startEventPoller(): void {
   }, POLL_INTERVAL_MS);
 }
 
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 function formatForwardedMessage(
   workspaceName: string,
   message: SessionMessage
@@ -222,7 +229,8 @@ function formatForwardedMessage(
   const text = extractAssistantText(message.content);
   if (!text) return null;
 
-  return `🤖 <b>${escHtml(workspaceName)}</b>\n\n${escHtml(truncate(text, 1200))}`;
+  const escaped = esc(trunc(text, 1200));
+  return `🤖 <b>${esc(workspaceName)}</b>\n\n${expandableQuote(escaped)}`;
 }
 
 function extractAssistantText(content: string): string | null {
@@ -266,10 +274,6 @@ function extractTextParts(content: unknown): string {
     .map((part) => part.text.trim())
     .filter(Boolean)
     .join("\n\n");
-}
-
-function truncate(s: string, maxLen: number): string {
-  return s.length > maxLen ? `${s.slice(0, maxLen - 3)}...` : s;
 }
 
 // ── Start ───────────────────────────────────────────────────

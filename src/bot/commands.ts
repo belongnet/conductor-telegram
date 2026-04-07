@@ -1,5 +1,4 @@
 import type { Context, Telegraf } from "telegraf";
-import { Markup } from "telegraf";
 import {
   answerPendingStdinDecision,
   getWorkspaceSessionInfo,
@@ -24,7 +23,16 @@ import {
   updateWorkspaceForwardCursor,
   getWorkspaceByTelegramMessage,
 } from "../store/queries.js";
-import type { Decision, Workspace, WorkspaceStatus } from "../types/index.js";
+import type { Decision, Workspace } from "../types/index.js";
+import {
+  btn,
+  escHtml,
+  expandableQuote,
+  statusIcon,
+  styledButtons,
+  styledKeyboard,
+  truncate,
+} from "./format.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import https from "node:https";
@@ -446,11 +454,11 @@ async function startWorkspaceFromMessage(
     chatId,
     msg.message_id,
     undefined,
-    `🟢 Agent <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
+    `🟢 <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
     {
       parse_mode: "HTML",
-      ...Markup.inlineKeyboard([
-        Markup.button.callback("Stop", `stop:${workspace.id}`),
+      ...styledKeyboard([
+        [btn("Stop", `stop:${workspace.id}`, "danger")],
       ]),
     }
   );
@@ -472,18 +480,19 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
     return `${icon} <b>${escHtml(name)}</b> — ${ws.status}\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
   });
 
-  const buttons = workspaces
+  const stopRows = workspaces
     .filter((ws) => ws.status === "running" || ws.status === "starting")
     .map((ws) => [
-      Markup.button.callback(
+      btn(
         `Stop ${ws.conductorWorkspaceName ?? ws.name}`,
-        `stop:${ws.id}`
+        `stop:${ws.id}`,
+        "danger"
       ),
     ]);
 
   await ctx.reply(lines.join("\n\n"), {
     parse_mode: "HTML",
-    ...(buttons.length > 0 ? Markup.inlineKeyboard(buttons) : {}),
+    ...(stopRows.length > 0 ? styledKeyboard(stopRows) : {}),
   });
 }
 
@@ -555,15 +564,15 @@ async function handleRepos(ctx: Context): Promise<void> {
   }
 
   const lines = repos.map((r, i) => `${i + 1}. <code>${escHtml(r)}</code>`).join("\n");
-  const buttons = repos.map((r, i) => [
-    Markup.button.callback(`${i + 1}. ${r}`, `run:${i + 1}`),
+  const repoButtons = repos.map((r, i) => [
+    btn(`${i + 1}. ${r}`, `run:${i + 1}`, "primary"),
   ]);
 
   await ctx.reply(
     `<b>Available repos:</b>\n\n${lines}\n\nTap a repo or use <code>/run 1 your prompt</code>`,
     {
       parse_mode: "HTML",
-      ...Markup.inlineKeyboard(buttons),
+      ...styledKeyboard(repoButtons),
     }
   );
 }
@@ -1236,25 +1245,3 @@ function stageDecisionAttachment(decision: Decision, sourcePath: string): string
   }
 }
 
-function statusIcon(status: WorkspaceStatus): string {
-  switch (status) {
-    case "starting":
-      return "🟡";
-    case "running":
-      return "🟢";
-    case "done":
-      return "✅";
-    case "failed":
-      return "🔴";
-    case "stopped":
-      return "⏹";
-  }
-}
-
-function truncate(s: string, maxLen: number): string {
-  return s.length > maxLen ? s.slice(0, maxLen - 3) + "..." : s;
-}
-
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
