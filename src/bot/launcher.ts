@@ -1,8 +1,5 @@
 import { exec, spawn, type ChildProcess } from "node:child_process";
-import { watch } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
@@ -18,8 +15,29 @@ const CLAUDE_BIN =
   process.env.CLAUDE_BIN ??
   `${process.env.HOME}/Library/Application Support/com.conductor.app/bin/claude`;
 
+// City names for workspace directory naming (matches Conductor's convention)
+const CITY_NAMES = [
+  "abuja", "accra", "algiers", "amman", "ankara", "athens", "auckland",
+  "baghdad", "bangkok", "beirut", "belgrade", "berlin", "bern", "bogota",
+  "brasilia", "brisbane", "brussels", "budapest", "cairo", "canberra",
+  "caracas", "colombo", "copenhagen", "cusco", "damascus", "delhi",
+  "denver", "detroit", "doha", "dublin", "durban", "entebbe", "geneva",
+  "guangzhou", "hanoi", "harare", "helsinki", "honolulu", "houston",
+  "istanbul", "jakarta", "jeddah", "kabul", "kampala", "kathmandu",
+  "kigali", "kinshasa", "kingston", "lagos", "lahore", "lisbon", "london",
+  "luanda", "lusaka", "madrid", "malabo", "manila", "maputo", "marrakech",
+  "melbourne", "milan", "minsk", "mogadishu", "moscow", "mumbai", "nairobi",
+  "nicosia", "oslo", "paris", "perth", "prague", "pretoria", "quito",
+  "rabat", "reykjavik", "riga", "riyadh", "rome", "rotterdam", "santiago",
+  "seattle", "seoul", "shanghai", "singapore", "sofia", "stockholm",
+  "sucre", "suva", "taipei", "tallinn", "tirana", "tokyo", "toronto",
+  "tripoli", "tunis", "vancouver", "warsaw", "wellington", "windhoek",
+  "yerevan", "zanzibar", "zurich",
+];
+
 // Track running agents by workspace name
 const runningAgents = new Map<string, ChildProcess>();
+const lastAssistantSdkMessageIds = new Map<string, string>();
 
 // ── Agent result interface ──────────────────────────────────
 
@@ -56,11 +74,15 @@ function spawnAgent(
   console.log(`[agent] Spawning: claude ${args.join(" ").slice(0, 100)}...`);
   console.log(`[agent] CWD: ${workspaceDir}`);
 
+  console.log(`[agent] CLAUDE_BIN: ${CLAUDE_BIN}`);
+
   const child = spawn(CLAUDE_BIN, args, {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, HOME: process.env.HOME },
   });
+
+  console.log(`[agent] Spawned PID: ${child.pid}`);
 
   runningAgents.set(workspaceName, child);
 
@@ -70,8 +92,11 @@ function spawnAgent(
   const done = new Promise<AgentResult>((resolve) => {
     let result: AgentResult = { isError: false, exitCode: null };
     let buffer = "";
+    let stdoutBytes = 0;
 
     child.stdout?.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      console.log(`[agent:stdout] Received ${chunk.length} bytes (total: ${stdoutBytes})`);
       buffer += chunk.toString();
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
@@ -129,41 +154,106 @@ function spawnAgent(
  * Process a streaming JSON message from Claude CLI and mirror to Conductor's DB.
  */
 function processStreamMessage(sessionId: string, msg: any, model: string): void {
-  // Only persist user and assistant messages
-  if (msg.type !== "user" && msg.type !== "assistant" && msg.type !== "result") {
+  // Mirror the same message families Conductor persists for Claude sessions.
+  if (
+    msg.type !== "user" &&
+    msg.type !== "assistant" &&
+    msg.type !== "result" &&
+    msg.type !== "system"
+  ) {
     return;
   }
 
-  const content = JSON.stringify({
-    type: msg.type,
-    ...(msg.message ? { message: msg.message } : {}),
-    ...(msg.type === "result" ? {
-      subtype: msg.subtype,
-      is_error: msg.is_error,
-      duration_ms: msg.duration_ms,
-      duration_api_ms: msg.duration_api_ms,
-      num_turns: msg.num_turns,
-      result: msg.result,
-      total_cost_usd: msg.total_cost_usd,
-      usage: msg.usage,
-    } : {}),
-  });
+  const role = msg.type === "user" ? "user" : "assistant";
+  const timestamp = msg.timestamp ?? new Date().toISOString();
+  const normalized = {
+    ...msg,
+    session_id: msg.session_id ?? sessionId,
+  };
+  const content =
+    role === "user" && isPlainUserPrompt(msg)
+      ? extractUserContent(msg)
+      : JSON.stringify(normalized);
 
   const messageId = randomUUID();
   const turnId = msg.uuid ?? randomUUID();
-  const timestamp = msg.timestamp ?? new Date().toISOString();
-  const msgModel = msg.message?.model ?? (msg.type === "assistant" ? model : null);
+  const sdkMessageId =
+    role === "assistant" && typeof msg.message?.id === "string"
+      ? msg.message.id
+      : null;
+  if (sdkMessageId) {
+    lastAssistantSdkMessageIds.set(sessionId, sdkMessageId);
+  }
+  const lastAssistantMessageId =
+    role === "user" && isPlainUserPrompt(msg)
+      ? lastAssistantSdkMessageIds.get(sessionId) ?? null
+      : null;
+  const msgModel =
+    role === "assistant" ? null : simplifyModel(msg.message?.model ?? model);
 
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
     db.prepare(
-      `INSERT OR IGNORE INTO session_messages (id, session_id, role, content, created_at, model, turn_id)
-       VALUES (?, ?, 'assistant', ?, ?, ?, ?)`
-    ).run(messageId, sessionId, content, timestamp, msgModel, turnId);
+      `INSERT OR IGNORE INTO session_messages
+       (id, session_id, role, content, created_at, sent_at, model, sdk_message_id, last_assistant_message_id, turn_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      messageId,
+      sessionId,
+      role,
+      content,
+      timestamp,
+      timestamp,
+      msgModel,
+      sdkMessageId,
+      lastAssistantMessageId,
+      turnId
+    );
     db.close();
   } catch (err) {
     console.error(`[db] Failed to insert message:`, err);
   }
+}
+
+function isPlainUserPrompt(msg: any): boolean {
+  const content = msg?.message?.content;
+  if (typeof content === "string") {
+    return true;
+  }
+  if (!Array.isArray(content) || content.length === 0) {
+    return false;
+  }
+  return content.every(
+    (part) => part?.type === "text" && typeof part.text === "string"
+  );
+}
+
+function extractUserContent(msg: any): string {
+  const content = msg?.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    const textParts = content
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text.trim())
+      .filter(Boolean);
+    if (textParts.length > 0) {
+      return textParts.join("\n\n");
+    }
+  }
+  return JSON.stringify({
+    type: msg.type,
+    ...(msg.message ? { message: msg.message } : {}),
+  });
+}
+
+function simplifyModel(model: string | null | undefined): string | null {
+  if (!model) return null;
+  if (model.includes("opus")) return "opus";
+  if (model.includes("sonnet")) return "sonnet";
+  if (model.includes("haiku")) return "haiku";
+  return model;
 }
 
 /**
@@ -185,71 +275,96 @@ function updateSessionStatus(sessionId: string, status: string): void {
 // ── Public API ──────────────────────────────────────────────
 
 /**
- * Launch a new Conductor workspace via deeplink, then spawn Claude CLI.
+ * Pick a random city name not already used by this repo's workspaces.
+ */
+function pickCityName(existingDirs: Set<string>): string {
+  const available = CITY_NAMES.filter((c) => !existingDirs.has(c));
+  if (available.length === 0) {
+    // Fallback: append random suffix
+    return `workspace-${Date.now()}`;
+  }
+  return available[Math.floor(Math.random() * available.length)];
+}
+
+/**
+ * Create a workspace programmatically: git worktree + Conductor DB records.
+ * No deeplinks needed — works even when Conductor UI is busy or unresponsive.
  */
 export async function launchWorkspace(
   repoPath: string,
   prompt: string,
   onOutput?: (data: string) => void
-): Promise<{ workspaceName: string; done: Promise<AgentResult> } | { error: string }> {
+): Promise<
+  { workspaceName: string; sessionId: string; done: Promise<AgentResult> } | { error: string }
+> {
   const repoName = path.basename(repoPath);
   const workspacesDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName);
 
   console.log(`[launcher] launchWorkspace called: repoPath=${repoPath}`);
 
-  // Snapshot existing directories
+  // Find existing workspace directories
   let existingDirs: Set<string>;
   try {
     const entries = await readdir(workspacesDir);
     existingDirs = new Set(entries);
-    console.log(`[launcher] Existing dirs in ${workspacesDir}: ${[...existingDirs].join(", ")}`);
-  } catch (err) {
+  } catch {
     existingDirs = new Set();
-    console.log(`[launcher] Workspaces dir not found (${workspacesDir}), starting fresh. Error: ${err}`);
   }
 
-  // Open deeplink to create workspace in Conductor
-  const deeplinkUrl = `conductor://new?path=${encodeURIComponent(repoPath)}`;
-  console.log(`[launcher] Opening deeplink: ${deeplinkUrl}`);
+  // Pick a city name for the workspace
+  const cityName = pickCityName(existingDirs);
+  const branchName = `belongcond/${cityName}`;
+  const workspaceDir = path.join(workspacesDir, cityName);
+
+  console.log(`[launcher] Creating workspace: ${cityName} (branch: ${branchName})`);
+
+  // 1. Look up the repo in Conductor's DB
+  const repoInfo = getRepoFromConductorDb(repoPath);
+  if (!repoInfo) {
+    return { error: `Repo "${repoPath}" not found in Conductor DB. Add it via the Conductor UI first.` };
+  }
+  console.log(`[launcher] Found repo: ${repoInfo.repoId} (${repoInfo.name})`);
+
+  // 2. Create git worktree
   try {
-    await execAsync(`open "${deeplinkUrl}"`);
-    console.log(`[launcher] Deeplink opened successfully`);
+    // Create branch from default branch and set up worktree
+    const defaultBranch = repoInfo.defaultBranch ?? "main";
+    await execAsync(`cd "${repoPath}" && git worktree add -b "${branchName}" "${workspaceDir}" "${defaultBranch}"`);
+    console.log(`[launcher] Git worktree created at ${workspaceDir}`);
   } catch (err) {
-    console.error(`[launcher] Deeplink failed:`, err);
-    return { error: `Failed to open deeplink: ${err}` };
+    console.error(`[launcher] Git worktree failed:`, err);
+    return { error: `Failed to create git worktree: ${err}` };
+  }
+  onOutput?.(`Workspace created: ${cityName}`);
+
+  // 3. Insert workspace + session into Conductor's DB
+  const workspaceId = randomUUID();
+  const sessionId = randomUUID();
+
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    db.prepare(
+      `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status)
+       VALUES (?, ?, ?, ?, ?, 'active', 'in-progress')`
+    ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId);
+
+    db.prepare(
+      `INSERT INTO sessions (id, status, model, permission_mode, workspace_id, agent_type)
+       VALUES (?, 'idle', 'opus', 'default', ?, 'claude')`
+    ).run(sessionId, workspaceId);
+
+    db.close();
+    console.log(`[launcher] DB records created: workspace=${workspaceId}, session=${sessionId}`);
+  } catch (err) {
+    console.error(`[launcher] DB insert failed:`, err);
+    return { error: `Failed to create DB records: ${err}` };
   }
 
-  // Watch for new directory (30s timeout)
-  console.log(`[launcher] Watching for new directory in ${workspacesDir} (30s timeout)...`);
-  const newDir = await waitForNewDirectory(workspacesDir, existingDirs, 30_000);
-  if (!newDir) {
-    return {
-      error: "Workspace creation timed out after 30s. Conductor may not be running.",
-    };
-  }
-
-  console.log(`[launcher] New workspace directory: ${newDir}`);
-  onOutput?.(`Workspace created: ${newDir}`);
-
-  // Give Conductor time to set up worktree and DB records
-  await sleep(3000);
-
-  // Read workspace + session info from Conductor's DB
-  const wsInfo = getWorkspaceFromConductorDb(newDir);
-  if (!wsInfo) {
-    return { error: `Could not find workspace "${newDir}" in Conductor DB.` };
-  }
-
-  console.log(`[launcher] Session ${wsInfo.sessionId} workspace ${wsInfo.workspaceId}`);
-
-  const workspaceDir = path.join(workspacesDir, newDir);
-  const model = wsInfo.model ?? "opus";
-
-  // Spawn Claude CLI — no sidecar socket needed
-  const { done } = spawnAgent(wsInfo.sessionId, workspaceDir, prompt, model, newDir);
+  // 4. Spawn Claude CLI
+  const { done } = spawnAgent(sessionId, workspaceDir, prompt, "opus", cityName);
   onOutput?.("Agent is running.");
 
-  return { workspaceName: newDir, done };
+  return { workspaceName: cityName, sessionId, done };
 }
 
 /**
@@ -299,18 +414,39 @@ export function isAgentRunning(workspaceName: string): boolean {
 
 // ── Conductor DB helpers ────────────────────────────────────
 
+interface ConductorRepoInfo {
+  repoId: string;
+  name: string;
+  defaultBranch: string | null;
+}
+
+function getRepoFromConductorDb(repoPath: string): ConductorRepoInfo | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = db.prepare(
+      `SELECT id, name, default_branch FROM repos WHERE root_path = ?`
+    ).get(repoPath) as any;
+    db.close();
+    if (!row) return null;
+    return { repoId: row.id, name: row.name, defaultBranch: row.default_branch };
+  } catch {
+    return null;
+  }
+}
+
 interface ConductorWorkspaceInfo {
   workspaceId: string;
   sessionId: string;
   model: string | null;
   repoName: string | null;
+  status: string | null;
 }
 
 function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const row = db.prepare(
-      `SELECT w.id as workspace_id, w.active_session_id as session_id, s.model, r.name as repo_name
+      `SELECT w.id as workspace_id, w.active_session_id as session_id, s.model, s.status, r.name as repo_name
        FROM workspaces w
        LEFT JOIN sessions s ON s.id = w.active_session_id
        LEFT JOIN repos r ON r.id = w.repository_id
@@ -324,10 +460,17 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
       sessionId: row.session_id,
       model: row.model,
       repoName: row.repo_name ?? null,
+      status: row.status ?? null,
     };
   } catch {
     return null;
   }
+}
+
+export function getWorkspaceSessionInfo(
+  workspaceName: string
+): ConductorWorkspaceInfo | null {
+  return getWorkspaceFromConductorDb(workspaceName);
 }
 
 /**
@@ -357,6 +500,14 @@ export interface SessionResult {
   durationMs: number;
   numTurns: number;
   isError: boolean;
+}
+
+export interface SessionMessage {
+  rowid: number;
+  role: string;
+  content: string;
+  createdAt: string;
+  sentAt: string | null;
 }
 
 export function getSessionResult(workspaceName: string): SessionResult | null {
@@ -393,50 +544,48 @@ export function getSessionResult(workspaceName: string): SessionResult | null {
   }
 }
 
-// ── Filesystem helpers ──────────────────────────────────────
-
-async function waitForNewDirectory(
-  dir: string,
-  existing: Set<string>,
-  timeoutMs: number
-): Promise<string | null> {
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      clearInterval(pollInterval);
-      watcher.close();
-      resolve(null);
-    }, timeoutMs);
-
-    const pollInterval = setInterval(async () => {
-      try {
-        const entries = await readdir(dir);
-        const newEntry = entries.find((e) => !existing.has(e));
-        if (newEntry) {
-          clearTimeout(timeout);
-          clearInterval(pollInterval);
-          watcher.close();
-          resolve(newEntry);
-        }
-      } catch {
-        // directory might not exist yet
-      }
-    }, 1000);
-
-    let watcher: ReturnType<typeof watch>;
-    try {
-      watcher = watch(dir, (eventType, filename) => {
-        if (filename && !existing.has(filename)) {
-          clearTimeout(timeout);
-          clearInterval(pollInterval);
-          watcher.close();
-          resolve(filename);
-        }
-      });
-    } catch {
-      watcher = { close: () => {} } as any;
-    }
-  });
+export function getMaxSessionMessageRowId(sessionId: string): number {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = db.prepare(
+      "SELECT MAX(rowid) as maxRowId FROM session_messages WHERE session_id = ?"
+    ).get(sessionId) as any;
+    db.close();
+    return Number(row?.maxRowId ?? 0);
+  } catch {
+    return 0;
+  }
 }
+
+export function getSessionMessagesAfter(
+  sessionId: string,
+  afterRowid: number,
+  limit = 25
+): SessionMessage[] {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const rows = db.prepare(
+      `SELECT rowid, role, content, created_at, sent_at
+       FROM session_messages
+       WHERE session_id = ? AND rowid > ?
+       ORDER BY rowid ASC
+       LIMIT ?`
+    ).all(sessionId, afterRowid, limit) as any[];
+    db.close();
+
+    return rows.map((row) => ({
+      rowid: Number(row.rowid),
+      role: row.role,
+      content: row.content,
+      createdAt: row.created_at,
+      sentAt: row.sent_at ?? null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// ── Shell helpers ────────────────────────────────────────────
 
 function execAsync(cmd: string): Promise<string> {
   return new Promise((resolve, reject) => {

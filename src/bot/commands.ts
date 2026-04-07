@@ -6,11 +6,14 @@ import {
   getActiveWorkspaces,
   getAllWorkspaces,
   getWorkspace,
+  getWorkspaceByName,
   getDecision,
   updateWorkspaceStatus,
   updateWorkspaceTelegramMessage,
   updateWorkspaceConductorName,
   answerDecision,
+  updateWorkspaceConductorSession,
+  getWorkspaceByTelegramMessage,
 } from "../store/queries.js";
 import type { Workspace, WorkspaceStatus } from "../types/index.js";
 import { readdirSync } from "node:fs";
@@ -163,6 +166,7 @@ async function handleRun(ctx: Context): Promise<void> {
 
   // Workspace created and agent running
   updateWorkspaceConductorName(workspace.id, result.workspaceName);
+  updateWorkspaceConductorSession(workspace.id, result.sessionId);
   updateWorkspaceStatus(workspace.id, "running");
 
   await ctx.telegram.editMessageText(
@@ -394,10 +398,16 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   if (!chatId) return;
 
   const text = (ctx.message as any)?.text?.trim();
-  if (!text) return;
+  if (!text || text.startsWith("/")) return;
 
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;
+
+  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedWorkspace) {
+    await sendMessageToWorkspace(ctx, repliedWorkspace, text);
+    return;
+  }
 
   const repoNum = pendingRepoSelection.get(chatId);
   if (!repoNum) return; // No pending selection, ignore
@@ -444,6 +454,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceConductorName(workspace.id, result.workspaceName);
+  updateWorkspaceConductorSession(workspace.id, result.sessionId);
   updateWorkspaceStatus(workspace.id, "running");
 
   await ctx.telegram.editMessageText(
@@ -492,33 +503,23 @@ async function handleSend(ctx: Context): Promise<void> {
   }
 
   const conductorName = workspace?.conductorWorkspaceName ?? wsName;
-
-  await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...`, {
-    parse_mode: "HTML",
-  });
-
-  const result = await sendToSession(conductorName, message);
-
-  if ("error" in result) {
-    await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
+  if (!workspace) {
+    await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...`, {
+      parse_mode: "HTML",
+    });
+    const result = await sendToSession(conductorName, message);
+    if ("error" in result) {
+      await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
+      return;
+    }
+    await ctx.reply(
+      `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(message, 200))}</i>`,
+      { parse_mode: "HTML" }
+    );
     return;
   }
 
-  if (workspace) {
-    updateWorkspaceStatus(workspace.id, "running");
-  }
-
-  const chatId = ctx.chat!.id;
-  await ctx.reply(
-    `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(message, 200))}</i>`,
-    { parse_mode: "HTML" }
-  );
-
-  if (workspace) {
-    result.done.then((agentResult) => {
-      notifyCompletion(_bot, chatId.toString(), workspace!.id, conductorName, agentResult);
-    });
-  }
+  await sendMessageToWorkspace(ctx, workspace, message);
 }
 
 // ── /help ───────────────────────────────────────────────────
@@ -537,7 +538,8 @@ Commands:
 /repos — List repos (tap to select)
 /help — Show this message
 
-Tap a repo from /repos, then type your prompt.`,
+Tap a repo from /repos, then type your prompt.
+Reply to a forwarded workspace message to send a follow-up to that same workspace.`,
     { parse_mode: "HTML" }
   );
 }
@@ -611,6 +613,82 @@ function notifyCompletion(
   bot.telegram
     .sendMessage(chatId, msg, { parse_mode: "HTML" })
     .catch((err) => console.error("[notify] error:", err));
+}
+
+function getReplyTargetWorkspace(
+  ctx: Context,
+  chatId: string
+): Workspace | undefined {
+  const reply = (ctx.message as any)?.reply_to_message;
+  const replyToMessageId = reply?.message_id;
+  if (!replyToMessageId) return undefined;
+
+  const linked = getWorkspaceByTelegramMessage(chatId, String(replyToMessageId));
+  if (linked) {
+    console.log(
+      `[reply-route] linked message ${replyToMessageId} -> ${linked.conductorWorkspaceName ?? linked.name}`
+    );
+    return linked;
+  }
+
+  const inferred = inferWorkspaceFromReply(reply);
+  if (inferred) {
+    console.log(
+      `[reply-route] inferred from replied text ${replyToMessageId} -> ${inferred.conductorWorkspaceName ?? inferred.name}`
+    );
+  } else {
+    console.log(`[reply-route] no match for replied message ${replyToMessageId}`);
+  }
+  return inferred;
+}
+
+function inferWorkspaceFromReply(reply: any): Workspace | undefined {
+  const text = [reply?.text, reply?.caption]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+  if (!text) return undefined;
+
+  const firstLine = text
+    .split("\n")
+    .map((line: string) => line.trim())
+    .find(Boolean);
+  if (!firstLine) return undefined;
+
+  const workspaceName = firstLine.replace(/^[^\p{L}\p{N}]*/u, "").trim();
+  if (!workspaceName) return undefined;
+
+  return getWorkspaceByName(workspaceName);
+}
+
+async function sendMessageToWorkspace(
+  ctx: Context,
+  workspace: Workspace,
+  message: string
+): Promise<void> {
+  const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
+
+  await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...`, {
+    parse_mode: "HTML",
+  });
+
+  const result = await sendToSession(conductorName, message);
+
+  if ("error" in result) {
+    await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
+    return;
+  }
+
+  updateWorkspaceStatus(workspace.id, "running");
+
+  const chatId = ctx.chat!.id;
+  await ctx.reply(
+    `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(message, 200))}</i>`,
+    { parse_mode: "HTML" }
+  );
+
+  result.done.then((agentResult) => {
+    notifyCompletion(_bot, chatId.toString(), workspace.id, conductorName, agentResult);
+  });
 }
 
 // ── Helpers ─────────────────────────────────────────────────

@@ -15,6 +15,8 @@ export interface Workspace {
   telegramChatId: string;
   telegramMessageId: string | null;
   conductorWorkspaceName: string | null;
+  conductorSessionId: string | null;
+  lastForwardedMessageRowid: number;
 }
 
 export type EventType =
