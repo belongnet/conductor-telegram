@@ -16,8 +16,9 @@ import {
   getWorkspaceByTelegramMessage,
 } from "../store/queries.js";
 import type { Workspace, WorkspaceStatus } from "../types/index.js";
-import { readdirSync } from "node:fs";
+import { readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import https from "node:https";
 
 // Map Telegram message IDs to decision IDs (for reply-based answering)
 const messageToDecision = new Map<number, number>();
@@ -30,13 +31,44 @@ export function trackDecisionMessage(messageId: number, decisionId: number): voi
   messageToDecision.set(messageId, decisionId);
 }
 
+const TELEGRAM_DOWNLOADS_DIR =
+  process.env.TELEGRAM_DOWNLOADS_DIR ??
+  `${process.env.HOME}/.conductor-telegram/downloads`;
+
 /**
- * Get a Telegram file URL for downloading.
+ * Download a Telegram file locally and return the local path.
+ * This avoids exposing the bot token in URLs and makes files accessible to agents.
  */
-async function getFileUrl(ctx: Context, fileId: string): Promise<string> {
+async function downloadTelegramFile(ctx: Context, fileId: string, ext: string = ""): Promise<string> {
   const file = await ctx.telegram.getFile(fileId);
   const token = (ctx.telegram as any).token;
-  return `https://api.telegram.org/file/bot${token}/` + file.file_path;
+  const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+
+  // Determine extension from Telegram's file_path if not provided
+  const fileExt = ext || path.extname(file.file_path ?? "") || ".bin";
+  const localName = `${Date.now()}-${fileId.slice(-8)}${fileExt}`;
+
+  mkdirSync(TELEGRAM_DOWNLOADS_DIR, { recursive: true });
+  const localPath = path.join(TELEGRAM_DOWNLOADS_DIR, localName);
+
+  const data = await fetchBuffer(url);
+  writeFileSync(localPath, data);
+  return localPath;
+}
+
+function fetchBuffer(url: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        fetchBuffer(res.headers.location!).then(resolve, reject);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    }).on("error", reject);
+  });
 }
 
 const CONDUCTOR_REPOS_DIR =
@@ -364,16 +396,16 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
 
   // If caption contains a bot command, route it (Telegram doesn't fire bot.command for photo captions)
   if (caption.startsWith("/")) {
-    const fileUrl = await getFileUrl(ctx, photo.file_id);
-    await handleCaptionCommand(ctx, caption, fileUrl);
+    const localPath = await downloadTelegramFile(ctx, photo.file_id, ".jpg");
+    await handleCaptionCommand(ctx, caption, localPath);
     return;
   }
 
   // Check if this is a reply to a decision
-  const fileUrl = await getFileUrl(ctx, photo.file_id);
+  const localPath = await downloadTelegramFile(ctx, photo.file_id, ".jpg");
   const answerText = caption
-    ? `[Image: ${fileUrl}]\n${caption}`
-    : `[Image: ${fileUrl}]`;
+    ? `[Image: ${localPath}]\n${caption}`
+    : `[Image: ${localPath}]`;
 
   if (await tryAnswerDecisionReply(ctx, answerText)) return;
 
@@ -459,9 +491,9 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
   const msg = ctx.message as any;
   if (!msg?.voice) return;
 
-  const fileUrl = await getFileUrl(ctx, msg.voice.file_id);
+  const localPath = await downloadTelegramFile(ctx, msg.voice.file_id, ".ogg");
   const duration = msg.voice.duration ?? 0;
-  const answerText = `[Voice message (${duration}s): ${fileUrl}]`;
+  const answerText = `[Voice message (${duration}s): ${localPath}]`;
 
   // Check if this is a reply to a decision
   if (await tryAnswerDecisionReply(ctx, answerText)) return;

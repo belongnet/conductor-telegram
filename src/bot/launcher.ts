@@ -354,6 +354,13 @@ export async function launchWorkspace(
        VALUES (?, 'idle', 'opus', 'default', ?, 'claude', ?)`
     ).run(sessionId, workspaceId, sessionId);
 
+    // Insert the initial user prompt so Conductor UI shows it
+    const promptMessageId = randomUUID();
+    db.prepare(
+      `INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at, model, turn_id)
+       VALUES (?, ?, 'user', ?, datetime('now'), datetime('now'), 'opus', ?)`
+    ).run(promptMessageId, sessionId, prompt, randomUUID());
+
     db.close();
     console.log(`[launcher] DB records created: workspace=${workspaceId}, session=${sessionId}`);
   } catch (err) {
