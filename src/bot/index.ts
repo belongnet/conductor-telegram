@@ -11,7 +11,6 @@ import {
   getSessionMessagesAfter,
   getSessionResult,
   getWorkspaceSessionInfo,
-  answerPendingStdinDecision,
   type SessionMessage,
 } from "./launcher.js";
 import {

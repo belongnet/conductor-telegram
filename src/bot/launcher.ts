@@ -793,10 +793,17 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
     const contentBlocks = msg.message?.content;
     if (Array.isArray(contentBlocks)) {
       for (const block of contentBlocks) {
-        if (
+        if (block.type === "tool_use") {
+          console.log(`[agent] tool_use block: name="${block.name}" id="${block.id}" workspace="${workspaceName}"`);
+        }
+        const isAskUser =
           block.type === "tool_use" &&
+          typeof block.name === "string" &&
           (block.name === "AskUserQuestion" ||
-            block.name === "mcp__conductor__AskUserQuestion") &&
+            block.name === "mcp__conductor__AskUserQuestion" ||
+            block.name.toLowerCase().includes("askuser"));
+        if (
+          isAskUser &&
           block.id &&
           !seenToolUseIds.has(block.id)
         ) {
@@ -821,6 +828,10 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
             pendingStdinDecisions.set(decisionId, workspaceName);
             console.log(
               `[agent] AskUserQuestion detected for ${workspaceName}: "${question.slice(0, 80)}..." → decision ${decisionId}`
+            );
+          } else {
+            console.warn(
+              `[agent] AskUserQuestion found but no tracked workspace for "${workspaceName}" — question will be lost`
             );
           }
         }
