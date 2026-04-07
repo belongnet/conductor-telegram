@@ -345,9 +345,9 @@ export async function launchWorkspace(
     const db = new Database(CONDUCTOR_DB_PATH);
     const defaultBranchName = repoInfo.defaultBranch ?? "main";
     db.prepare(
-      `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status, initialization_parent_branch, intended_target_branch)
-       VALUES (?, ?, ?, ?, ?, 'ready', 'in-progress', ?, ?)`
-    ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId, defaultBranchName, defaultBranchName);
+      `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status, initialization_parent_branch, intended_target_branch, placeholder_branch_name, initialization_files_copied)
+       VALUES (?, ?, ?, ?, ?, 'ready', 'in-progress', ?, ?, ?, 0)`
+    ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId, defaultBranchName, defaultBranchName, branchName);
 
     db.prepare(
       `INSERT INTO sessions (id, status, model, permission_mode, workspace_id, agent_type, claude_session_id)
