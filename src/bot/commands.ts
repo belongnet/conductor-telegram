@@ -19,6 +19,26 @@ import type { Workspace, WorkspaceStatus } from "../types/index.js";
 import { readdirSync } from "node:fs";
 import path from "node:path";
 
+// Map Telegram message IDs to decision IDs (for reply-based answering)
+const messageToDecision = new Map<number, number>();
+
+/**
+ * Register a Telegram message ID as associated with a decision,
+ * so that replies to that message can answer the decision.
+ */
+export function trackDecisionMessage(messageId: number, decisionId: number): void {
+  messageToDecision.set(messageId, decisionId);
+}
+
+/**
+ * Get a Telegram file URL for downloading.
+ */
+async function getFileUrl(ctx: Context, fileId: string): Promise<string> {
+  const file = await ctx.telegram.getFile(fileId);
+  const token = (ctx.telegram as any).token;
+  return `https://api.telegram.org/file/bot${token}/` + file.file_path;
+}
+
 const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ??
   `${process.env.HOME}/conductor/repos`;
@@ -65,7 +85,9 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^decide:(\d+):(.+)$/, handleDecisionCallback);
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
 
-  // Text handler for two-step run flow (after tapping a repo button)
+  // Media and text handlers
+  bot.on("photo", handlePhotoMessage);
+  bot.on("voice", handleVoiceMessage);
   bot.on("text", handleTextMessage);
 }
 
@@ -302,7 +324,74 @@ async function handleRunRepoCallback(ctx: Context): Promise<void> {
   );
 }
 
-// ── Text handler (two-step run flow) ────────────────────────
+// ── Reply-to-decision helper ─────────────────────────────────
+
+/**
+ * Check if a message is a reply to a tracked decision message.
+ * If so, answer the decision and return true.
+ */
+async function tryAnswerDecisionReply(ctx: Context, answerText: string): Promise<boolean> {
+  const replyTo = (ctx.message as any)?.reply_to_message?.message_id;
+  if (!replyTo) return false;
+
+  const decisionId = messageToDecision.get(replyTo);
+  if (!decisionId) return false;
+
+  const decision = getDecision(decisionId);
+  if (!decision || decision.answer) return false; // Already answered
+
+  answerDecision(decisionId, answerText);
+  messageToDecision.delete(replyTo);
+  await ctx.reply(`Answered: ${truncate(answerText, 200)}`, {
+    reply_parameters: { message_id: (ctx.message as any).message_id },
+  });
+  return true;
+}
+
+// ── Photo handler ────────────────────────────────────────────
+
+async function handlePhotoMessage(ctx: Context): Promise<void> {
+  const msg = ctx.message as any;
+  if (!msg?.photo?.length) return;
+
+  // Get the largest photo (last in the array)
+  const photo = msg.photo[msg.photo.length - 1];
+  const caption = msg.caption?.trim() ?? "";
+
+  // Check if this is a reply to a decision
+  const fileUrl = await getFileUrl(ctx, photo.file_id);
+  const answerText = caption
+    ? `[Image: ${fileUrl}]\n${caption}`
+    : `[Image: ${fileUrl}]`;
+
+  if (await tryAnswerDecisionReply(ctx, answerText)) return;
+
+  // Not a reply to a decision — treat as a standalone message
+  await ctx.reply(
+    "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
+  );
+}
+
+// ── Voice handler ────────────────────────────────────────────
+
+async function handleVoiceMessage(ctx: Context): Promise<void> {
+  const msg = ctx.message as any;
+  if (!msg?.voice) return;
+
+  const fileUrl = await getFileUrl(ctx, msg.voice.file_id);
+  const duration = msg.voice.duration ?? 0;
+  const answerText = `[Voice message (${duration}s): ${fileUrl}]`;
+
+  // Check if this is a reply to a decision
+  if (await tryAnswerDecisionReply(ctx, answerText)) return;
+
+  // Not a reply to a decision
+  await ctx.reply(
+    "Got your voice message. Reply to a question from an agent, or use /send to forward to a workspace."
+  );
+}
+
+// ── Text handler (two-step run flow + decision replies) ──────
 
 async function handleTextMessage(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
@@ -310,6 +399,9 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
   const text = (ctx.message as any)?.text?.trim();
   if (!text || text.startsWith("/")) return;
+
+  // Check if this is a reply to a decision question
+  if (await tryAnswerDecisionReply(ctx, text)) return;
 
   const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
   if (repliedWorkspace) {
