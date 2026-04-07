@@ -16,6 +16,7 @@ const ConfigSchema = z.object({
   version: z.literal(1),
   botToken: z.string().min(1, "Bot token is required"),
   ownerChatId: z.string().min(1, "Owner chat ID is required"),
+  ownerUserId: z.string().optional(),
   dbPath: z.string().optional(),
   conductorDbPath: z.string().optional(),
   conductorWorkspacesDir: z.string().optional(),
@@ -45,6 +46,7 @@ const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {
   version: 1,
   botToken: "",
   ownerChatId: "",
+  ownerUserId: undefined,
   dbPath: path.join(CONFIG_DIR, "conductor-telegram.db"),
   conductorDbPath: path.join(
     os.homedir(),
@@ -75,6 +77,7 @@ function configFromEnvSource(env: EnvConfigSource): Partial<Config> {
   const config: Partial<Config> = { version: 1 };
   if (env.BOT_TOKEN) config.botToken = env.BOT_TOKEN;
   if (env.OWNER_CHAT_ID) config.ownerChatId = env.OWNER_CHAT_ID;
+  if (env.OWNER_USER_ID) config.ownerUserId = env.OWNER_USER_ID;
   if (env.DB_PATH) config.dbPath = env.DB_PATH;
   if (env.CONDUCTOR_DB_PATH) config.conductorDbPath = env.CONDUCTOR_DB_PATH;
   if (env.CONDUCTOR_WORKSPACES_DIR) {

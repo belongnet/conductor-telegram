@@ -1,4 +1,4 @@
-import { Telegraf, Markup } from "telegraf";
+import { Telegraf } from "telegraf";
 import { getDb } from "../store/db.js";
 import { authGuard } from "./middleware.js";
 import {
@@ -24,9 +24,21 @@ import {
   updateWorkspaceStatus,
 } from "../store/queries.js";
 import type { HumanRequestPayload } from "../types/index.js";
+import {
+  btn,
+  escHtml as esc,
+  expandableQuote,
+  formatStats,
+  markdownToTelegramHtml,
+  maybeExpandableQuote,
+  styledButtons,
+  truncate as trunc,
+} from "./format.js";
+import { closeWorkspaceTopic } from "./forum.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
+const OWNER_USER_ID = process.env.OWNER_USER_ID;
 const POLL_INTERVAL_MS = 5000;
 
 if (!BOT_TOKEN || !OWNER_CHAT_ID) {
@@ -59,7 +71,7 @@ bot.use((ctx, next) => {
 });
 
 // Auth: only respond to the owner
-bot.use(authGuard(OWNER_CHAT_ID));
+bot.use(authGuard(OWNER_CHAT_ID, OWNER_USER_ID));
 
 // Register commands
 registerCommands(bot);
@@ -109,7 +121,10 @@ function startSessionPoller(): void {
             );
             if (!forwarded) continue;
             bot.telegram
-              .sendMessage(ws.telegramChatId, forwarded, { parse_mode: "HTML" })
+              .sendMessage(ws.telegramChatId, forwarded, {
+                parse_mode: "HTML",
+                ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
+              })
               .then((sent) => {
                 linkTelegramMessage(
                   ws.telegramChatId,
@@ -135,17 +150,27 @@ function startSessionPoller(): void {
           const name = ws.conductorWorkspaceName ?? ws.name;
           const result = getSessionResult(ws.conductorWorkspaceName!);
 
-          let msg = `✅ Agent <b>${escHtml(name)}</b> finished.`;
+          let msg = `✅ <b>${esc(name)}</b> finished`;
           if (result) {
-            const parts: string[] = [];
-            if (result.costUsd) parts.push(`$${result.costUsd.toFixed(2)}`);
-            if (result.numTurns) parts.push(`${result.numTurns} turns`);
-            if (result.durationMs) parts.push(`${Math.round(result.durationMs / 1000)}s`);
-            if (parts.length) msg += `\n${parts.join(" · ")}`;
+            const stats = formatStats(result);
+            if (stats) msg += `  <code>${stats}</code>`;
+            if (result.resultText) {
+              msg += `\n\n${maybeExpandableQuote(
+                markdownToTelegramHtml(trunc(result.resultText, 800))
+              )}`;
+            }
           }
 
           bot.telegram
-            .sendMessage(ws.telegramChatId, msg, { parse_mode: "HTML" })
+            .sendMessage(ws.telegramChatId, msg, {
+              parse_mode: "HTML",
+              ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
+            })
+            .then(() => {
+              if (ws.telegramThreadId) {
+                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
+              }
+            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
@@ -153,9 +178,17 @@ function startSessionPoller(): void {
           bot.telegram
             .sendMessage(
               ws.telegramChatId,
-              `🔴 Agent <b>${escHtml(name)}</b> encountered an error.`,
-              { parse_mode: "HTML" }
+              `🔴 <b>${esc(name)}</b> encountered an error.`,
+              {
+                parse_mode: "HTML",
+                ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
+              }
             )
+            .then(() => {
+              if (ws.telegramThreadId) {
+                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
+              }
+            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         }
       }
@@ -185,21 +218,27 @@ function startEventPoller(): void {
           const chatId = ws?.telegramChatId ?? OWNER_CHAT_ID!;
           const wsName = ws?.conductorWorkspaceName ?? ws?.name ?? "unknown";
 
-          let text = `❓ <b>${escHtml(wsName)}</b> asks:\n\n${escHtml(payload.question)}`;
+          const questionHtml = esc(payload.question);
+          let text = `❓ <b>${esc(wsName)}</b> needs your input\n\n`;
+          text += expandableQuote(questionHtml, 300);
+
           if (!payload.options?.length) {
             text += `\n\n<i>Reply to this message with text, a photo, or a voice message.</i>`;
           }
 
           const buttons = payload.options?.length
-            ? Markup.inlineKeyboard(
-                payload.options.map((opt, i) => [
-                  Markup.button.callback(opt, `decide:${payload.decisionId}:${i}`),
-                ])
+            ? styledButtons(
+                payload.options.map((opt, i) =>
+                  btn(opt, `decide:${payload.decisionId}:${i}`, "primary")
+                )
               )
             : {};
 
+          const threadOpts = ws?.telegramThreadId
+            ? { message_thread_id: ws.telegramThreadId }
+            : {};
           bot.telegram
-            .sendMessage(chatId, text, { parse_mode: "HTML", ...buttons })
+            .sendMessage(chatId, text, { parse_mode: "HTML", ...buttons, ...threadOpts })
             .then((sentMsg) => {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
@@ -210,10 +249,6 @@ function startEventPoller(): void {
       console.error("[event-poller] error:", err);
     }
   }, POLL_INTERVAL_MS);
-}
-
-function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function formatForwardedMessage(
@@ -227,7 +262,8 @@ function formatForwardedMessage(
   const text = extractAssistantText(message.content);
   if (!text) return null;
 
-  return `🤖 <b>${escHtml(workspaceName)}</b>\n\n${escHtml(truncate(text, 1200))}`;
+  const formatted = markdownToTelegramHtml(trunc(text, 1200));
+  return `🤖 <b>${esc(workspaceName)}</b>\n\n${maybeExpandableQuote(formatted)}`;
 }
 
 function extractAssistantText(content: string): string | null {
@@ -236,7 +272,22 @@ function extractAssistantText(content: string): string | null {
     if (parsed?.type === "result") {
       return null;
     }
-    return extractTextParts(parsed?.message?.content) || null;
+
+    const msgContent = parsed?.message?.content;
+    // Extract text parts first
+    const text = extractTextParts(msgContent);
+
+    // Also check for AskUserQuestion tool_use (question text is forwarded via
+    // the decision/event system, so we just skip these to avoid double display)
+    if (!text && Array.isArray(msgContent)) {
+      const hasOnlyToolUse = msgContent.every(
+        (block: any) =>
+          block?.type === "tool_use" || block?.type === "thinking"
+      );
+      if (hasOnlyToolUse) return null;
+    }
+
+    return text || null;
   } catch {
     return null;
   }
@@ -256,10 +307,6 @@ function extractTextParts(content: unknown): string {
     .map((part) => part.text.trim())
     .filter(Boolean)
     .join("\n\n");
-}
-
-function truncate(s: string, maxLen: number): string {
-  return s.length > maxLen ? `${s.slice(0, maxLen - 3)}...` : s;
 }
 
 // ── Start ───────────────────────────────────────────────────

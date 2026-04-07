@@ -171,6 +171,26 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
   const ownerChatId =
     (chatIdInput as string) || existingConfig.ownerChatId || "";
 
+  const ownerUserIdInput = await p.text({
+    message: "Your Telegram user ID (optional, for forum/supergroup mode)",
+    placeholder: existingConfig.ownerUserId
+      ? "(press Enter to keep current)"
+      : "Leave blank for direct chats",
+    defaultValue: existingConfig.ownerUserId,
+    validate: (val) => {
+      if (!val) return;
+      if (!/^\d+$/.test(val)) return "User ID must be numeric";
+    },
+  });
+
+  if (p.isCancel(ownerUserIdInput)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+
+  const ownerUserId =
+    (ownerUserIdInput as string) || existingConfig.ownerUserId || undefined;
+
   // Conductor paths
   const defaultWorkspacesDir =
     existingConfig.conductorWorkspacesDir ??
@@ -221,6 +241,7 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
     version: 1,
     botToken,
     ownerChatId,
+    ownerUserId,
     dbPath: existingConfig.dbPath,
     conductorDbPath: existingConfig.conductorDbPath,
     conductorWorkspacesDir: (workspacesDir as string) || defaultWorkspacesDir,
@@ -241,6 +262,7 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
       "Configuration summary:",
       `  Bot:        @${validation.username}`,
       `  Chat ID:    ${ownerChatId}`,
+      `  User ID:    ${ownerUserId ?? "(not set)"}`,
       `  Workspaces: ${config.conductorWorkspacesDir}`,
       `  Repos:      ${config.conductorReposDir}`,
       `  Config:     ~/.conductor-telegram/config.json`,

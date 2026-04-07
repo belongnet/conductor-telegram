@@ -134,6 +134,7 @@ async function main(): Promise<void> {
       // Inject config into process.env for the existing bot code
       process.env.BOT_TOKEN = config.botToken;
       process.env.OWNER_CHAT_ID = config.ownerChatId;
+      if (config.ownerUserId) process.env.OWNER_USER_ID = config.ownerUserId;
       if (config.dbPath) process.env.DB_PATH = config.dbPath;
       if (config.conductorDbPath)
         process.env.CONDUCTOR_DB_PATH = config.conductorDbPath;
