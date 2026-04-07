@@ -51,7 +51,8 @@ if (!BOT_TOKEN || !OWNER_CHAT_ID) {
   console.error(
     `ERROR: Missing required environment variable(s): ${missing.join(", ")}\n` +
     `CAUSE: Neither config.json nor env vars provide these values\n` +
-    `FIX:   Run 'conductor-telegram setup' or set ${missing.join(" and ")} in your environment`
+    `FIX:   Run 'conductor-telegram setup' or set ${missing.join(" and ")} in your environment\n` +
+    `       For manual Telegram bootstrap, you can temporarily set OWNER_CHAT_ID=0 and use /setup to discover the correct IDs`
   );
   process.exit(2);
 }
@@ -83,9 +84,11 @@ async function syncTelegramCommands(): Promise<void> {
   await bot.telegram.callApi("deleteMyCommands", {
     scope: { type: "all_private_chats" },
   });
-  await bot.telegram.callApi("deleteMyCommands", {
-    scope: { type: "chat", chat_id: OWNER_CHAT_ID! },
-  });
+  if (OWNER_CHAT_ID !== "0") {
+    await bot.telegram.callApi("deleteMyCommands", {
+      scope: { type: "chat", chat_id: OWNER_CHAT_ID! },
+    });
+  }
   await bot.telegram.setMyCommands(commands);
 }
 
@@ -309,6 +312,14 @@ function extractTextParts(content: unknown): string {
     .join("\n\n");
 }
 
+function logSetupHints(): void {
+  console.log("[setup] Use /setup for guided private-chat and forum-topic configuration.");
+  if (OWNER_CHAT_ID === "0") {
+    console.log(
+      "[setup] Bootstrap mode is enabled because OWNER_CHAT_ID=0. /start, /help, and /setup are temporarily allowed before auth so you can discover the correct chat and user IDs."
+    );
+  }
+}
 // ── Start ───────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -321,6 +332,7 @@ async function main(): Promise<void> {
   startSessionPoller();
   startEventPoller();
   console.log("  Status: Connected · Polling every 5s");
+  logSetupHints();
 
   // Graceful shutdown
   const shutdown = () => {

@@ -15,6 +15,14 @@ export function authGuard(
     const chatId = ctx.chat?.id?.toString();
     const userId = ctx.from?.id?.toString();
     const chatType = ctx.chat?.type;
+    const text = (ctx.message as any)?.text?.trim() ?? "";
+    const isBootstrapSetupCommand =
+      ownerChatId === "0" && /^\/(start|help|setup)\b/.test(text);
+
+    // Bootstrap mode: allow setup/help commands before IDs are configured.
+    if (isBootstrapSetupCommand) {
+      return next();
+    }
 
     // Direct chat: match on chat ID only.
     if (chatType === "private" && chatId === ownerChatId) {
