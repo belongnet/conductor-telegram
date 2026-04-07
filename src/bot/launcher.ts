@@ -343,15 +343,16 @@ export async function launchWorkspace(
 
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
+    const defaultBranchName = repoInfo.defaultBranch ?? "main";
     db.prepare(
-      `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status)
-       VALUES (?, ?, ?, ?, ?, 'active', 'in-progress')`
-    ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId);
+      `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status, initialization_parent_branch, intended_target_branch)
+       VALUES (?, ?, ?, ?, ?, 'ready', 'in-progress', ?, ?)`
+    ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId, defaultBranchName, defaultBranchName);
 
     db.prepare(
-      `INSERT INTO sessions (id, status, model, permission_mode, workspace_id, agent_type)
-       VALUES (?, 'idle', 'opus', 'default', ?, 'claude')`
-    ).run(sessionId, workspaceId);
+      `INSERT INTO sessions (id, status, model, permission_mode, workspace_id, agent_type, claude_session_id)
+       VALUES (?, 'idle', 'opus', 'default', ?, 'claude', ?)`
+    ).run(sessionId, workspaceId, sessionId);
 
     db.close();
     console.log(`[launcher] DB records created: workspace=${workspaceId}, session=${sessionId}`);
