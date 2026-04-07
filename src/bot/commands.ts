@@ -1,6 +1,6 @@
 import type { Context, Telegraf } from "telegraf";
 import { Markup } from "telegraf";
-import { launchWorkspace, stopAgent, sendToSession, type AgentResult } from "./launcher.js";
+import { launchWorkspace, stopAgent, sendToSession, getWorkspaceDir, type AgentResult } from "./launcher.js";
 import {
   createWorkspace,
   getActiveWorkspaces,
@@ -16,7 +16,7 @@ import {
   getWorkspaceByTelegramMessage,
 } from "../store/queries.js";
 import type { Workspace, WorkspaceStatus } from "../types/index.js";
-import { readdirSync } from "node:fs";
+import { readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const CONDUCTOR_REPOS_DIR =
@@ -64,6 +64,9 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^open:(.+)$/, handleOpenCallback);
   bot.action(/^decide:(\d+):(.+)$/, handleDecisionCallback);
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
+
+  // Photo handler — downloads images from Telegram and forwards to workspace agents
+  bot.on("photo", handlePhotoMessage);
 
   // Text handler for two-step run flow (after tapping a repo button)
   bot.on("text", handleTextMessage);
@@ -302,6 +305,97 @@ async function handleRunRepoCallback(ctx: Context): Promise<void> {
   );
 }
 
+// ── Photo handler — download and forward to workspace ───────
+
+async function handlePhotoMessage(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return;
+
+  const message = ctx.message as any;
+  const photos = message?.photo;
+  if (!photos || photos.length === 0) return;
+
+  // Get the highest resolution photo (last in array)
+  const photo = photos[photos.length - 1];
+  const caption = message?.caption?.trim() ?? "";
+
+  // Determine target workspace from reply context
+  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
+  if (!repliedWorkspace) {
+    await ctx.reply(
+      "To send a photo to an agent, reply to one of its messages with the photo.\n\nOr use: /send <workspace> <message>",
+    );
+    return;
+  }
+
+  const conductorName = repliedWorkspace.conductorWorkspaceName ?? repliedWorkspace.name;
+
+  try {
+    // Download photo from Telegram using bot token auth
+    const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+    const response = await fetch(fileLink.href);
+    if (!response.ok) {
+      throw new Error(`Failed to download: ${response.status}`);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    // Save to workspace's .context/attachments/ directory
+    const wsDir = getWorkspaceDir(conductorName);
+    if (!wsDir) {
+      await ctx.reply(`Could not find workspace directory for <b>${escHtml(conductorName)}</b>.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    const attachmentsDir = path.join(wsDir, ".context", "attachments");
+    mkdirSync(attachmentsDir, { recursive: true });
+
+    const ext = fileLink.href.includes(".png") ? ".png" : ".jpg";
+    const filename = `${Date.now()}-${photo.file_unique_id}${ext}`;
+    const filePath = path.join(attachmentsDir, filename);
+    writeFileSync(filePath, buffer);
+
+    console.log(`[photo] Saved ${buffer.length} bytes to ${filePath}`);
+
+    // Build prompt with the image path
+    const promptParts: string[] = [];
+    if (caption) {
+      promptParts.push(caption);
+    } else {
+      promptParts.push("The user sent a screenshot/image. Please review it.");
+    }
+    promptParts.push(`\n[Attached: ${filePath}]`);
+
+    const prompt = promptParts.join("\n");
+
+    await ctx.reply(`Sending photo to <b>${escHtml(conductorName)}</b>...`, {
+      parse_mode: "HTML",
+    });
+
+    const result = await sendToSession(conductorName, prompt);
+
+    if ("error" in result) {
+      await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
+      return;
+    }
+
+    updateWorkspaceStatus(repliedWorkspace.id, "running");
+
+    await ctx.reply(
+      `📸 Photo sent to <b>${escHtml(conductorName)}</b>${caption ? `:\n<i>${escHtml(truncate(caption, 200))}</i>` : ""}`,
+      { parse_mode: "HTML" }
+    );
+
+    result.done.then((agentResult) => {
+      notifyCompletion(_bot, chatId, repliedWorkspace.id, conductorName, agentResult);
+    });
+  } catch (err) {
+    console.error(`[photo] Error:`, err);
+    await ctx.reply(`Failed to process photo: ${err}`);
+  }
+}
+
 // ── Text handler (two-step run flow) ────────────────────────
 
 async function handleTextMessage(ctx: Context): Promise<void> {
@@ -447,7 +541,8 @@ Commands:
 /help — Show this message
 
 Tap a repo from /repos, then type your prompt.
-Reply to a forwarded workspace message to send a follow-up to that same workspace.`,
+Reply to a forwarded workspace message to send a follow-up to that same workspace.
+Reply with a photo/screenshot to send it to the agent.`,
     { parse_mode: "HTML" }
   );
 }

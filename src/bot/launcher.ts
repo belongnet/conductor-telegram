@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 
-const CONDUCTOR_WORKSPACES_DIR =
+export const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
 
 const CONDUCTOR_DB_PATH =
@@ -164,32 +164,35 @@ function processStreamMessage(sessionId: string, msg: any, model: string): void 
     return;
   }
 
-  const role = msg.type === "user" ? "user" : "assistant";
+  // Conductor stores only the initial user prompt as role="user" (plain text).
+  // All other stream events (assistant, tool_results, system, result) use role="assistant"
+  // with the full JSON event as content — the "type" field inside the JSON distinguishes them.
+  const isInitialUserPrompt = msg.type === "user" && isPlainUserPrompt(msg);
+  const role = isInitialUserPrompt ? "user" : "assistant";
   const timestamp = msg.timestamp ?? new Date().toISOString();
   const normalized = {
     ...msg,
     session_id: msg.session_id ?? sessionId,
   };
-  const content =
-    role === "user" && isPlainUserPrompt(msg)
-      ? extractUserContent(msg)
-      : JSON.stringify(normalized);
+  const content = isInitialUserPrompt
+    ? extractUserContent(msg)
+    : JSON.stringify(normalized);
 
   const messageId = randomUUID();
   const turnId = msg.uuid ?? randomUUID();
   const sdkMessageId =
-    role === "assistant" && typeof msg.message?.id === "string"
+    msg.type === "assistant" && typeof msg.message?.id === "string"
       ? msg.message.id
       : null;
   if (sdkMessageId) {
     lastAssistantSdkMessageIds.set(sessionId, sdkMessageId);
   }
-  const lastAssistantMessageId =
-    role === "user" && isPlainUserPrompt(msg)
-      ? lastAssistantSdkMessageIds.get(sessionId) ?? null
-      : null;
-  const msgModel =
-    role === "assistant" ? null : simplifyModel(msg.message?.model ?? model);
+  const lastAssistantMessageId = isInitialUserPrompt
+    ? lastAssistantSdkMessageIds.get(sessionId) ?? null
+    : null;
+  const msgModel = isInitialUserPrompt
+    ? simplifyModel(msg.message?.model ?? model)
+    : null;
 
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
@@ -583,6 +586,16 @@ export function getSessionMessagesAfter(
   } catch {
     return [];
   }
+}
+
+/**
+ * Get the filesystem path for a workspace by its directory name.
+ * Looks up the repo name from Conductor's DB to build the full path.
+ */
+export function getWorkspaceDir(workspaceName: string): string | null {
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  if (!wsInfo?.repoName) return null;
+  return path.join(CONDUCTOR_WORKSPACES_DIR, wsInfo.repoName, workspaceName);
 }
 
 // ── Shell helpers ────────────────────────────────────────────
