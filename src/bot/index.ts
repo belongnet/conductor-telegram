@@ -1,7 +1,7 @@
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf";
 import { getDb } from "../store/db.js";
 import { authGuard } from "./middleware.js";
-import { registerCommands } from "./commands.js";
+import { registerCommands, trackDecisionMessage } from "./commands.js";
 import {
   getMaxSessionMessageRowId,
   getSessionMessagesAfter,
@@ -11,11 +11,15 @@ import {
 } from "./launcher.js";
 import {
   getAllWorkspaces,
+  getMaxEventId,
+  getNewEvents,
+  getWorkspace,
   linkTelegramMessage,
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
 } from "../store/queries.js";
+import type { HumanRequestPayload } from "../types/index.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
@@ -39,7 +43,9 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Debug: log all incoming updates
 bot.use((ctx, next) => {
-  console.log(`[update] type=${ctx.updateType} chat=${ctx.chat?.id} text=${(ctx.message as any)?.text?.slice(0, 50)}`);
+  const msg = ctx.message as any;
+  const preview = msg?.text?.slice(0, 50) ?? (msg?.photo ? "[photo]" : msg?.voice ? "[voice]" : "");
+  console.log(`[update] type=${ctx.updateType} chat=${ctx.chat?.id} ${preview}`);
   return next();
 });
 
@@ -143,6 +149,53 @@ function startSessionPoller(): void {
   }, POLL_INTERVAL_MS);
 }
 
+// ── Event polling (human_request → Telegram) ────────────────
+
+let eventPollTimer: ReturnType<typeof setInterval> | null = null;
+let lastEventId = 0;
+
+function startEventPoller(): void {
+  lastEventId = getMaxEventId();
+
+  eventPollTimer = setInterval(() => {
+    try {
+      const events = getNewEvents(lastEventId);
+      for (const event of events) {
+        lastEventId = event.id;
+
+        if (event.type === "human_request") {
+          const payload: HumanRequestPayload = JSON.parse(event.payload);
+          const ws = getWorkspace(event.workspaceId);
+          const chatId = ws?.telegramChatId ?? OWNER_CHAT_ID!;
+          const wsName = ws?.conductorWorkspaceName ?? ws?.name ?? "unknown";
+
+          let text = `❓ <b>${escHtml(wsName)}</b> asks:\n\n${escHtml(payload.question)}`;
+          if (!payload.options?.length) {
+            text += `\n\n<i>Reply to this message with text, a photo, or a voice message.</i>`;
+          }
+
+          const buttons = payload.options?.length
+            ? Markup.inlineKeyboard(
+                payload.options.map((opt, i) => [
+                  Markup.button.callback(opt, `decide:${payload.decisionId}:${i}`),
+                ])
+              )
+            : {};
+
+          bot.telegram
+            .sendMessage(chatId, text, { parse_mode: "HTML", ...buttons })
+            .then((sentMsg) => {
+              trackDecisionMessage(sentMsg.message_id, payload.decisionId);
+            })
+            .catch((err) => console.error(`[event-poller] send error:`, err));
+        }
+      }
+    } catch (err) {
+      console.error("[event-poller] error:", err);
+    }
+  }, POLL_INTERVAL_MS);
+}
+
 function escHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -229,12 +282,14 @@ async function main(): Promise<void> {
 
   bot.launch();
   startSessionPoller();
+  startEventPoller();
   console.log("Bot is running. Listening for messages...");
 
   // Graceful shutdown
   const shutdown = () => {
     console.log("Shutting down...");
     if (pollTimer) clearInterval(pollTimer);
+    if (eventPollTimer) clearInterval(eventPollTimer);
     bot.stop("SIGTERM");
     process.exit(0);
   };
