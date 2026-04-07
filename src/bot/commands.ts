@@ -138,6 +138,7 @@ export interface TelegramCommandDefinition {
 }
 
 const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
+  { command: "setup", description: "Show setup guide and ID discovery steps" },
   { command: "run", description: "Start a new workspace run" },
   { command: "review", description: "Start a review session for a workspace" },
   { command: "send", description: "Send a follow-up to a workspace" },
@@ -336,6 +337,8 @@ async function sendPromptToTarget(
 }
 
 export function registerCommands(bot: Telegraf<Context>): void {
+  bot.start(handleSetup);
+  bot.command("setup", handleSetup);
   bot.command("run", handleRun);
   bot.command("workspaces", handleWorkspaces);
   bot.command("status", handleStatus);
@@ -358,6 +361,48 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.on("photo", handlePhotoMessage);
   bot.on("voice", handleVoiceMessage);
   bot.on("text", handleTextMessage);
+}
+
+function buildSetupMessage(ctx: Context): string {
+  const chatId = ctx.chat?.id?.toString() ?? "unknown";
+  const userId = ctx.from?.id?.toString() ?? "unknown";
+  const chatType = ctx.chat?.type ?? "unknown";
+  const isPrivateChat = chatType === "private";
+  const currentIds = isPrivateChat
+    ? `Current private chat ID: <code>${escHtml(chatId)}</code>\nYour Telegram user ID: <code>${escHtml(userId)}</code>`
+    : `Current chat ID: <code>${escHtml(chatId)}</code>\nYour Telegram user ID: <code>${escHtml(userId)}</code>`;
+  const privateChatStep = isPrivateChat
+    ? `2. Set <code>OWNER_CHAT_ID=${escHtml(chatId)}</code>.`
+    : "2. Open a direct chat with the bot and run <code>/setup</code> there to get the private chat ID.";
+  const forumChatStep = isPrivateChat
+    ? "4. Send <code>/setup</code> in the target supergroup to see that group chat ID."
+    : `4. This supergroup chat ID is <code>${escHtml(chatId)}</code>.`;
+
+  return `<b>Conductor Telegram setup</b>
+
+${currentIds}
+
+<b>Private chat mode</b>
+1. Open a direct chat with this bot.
+${privateChatStep}
+3. Leave <code>OWNER_USER_ID</code> empty.
+4. Restart the bot and use <code>/run</code> or <code>/repos</code>.
+
+<b>Forum topic mode</b>
+Add the bot to your target group, make it admin, then run setup in that group:
+1. Create a Telegram supergroup and enable <b>Topics</b>.
+2. Add this bot to that supergroup.
+3. Make the bot an admin with permission to create/manage topics and send messages.
+${forumChatStep}
+5. Set <code>OWNER_CHAT_ID</code> to the group chat ID shown there and <code>OWNER_USER_ID=${escHtml(userId)}</code>.
+6. Restart the bot. New workspaces will create one topic per workspace automatically.
+
+<b>Bootstrap / ID discovery</b>
+If you do not know the IDs yet, temporarily set <code>OWNER_CHAT_ID=0</code> and optionally <code>OWNER_USER_ID=0</code>, restart the bot, then send <code>/start</code> or <code>/setup</code>. Those commands are allowed in bootstrap mode so the bot can show you the current chat and user IDs.
+
+<b>Notes</b>
+- For topic mode, <code>OWNER_CHAT_ID</code> is the supergroup ID, not a topic ID.
+- If topic creation fails because the chat is not a forum or the bot lacks permissions, the bot falls back to normal chat messages.`;
 }
 
 // ── /run <repo> <prompt> ────────────────────────────────────
@@ -1129,6 +1174,12 @@ async function handleGstack(ctx: Context): Promise<void> {
   await sendPromptToTarget(ctx, target, buildGstackPrompt(extraInstructions));
 }
 
+// ── /setup, /start ──────────────────────────────────────────
+
+async function handleSetup(ctx: Context): Promise<void> {
+  await ctx.reply(buildSetupMessage(ctx), { parse_mode: "HTML" });
+}
+
 // ── /help ───────────────────────────────────────────────────
 
 async function handleHelp(ctx: Context): Promise<void> {
@@ -1136,6 +1187,7 @@ async function handleHelp(ctx: Context): Promise<void> {
     `<b>Conductor Telegram Bot</b>
 
 Commands:
+/setup — Show setup guide and ID discovery steps
 /run &lt;repo&gt; &lt;prompt&gt; — Start a new workspace
 /run &lt;number&gt; &lt;prompt&gt; — Start using repo number
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
@@ -1149,6 +1201,7 @@ Commands:
 /repos — List repos (tap to select)
 /help — Show this message
 
+Use <code>/setup</code> for private-chat mode, forum-topic mode, and ID discovery instructions.
 Tap a repo from /repos, then type your prompt.
 Reply to a forwarded workspace message to target that workspace with /send, /review, /skills, /skill, or /gstack.
 Reply with a photo, screenshot, or voice note to send it to the agent.`,
