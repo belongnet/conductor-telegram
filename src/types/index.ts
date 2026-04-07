@@ -17,6 +17,7 @@ export interface Workspace {
   conductorWorkspaceName: string | null;
   conductorSessionId: string | null;
   lastForwardedMessageRowid: number;
+  telegramThreadId: number | null;
 }
 
 export type EventType =

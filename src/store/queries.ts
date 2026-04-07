@@ -36,6 +36,7 @@ export function createWorkspace(opts: {
     conductorWorkspaceName: null,
     conductorSessionId: null,
     lastForwardedMessageRowid: 0,
+    telegramThreadId: null,
   };
 }
 
@@ -114,6 +115,29 @@ export function updateWorkspaceConductorSession(
   ).run(sessionId, id);
 }
 
+export function updateWorkspaceThreadId(
+  id: string,
+  threadId: number
+): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE workspaces SET telegram_thread_id = ? WHERE id = ?"
+  ).run(threadId, id);
+}
+
+export function getWorkspaceByThreadId(
+  chatId: string,
+  threadId: number
+): Workspace | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT * FROM workspaces WHERE telegram_chat_id = ? AND telegram_thread_id = ? ORDER BY created_at DESC LIMIT 1"
+    )
+    .get(chatId, threadId) as any;
+  return row ? mapWorkspaceRow(row) : undefined;
+}
+
 export function updateWorkspaceForwardCursor(
   id: string,
   rowid: number
@@ -166,6 +190,7 @@ function mapWorkspaceRow(row: any): Workspace {
     conductorWorkspaceName: row.conductor_workspace_name,
     conductorSessionId: row.conductor_session_id ?? null,
     lastForwardedMessageRowid: Number(row.last_forwarded_message_rowid ?? 0),
+    telegramThreadId: row.telegram_thread_id ?? null,
   };
 }
 

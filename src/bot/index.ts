@@ -34,9 +34,11 @@ import {
   styledButtons,
   truncate as trunc,
 } from "./format.js";
+import { closeWorkspaceTopic } from "./forum.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
+const OWNER_USER_ID = process.env.OWNER_USER_ID;
 const POLL_INTERVAL_MS = 5000;
 
 if (!BOT_TOKEN) {
@@ -64,7 +66,7 @@ bot.use((ctx, next) => {
 });
 
 // Auth: only respond to the owner
-bot.use(authGuard(OWNER_CHAT_ID));
+bot.use(authGuard(OWNER_CHAT_ID, OWNER_USER_ID));
 
 // Register commands
 registerCommands(bot);
@@ -114,7 +116,10 @@ function startSessionPoller(): void {
             );
             if (!forwarded) continue;
             bot.telegram
-              .sendMessage(ws.telegramChatId, forwarded, { parse_mode: "HTML" })
+              .sendMessage(ws.telegramChatId, forwarded, {
+                parse_mode: "HTML",
+                ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
+              })
               .then((sent) => {
                 linkTelegramMessage(
                   ws.telegramChatId,
@@ -152,7 +157,15 @@ function startSessionPoller(): void {
           }
 
           bot.telegram
-            .sendMessage(ws.telegramChatId, msg, { parse_mode: "HTML" })
+            .sendMessage(ws.telegramChatId, msg, {
+              parse_mode: "HTML",
+              ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
+            })
+            .then(() => {
+              if (ws.telegramThreadId) {
+                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
+              }
+            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
@@ -161,8 +174,16 @@ function startSessionPoller(): void {
             .sendMessage(
               ws.telegramChatId,
               `🔴 <b>${esc(name)}</b> encountered an error.`,
-              { parse_mode: "HTML" }
+              {
+                parse_mode: "HTML",
+                ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
+              }
             )
+            .then(() => {
+              if (ws.telegramThreadId) {
+                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
+              }
+            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         }
       }
@@ -208,8 +229,11 @@ function startEventPoller(): void {
               )
             : {};
 
+          const threadOpts = ws?.telegramThreadId
+            ? { message_thread_id: ws.telegramThreadId }
+            : {};
           bot.telegram
-            .sendMessage(chatId, text, { parse_mode: "HTML", ...buttons })
+            .sendMessage(chatId, text, { parse_mode: "HTML", ...buttons, ...threadOpts })
             .then((sentMsg) => {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
