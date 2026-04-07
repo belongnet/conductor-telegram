@@ -79,6 +79,26 @@ function fetchBuffer(url: string): Promise<Buffer> {
   });
 }
 
+// Map Telegram message IDs to decision IDs (for reply-based answering)
+const messageToDecision = new Map<number, number>();
+
+/**
+ * Register a Telegram message ID as associated with a decision,
+ * so that replies to that message can answer the decision.
+ */
+export function trackDecisionMessage(messageId: number, decisionId: number): void {
+  messageToDecision.set(messageId, decisionId);
+}
+
+/**
+ * Get a Telegram file URL for downloading.
+ */
+async function getFileUrl(ctx: Context, fileId: string): Promise<string> {
+  const file = await ctx.telegram.getFile(fileId);
+  const token = (ctx.telegram as any).token;
+  return `https://api.telegram.org/file/bot${token}/` + file.file_path;
+}
+
 const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ??
   `${process.env.HOME}/conductor/repos`;
@@ -636,7 +656,6 @@ async function tryAnswerDecisionReplyWithFormatter(
   });
   return true;
 }
-
 // ── Photo handler ────────────────────────────────────────────
 
 async function handlePhotoMessage(ctx: Context): Promise<void> {
@@ -738,7 +757,6 @@ async function handleCaptionCommand(
     "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
   );
 }
-
 // ── Voice handler ────────────────────────────────────────────
 
 async function handleVoiceMessage(ctx: Context): Promise<void> {
