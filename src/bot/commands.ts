@@ -31,7 +31,8 @@ import {
   reopenWorkspaceTopic,
 } from "./forum.js";
 import type { Decision, Workspace } from "../types/index.js";
-import { btn, escHtml, statusIcon, styledKeyboard, truncate } from "./format.js";
+import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
+import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import https from "node:https";
@@ -138,7 +139,7 @@ export interface TelegramCommandDefinition {
 }
 
 const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
-  { command: "setup", description: "Show setup guide and ID discovery steps" },
+  { command: "setup", description: "Check setup and apply this chat" },
   { command: "run", description: "Start a new workspace run" },
   { command: "review", description: "Start a review session for a workspace" },
   { command: "send", description: "Send a follow-up to a workspace" },
@@ -356,6 +357,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^open:(.+)$/, handleOpenCallback);
   bot.action(/^decide:(\d+):(.+)$/, handleDecisionCallback);
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
+  bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
 
   // Media and text handlers
   bot.on("photo", handlePhotoMessage);
@@ -363,46 +365,211 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.on("text", handleTextMessage);
 }
 
-function buildSetupMessage(ctx: Context): string {
+interface SetupDiagnostics {
+  botCanManageTopics: boolean | null;
+  botStatus: string | null;
+  botUsername: string | null;
+  chatId: string;
+  chatTitle: string | null;
+  chatType: string;
+  configuredOwnerChatId: string | null;
+  configuredOwnerUserId: string | null;
+  isForum: boolean | null;
+  userId: string;
+}
+
+interface SetupResponse {
+  message: string;
+  showApplyButton: boolean;
+}
+
+async function getSetupDiagnostics(ctx: Context): Promise<SetupDiagnostics> {
   const chatId = ctx.chat?.id?.toString() ?? "unknown";
   const userId = ctx.from?.id?.toString() ?? "unknown";
   const chatType = ctx.chat?.type ?? "unknown";
-  const isPrivateChat = chatType === "private";
-  const currentIds = isPrivateChat
-    ? `Current private chat ID: <code>${escHtml(chatId)}</code>\nYour Telegram user ID: <code>${escHtml(userId)}</code>`
-    : `Current chat ID: <code>${escHtml(chatId)}</code>\nYour Telegram user ID: <code>${escHtml(userId)}</code>`;
-  const privateChatStep = isPrivateChat
-    ? `2. Set <code>OWNER_CHAT_ID=${escHtml(chatId)}</code>.`
-    : "2. Open a direct chat with the bot and run <code>/setup</code> there to get the private chat ID.";
-  const forumChatStep = isPrivateChat
-    ? "4. Send <code>/setup</code> in the target supergroup to see that group chat ID."
-    : `4. This supergroup chat ID is <code>${escHtml(chatId)}</code>.`;
 
-  return `<b>Conductor Telegram setup</b>
+  let chatTitle: string | null = null;
+  let isForum: boolean | null = null;
+  let botUsername: string | null = null;
+  let botStatus: string | null = null;
+  let botCanManageTopics: boolean | null = null;
+
+  const chatInfo = await (ctx.chat ? ctx.getChat().catch(() => ctx.chat as any) : Promise.resolve(null));
+  if (chatInfo) {
+    chatTitle = (chatInfo as any).title ?? null;
+    if (typeof (chatInfo as any).is_forum === "boolean") {
+      isForum = (chatInfo as any).is_forum;
+    }
+  }
+
+  const botInfo = await ctx.telegram.getMe().catch(() => null);
+  if (botInfo) {
+    botUsername = botInfo.username ?? null;
+    if (ctx.chat) {
+      const member = await ctx.telegram
+        .getChatMember(ctx.chat.id, botInfo.id)
+        .catch(() => null);
+      if (member) {
+        botStatus = (member as any).status ?? null;
+        if ("can_manage_topics" in (member as any)) {
+          botCanManageTopics = Boolean((member as any).can_manage_topics);
+        }
+      }
+    }
+  }
+
+  return {
+    botCanManageTopics,
+    botStatus,
+    botUsername,
+    chatId,
+    chatTitle,
+    chatType,
+    configuredOwnerChatId: process.env.OWNER_CHAT_ID ?? null,
+    configuredOwnerUserId: process.env.OWNER_USER_ID ?? null,
+    isForum,
+    userId,
+  };
+}
+
+function buildRuntimeConfigSnapshot(): Config {
+  const loaded = tryLoadConfig();
+  if (loaded) {
+    return loaded;
+  }
+
+  return {
+    version: 1,
+    botToken: process.env.BOT_TOKEN ?? "",
+    ownerChatId: process.env.OWNER_CHAT_ID ?? "",
+    ownerUserId: process.env.OWNER_USER_ID || undefined,
+    dbPath: process.env.DB_PATH || undefined,
+    conductorDbPath: process.env.CONDUCTOR_DB_PATH || undefined,
+    conductorWorkspacesDir: process.env.CONDUCTOR_WORKSPACES_DIR || undefined,
+    conductorReposDir: process.env.CONDUCTOR_REPOS_DIR || undefined,
+    downloadsDir: process.env.TELEGRAM_DOWNLOADS_DIR || undefined,
+    claudeBin: process.env.CLAUDE_BIN || undefined,
+    codexBin: process.env.CODEX_BIN || undefined,
+    permissionMode: process.env.TELEGRAM_AGENT_PERMISSION_MODE || undefined,
+    defaultAgentType: process.env.TELEGRAM_DEFAULT_AGENT_TYPE || undefined,
+    defaultModel: process.env.TELEGRAM_DEFAULT_MODEL || undefined,
+    reviewAgentType: process.env.TELEGRAM_REVIEW_AGENT_TYPE || undefined,
+    reviewModel: process.env.TELEGRAM_REVIEW_MODEL || undefined,
+  };
+}
+
+function applySetupConfiguration(diag: SetupDiagnostics): void {
+  const config = buildRuntimeConfigSnapshot();
+  config.ownerChatId = diag.chatId;
+  config.ownerUserId = diag.chatType === "private" ? undefined : diag.userId;
+  saveConfig(config);
+
+  process.env.OWNER_CHAT_ID = diag.chatId;
+  if (diag.chatType === "private") {
+    delete process.env.OWNER_USER_ID;
+  } else {
+    process.env.OWNER_USER_ID = diag.userId;
+  }
+}
+
+function buildSetupResponse(diag: SetupDiagnostics): SetupResponse {
+  const isPrivateChat = diag.chatType === "private";
+  const currentIds = isPrivateChat
+    ? `Current private chat ID: <code>${escHtml(diag.chatId)}</code>\nYour Telegram user ID: <code>${escHtml(diag.userId)}</code>`
+    : `${diag.chatTitle ? `Current chat: <b>${escHtml(diag.chatTitle)}</b>\n` : ""}Current chat ID: <code>${escHtml(diag.chatId)}</code>\nYour Telegram user ID: <code>${escHtml(diag.userId)}</code>`;
+  const configLines = [
+    `Configured OWNER_CHAT_ID: <code>${escHtml(diag.configuredOwnerChatId ?? "unset")}</code>`,
+    `Configured OWNER_USER_ID: <code>${escHtml(diag.configuredOwnerUserId ?? "unset")}</code>`,
+  ];
+
+  if (diag.botStatus) {
+    configLines.push(`Bot role in this chat: <code>${escHtml(diag.botStatus)}</code>`);
+  }
+  if (!isPrivateChat && diag.chatType === "supergroup") {
+    configLines.push(
+      `Topics enabled: <code>${diag.isForum === true ? "yes" : diag.isForum === false ? "no" : "unknown"}</code>`
+    );
+  }
+  if (!isPrivateChat && diag.botCanManageTopics !== null) {
+    configLines.push(
+      `Bot can manage topics: <code>${diag.botCanManageTopics ? "yes" : "no"}</code>`
+    );
+  }
+
+  const remainingSteps: string[] = [];
+  const currentChatConfigured = diag.configuredOwnerChatId === diag.chatId;
+  const currentUserConfigured = diag.configuredOwnerUserId === diag.userId;
+  const canApplyCurrentChat =
+    !currentChatConfigured ||
+    (isPrivateChat && !!diag.configuredOwnerUserId) ||
+    (!isPrivateChat && !currentUserConfigured);
+
+  if (isPrivateChat) {
+    if (!currentChatConfigured) {
+      remainingSteps.push("Apply this private chat as the bot owner chat.");
+    }
+    if (diag.configuredOwnerUserId) {
+      remainingSteps.push("Clear the group-only owner user setting for private-chat mode.");
+    }
+  } else {
+    if (!currentChatConfigured) {
+      remainingSteps.push("Apply this chat as the active owner chat.");
+    }
+    if (!currentUserConfigured) {
+      remainingSteps.push("Apply your current Telegram user as the owner for this chat.");
+    }
+    if (diag.chatType !== "supergroup") {
+      remainingSteps.push("Use a Telegram <b>supergroup</b> for forum-topic mode.");
+    } else if (diag.isForum === false) {
+      remainingSteps.push(
+        "Enable <b>Topics</b> in this supergroup if you want one topic per workspace."
+      );
+    }
+    if (diag.botStatus && diag.botStatus !== "administrator" && diag.botStatus !== "creator") {
+      remainingSteps.push("Promote the bot to admin in this chat.");
+    }
+    if (diag.isForum === true && diag.botCanManageTopics === false) {
+      remainingSteps.push("Grant the bot permission to manage topics.");
+    }
+  }
+
+  const summary =
+    remainingSteps.length === 0
+      ? isPrivateChat
+        ? "This private chat is already configured. No unconfigure step is needed."
+        : "This chat is already configured. No unconfigure step is needed."
+      : isPrivateChat
+        ? "This private chat is reachable. Only the remaining items below still need changes."
+        : "The bot is already in this chat, so you do not need to create or re-add anything. Only the remaining items below still need changes.";
+
+  const nextSteps =
+    remainingSteps.length === 0
+      ? isPrivateChat
+        ? "Next: use <code>/repos</code> or <code>/run</code> here."
+        : diag.chatType === "supergroup" && diag.isForum === true
+          ? "Next: use <code>/repos</code> or <code>/run</code>. New workspaces will get their own topics."
+          : "Next: use <code>/repos</code> or <code>/run</code>. Group chat mode works now; forum topics are optional."
+      : `<b>Remaining steps</b>\n${remainingSteps.map((step, i) => `${i + 1}. ${step}`).join("\n")}${canApplyCurrentChat ? "\n\nTap <b>Use This Chat</b> below and the bot will update the chat/user config automatically." : ""}`;
+
+  const commandHint =
+    !isPrivateChat && diag.botUsername
+      ? `\nIf commands are flaky in this group, use <code>/setup@${escHtml(diag.botUsername)}</code>.`
+      : "";
+
+  return {
+    message: `<b>Conductor Telegram setup check</b>
 
 ${currentIds}
 
-<b>Private chat mode</b>
-1. Open a direct chat with this bot.
-${privateChatStep}
-3. Leave <code>OWNER_USER_ID</code> empty.
-4. Restart the bot and use <code>/run</code> or <code>/repos</code>.
+<b>Current config</b>
+${configLines.join("\n")}
 
-<b>Forum topic mode</b>
-Add the bot to your target group, make it admin, then run setup in that group:
-1. Create a Telegram supergroup and enable <b>Topics</b>.
-2. Add this bot to that supergroup.
-3. Make the bot an admin with permission to create/manage topics and send messages.
-${forumChatStep}
-5. Set <code>OWNER_CHAT_ID</code> to the group chat ID shown there and <code>OWNER_USER_ID=${escHtml(userId)}</code>.
-6. Restart the bot. New workspaces will create one topic per workspace automatically.
+<b>Status</b>
+${summary}
 
-<b>Bootstrap / ID discovery</b>
-If you do not know the IDs yet, temporarily set <code>OWNER_CHAT_ID=0</code> and optionally <code>OWNER_USER_ID=0</code>, restart the bot, then send <code>/start</code> or <code>/setup</code>. Those commands are allowed in bootstrap mode so the bot can show you the current chat and user IDs.
-
-<b>Notes</b>
-- For topic mode, <code>OWNER_CHAT_ID</code> is the supergroup ID, not a topic ID.
-- If topic creation fails because the chat is not a forum or the bot lacks permissions, the bot falls back to normal chat messages.`;
+${nextSteps}${commandHint}`,
+    showApplyButton: canApplyCurrentChat,
+  };
 }
 
 // ── /run <repo> <prompt> ────────────────────────────────────
@@ -1177,7 +1344,14 @@ async function handleGstack(ctx: Context): Promise<void> {
 // ── /setup, /start ──────────────────────────────────────────
 
 async function handleSetup(ctx: Context): Promise<void> {
-  await ctx.reply(buildSetupMessage(ctx), { parse_mode: "HTML" });
+  const response = await getSetupDiagnostics(ctx).then(buildSetupResponse);
+  const setupUserId = ctx.from?.id;
+  await ctx.reply(response.message, {
+    parse_mode: "HTML",
+    ...(response.showApplyButton && setupUserId
+      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`, "success")])
+      : {}),
+  });
 }
 
 // ── /help ───────────────────────────────────────────────────
@@ -1187,7 +1361,7 @@ async function handleHelp(ctx: Context): Promise<void> {
     `<b>Conductor Telegram Bot</b>
 
 Commands:
-/setup — Show setup guide and ID discovery steps
+/setup — Check setup and apply this chat
 /run &lt;repo&gt; &lt;prompt&gt; — Start a new workspace
 /run &lt;number&gt; &lt;prompt&gt; — Start using repo number
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
@@ -1201,7 +1375,7 @@ Commands:
 /repos — List repos (tap to select)
 /help — Show this message
 
-Use <code>/setup</code> for private-chat mode, forum-topic mode, and ID discovery instructions.
+Use <code>/setup</code> to check the current chat and let the bot configure it for you.
 Tap a repo from /repos, then type your prompt.
 Reply to a forwarded workspace message to target that workspace with /send, /review, /skills, /skill, or /gstack.
 Reply with a photo, screenshot, or voice note to send it to the agent.`,
@@ -1210,6 +1384,46 @@ Reply with a photo, screenshot, or voice note to send it to the agent.`,
 }
 
 // ── Inline button callbacks ─────────────────────────────────
+
+async function handleSetupApplyCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const expectedUserId = match?.[1];
+  const currentUserId = ctx.from?.id?.toString();
+  if (!expectedUserId || currentUserId !== expectedUserId) {
+    await ctx.answerCbQuery("Run /setup yourself in this chat");
+    return;
+  }
+
+  const diag = await getSetupDiagnostics(ctx);
+
+  try {
+    applySetupConfiguration(diag);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await ctx.answerCbQuery("Failed to save setup");
+    await ctx.reply(`Failed to save setup: ${escHtml(message)}`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const response = buildSetupResponse({
+    ...diag,
+    configuredOwnerChatId: diag.chatId,
+    configuredOwnerUserId: diag.chatType === "private" ? null : diag.userId,
+  });
+
+  await ctx.answerCbQuery("This chat is now configured");
+  const edit = (ctx as any).editMessageText?.bind(ctx);
+  if (edit) {
+    await edit(response.message, { parse_mode: "HTML" }).catch(async () => {
+      await ctx.reply(response.message, { parse_mode: "HTML" });
+    });
+    return;
+  }
+
+  await ctx.reply(response.message, { parse_mode: "HTML" });
+}
 
 async function handleStopCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
