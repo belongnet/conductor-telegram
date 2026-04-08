@@ -28,6 +28,7 @@ import {
 import {
   createWorkspaceTopic,
   closeWorkspaceTopic,
+  renameWorkspaceTopic,
   reopenWorkspaceTopic,
 } from "./forum.js";
 import type { Decision, Workspace } from "../types/index.js";
@@ -679,6 +680,20 @@ async function startWorkspaceFromMessage(
   updateWorkspaceConductorSession(workspace.id, result.sessionId);
   updateWorkspaceForwardCursor(workspace.id, result.initialCursorRowid);
   updateWorkspaceStatus(workspace.id, "running");
+
+  if (threadId) {
+    try {
+      await renameWorkspaceTopic(
+        ctx.telegram,
+        chatIdStr,
+        threadId,
+        repoPath,
+        result.workspaceName
+      );
+    } catch (err) {
+      console.error(`[forum] could not rename topic ${threadId}:`, err);
+    }
+  }
 
   await ctx.telegram.editMessageText(
     chatId,

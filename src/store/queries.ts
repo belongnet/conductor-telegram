@@ -76,6 +76,16 @@ export function getAllWorkspaces(limit = 10): Workspace[] {
   return rows.map(mapWorkspaceRow);
 }
 
+export function getAllThreadedWorkspaces(): Workspace[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM workspaces WHERE telegram_thread_id IS NOT NULL ORDER BY created_at DESC"
+    )
+    .all() as any[];
+  return rows.map(mapWorkspaceRow);
+}
+
 export function updateWorkspaceStatus(
   id: string,
   status: WorkspaceStatus

@@ -1,4 +1,6 @@
+import path from "node:path";
 import type { Telegram } from "telegraf";
+import type { Workspace } from "../types/index.js";
 
 // Icon colors available for forum topics (Telegram API exact values)
 type TopicColor = 7322096 | 16766590 | 13338331 | 9367192 | 16749490 | 16478047;
@@ -30,7 +32,7 @@ export async function createWorkspaceTopic(
   workspaceName: string
 ): Promise<number | null> {
   try {
-    const topicName = `${repoName} / ${workspaceName}`;
+    const topicName = buildTopicName(repoName, workspaceName);
     const result = await telegram.createForumTopic(chatId, topicName, {
       icon_color: pickColor(repoName),
     });
@@ -39,6 +41,53 @@ export async function createWorkspaceTopic(
     // Chat is not a forum-enabled supergroup, or bot lacks permissions
     console.log(`[forum] could not create topic: ${err.message}`);
     return null;
+  }
+}
+
+/**
+ * Build the canonical topic name for a workspace.
+ */
+export function buildTopicName(repoName: string, workspaceName: string): string {
+  return `${workspaceName} · ${repoName}`;
+}
+
+export async function renameWorkspaceTopic(
+  telegram: Telegram,
+  chatId: string,
+  threadId: number,
+  repoPath: string,
+  workspaceName: string
+): Promise<void> {
+  const repoName = path.basename(repoPath);
+  const newName = buildTopicName(repoName, workspaceName);
+  await telegram.callApi("editForumTopic", {
+    chat_id: chatId,
+    message_thread_id: threadId,
+    name: newName,
+  });
+}
+
+/**
+ * Rename all existing forum topics to the current naming format.
+ * Safe to call on every startup — Telegram ignores no-op renames.
+ */
+export async function renameWorkspaceTopics(
+  telegram: Telegram,
+  workspaces: Workspace[]
+): Promise<void> {
+  for (const ws of workspaces) {
+    if (!ws.telegramThreadId || !ws.conductorWorkspaceName) continue;
+    try {
+      await renameWorkspaceTopic(
+        telegram,
+        ws.telegramChatId,
+        ws.telegramThreadId,
+        ws.repoPath,
+        ws.conductorWorkspaceName
+      );
+    } catch (err: any) {
+      console.log(`[forum] could not rename topic ${ws.telegramThreadId}: ${err.message}`);
+    }
   }
 }
 
