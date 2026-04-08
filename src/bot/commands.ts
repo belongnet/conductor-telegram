@@ -33,7 +33,7 @@ import {
 } from "./forum.js";
 import type { Decision, Workspace } from "../types/index.js";
 import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
-import { routeVoiceMessage, routeTextMessage } from "./ai-router.js";
+import { routeVoiceMessage, routeTextMessage, transcribeVoiceMessage } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -1154,18 +1154,28 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
 
   const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
   if (repliedWorkspace) {
-    const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
-    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+    const transcript = await transcribeVoiceMessage(localPath);
+    if (transcript) {
+      await sendMessageToWorkspace(ctx, repliedWorkspace, transcript, [localPath]);
+    } else {
+      const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+      await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+    }
     return;
   }
 
-  // If sent inside a forum topic, route to that workspace automatically
+  // If sent inside a forum topic, transcribe and route to that workspace
   const threadId = (ctx.message as any)?.message_thread_id;
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
     if (threadWorkspace) {
-      const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
-      await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      const transcript = await transcribeVoiceMessage(localPath);
+      if (transcript) {
+        await sendMessageToWorkspace(ctx, threadWorkspace, transcript, [localPath]);
+      } else {
+        const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+        await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      }
       return;
     }
   }
