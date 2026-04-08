@@ -11,10 +11,17 @@ const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
 
 function dim(s: string): string {
-  return noColor ? s : `\x1b[2m${s}\x1b[0m`;
+  return noColor ? s : `\x1b[2m${s}\x1b[22m`;
 }
-function cyan(s: string): string {
-  return noColor ? s : `\x1b[36m${s}\x1b[0m`;
+const trueColor =
+  process.env.COLORTERM === "truecolor" ||
+  process.env.COLORTERM === "24bit";
+
+function teal(s: string): string {
+  if (noColor) return s;
+  // Use 24-bit teal (#00D4AA) when supported, fall back to standard cyan
+  const code = trueColor ? "38;2;0;212;170" : "36";
+  return `\x1b[${code}m${s}\x1b[39m`;
 }
 
 function getVersion(): string {
@@ -41,7 +48,7 @@ export function printBanner(statusLine?: string): void {
 
   const version = getVersion();
   console.log();
-  console.log(`  ${cyan("conductor-telegram")} v${version}`);
+  console.log(`  ${teal("conductor-telegram")} v${version}`);
   console.log(dim("  Built by Belong.net · conductor.build"));
   if (statusLine) {
     console.log();
