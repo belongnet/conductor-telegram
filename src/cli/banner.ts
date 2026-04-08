@@ -13,8 +13,8 @@ const noColor =
 function dim(s: string): string {
   return noColor ? s : `\x1b[2m${s}\x1b[0m`;
 }
-function cyan(s: string): string {
-  return noColor ? s : `\x1b[36m${s}\x1b[0m`;
+function teal(s: string): string {
+  return noColor ? s : `\x1b[38;2;0;212;170m${s}\x1b[0m`;
 }
 
 function getVersion(): string {
@@ -41,7 +41,7 @@ export function printBanner(statusLine?: string): void {
 
   const version = getVersion();
   console.log();
-  console.log(`  ${cyan("conductor-telegram")} v${version}`);
+  console.log(`  ${teal("conductor-telegram")} v${version}`);
   console.log(dim("  Built by Belong.net · conductor.build"));
   if (statusLine) {
     console.log();
