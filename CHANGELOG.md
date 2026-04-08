@@ -2,6 +2,16 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.0.0] - 2026-04-08
+
+### Added
+- GitHub Pages documentation site with setup guide, architecture diagram, and interactive mockups
+- MIT LICENSE file
+- CONTRIBUTING.md with development setup, branching conventions, and PR guidelines
+- GitHub issue templates (bug report, feature request)
+- Pull request template with testing checklist
+- GitHub Actions workflow for automatic Pages deployment
+
 ## [0.2.1.0] - 2026-04-08
 
 ### Added
