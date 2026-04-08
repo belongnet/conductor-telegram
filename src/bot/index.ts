@@ -33,6 +33,7 @@ import {
   markdownToTelegramHtml,
   maybeExpandableQuote,
   styledButtons,
+  styledKeyboard,
   truncate as trunc,
 } from "./format.js";
 import { closeWorkspaceTopic, renameWorkspaceTopics } from "./forum.js";
@@ -177,9 +178,17 @@ function startSessionPoller(): void {
             }
           }
 
+          const postDoneButtons = styledKeyboard([
+            [
+              btn("🔍 Review Changes", `postdone:review:${ws.id}`, "primary"),
+              btn("🔀 Generate PR", `postdone:pr:${ws.id}`, "success"),
+            ],
+          ]);
+
           bot.telegram
             .sendMessage(ws.telegramChatId, msg, {
               parse_mode: "HTML",
+              ...postDoneButtons,
               ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
             })
             .then(() => {
