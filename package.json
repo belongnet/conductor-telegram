@@ -1,6 +1,6 @@
 {
   "name": "conductor-telegram",
-  "version": "0.2.0",
+  "version": "0.3.1.0",
   "description": "Telegram bot for remote oversight of Conductor workspaces. Built by Belong.net.",
   "type": "module",
   "main": "dist/cli/index.js",
