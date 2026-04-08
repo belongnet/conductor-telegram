@@ -32,6 +32,7 @@ import {
 } from "./forum.js";
 import type { Decision, Workspace } from "../types/index.js";
 import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
+import { routeVoiceMessage, routeTextMessage } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -1030,6 +1031,91 @@ async function handleCaptionCommand(
     "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
   );
 }
+// ── AI auto-routing for general-thread messages ─────────────
+
+async function tryAutoRouteVoice(
+  ctx: Context,
+  chatId: string,
+  voicePath: string
+): Promise<boolean> {
+  const repos = getRepoList();
+  if (repos.length === 0) return false;
+
+  const activeWorkspaces = getAutoRoutableWorkspaces(chatId);
+
+  try {
+    await ctx.reply("🎙 Listening...");
+    const result = await routeVoiceMessage(voicePath, repos, activeWorkspaces);
+    if (!result) return false;
+
+    return await executeRouteResult(ctx, chatId, result, [voicePath]);
+  } catch (err) {
+    console.error("[ai-router] voice routing failed:", err);
+    return false;
+  }
+}
+
+async function tryAutoRouteText(
+  ctx: Context,
+  chatId: string,
+  text: string
+): Promise<boolean> {
+  const repos = getRepoList();
+  if (repos.length === 0) return false;
+
+  const activeWorkspaces = getAutoRoutableWorkspaces(chatId);
+
+  try {
+    const result = await routeTextMessage(text, repos, activeWorkspaces);
+    if (!result) return false;
+
+    return await executeRouteResult(ctx, chatId, result);
+  } catch (err) {
+    console.error("[ai-router] text routing failed:", err);
+    return false;
+  }
+}
+
+async function executeRouteResult(
+  ctx: Context,
+  chatId: string,
+  result: { action: string; repoName?: string; workspaceId?: string; prompt: string; transcript: string },
+  attachments: string[] = []
+): Promise<boolean> {
+  if (result.action === "existing" && result.workspaceId) {
+    const workspace = getWorkspace(result.workspaceId);
+    if (
+      workspace &&
+      workspace.telegramChatId === chatId &&
+      workspace.status === "running" &&
+      workspace.conductorWorkspaceName
+    ) {
+      await sendMessageToWorkspace(ctx, workspace, result.prompt, attachments);
+      return true;
+    }
+    // Workspace not found — fall through to create new
+  }
+
+  if (result.repoName) {
+    const resolved = resolveRepo(result.repoName);
+    if (resolved) {
+      await startWorkspaceFromMessage(ctx, resolved, result.prompt, attachments);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getAutoRoutableWorkspaces(chatId: string): Workspace[] {
+  return getActiveWorkspaces().filter(
+    (workspace) =>
+      workspace.telegramChatId === chatId &&
+      workspace.status === "running" &&
+      !!workspace.conductorWorkspaceName
+  );
+}
+
 // ── Voice handler ────────────────────────────────────────────
 
 async function handleVoiceMessage(ctx: Context): Promise<void> {
@@ -1068,6 +1154,10 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
       return;
     }
   }
+
+  // Auto-route: use AI to transcribe and determine the target repo/workspace
+  const routed = await tryAutoRouteVoice(ctx, chatId, localPath);
+  if (routed) return;
 
   await ctx.reply(
     "Got your voice message. Reply to a question from an agent, or use /send to forward to a workspace."
@@ -1117,10 +1207,19 @@ async function handleTextMessage(ctx: Context): Promise<void> {
     }
   }
 
-  if (!selectionKey) return;
+  if (!selectionKey) {
+    // No reply context, no forum thread, no pending selection key —
+    // try AI auto-routing for general-thread messages.
+    await tryAutoRouteText(ctx, chatId, text);
+    return;
+  }
 
   const pendingSelection = pendingRepoSelection.get(selectionKey);
-  if (!pendingSelection) return; // No pending selection, ignore
+  if (!pendingSelection) {
+    // Has a selection key but no pending selection — try AI auto-routing
+    await tryAutoRouteText(ctx, chatId, text);
+    return;
+  }
 
   const prompt = text;
 

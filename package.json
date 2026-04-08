@@ -40,13 +40,22 @@
       "bot/index": "src/bot/index.ts",
       "mcp/server": "src/mcp/server.ts"
     },
-    "format": ["esm"],
+    "format": [
+      "esm"
+    ],
     "target": "node22",
     "splitting": true,
     "clean": true,
     "dts": false
   },
-  "keywords": ["telegram", "conductor", "ai", "agent", "oversight", "mcp"],
+  "keywords": [
+    "telegram",
+    "conductor",
+    "ai",
+    "agent",
+    "oversight",
+    "mcp"
+  ],
   "author": "Belong.net",
   "license": "MIT",
   "homepage": "https://conductor.build",
