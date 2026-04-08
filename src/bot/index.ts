@@ -191,11 +191,6 @@ function startSessionPoller(): void {
               ...postDoneButtons,
               ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
             })
-            .then(() => {
-              if (ws.telegramThreadId) {
-                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
-              }
-            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
