@@ -51,7 +51,6 @@ If the bot is already configured for your private chat, you can also add it to a
 ### Bootstrap mode
 
 When `OWNER_CHAT_ID=0`, the bot temporarily allows `/start`, `/help`, and `/setup` before auth is configured. This is the intended bootstrap mode for letting the bot configure the active chat for you.
-
 ## Commands
 
 ```
