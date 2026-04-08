@@ -28,8 +28,8 @@ import {
 import {
   createWorkspaceTopic,
   closeWorkspaceTopic,
-  renameWorkspaceTopic,
   reopenWorkspaceTopic,
+  syncWorkspaceTopic,
 } from "./forum.js";
 import type { Decision, Workspace } from "../types/index.js";
 import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
@@ -680,16 +680,12 @@ async function startWorkspaceFromMessage(
   updateWorkspaceConductorSession(workspace.id, result.sessionId);
   updateWorkspaceForwardCursor(workspace.id, result.initialCursorRowid);
   updateWorkspaceStatus(workspace.id, "running");
+  workspace.conductorWorkspaceName = result.workspaceName;
+  workspace.status = "running";
 
   if (threadId) {
     try {
-      await renameWorkspaceTopic(
-        ctx.telegram,
-        chatIdStr,
-        threadId,
-        repoPath,
-        result.workspaceName
-      );
+      await syncWorkspaceTopic(ctx.telegram, workspace);
     } catch (err) {
       console.error(`[forum] could not rename topic ${threadId}:`, err);
     }
@@ -793,6 +789,11 @@ async function handleStop(ctx: Context): Promise<void> {
 
   updateWorkspaceStatus(workspace.id, "stopped");
   if (workspace.telegramThreadId) {
+    try {
+      await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "stopped" });
+    } catch (err) {
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err);
+    }
     await closeWorkspaceTopic(
       ctx.telegram,
       workspace.telegramChatId,
@@ -896,6 +897,12 @@ async function tryAnswerDecisionReply(ctx: Context, answerText: string): Promise
   answerDecision(decisionId, answerText);
   answerPendingStdinDecision(decisionId, answerText);
   messageToDecision.delete(replyTo);
+  const workspace = getWorkspace(decision.workspaceId);
+  if (workspace?.telegramThreadId) {
+    syncWorkspaceTopic(ctx.telegram, workspace).catch((err) =>
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+    );
+  }
   await ctx.reply(`Answered: ${truncate(answerText, 200)}`, {
     reply_parameters: { message_id: (ctx.message as any).message_id },
   });
@@ -918,6 +925,12 @@ async function tryAnswerDecisionReplyWithFormatter(
   const answerText = formatAnswer(decision);
   answerDecision(decisionId, answerText);
   messageToDecision.delete(replyTo);
+  const workspace = getWorkspace(decision.workspaceId);
+  if (workspace?.telegramThreadId) {
+    syncWorkspaceTopic(ctx.telegram, workspace).catch((err) =>
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+    );
+  }
   await ctx.reply(`Answered: ${truncate(answerText, 200)}`, {
     reply_parameters: { message_id: (ctx.message as any).message_id },
   });
@@ -1483,6 +1496,11 @@ async function handleStopCallback(ctx: Context): Promise<void> {
 
   updateWorkspaceStatus(workspaceId, "stopped");
   if (workspace?.telegramThreadId) {
+    try {
+      await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "stopped" });
+    } catch (err) {
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err);
+    }
     await closeWorkspaceTopic(
       ctx.telegram,
       workspace.telegramChatId,
@@ -1514,6 +1532,12 @@ async function handleDecisionCallback(ctx: Context): Promise<void> {
 
   answerDecision(decisionId, answer);
   answerPendingStdinDecision(decisionId, answer);
+  const workspace = getWorkspace(decision.workspaceId);
+  if (workspace?.telegramThreadId) {
+    syncWorkspaceTopic(ctx.telegram, workspace).catch((err) =>
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+    );
+  }
 
   await ctx.answerCbQuery(`Answered: ${answer}`);
   await ctx.editMessageReplyMarkup(undefined);
@@ -1597,6 +1621,12 @@ async function sendMessageToWorkspace(
   }
 
   updateWorkspaceStatus(workspace.id, "running");
+  workspace.status = "running";
+  if (workspace.telegramThreadId) {
+    syncWorkspaceTopic(ctx.telegram, workspace).catch((err) =>
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+    );
+  }
 
   await ctx.reply(
     `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(messagePreview, 200))}</i>`,

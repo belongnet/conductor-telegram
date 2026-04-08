@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getDb } from "./db.js";
 import type {
+  EventType,
   Workspace,
   WorkspaceEvent,
   WorkspaceStatus,
@@ -257,6 +258,27 @@ export function getNewEvents(afterId: number): WorkspaceEvent[] {
     payload: r.payload,
     createdAt: r.created_at,
   }));
+}
+
+export function getLatestEventByType(
+  workspaceId: string,
+  type: EventType
+): WorkspaceEvent | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT * FROM events WHERE workspace_id = ? AND type = ? ORDER BY id DESC LIMIT 1"
+    )
+    .get(workspaceId, type) as any;
+  return row
+    ? {
+        id: row.id,
+        workspaceId: row.workspace_id,
+        type: row.type,
+        payload: row.payload,
+        createdAt: row.created_at,
+      }
+    : undefined;
 }
 
 // ── Decisions ───────────────────────────────────────────────

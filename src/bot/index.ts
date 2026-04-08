@@ -35,7 +35,11 @@ import {
   styledButtons,
   truncate as trunc,
 } from "./format.js";
-import { closeWorkspaceTopic, renameWorkspaceTopics } from "./forum.js";
+import {
+  closeWorkspaceTopic,
+  renameWorkspaceTopics,
+  syncWorkspaceTopic,
+} from "./forum.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
@@ -159,6 +163,11 @@ function startSessionPoller(): void {
         const sessionStatus = sessionInfo.status;
         if (sessionStatus === "working" && ws.status !== "running") {
           updateWorkspaceStatus(ws.id, "running");
+          if (ws.telegramThreadId) {
+            syncWorkspaceTopic(bot.telegram, { ...ws, status: "running" }).catch((err) =>
+              console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+            );
+          }
         }
 
         if (sessionStatus === "idle" && ws.status === "running") {
@@ -184,6 +193,9 @@ function startSessionPoller(): void {
             })
             .then(() => {
               if (ws.telegramThreadId) {
+                syncWorkspaceTopic(bot.telegram, { ...ws, status: "done" }).catch((err) =>
+                  console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+                );
                 closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
               }
             })
@@ -202,6 +214,9 @@ function startSessionPoller(): void {
             )
             .then(() => {
               if (ws.telegramThreadId) {
+                syncWorkspaceTopic(bot.telegram, { ...ws, status: "failed" }).catch((err) =>
+                  console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+                );
                 closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
               }
             })
@@ -227,10 +242,10 @@ function startEventPoller(): void {
       const events = getNewEvents(lastEventId);
       for (const event of events) {
         lastEventId = event.id;
+        const ws = getWorkspace(event.workspaceId);
 
         if (event.type === "human_request") {
           const payload: HumanRequestPayload = JSON.parse(event.payload);
-          const ws = getWorkspace(event.workspaceId);
           const chatId = ws?.telegramChatId ?? getOwnerChatId()!;
           const wsName = ws?.conductorWorkspaceName ?? ws?.name ?? "unknown";
 
@@ -259,6 +274,16 @@ function startEventPoller(): void {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
             .catch((err) => console.error(`[event-poller] send error:`, err));
+        }
+
+        if (ws?.telegramThreadId && (
+          event.type === "human_request" ||
+          event.type === "status" ||
+          event.type === "artifact"
+        )) {
+          syncWorkspaceTopic(bot.telegram, ws).catch((err) =>
+            console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+          );
         }
       }
     } catch (err) {
