@@ -13,8 +13,15 @@ const noColor =
 function dim(s: string): string {
   return noColor ? s : `\x1b[2m${s}\x1b[0m`;
 }
+const trueColor =
+  process.env.COLORTERM === "truecolor" ||
+  process.env.COLORTERM === "24bit";
+
 function teal(s: string): string {
-  return noColor ? s : `\x1b[38;2;0;212;170m${s}\x1b[0m`;
+  if (noColor) return s;
+  // Use 24-bit teal (#00D4AA) when supported, fall back to standard cyan
+  const code = trueColor ? "38;2;0;212;170" : "36";
+  return `\x1b[${code}m${s}\x1b[39m`;
 }
 
 function getVersion(): string {
