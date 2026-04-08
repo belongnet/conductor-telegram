@@ -37,22 +37,28 @@ import {
 import { closeWorkspaceTopic } from "./forum.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID;
-const OWNER_USER_ID = process.env.OWNER_USER_ID;
 const POLL_INTERVAL_MS = 5000;
 
-if (!BOT_TOKEN || !OWNER_CHAT_ID) {
+function getOwnerChatId(): string | undefined {
+  return process.env.OWNER_CHAT_ID;
+}
+
+function getOwnerUserId(): string | undefined {
+  return process.env.OWNER_USER_ID;
+}
+
+if (!BOT_TOKEN || !getOwnerChatId()) {
   // When launched via CLI, config is already validated. This guard is for
   // direct `node dist/bot/index.js` invocations (legacy .env workflow).
   const missing = [
     !BOT_TOKEN && "BOT_TOKEN",
-    !OWNER_CHAT_ID && "OWNER_CHAT_ID",
+    !getOwnerChatId() && "OWNER_CHAT_ID",
   ].filter(Boolean);
   console.error(
     `ERROR: Missing required environment variable(s): ${missing.join(", ")}\n` +
     `CAUSE: Neither config.json nor env vars provide these values\n` +
     `FIX:   Run 'conductor-telegram setup' or set ${missing.join(" and ")} in your environment\n` +
-    `       For manual Telegram bootstrap, you can temporarily set OWNER_CHAT_ID=0 and use /setup to discover the correct IDs`
+    `       For manual Telegram bootstrap, you can temporarily set OWNER_CHAT_ID=0 and use /setup to configure the active chat`
   );
   process.exit(2);
 }
@@ -72,7 +78,12 @@ bot.use((ctx, next) => {
 });
 
 // Auth: only respond to the owner
-bot.use(authGuard(OWNER_CHAT_ID, OWNER_USER_ID));
+bot.use(
+  authGuard(() => ({
+    ownerChatId: getOwnerChatId(),
+    ownerUserId: getOwnerUserId(),
+  }))
+);
 
 // Register commands
 registerCommands(bot);
@@ -84,9 +95,10 @@ async function syncTelegramCommands(): Promise<void> {
   await bot.telegram.callApi("deleteMyCommands", {
     scope: { type: "all_private_chats" },
   });
-  if (OWNER_CHAT_ID !== "0") {
+  const ownerChatId = getOwnerChatId();
+  if (ownerChatId !== "0") {
     await bot.telegram.callApi("deleteMyCommands", {
-      scope: { type: "chat", chat_id: OWNER_CHAT_ID! },
+      scope: { type: "chat", chat_id: ownerChatId! },
     });
   }
   await bot.telegram.setMyCommands(commands);
@@ -218,7 +230,7 @@ function startEventPoller(): void {
         if (event.type === "human_request") {
           const payload: HumanRequestPayload = JSON.parse(event.payload);
           const ws = getWorkspace(event.workspaceId);
-          const chatId = ws?.telegramChatId ?? OWNER_CHAT_ID!;
+          const chatId = ws?.telegramChatId ?? getOwnerChatId()!;
           const wsName = ws?.conductorWorkspaceName ?? ws?.name ?? "unknown";
 
           const questionHtml = esc(payload.question);
@@ -314,9 +326,9 @@ function extractTextParts(content: unknown): string {
 
 function logSetupHints(): void {
   console.log("[setup] Use /setup for guided private-chat and forum-topic configuration.");
-  if (OWNER_CHAT_ID === "0") {
+  if (getOwnerChatId() === "0") {
     console.log(
-      "[setup] Bootstrap mode is enabled because OWNER_CHAT_ID=0. /start, /help, and /setup are temporarily allowed before auth so you can discover the correct chat and user IDs."
+      "[setup] Bootstrap mode is enabled because OWNER_CHAT_ID=0. /start, /help, and /setup are temporarily allowed before auth so the bot can configure the active chat for you."
     );
   }
 }

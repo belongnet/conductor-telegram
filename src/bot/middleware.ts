@@ -1,5 +1,10 @@
 import type { Context, MiddlewareFn } from "telegraf";
 
+interface AuthConfig {
+  ownerChatId?: string;
+  ownerUserId?: string;
+}
+
 /**
  * Auth middleware: only allow messages from the configured owner.
  *
@@ -7,20 +12,34 @@ import type { Context, MiddlewareFn } from "telegraf";
  * In a supergroup (forum topics mode), also checks the sender's user ID
  * against OWNER_USER_ID so other group members are ignored.
  */
-export function authGuard(
-  ownerChatId: string,
-  ownerUserId?: string
-): MiddlewareFn<Context> {
+export function authGuard(getConfig: () => AuthConfig): MiddlewareFn<Context> {
   return (ctx, next) => {
+    const { ownerChatId = "", ownerUserId } = getConfig();
     const chatId = ctx.chat?.id?.toString();
     const userId = ctx.from?.id?.toString();
     const chatType = ctx.chat?.type;
     const text = (ctx.message as any)?.text?.trim() ?? "";
+    const callbackData = (ctx.callbackQuery as any)?.data ?? "";
+    const isSetupCommand = /^\/(start|help|setup)\b/.test(text);
+    const isSetupAction = typeof callbackData === "string" && callbackData.startsWith("setup:");
+    const effectiveOwnerUserId =
+      ownerUserId ??
+      (ownerChatId && !ownerChatId.startsWith("-") ? ownerChatId : undefined);
     const isBootstrapSetupCommand =
-      ownerChatId === "0" && /^\/(start|help|setup)\b/.test(text);
+      ownerChatId === "0" && (isSetupCommand || isSetupAction);
+    const isOwnerSetupCommand =
+      (isSetupCommand || isSetupAction) &&
+      !!effectiveOwnerUserId &&
+      userId === effectiveOwnerUserId;
 
     // Bootstrap mode: allow setup/help commands before IDs are configured.
     if (isBootstrapSetupCommand) {
+      return next();
+    }
+
+    // Setup/help/start should also work for the configured owner in any chat
+    // so they can discover a new group/supergroup ID without resetting config.
+    if (isOwnerSetupCommand) {
       return next();
     }
 
