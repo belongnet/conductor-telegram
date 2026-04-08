@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>conductor-telegram — Remote AI Agent Oversight via Telegram</title>
+<meta name="description" content="Run AI agents, approve decisions, and monitor progress from your phone. Open source Telegram bot for Conductor workspaces.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300..700;1,9..40,300..700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0A0A0B;
+    --surface: #141416;
+    --surface-raised: #1C1C1F;
+    --border: #27272A;
+    --border-subtle: #1E1E21;
+    --text: #FAFAFA;
+    --text-muted: #71717A;
+    --text-dim: #52525B;
+    --accent: #00D4AA;
+    --accent-dim: #00D4AA22;
+    --warning: #F59E0B;
+    --error: #EF4444;
+    --success: #22C55E;
+    --info: #3B82F6;
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --font-body: 'DM Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* NAV */
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0;
+  }
+  nav .container {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .nav-brand {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--accent);
+  }
+  .nav-links {
+    display: flex;
+    gap: 24px;
+    list-style: none;
+  }
+  .nav-links a {
+    font-size: 14px;
+    color: var(--text-muted);
+    transition: color 0.12s;
+  }
+  .nav-links a:hover { color: var(--text); text-decoration: none; }
+
+  /* HERO */
+  .hero {
+    padding: 80px 0 64px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+  }
+  .hero-badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--accent);
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: 9999px;
+    padding: 4px 14px;
+    margin-bottom: 24px;
+  }
+  .hero h1 {
+    font-family: var(--font-body);
+    font-size: clamp(32px, 5vw, 48px);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+    margin-bottom: 16px;
+  }
+  .hero h1 span { color: var(--accent); }
+  .hero p {
+    font-size: 17px;
+    color: var(--text-muted);
+    max-width: 560px;
+    margin: 0 auto 32px;
+    line-height: 1.7;
+  }
+  .hero-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-body);
+    font-size: 14px;
+    font-weight: 500;
+    padding: 10px 20px;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: all 0.12s;
+    text-decoration: none;
+  }
+  .btn:hover { text-decoration: none; }
+  .btn-primary {
+    background: var(--accent);
+    color: #0A0A0B;
+    border-color: var(--accent);
+  }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-secondary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--text-muted); }
+
+  /* INSTALL BLOCK */
+  .install-block {
+    max-width: 480px;
+    margin: 32px auto 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+  .install-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    background: var(--surface-raised);
+    border-bottom: 1px solid var(--border);
+  }
+  .install-header span {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .copy-btn {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 2px 8px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .install-code {
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--text);
+    overflow-x: auto;
+  }
+  .install-code .prompt { color: var(--text-dim); user-select: none; }
+  .install-code .cmd { color: var(--accent); }
+
+  /* SECTIONS */
+  section {
+    padding: 64px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  section:last-of-type { border-bottom: none; }
+  .section-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+  section h2 {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin-bottom: 8px;
+  }
+  section .lead {
+    font-size: 16px;
+    color: var(--text-muted);
+    margin-bottom: 32px;
+    max-width: 640px;
+  }
+
+  /* FEATURES GRID */
+  .features-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+  }
+  .feature-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 24px;
+  }
+  .feature-icon {
+    font-size: 20px;
+    margin-bottom: 12px;
+    display: block;
+  }
+  .feature-card h3 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .feature-card p {
+    font-size: 14px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }
+
+  /* TERMINAL MOCKUP */
+  .terminal {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    margin-bottom: 16px;
+  }
+  .terminal-bar {
+    background: var(--surface);
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .terminal-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--border);
+  }
+  .terminal-title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-left: 8px;
+  }
+  .terminal-body {
+    padding: 20px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+  }
+  .terminal-body .p { color: var(--text-dim); }
+  .terminal-body .c { color: var(--text); }
+  .terminal-body .a { color: var(--accent); }
+  .terminal-body .d { color: var(--text-dim); }
+  .terminal-body .ok { color: var(--success); }
+  .terminal-body .w { color: var(--warning); }
+
+  /* TELEGRAM MOCKUP */
+  .telegram-mock {
+    background: #0E0E10;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    max-width: 400px;
+  }
+  .tg-header {
+    background: #1A1A1D;
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 1px solid #27272A;
+  }
+  .tg-avatar {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 600;
+    color: #0A0A0B;
+  }
+  .tg-name { font-size: 15px; font-weight: 600; }
+  .tg-sub { font-size: 12px; color: var(--text-dim); }
+  .tg-messages { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .tg-msg {
+    max-width: 85%;
+    padding: 10px 14px;
+    font-size: 14px;
+    line-height: 1.5;
+    border-radius: 12px 12px 12px 4px;
+  }
+  .tg-msg.bot { background: #1E1E22; align-self: flex-start; }
+  .tg-msg.user {
+    background: #00D4AA22;
+    border: 1px solid #00D4AA44;
+    align-self: flex-end;
+    border-radius: 12px 12px 4px 12px;
+  }
+  .tg-msg .label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+  .tg-msg code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: #0A0A0B88;
+    padding: 2px 5px;
+    border-radius: 3px;
+    color: var(--accent);
+  }
+  .tg-msg .time {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-align: right;
+    margin-top: 4px;
+  }
+
+  /* SIDE BY SIDE */
+  .side-by-side {
+    display: grid;
+    grid-template-columns: 1fr 400px;
+    gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 860px) {
+    .side-by-side { grid-template-columns: 1fr; }
+    .telegram-mock { max-width: 100%; }
+  }
+
+  /* STEPS */
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 32px;
+    counter-reset: step;
+  }
+  .step {
+    display: grid;
+    grid-template-columns: 48px 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+  .step-num {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+  .step h3 {
+    font-size: 17px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .step p {
+    font-size: 14px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }
+  .step code {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 2px 6px;
+    color: var(--accent);
+  }
+
+  /* CONFIG TABLE */
+  .config-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  .config-table th {
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .config-table td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-muted);
+  }
+  .config-table td:first-child {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+  }
+  .config-table td:nth-child(2) {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  /* ARCHITECTURE */
+  .arch-diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 32px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.8;
+    overflow-x: auto;
+    color: var(--text-muted);
+  }
+  .arch-diagram .h { color: var(--accent); font-weight: 600; }
+  .arch-diagram .s { color: var(--text-dim); }
+
+  /* FOOTER */
+  footer {
+    padding: 32px 0;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-dim);
+    border-top: 1px solid var(--border);
+  }
+  footer a { color: var(--text-muted); }
+  footer a:hover { color: var(--accent); }
+
+  /* CODE BLOCKS */
+  .code-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+    margin: 16px 0;
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="container">
+    <a class="nav-brand" href="#">conductor-telegram</a>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="#setup">Setup</a></li>
+      <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#contributing">Contributing</a></li>
+      <li><a href="https://github.com/belongnet/conductor-telegram">GitHub</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero">
+  <div class="container">
+    <span class="hero-badge">v0.2.1 / MIT / TypeScript</span>
+    <h1>Remote oversight for your<br><span>AI agent workspaces</span></h1>
+    <p>Run agents, approve decisions, and monitor progress from your phone. A Telegram bot and MCP server for Conductor workspaces.</p>
+    <div class="hero-actions">
+      <a href="#setup" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/belongnet/conductor-telegram" class="btn btn-secondary">View on GitHub</a>
+    </div>
+    <div class="install-block">
+      <div class="install-header">
+        <span>Terminal</span>
+        <button class="copy-btn" onclick="navigator.clipboard.writeText('npm i -g conductor-telegram\nconductor-telegram setup\nconductor-telegram')">Copy</button>
+      </div>
+      <div class="install-code">
+        <span class="prompt">$</span> <span class="cmd">npm i -g conductor-telegram</span><br>
+        <span class="prompt">$</span> <span class="cmd">conductor-telegram setup</span><br>
+        <span class="prompt">$</span> <span class="cmd">conductor-telegram</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="container">
+    <div class="section-label">// what it does</div>
+    <h2>Control your AI agents from anywhere</h2>
+    <p class="lead">conductor-telegram bridges your Conductor workspaces to Telegram. Start workspaces, review PRs, and approve agent decisions without opening a laptop.</p>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <span class="feature-icon">&#9889;</span>
+        <h3>Launch workspaces remotely</h3>
+        <p>Start new AI agent workspaces from Telegram. Pick a repo, describe the task, and the agent gets to work.</p>
+      </div>
+      <div class="feature-card">
+        <span class="feature-icon">&#9745;</span>
+        <h3>Approve decisions</h3>
+        <p>Agents ask for permission before risky operations. Approve or reject from your phone with a quick reply.</p>
+      </div>
+      <div class="feature-card">
+        <span class="feature-icon">&#128241;</span>
+        <h3>Real-time status</h3>
+        <p>Get progress reports as agents work. See what files changed, what PRs were created, and when things go wrong.</p>
+      </div>
+      <div class="feature-card">
+        <span class="feature-icon">&#128483;</span>
+        <h3>Forum topics per workspace</h3>
+        <p>Each workspace gets its own Telegram forum topic. Clean separation, easy to follow, no noise.</p>
+      </div>
+      <div class="feature-card">
+        <span class="feature-icon">&#128295;</span>
+        <h3>MCP server</h3>
+        <p>Three tools for agents: report_status, report_artifact, and request_human. Agents talk to you through the protocol.</p>
+      </div>
+      <div class="feature-card">
+        <span class="feature-icon">&#9881;</span>
+        <h3>Self-diagnosing</h3>
+        <p>Run <code>doctor</code> to check Node.js, config, bot token, database, Conductor, MCP plugin, and repos. All at once.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how-it-works">
+  <div class="container">
+    <div class="section-label">// how it works</div>
+    <h2>CLI meets Telegram</h2>
+    <p class="lead">The CLI runs the bot process. Telegram is the interface. Agents communicate through MCP.</p>
+
+    <div class="side-by-side">
+      <div>
+        <div class="terminal">
+          <div class="terminal-bar">
+            <div class="terminal-dot"></div>
+            <div class="terminal-dot"></div>
+            <div class="terminal-dot"></div>
+            <span class="terminal-title">Terminal</span>
+          </div>
+          <div class="terminal-body">
+<span class="p">$</span> <span class="c">conductor-telegram</span>
+
+  <span class="a">conductor-telegram</span> v0.2.1
+  <span class="d">Built by Belong.net · conductor.build</span>
+
+  <span class="ok">&#10003;</span> Bot connected as <span class="a">@ConductorBot</span>
+  <span class="ok">&#10003;</span> Listening in chat <span class="d">-1001234567890</span>
+  <span class="ok">&#10003;</span> MCP server ready on stdio
+
+<span class="p">$</span> <span class="c">conductor-telegram doctor</span>
+
+  <span class="ok">&#10003;</span> Node.js     v22.14.0 <span class="d">(required >=22)</span>
+  <span class="ok">&#10003;</span> Config      <span class="d">~/.conductor-telegram/config.json</span>
+  <span class="ok">&#10003;</span> Bot token   <span class="a">@ConductorBot</span> connected
+  <span class="ok">&#10003;</span> Database    <span class="d">conductor-telegram.db</span>
+  <span class="ok">&#10003;</span> Conductor   <span class="d">conductor.db</span>
+  <span class="ok">&#10003;</span> MCP Plugin  installed
+  <span class="ok">&#10003;</span> Repos       <span class="d">4 repositories</span>
+
+  <span class="a">All systems operational.</span>
+          </div>
+        </div>
+      </div>
+      <div class="telegram-mock">
+        <div class="tg-header">
+          <div class="tg-avatar">C</div>
+          <div>
+            <div class="tg-name">Conductor</div>
+            <div class="tg-sub">online</div>
+          </div>
+        </div>
+        <div class="tg-messages">
+          <div class="tg-msg bot">
+            <div class="label">conductor / api-refactor</div>
+            Agent started on <code>conductor-telegram</code>
+            <div class="time">20:41</div>
+          </div>
+          <div class="tg-msg bot">
+            <div class="label">status</div>
+            Analyzing codebase. Found 12 source files across 5 modules. Planning refactor...
+            <div class="time">20:42</div>
+          </div>
+          <div class="tg-msg bot">
+            <div class="label">&#9888; approval needed</div>
+            Agent wants to restructure <code>commands.ts</code> into 4 smaller modules. Approve?
+            <div class="time">20:44</div>
+          </div>
+          <div class="tg-msg user">
+            Yes, go ahead. Keep the existing exports.
+            <div class="time">20:45</div>
+          </div>
+          <div class="tg-msg bot">
+            <div class="label">artifact</div>
+            PR #48 created: <code>refactor: split commands</code><br>+412 -389 across 6 files
+            <div class="time">20:51</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SETUP -->
+<section id="setup">
+  <div class="container">
+    <div class="section-label">// getting started</div>
+    <h2>Setup in 3 minutes</h2>
+    <p class="lead">The setup wizard handles everything. You just need a Telegram bot token.</p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div>
+          <h3>Create a Telegram bot</h3>
+          <p>Open <a href="https://t.me/BotFather">@BotFather</a> in Telegram, send <code>/newbot</code>, and copy the token. That's your <code>BOT_TOKEN</code>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div>
+          <h3>Install and run setup</h3>
+          <p>Install globally with npm, then run the interactive setup wizard. It auto-detects existing <code>.env</code> files.</p>
+          <div class="code-block">
+            npm i -g conductor-telegram<br>
+            conductor-telegram setup
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div>
+          <h3>Start the bot</h3>
+          <p>Run <code>conductor-telegram</code> to start. Send <code>/setup</code> in your Telegram chat to link the bot. It will detect whether you're in a private chat or a forum group.</p>
+          <div class="code-block">
+            conductor-telegram
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div>
+          <h3>Install the MCP plugin</h3>
+          <p>So agents can talk back to Telegram. This installs the MCP server into Claude Code.</p>
+          <div class="code-block">
+            conductor-telegram install-plugin
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h3 style="margin-top:48px; margin-bottom:16px;">Configuration</h3>
+    <p class="lead">Config is stored at <code style="font-family:var(--font-mono);font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:2px 6px;color:var(--accent);">~/.conductor-telegram/config.json</code>. Precedence: CLI flags > env vars > config.json > defaults.</p>
+
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden;">
+      <table class="config-table">
+        <thead>
+          <tr><th>Flag</th><th>Env Var</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>--token</td><td>BOT_TOKEN</td><td>Telegram bot token from @BotFather</td></tr>
+          <tr><td>--chat-id</td><td>OWNER_CHAT_ID</td><td>Your Telegram chat ID</td></tr>
+          <tr><td>--db-path</td><td>DB_PATH</td><td>SQLite database path</td></tr>
+          <tr><td></td><td>CONDUCTOR_WORKSPACES_DIR</td><td>Conductor workspaces directory</td></tr>
+          <tr><td></td><td>CONDUCTOR_REPOS_DIR</td><td>Repository directory</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture">
+  <div class="container">
+    <div class="section-label">// under the hood</div>
+    <h2>Architecture</h2>
+    <p class="lead">Three components: a CLI that manages config, a Telegram bot that handles user interaction, and an MCP server that agents use to communicate.</p>
+
+    <div class="arch-diagram">
+<span class="h">Operator (Telegram)</span>       <span class="h">Conductor Workspace</span>
+        <span class="s">|</span>                          <span class="s">|</span>
+        <span class="s">|</span>  /run, /send, /review    <span class="s">|</span>  report_status
+        <span class="s">|</span>  /approve, /stop          <span class="s">|</span>  report_artifact
+        <span class="s">v</span>                          <span class="s">v</span>  request_human
+   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
+   <span class="s">|</span> <span class="h">Telegram</span>  <span class="s">|</span><span class="s">&lt;--------&gt;</span><span class="s">|</span> <span class="h">MCP Server</span><span class="s">|</span>
+   <span class="s">|</span> <span class="h">Bot</span>       <span class="s">|</span>          <span class="s">|</span>           <span class="s">|</span>
+   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
+        <span class="s">|</span>                          <span class="s">|</span>
+        <span class="s">v</span>                          <span class="s">v</span>
+   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
+   <span class="s">|</span> <span class="h">SQLite DB</span> <span class="s">|</span>          <span class="s">|</span> <span class="h">Claude</span>    <span class="s">|</span>
+   <span class="s">|</span> sessions  <span class="s">|</span>          <span class="s">|</span> <span class="h">Code</span>      <span class="s">|</span>
+   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
+    </div>
+
+    <div style="margin-top:24px;">
+      <div class="code-block">
+src/
+  bot/         # Telegram bot: commands, middleware, formatting, forum topics
+  cli/         # CLI: setup wizard, doctor, banner, config management
+  mcp/         # MCP server: report_status, report_artifact, request_human
+  store/       # SQLite: database setup and query layer
+  types/       # Shared TypeScript types
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CONTRIBUTING -->
+<section id="contributing">
+  <div class="container">
+    <div class="section-label">// get involved</div>
+    <h2>Contributing</h2>
+    <p class="lead">conductor-telegram is MIT licensed and open to contributions. Here's how to get started.</p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div>
+          <h3>Fork and clone</h3>
+          <div class="code-block">
+            git clone https://github.com/YOUR_USERNAME/conductor-telegram.git<br>
+            cd conductor-telegram<br>
+            npm install
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div>
+          <h3>Create a branch</h3>
+          <div class="code-block">
+            git checkout -b feat/your-feature
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div>
+          <h3>Make your changes</h3>
+          <p>Run <code>npm run dev</code> for live reload during development. Run <code>npm run typecheck</code> before committing.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div>
+          <h3>Open a PR</h3>
+          <p>Push your branch and open a pull request. Describe what you changed and why. We review everything.</p>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:32px;">
+      <h3 style="margin-bottom:12px;">Good first issues</h3>
+      <p style="color:var(--text-muted);font-size:14px;margin-bottom:16px;">Look for issues labeled <code>good first issue</code> on GitHub. These are scoped, well-described, and a great way to get familiar with the codebase.</p>
+      <a href="https://github.com/belongnet/conductor-telegram/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22" class="btn btn-secondary">Browse good first issues</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>Built by <a href="https://belong.net">Belong.net</a> · <a href="https://conductor.build">conductor.build</a> · MIT License</p>
+  </div>
+</footer>
+
+</body>
+</html>
