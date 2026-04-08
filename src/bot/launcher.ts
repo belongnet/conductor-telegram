@@ -1097,8 +1097,14 @@ export async function launchWorkspace(
 
   // 2. Create git worktree
   try {
-    // Create branch from default branch and set up worktree
     const defaultBranch = repoInfo.defaultBranch ?? "main";
+    // Delete stale branch if it exists (left over from a previously deleted workspace)
+    try {
+      await execAsync(`cd "${repoPath}" && git branch -D "${branchName}" 2>/dev/null`);
+      console.log(`[launcher] Deleted stale branch ${branchName}`);
+    } catch {
+      // Branch doesn't exist — expected path
+    }
     await execAsync(`cd "${repoPath}" && git worktree add -b "${branchName}" "${workspaceDir}" "${defaultBranch}"`);
     console.log(`[launcher] Git worktree created at ${workspaceDir}`);
   } catch (err) {
