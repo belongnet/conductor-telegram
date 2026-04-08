@@ -205,7 +205,6 @@ function startSessionPoller(): void {
                 syncWorkspaceTopic(bot.telegram, { ...ws, status: "done" }).catch((err) =>
                   console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
                 );
-                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
               }
             })
             .catch((err) => console.error(`[poller] notify error:`, err));
