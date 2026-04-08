@@ -39,6 +39,9 @@ import https from "node:https";
 // Map Telegram message IDs to decision IDs (for reply-based answering)
 const messageToDecision = new Map<number, number>();
 
+// Track repo-selection confirmation messages so replies create a workspace directly
+const messageToRepoSelection = new Map<number, string>(); // messageId → repoName
+
 /**
  * Register a Telegram message ID as associated with a decision,
  * so that replies to that message can answer the decision.
@@ -628,10 +631,11 @@ async function handleRunRepoCallback(ctx: Context): Promise<void> {
   pendingRepoSelection.set(selectionKey, repoNum);
 
   await ctx.answerCbQuery(`Selected: ${repoName}`);
-  await ctx.reply(
-    `Selected <b>${escHtml(repoName)}</b>. Now send your prompt as a message, or use:\n<code>/run ${repoNum} your prompt here</code>`,
+  const confirmMsg = await ctx.reply(
+    `Selected <b>${escHtml(repoName)}</b>. Now send your prompt as a message (or reply to this message), or use:\n<code>/run ${repoNum} your prompt here</code>`,
     { parse_mode: "HTML" }
   );
+  messageToRepoSelection.set(confirmMsg.message_id, repoName);
 }
 
 // ── Reply-to-decision helper ─────────────────────────────────
@@ -858,6 +862,19 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;
+
+  // Check if this is a reply to a repo-selection confirmation message
+  const replyToMsgId = (ctx.message as any)?.reply_to_message?.message_id;
+  if (replyToMsgId) {
+    const repoName = messageToRepoSelection.get(replyToMsgId);
+    if (repoName) {
+      messageToRepoSelection.delete(replyToMsgId);
+      // Also clear pending selection if any
+      if (selectionKey) pendingRepoSelection.delete(selectionKey);
+      await startWorkspaceFromMessage(ctx, repoName, text);
+      return;
+    }
+  }
 
   const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
   if (repliedWorkspace) {
