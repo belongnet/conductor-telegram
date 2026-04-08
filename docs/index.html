@@ -208,7 +208,6 @@
     margin-bottom: 16px;
   }
   .hero h1 span {
-    color: var(--accent);
     background: linear-gradient(135deg, #00D4AA, #3B82F6);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -227,16 +226,11 @@
     justify-content: center;
     flex-wrap: wrap;
   }
-
-  /* Hero illustration */
   .hero-illustration {
     margin: 40px auto 0;
-    max-width: 480px;
+    max-width: 520px;
   }
-  .hero-illustration svg {
-    width: 100%;
-    height: auto;
-  }
+  .hero-illustration svg { width: 100%; height: auto; }
 
   .btn {
     display: inline-flex;
@@ -258,10 +252,7 @@
     color: #0A0A0B;
     border-color: var(--accent);
   }
-  .btn-primary:hover {
-    opacity: 0.9;
-    box-shadow: 0 0 20px var(--accent-glow);
-  }
+  .btn-primary:hover { opacity: 0.9; box-shadow: 0 0 20px var(--accent-glow); }
   .btn-secondary {
     background: transparent;
     color: var(--text);
@@ -286,11 +277,7 @@
     background: var(--surface-raised);
     border-bottom: 1px solid var(--border);
   }
-  .install-header span {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-dim);
-  }
+  .install-header span { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
   .copy-btn {
     font-family: var(--font-mono);
     font-size: 11px;
@@ -315,11 +302,7 @@
   .install-code .cmd { color: var(--accent); }
 
   /* ===== SECTIONS ===== */
-  section {
-    padding: 64px 0;
-    border-bottom: 1px solid var(--border);
-    position: relative;
-  }
+  section { padding: 64px 0; border-bottom: 1px solid var(--border); position: relative; }
   section:last-of-type { border-bottom: none; }
   .section-label {
     font-family: var(--font-mono);
@@ -329,25 +312,11 @@
     color: var(--text-dim);
     margin-bottom: 12px;
   }
-  section h2 {
-    font-size: 28px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    margin-bottom: 8px;
-  }
-  section .lead {
-    font-size: 16px;
-    color: var(--text-muted);
-    margin-bottom: 32px;
-    max-width: 640px;
-  }
+  section h2 { font-size: 28px; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 8px; }
+  section .lead { font-size: 16px; color: var(--text-muted); margin-bottom: 32px; max-width: 640px; }
 
   /* ===== FEATURES GRID ===== */
-  .features-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 16px;
-  }
+  .features-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
   .feature-card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -372,10 +341,8 @@
     box-shadow: 0 8px 32px rgba(0, 212, 170, 0.06);
   }
   .feature-card:hover::before { opacity: 1; }
-
   .feature-icon-wrap {
-    width: 44px;
-    height: 44px;
+    width: 44px; height: 44px;
     border-radius: 10px;
     background: var(--accent-dim);
     border: 1px solid rgba(0, 212, 170, 0.15);
@@ -385,25 +352,15 @@
     margin-bottom: 14px;
   }
   .feature-icon-wrap svg {
-    width: 22px;
-    height: 22px;
+    width: 22px; height: 22px;
     stroke: var(--accent);
     fill: none;
     stroke-width: 1.5;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
-
-  .feature-card h3 {
-    font-size: 16px;
-    font-weight: 600;
-    margin-bottom: 8px;
-  }
-  .feature-card p {
-    font-size: 14px;
-    color: var(--text-muted);
-    line-height: 1.6;
-  }
+  .feature-card h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
+  .feature-card p { font-size: 14px; color: var(--text-muted); line-height: 1.6; }
 
   /* ===== TERMINAL MOCKUP ===== */
   .terminal {
@@ -421,19 +378,11 @@
     gap: 8px;
     border-bottom: 1px solid var(--border);
   }
-  .terminal-dot {
-    width: 10px; height: 10px;
-    border-radius: 50%;
-  }
+  .terminal-dot { width: 10px; height: 10px; border-radius: 50%; }
   .terminal-dot:nth-child(1) { background: #EF4444; }
   .terminal-dot:nth-child(2) { background: #F59E0B; }
   .terminal-dot:nth-child(3) { background: #22C55E; }
-  .terminal-title {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-dim);
-    margin-left: 8px;
-  }
+  .terminal-title { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); margin-left: 8px; }
   .terminal-body {
     padding: 20px;
     font-family: var(--font-mono);
@@ -446,7 +395,6 @@
   .terminal-body .a { color: var(--accent); }
   .terminal-body .d { color: var(--text-dim); }
   .terminal-body .ok { color: var(--success); }
-  .terminal-body .w { color: var(--warning); }
 
   /* ===== TELEGRAM MOCKUP ===== */
   .telegram-mock {
@@ -468,163 +416,76 @@
     width: 36px; height: 36px;
     border-radius: 50%;
     background: linear-gradient(135deg, var(--accent), #3B82F6);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-family: var(--font-mono);
-    font-size: 16px;
-    font-weight: 600;
-    color: #0A0A0B;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 16px; font-weight: 600; color: #0A0A0B;
   }
   .tg-name { font-size: 15px; font-weight: 600; }
   .tg-sub { font-size: 12px; color: var(--text-dim); }
   .tg-messages { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
   .tg-msg {
-    max-width: 85%;
-    padding: 10px 14px;
-    font-size: 14px;
-    line-height: 1.5;
+    max-width: 85%; padding: 10px 14px;
+    font-size: 14px; line-height: 1.5;
     border-radius: 12px 12px 12px 4px;
   }
   .tg-msg.bot { background: #1E1E22; align-self: flex-start; }
   .tg-msg.user {
-    background: #00D4AA22;
-    border: 1px solid #00D4AA44;
-    align-self: flex-end;
-    border-radius: 12px 12px 4px 12px;
+    background: #00D4AA22; border: 1px solid #00D4AA44;
+    align-self: flex-end; border-radius: 12px 12px 4px 12px;
   }
-  .tg-msg .label {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--accent);
-    margin-bottom: 4px;
-  }
+  .tg-msg .label { font-family: var(--font-mono); font-size: 11px; color: var(--accent); margin-bottom: 4px; }
   .tg-msg code {
-    font-family: var(--font-mono);
-    font-size: 12px;
-    background: #0A0A0B88;
-    padding: 2px 5px;
-    border-radius: 3px;
-    color: var(--accent);
+    font-family: var(--font-mono); font-size: 12px;
+    background: #0A0A0B88; padding: 2px 5px; border-radius: 3px; color: var(--accent);
   }
-  .tg-msg .time {
-    font-size: 11px;
-    color: var(--text-dim);
-    text-align: right;
-    margin-top: 4px;
-  }
+  .tg-msg .time { font-size: 11px; color: var(--text-dim); text-align: right; margin-top: 4px; }
 
   /* ===== SIDE BY SIDE ===== */
-  .side-by-side {
-    display: grid;
-    grid-template-columns: 1fr 400px;
-    gap: 24px;
-    align-items: start;
-  }
+  .side-by-side { display: grid; grid-template-columns: 1fr 400px; gap: 24px; align-items: start; }
   @media (max-width: 860px) {
     .side-by-side { grid-template-columns: 1fr; }
     .telegram-mock { max-width: 100%; }
   }
 
   /* ===== STEPS ===== */
-  .steps {
-    display: flex;
-    flex-direction: column;
-    gap: 32px;
-    counter-reset: step;
-  }
-  .step {
-    display: grid;
-    grid-template-columns: 48px 1fr;
-    gap: 16px;
-    align-items: start;
-  }
+  .steps { display: flex; flex-direction: column; gap: 32px; }
+  .step { display: grid; grid-template-columns: 48px 1fr; gap: 16px; align-items: start; }
   .step-num {
-    width: 48px; height: 48px;
-    border-radius: 50%;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-family: var(--font-mono);
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--accent);
-    flex-shrink: 0;
-    transition: all 0.3s;
+    width: 48px; height: 48px; border-radius: 50%;
+    background: var(--surface); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 16px; font-weight: 600;
+    color: var(--accent); flex-shrink: 0; transition: all 0.3s;
   }
-  .step:hover .step-num {
-    border-color: var(--accent);
-    box-shadow: 0 0 16px var(--accent-glow);
-  }
-  .step h3 {
-    font-size: 17px;
-    font-weight: 600;
-    margin-bottom: 6px;
-  }
-  .step p {
-    font-size: 14px;
-    color: var(--text-muted);
-    line-height: 1.6;
-  }
+  .step:hover .step-num { border-color: var(--accent); box-shadow: 0 0 16px var(--accent-glow); }
+  .step h3 { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+  .step p { font-size: 14px; color: var(--text-muted); line-height: 1.6; }
   .step code {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    padding: 2px 6px;
-    color: var(--accent);
+    font-family: var(--font-mono); font-size: 13px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 2px 6px; color: var(--accent);
   }
 
   /* ===== CONFIG TABLE ===== */
-  .config-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 14px;
-  }
+  .config-table { width: 100%; border-collapse: collapse; font-size: 14px; }
   .config-table th {
-    text-align: left;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-dim);
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--border);
+    text-align: left; font-family: var(--font-mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim);
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
   }
-  .config-table td {
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border-subtle);
-    color: var(--text-muted);
-  }
-  .config-table td:first-child {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    color: var(--accent);
-  }
-  .config-table td:nth-child(2) {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    color: var(--text-dim);
-  }
+  .config-table td { padding: 12px 16px; border-bottom: 1px solid var(--border-subtle); color: var(--text-muted); }
+  .config-table td:first-child { font-family: var(--font-mono); font-size: 13px; color: var(--accent); }
+  .config-table td:nth-child(2) { font-family: var(--font-mono); font-size: 13px; color: var(--text-dim); }
 
   /* ===== ARCHITECTURE — MERMAID ===== */
-  .arch-section {
-    position: relative;
-  }
+  .arch-section { position: relative; }
   .arch-section::before {
     content: '';
-    position: absolute;
-    top: 50%; left: 50%;
+    position: absolute; top: 50%; left: 50%;
     width: 600px; height: 600px;
     transform: translate(-50%, -50%);
     background: radial-gradient(circle, var(--accent-glow), transparent 70%);
-    pointer-events: none;
-    opacity: 0.3;
+    pointer-events: none; opacity: 0.3;
   }
-
   .mermaid-container {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -633,89 +494,46 @@
     overflow-x: auto;
     position: relative;
   }
-  .mermaid-container .mermaid {
-    display: flex;
-    justify-content: center;
-  }
-  .mermaid-container .mermaid svg {
-    max-width: 100%;
-    height: auto;
-  }
+  .mermaid-container .mermaid { display: flex; justify-content: center; }
 
   .arch-cards {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 12px;
-    margin-top: 24px;
+    gap: 12px; margin-top: 24px;
   }
   .arch-card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    padding: 16px;
-    transition: border-color 0.2s;
+    padding: 16px; transition: border-color 0.2s;
   }
   .arch-card:hover { border-color: var(--accent-glow); }
-  .arch-card-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
-  }
-  .arch-card-header svg {
-    width: 18px; height: 18px;
-    stroke: var(--accent);
-    fill: none;
-    stroke-width: 1.5;
-  }
-  .arch-card h4 {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    font-weight: 600;
-  }
-  .arch-card p {
-    font-size: 13px;
-    color: var(--text-muted);
-    line-height: 1.5;
-  }
+  .arch-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .arch-card-header svg { width: 18px; height: 18px; stroke: var(--accent); fill: none; stroke-width: 1.5; }
+  .arch-card h4 { font-family: var(--font-mono); font-size: 13px; font-weight: 600; }
+  .arch-card p { font-size: 13px; color: var(--text-muted); line-height: 1.5; }
 
   /* ===== CODE BLOCKS ===== */
   .code-block {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 16px;
-    font-family: var(--font-mono);
-    font-size: 13px;
-    line-height: 1.7;
-    overflow-x: auto;
-    margin: 16px 0;
-    color: var(--text);
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-md); padding: 16px;
+    font-family: var(--font-mono); font-size: 13px; line-height: 1.7;
+    overflow-x: auto; margin: 16px 0; color: var(--text);
   }
 
   /* ===== FOOTER ===== */
   footer {
-    padding: 32px 0;
-    text-align: center;
-    font-size: 13px;
-    color: var(--text-dim);
+    padding: 32px 0; text-align: center;
+    font-size: 13px; color: var(--text-dim);
     border-top: 1px solid var(--border);
   }
   footer a { color: var(--text-muted); }
   footer a:hover { color: var(--accent); }
 
   /* ===== SCROLL ANIMATIONS ===== */
-  .fade-in {
-    opacity: 0;
-    transform: translateY(20px);
-    transition: opacity 0.6s ease, transform 0.6s ease;
-  }
-  .fade-in.visible {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  .fade-in { opacity: 0; transform: translateY(20px); transition: opacity 0.6s ease, transform 0.6s ease; }
+  .fade-in.visible { opacity: 1; transform: translateY(0); }
 
-  /* ===== RESPONSIVE ===== */
   @media (max-width: 640px) {
     .nav-links { gap: 16px; }
     .hero { padding: 48px 0 40px; }
@@ -732,14 +550,8 @@
 <div class="bg-gradient-orb bg-orb-2"></div>
 <div class="bg-gradient-orb bg-orb-3"></div>
 <div class="particles">
-  <div class="particle"></div>
-  <div class="particle"></div>
-  <div class="particle"></div>
-  <div class="particle"></div>
-  <div class="particle"></div>
-  <div class="particle"></div>
-  <div class="particle"></div>
-  <div class="particle"></div>
+  <div class="particle"></div><div class="particle"></div><div class="particle"></div><div class="particle"></div>
+  <div class="particle"></div><div class="particle"></div><div class="particle"></div><div class="particle"></div>
 </div>
 
 <nav>
@@ -766,10 +578,9 @@
       <a href="https://github.com/belongnet/conductor-telegram" class="btn btn-secondary">View on GitHub</a>
     </div>
 
-    <!-- Hero SVG illustration: phone + terminal connected by signal lines -->
+    <!-- Hero SVG illustration -->
     <div class="hero-illustration">
-      <svg viewBox="0 0 480 180" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <!-- Terminal -->
+      <svg viewBox="0 0 520 180" fill="none" xmlns="http://www.w3.org/2000/svg">
         <rect x="20" y="30" width="160" height="120" rx="8" stroke="#27272A" stroke-width="1.5" fill="#141416"/>
         <rect x="20" y="30" width="160" height="24" rx="8" fill="#1C1C1F"/>
         <circle cx="36" cy="42" r="4" fill="#EF4444" opacity="0.7"/>
@@ -783,57 +594,45 @@
         <text x="48" y="108" font-family="monospace" font-size="9" fill="#71717A">MCP server ready</text>
         <text x="36" y="124" font-family="monospace" font-size="9" fill="#22C55E">&#x2713;</text>
         <text x="48" y="124" font-family="monospace" font-size="9" fill="#71717A">Listening...</text>
-
-        <!-- Connection lines with animation -->
-        <line x1="190" y1="90" x2="295" y2="90" stroke="#00D4AA" stroke-width="1" stroke-dasharray="6 4" opacity="0.5">
+        <line x1="190" y1="90" x2="305" y2="90" stroke="#00D4AA" stroke-width="1" stroke-dasharray="6 4" opacity="0.5">
           <animate attributeName="stroke-dashoffset" from="0" to="-20" dur="2s" repeatCount="indefinite"/>
         </line>
-        <circle cx="240" cy="90" r="3" fill="#00D4AA" opacity="0.6">
-          <animate attributeName="cx" from="200" to="290" dur="1.5s" repeatCount="indefinite"/>
+        <circle r="3" fill="#00D4AA" opacity="0.6">
+          <animate attributeName="cx" from="200" to="295" dur="1.5s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="90;90" dur="1.5s" repeatCount="indefinite"/>
           <animate attributeName="opacity" values="0;0.8;0" dur="1.5s" repeatCount="indefinite"/>
         </circle>
-
-        <!-- Signal waves -->
-        <path d="M255 70 Q260 65 265 70" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.3">
+        <path d="M260 70 Q265 65 270 70" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.3">
           <animate attributeName="opacity" values="0.1;0.5;0.1" dur="2s" repeatCount="indefinite"/>
         </path>
-        <path d="M250 62 Q258 55 266 62" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.2">
+        <path d="M255 62 Q263 55 271 62" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.2">
           <animate attributeName="opacity" values="0.1;0.4;0.1" dur="2s" repeatCount="indefinite" begin="0.3s"/>
         </path>
-        <path d="M245 54 Q256 45 267 54" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.15">
+        <path d="M250 54 Q261 45 272 54" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.15">
           <animate attributeName="opacity" values="0.05;0.3;0.05" dur="2s" repeatCount="indefinite" begin="0.6s"/>
         </path>
-
-        <!-- Phone -->
-        <rect x="300" y="20" width="90" height="140" rx="12" stroke="#27272A" stroke-width="1.5" fill="#141416"/>
-        <rect x="308" y="36" width="74" height="108" rx="4" fill="#0E0E10"/>
-        <rect x="332" y="26" width="26" height="4" rx="2" fill="#27272A"/>
-        <!-- Telegram messages in phone -->
-        <rect x="314" y="44" width="56" height="18" rx="6" fill="#1E1E22"/>
-        <text x="320" y="56" font-family="monospace" font-size="6" fill="#00D4AA">status</text>
-        <rect x="330" y="68" width="44" height="18" rx="6" fill="#00D4AA22" stroke="#00D4AA44" stroke-width="0.5"/>
-        <text x="336" y="80" font-family="monospace" font-size="6" fill="#FAFAFA">Approve</text>
-        <rect x="314" y="92" width="56" height="18" rx="6" fill="#1E1E22"/>
-        <text x="320" y="104" font-family="monospace" font-size="6" fill="#00D4AA">PR #48</text>
-        <!-- Notification dot -->
-        <circle cx="384" cy="28" r="5" fill="#00D4AA" opacity="0.8">
+        <rect x="310" y="20" width="90" height="140" rx="12" stroke="#27272A" stroke-width="1.5" fill="#141416"/>
+        <rect x="318" y="36" width="74" height="108" rx="4" fill="#0E0E10"/>
+        <rect x="342" y="26" width="26" height="4" rx="2" fill="#27272A"/>
+        <rect x="324" y="44" width="56" height="18" rx="6" fill="#1E1E22"/>
+        <text x="330" y="56" font-family="monospace" font-size="6" fill="#00D4AA">status</text>
+        <rect x="340" y="68" width="44" height="18" rx="6" fill="#00D4AA22" stroke="#00D4AA44" stroke-width="0.5"/>
+        <text x="346" y="80" font-family="monospace" font-size="6" fill="#FAFAFA">Approve</text>
+        <rect x="324" y="92" width="56" height="18" rx="6" fill="#1E1E22"/>
+        <text x="330" y="104" font-family="monospace" font-size="6" fill="#00D4AA">PR #48</text>
+        <circle cx="394" cy="28" r="5" fill="#00D4AA" opacity="0.8">
           <animate attributeName="r" values="4;6;4" dur="2s" repeatCount="indefinite"/>
           <animate attributeName="opacity" values="0.6;1;0.6" dur="2s" repeatCount="indefinite"/>
         </circle>
-
-        <!-- Labels -->
-        <text x="66" y="168" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Your Machine</text>
-        <text x="345" y="168" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Your Phone</text>
-
-        <!-- Conductor agent icon -->
-        <rect x="410" y="50" width="56" height="80" rx="6" stroke="#27272A" stroke-width="1" fill="#141416" stroke-dasharray="3 2"/>
-        <text x="438" y="78" font-family="monospace" font-size="8" fill="#3B82F6" text-anchor="middle">Agent</text>
-        <text x="438" y="92" font-family="monospace" font-size="7" fill="#52525B" text-anchor="middle">Claude</text>
-        <text x="438" y="104" font-family="monospace" font-size="7" fill="#52525B" text-anchor="middle">Code</text>
-        <line x1="390" y1="90" x2="408" y2="90" stroke="#3B82F6" stroke-width="1" stroke-dasharray="4 3" opacity="0.4">
+        <rect x="430" y="50" width="72" height="80" rx="6" stroke="#27272A" stroke-width="1" fill="#141416" stroke-dasharray="3 2"/>
+        <text x="466" y="78" font-family="monospace" font-size="8" fill="#3B82F6" text-anchor="middle">Claude</text>
+        <text x="466" y="92" font-family="monospace" font-size="7" fill="#52525B" text-anchor="middle">Code Agent</text>
+        <line x1="400" y1="90" x2="428" y2="90" stroke="#3B82F6" stroke-width="1" stroke-dasharray="4 3" opacity="0.4">
           <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="2s" repeatCount="indefinite"/>
         </line>
-        <text x="438" y="145" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Workspace</text>
+        <text x="100" y="170" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Your Machine</text>
+        <text x="355" y="170" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Your Phone</text>
+        <text x="466" y="145" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Workspace</text>
       </svg>
     </div>
 
@@ -857,47 +656,34 @@
     <div class="section-label">// what it does</div>
     <h2>Control your AI agents from anywhere</h2>
     <p class="lead">conductor-telegram bridges your Conductor workspaces to Telegram. Start workspaces, review PRs, and approve agent decisions without opening a laptop.</p>
-
     <div class="features-grid">
       <div class="feature-card fade-in">
-        <div class="feature-icon-wrap">
-          <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-        </div>
+        <div class="feature-icon-wrap"><svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
         <h3>Launch workspaces remotely</h3>
         <p>Start new AI agent workspaces from Telegram. Pick a repo, describe the task, and the agent gets to work.</p>
       </div>
       <div class="feature-card fade-in">
-        <div class="feature-icon-wrap">
-          <svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
-        </div>
+        <div class="feature-icon-wrap"><svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg></div>
         <h3>Approve decisions</h3>
         <p>Agents ask for permission before risky operations. Approve or reject from your phone with a quick reply.</p>
       </div>
       <div class="feature-card fade-in">
-        <div class="feature-icon-wrap">
-          <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
-        </div>
+        <div class="feature-icon-wrap"><svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
         <h3>Real-time status</h3>
         <p>Get progress reports as agents work. See what files changed, what PRs were created, and when things go wrong.</p>
       </div>
       <div class="feature-card fade-in">
-        <div class="feature-icon-wrap">
-          <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-        </div>
+        <div class="feature-icon-wrap"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg></div>
         <h3>Forum topics per workspace</h3>
         <p>Each workspace gets its own Telegram forum topic. Clean separation, easy to follow, no noise.</p>
       </div>
       <div class="feature-card fade-in">
-        <div class="feature-icon-wrap">
-          <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-        </div>
+        <div class="feature-icon-wrap"><svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div>
         <h3>MCP server</h3>
         <p>Three tools for agents: report_status, report_artifact, and request_human. Agents talk to you through the protocol.</p>
       </div>
       <div class="feature-card fade-in">
-        <div class="feature-icon-wrap">
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
-        </div>
+        <div class="feature-icon-wrap"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg></div>
         <h3>Self-diagnosing</h3>
         <p>Run <code>doctor</code> to check Node.js, config, bot token, database, Conductor, MCP plugin, and repos. All at once.</p>
       </div>
@@ -911,7 +697,6 @@
     <div class="section-label">// how it works</div>
     <h2>CLI meets Telegram</h2>
     <p class="lead">The CLI runs the bot process. Telegram is the interface. Agents communicate through MCP.</p>
-
     <div class="side-by-side">
       <div>
         <div class="terminal">
@@ -925,7 +710,7 @@
 <span class="p">$</span> <span class="c">conductor-telegram</span>
 
   <span class="a">conductor-telegram</span> v0.2.1
-  <span class="d">Built by Belong.net · conductor.build</span>
+  <span class="d">Built by Belong.net</span>
 
   <span class="ok">&#10003;</span> Bot connected as <span class="a">@ConductorBot</span>
   <span class="ok">&#10003;</span> Listening in chat <span class="d">-1001234567890</span>
@@ -933,7 +718,7 @@
 
 <span class="p">$</span> <span class="c">conductor-telegram doctor</span>
 
-  <span class="ok">&#10003;</span> Node.js     v22.14.0 <span class="d">(required >=22)</span>
+  <span class="ok">&#10003;</span> Node.js     v22.14.0 <span class="d">(required &gt;=22)</span>
   <span class="ok">&#10003;</span> Config      <span class="d">~/.conductor-telegram/config.json</span>
   <span class="ok">&#10003;</span> Bot token   <span class="a">@ConductorBot</span> connected
   <span class="ok">&#10003;</span> Database    <span class="d">conductor-telegram.db</span>
@@ -990,34 +775,28 @@
     <div class="section-label">// getting started</div>
     <h2>Setup in 3 minutes</h2>
     <p class="lead">The setup wizard handles everything. You just need a Telegram bot token.</p>
-
     <div class="steps">
       <div class="step fade-in">
         <div class="step-num">1</div>
         <div>
           <h3>Create a Telegram bot</h3>
-          <p>Open <a href="https://t.me/BotFather">@BotFather</a> in Telegram, send <code>/newbot</code>, and copy the token. That's your <code>BOT_TOKEN</code>.</p>
+          <p>Open <a href="https://t.me/BotFather">@BotFather</a> in Telegram, send <code>/newbot</code>, and copy the token.</p>
         </div>
       </div>
       <div class="step fade-in">
         <div class="step-num">2</div>
         <div>
           <h3>Install and run setup</h3>
-          <p>Install globally with npm, then run the interactive setup wizard. It auto-detects existing <code>.env</code> files.</p>
-          <div class="code-block">
-            npm i -g conductor-telegram<br>
-            conductor-telegram setup
-          </div>
+          <p>Install globally with npm, then run the interactive setup wizard.</p>
+          <div class="code-block">npm i -g conductor-telegram<br>conductor-telegram setup</div>
         </div>
       </div>
       <div class="step fade-in">
         <div class="step-num">3</div>
         <div>
           <h3>Start the bot</h3>
-          <p>Run <code>conductor-telegram</code> to start. Send <code>/setup</code> in your Telegram chat to link the bot. It will detect whether you're in a private chat or a forum group.</p>
-          <div class="code-block">
-            conductor-telegram
-          </div>
+          <p>Run <code>conductor-telegram</code> to start. Send <code>/setup</code> in your Telegram chat to link the bot.</p>
+          <div class="code-block">conductor-telegram</div>
         </div>
       </div>
       <div class="step fade-in">
@@ -1025,21 +804,15 @@
         <div>
           <h3>Install the MCP plugin</h3>
           <p>So agents can talk back to Telegram. This installs the MCP server into Claude Code.</p>
-          <div class="code-block">
-            conductor-telegram install-plugin
-          </div>
+          <div class="code-block">conductor-telegram install-plugin</div>
         </div>
       </div>
     </div>
-
     <h3 style="margin-top:48px; margin-bottom:16px;">Configuration</h3>
-    <p class="lead">Config is stored at <code style="font-family:var(--font-mono);font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:2px 6px;color:var(--accent);">~/.conductor-telegram/config.json</code>. Precedence: CLI flags > env vars > config.json > defaults.</p>
-
+    <p class="lead">Config stored at <code style="font-family:var(--font-mono);font-size:13px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);padding:2px 6px;color:var(--accent);">~/.conductor-telegram/config.json</code>. Precedence: CLI flags &gt; env vars &gt; config.json &gt; defaults.</p>
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden;">
       <table class="config-table">
-        <thead>
-          <tr><th>Flag</th><th>Env Var</th><th>Description</th></tr>
-        </thead>
+        <thead><tr><th>Flag</th><th>Env Var</th><th>Description</th></tr></thead>
         <tbody>
           <tr><td>--token</td><td>BOT_TOKEN</td><td>Telegram bot token from @BotFather</td></tr>
           <tr><td>--chat-id</td><td>OWNER_CHAT_ID</td><td>Your Telegram chat ID</td></tr>
@@ -1058,45 +831,43 @@
     <div class="section-label">// under the hood</div>
     <h2>Architecture</h2>
     <p class="lead">Three components: a CLI that manages config, a Telegram bot that handles user interaction, and an MCP server that agents use to communicate.</p>
-
     <div class="mermaid-container">
-      <div class="mermaid">
-%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#1C1C1F', 'primaryBorderColor': '#00D4AA', 'primaryTextColor': '#FAFAFA', 'lineColor': '#00D4AA', 'secondaryColor': '#141416', 'tertiaryColor': '#0A0A0B', 'edgeLabelBackground': '#141416', 'clusterBkg': '#141416', 'clusterBorder': '#27272A', 'fontSize': '14px' }}}%%
+      <pre class="mermaid">
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#1C1C1F', 'primaryBorderColor': '#00D4AA', 'primaryTextColor': '#FAFAFA', 'lineColor': '#00D4AA', 'secondaryColor': '#141416', 'tertiaryColor': '#0A0A0B', 'edgeLabelBackground': '#141416', 'clusterBkg': '#141416', 'clusterBorder': '#27272A', 'fontSize': '14px', 'fontFamily': 'DM Sans, sans-serif' }}}%%
 graph TB
-    subgraph operator["Operator"]
-        TG["Telegram App<br/><small>Commands &amp; Approvals</small>"]
+    subgraph operator[" Operator "]
+        TG["Telegram App\nCommands &amp; Approvals"]
     end
 
-    subgraph server["Your Machine"]
-        BOT["Telegram Bot<br/><small>Telegraf · Commands · Middleware</small>"]
-        CLI["CLI<br/><small>Setup · Doctor · Config</small>"]
-        DB[("SQLite<br/><small>Sessions · State</small>")]
+    subgraph server[" Your Machine "]
+        CLI["CLI\nSetup · Doctor · Config"]
+        BOT["Telegram Bot\nTelegraf · Middleware"]
+        DB[("SQLite\nSessions · State")]
     end
 
-    subgraph workspace["Conductor Workspace"]
-        MCP["MCP Server<br/><small>stdio transport</small>"]
-        AGENT["Claude Code<br/><small>AI Agent</small>"]
+    subgraph workspace[" Conductor Workspace "]
+        MCP["MCP Server\nstdio transport"]
+        AGENT["Claude Code\nAI Agent"]
     end
 
     TG -- "/run · /send · /approve" --> BOT
-    BOT -- "Status · Artifacts · Questions" --> TG
+    BOT -- "Status · Artifacts" --> TG
     CLI -. "manages" .-> BOT
     BOT <--> DB
-    MCP -- "report_status<br/>report_artifact<br/>request_human" --> BOT
+    MCP -- "report_status\nreport_artifact\nrequest_human" --> BOT
     AGENT <--> MCP
 
     style operator fill:#0A0A0B,stroke:#27272A,stroke-width:1px,color:#71717A
     style server fill:#0A0A0B,stroke:#27272A,stroke-width:1px,color:#71717A
     style workspace fill:#0A0A0B,stroke:#27272A,stroke-width:1px,color:#71717A
-    style TG fill:#1C1C1F,stroke:#3B82F6,stroke-width:1.5px,color:#FAFAFA
-    style BOT fill:#1C1C1F,stroke:#00D4AA,stroke-width:1.5px,color:#FAFAFA
+    style TG fill:#1C1C1F,stroke:#3B82F6,stroke-width:2px,color:#FAFAFA
+    style BOT fill:#1C1C1F,stroke:#00D4AA,stroke-width:2px,color:#FAFAFA
     style CLI fill:#1C1C1F,stroke:#71717A,stroke-width:1px,color:#FAFAFA
-    style DB fill:#1C1C1F,stroke:#F59E0B,stroke-width:1.5px,color:#FAFAFA
-    style MCP fill:#1C1C1F,stroke:#00D4AA,stroke-width:1.5px,color:#FAFAFA
-    style AGENT fill:#1C1C1F,stroke:#3B82F6,stroke-width:1.5px,color:#FAFAFA
-      </div>
+    style DB fill:#1C1C1F,stroke:#F59E0B,stroke-width:2px,color:#FAFAFA
+    style MCP fill:#1C1C1F,stroke:#00D4AA,stroke-width:2px,color:#FAFAFA
+    style AGENT fill:#1C1C1F,stroke:#3B82F6,stroke-width:2px,color:#FAFAFA
+      </pre>
     </div>
-
     <div class="arch-cards">
       <div class="arch-card fade-in">
         <div class="arch-card-header">
@@ -1135,48 +906,40 @@ graph TB
   <div class="container">
     <div class="section-label">// get involved</div>
     <h2>Contributing</h2>
-    <p class="lead">conductor-telegram is MIT licensed and open to contributions. Here's how to get started.</p>
-
+    <p class="lead">conductor-telegram is MIT licensed and open to contributions.</p>
     <div class="steps">
       <div class="step fade-in">
         <div class="step-num">1</div>
         <div>
           <h3>Fork and clone</h3>
-          <div class="code-block">
-            git clone https://github.com/YOUR_USERNAME/conductor-telegram.git<br>
-            cd conductor-telegram<br>
-            npm install
-          </div>
+          <div class="code-block">git clone https://github.com/YOUR_USERNAME/conductor-telegram.git<br>cd conductor-telegram<br>npm install</div>
         </div>
       </div>
       <div class="step fade-in">
         <div class="step-num">2</div>
         <div>
           <h3>Create a branch</h3>
-          <div class="code-block">
-            git checkout -b feat/your-feature
-          </div>
+          <div class="code-block">git checkout -b feat/your-feature</div>
         </div>
       </div>
       <div class="step fade-in">
         <div class="step-num">3</div>
         <div>
           <h3>Make your changes</h3>
-          <p>Run <code>npm run dev</code> for live reload during development. Run <code>npm run typecheck</code> before committing.</p>
+          <p>Run <code>npm run dev</code> for live reload. Run <code>npm run typecheck</code> before committing.</p>
         </div>
       </div>
       <div class="step fade-in">
         <div class="step-num">4</div>
         <div>
           <h3>Open a PR</h3>
-          <p>Push your branch and open a pull request. Describe what you changed and why. We review everything.</p>
+          <p>Push your branch and open a pull request. Describe what you changed and why.</p>
         </div>
       </div>
     </div>
-
     <div style="margin-top:32px;">
       <h3 style="margin-bottom:12px;">Good first issues</h3>
-      <p style="color:var(--text-muted);font-size:14px;margin-bottom:16px;">Look for issues labeled <code>good first issue</code> on GitHub. These are scoped, well-described, and a great way to get familiar with the codebase.</p>
+      <p style="color:var(--text-muted);font-size:14px;margin-bottom:16px;">Look for issues labeled <code>good first issue</code> on GitHub.</p>
       <a href="https://github.com/belongnet/conductor-telegram/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22" class="btn btn-secondary">Browse good first issues</a>
     </div>
   </div>
@@ -1188,7 +951,6 @@ graph TB
   </div>
 </footer>
 
-<!-- Mermaid.js for architecture diagram -->
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <script>
   mermaid.initialize({
@@ -1201,18 +963,12 @@ graph TB
       lineColor: '#00D4AA',
       fontSize: '14px'
     },
-    flowchart: {
-      curve: 'basis',
-      padding: 20
-    }
+    flowchart: { curve: 'basis', padding: 20 }
   });
 
-  // Scroll-triggered fade-in animations
   const observer = new IntersectionObserver((entries) => {
     entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('visible');
-      }
+      if (entry.isIntersecting) entry.target.classList.add('visible');
     });
   }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
 
