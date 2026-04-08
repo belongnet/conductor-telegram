@@ -211,13 +211,21 @@ function getReviewAgentType(): AgentType {
   return getDefaultAgentType();
 }
 
+/**
+ * Strip Conductor-internal context-window suffixes (e.g. "opus-1m" → "opus")
+ * so the model identifier is valid for the Claude CLI.
+ */
+function normalizeModelForCli(model: string): string {
+  return model.replace(/-\d+[mk]$/i, "");
+}
+
 function resolveAgentModel(
   agentType: AgentType,
   launchMode: LaunchMode,
   requestedModel?: string | null
 ): string {
   if (requestedModel?.trim()) {
-    return requestedModel.trim();
+    return normalizeModelForCli(requestedModel.trim());
   }
 
   const envModel =
@@ -225,11 +233,11 @@ function resolveAgentModel(
       ? process.env.TELEGRAM_REVIEW_MODEL
       : process.env.TELEGRAM_DEFAULT_MODEL;
   if (envModel?.trim()) {
-    return envModel.trim();
+    return normalizeModelForCli(envModel.trim());
   }
 
   if (agentType === "claude") {
-    return (
+    return normalizeModelForCli(
       getSettingValue("default_model") ??
       getRecentModelForAgent("claude") ??
       DEFAULT_CLAUDE_MODEL
@@ -1191,7 +1199,7 @@ export async function sendToSession(
     wsInfo.sessionId,
     workspaceDir,
     fullPrompt,
-    wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt"),
+    normalizeModelForCli(wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt")),
     wsInfo.agentType,
     workspaceName,
     {
