@@ -20,6 +20,7 @@
     --text-dim: #52525B;
     --accent: #00D4AA;
     --accent-dim: #00D4AA22;
+    --accent-glow: #00D4AA15;
     --warning: #F59E0B;
     --error: #EF4444;
     --success: #22C55E;
@@ -53,12 +54,42 @@
     padding: 0 24px;
   }
 
+  /* ANIMATIONS */
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-8px); }
+  }
+  @keyframes pulse-glow {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 0.8; }
+  }
+  @keyframes drift {
+    0% { transform: translate(0, 0); }
+    25% { transform: translate(10px, -5px); }
+    50% { transform: translate(-5px, -10px); }
+    75% { transform: translate(-10px, 5px); }
+    100% { transform: translate(0, 0); }
+  }
+  @keyframes grid-pulse {
+    0%, 100% { opacity: 0.03; }
+    50% { opacity: 0.06; }
+  }
+  @keyframes fade-in-up {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes dash-flow {
+    to { stroke-dashoffset: -20; }
+  }
+
   /* NAV */
   nav {
     position: sticky;
     top: 0;
     z-index: 100;
-    background: var(--bg);
+    background: rgba(10, 10, 11, 0.85);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--border);
     padding: 12px 0;
   }
@@ -90,7 +121,22 @@
     padding: 80px 0 64px;
     text-align: center;
     border-bottom: 1px solid var(--border);
+    position: relative;
+    overflow: hidden;
   }
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 600px;
+    height: 600px;
+    background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
+    animation: pulse-glow 6s ease-in-out infinite;
+    pointer-events: none;
+  }
+  .hero .container { position: relative; z-index: 1; }
   .hero-badge {
     display: inline-block;
     font-family: var(--font-mono);
@@ -201,8 +247,11 @@
   section {
     padding: 64px 0;
     border-bottom: 1px solid var(--border);
+    position: relative;
+    overflow: hidden;
   }
   section:last-of-type { border-bottom: none; }
+  section .container { position: relative; z-index: 1; }
   .section-label {
     font-family: var(--font-mono);
     font-size: 11px;
@@ -224,6 +273,53 @@
     max-width: 640px;
   }
 
+  /* SECTION ILLUSTRATIONS */
+  .section-illustration {
+    position: absolute;
+    pointer-events: none;
+    opacity: 0.06;
+  }
+
+  /* ANIMATED GRID BACKGROUND */
+  .grid-bg {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--accent) 1px, transparent 1px),
+      linear-gradient(90deg, var(--accent) 1px, transparent 1px);
+    background-size: 60px 60px;
+    opacity: 0.03;
+    animation: grid-pulse 8s ease-in-out infinite;
+    pointer-events: none;
+  }
+
+  /* FLOATING ORBS */
+  .orb {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(60px);
+    pointer-events: none;
+    animation: drift 20s ease-in-out infinite;
+  }
+  .orb-1 {
+    width: 300px;
+    height: 300px;
+    background: var(--accent);
+    opacity: 0.04;
+    top: 10%;
+    right: -100px;
+    animation-delay: -5s;
+  }
+  .orb-2 {
+    width: 200px;
+    height: 200px;
+    background: var(--info);
+    opacity: 0.03;
+    bottom: 20%;
+    left: -50px;
+    animation-delay: -10s;
+  }
+
   /* FEATURES GRID */
   .features-grid {
     display: grid;
@@ -235,11 +331,45 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 24px;
+    transition: border-color 0.2s, transform 0.2s;
+    position: relative;
+    overflow: hidden;
   }
+  .feature-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+  }
+  .feature-card::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .feature-card:hover::after { opacity: 0.6; }
   .feature-icon {
-    font-size: 20px;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--radius-md);
+    background: var(--accent-dim);
+    border: 1px solid #00D4AA33;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     margin-bottom: 12px;
-    display: block;
+  }
+  .feature-icon svg {
+    width: 20px;
+    height: 20px;
+    stroke: var(--accent);
+    fill: none;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
   .feature-card h3 {
     font-size: 16px;
@@ -453,20 +583,59 @@
     color: var(--text-dim);
   }
 
-  /* ARCHITECTURE */
-  .arch-diagram {
+  /* ARCHITECTURE - MERMAID */
+  .arch-container {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 32px;
-    font-family: var(--font-mono);
-    font-size: 13px;
-    line-height: 1.8;
-    overflow-x: auto;
-    color: var(--text-muted);
+    position: relative;
+    overflow: hidden;
   }
-  .arch-diagram .h { color: var(--accent); font-weight: 600; }
-  .arch-diagram .s { color: var(--text-dim); }
+  .arch-container::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(circle at 20% 50%, var(--accent-glow) 0%, transparent 50%),
+      radial-gradient(circle at 80% 50%, #3B82F615 0%, transparent 50%);
+    pointer-events: none;
+  }
+  .arch-container .mermaid {
+    position: relative;
+    z-index: 1;
+  }
+  .arch-container .mermaid svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* ARCHITECTURE - CUSTOM SVG DIAGRAM */
+  .arch-svg-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 40px 24px;
+    position: relative;
+    overflow: hidden;
+  }
+  .arch-svg-wrap::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(circle at 20% 40%, var(--accent-glow) 0%, transparent 50%),
+      radial-gradient(circle at 80% 60%, #3B82F610 0%, transparent 50%);
+    pointer-events: none;
+  }
+  .arch-svg-wrap svg {
+    display: block;
+    width: 100%;
+    max-width: 800px;
+    margin: 0 auto;
+    position: relative;
+    z-index: 1;
+  }
 
   /* FOOTER */
   footer {
@@ -491,6 +660,18 @@
     overflow-x: auto;
     margin: 16px 0;
     color: var(--text);
+  }
+
+  /* DATA FLOW ANIMATION on arch diagram */
+  .data-dot {
+    animation: dash-flow 1.5s linear infinite;
+  }
+
+  /* RESPONSIVE */
+  @media (max-width: 640px) {
+    .nav-links { gap: 14px; }
+    .nav-links a { font-size: 12px; }
+    .hero { padding: 48px 0 40px; }
   }
 </style>
 </head>
@@ -535,6 +716,7 @@
 
 <!-- FEATURES -->
 <section id="features">
+  <div class="orb orb-1"></div>
   <div class="container">
     <div class="section-label">// what it does</div>
     <h2>Control your AI agents from anywhere</h2>
@@ -542,32 +724,44 @@
 
     <div class="features-grid">
       <div class="feature-card">
-        <span class="feature-icon">&#9889;</span>
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        </div>
         <h3>Launch workspaces remotely</h3>
         <p>Start new AI agent workspaces from Telegram. Pick a repo, describe the task, and the agent gets to work.</p>
       </div>
       <div class="feature-card">
-        <span class="feature-icon">&#9745;</span>
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        </div>
         <h3>Approve decisions</h3>
         <p>Agents ask for permission before risky operations. Approve or reject from your phone with a quick reply.</p>
       </div>
       <div class="feature-card">
-        <span class="feature-icon">&#128241;</span>
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+        </div>
         <h3>Real-time status</h3>
         <p>Get progress reports as agents work. See what files changed, what PRs were created, and when things go wrong.</p>
       </div>
       <div class="feature-card">
-        <span class="feature-icon">&#128483;</span>
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </div>
         <h3>Forum topics per workspace</h3>
         <p>Each workspace gets its own Telegram forum topic. Clean separation, easy to follow, no noise.</p>
       </div>
       <div class="feature-card">
-        <span class="feature-icon">&#128295;</span>
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+        </div>
         <h3>MCP server</h3>
         <p>Three tools for agents: report_status, report_artifact, and request_human. Agents talk to you through the protocol.</p>
       </div>
       <div class="feature-card">
-        <span class="feature-icon">&#9881;</span>
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+        </div>
         <h3>Self-diagnosing</h3>
         <p>Run <code>doctor</code> to check Node.js, config, bot token, database, Conductor, MCP plugin, and repos. All at once.</p>
       </div>
@@ -577,6 +771,7 @@
 
 <!-- HOW IT WORKS -->
 <section id="how-it-works">
+  <div class="orb orb-2"></div>
   <div class="container">
     <div class="section-label">// how it works</div>
     <h2>CLI meets Telegram</h2>
@@ -656,6 +851,7 @@
 
 <!-- SETUP -->
 <section id="setup">
+  <div class="grid-bg"></div>
   <div class="container">
     <div class="section-label">// getting started</div>
     <h2>Setup in 3 minutes</h2>
@@ -724,27 +920,110 @@
 
 <!-- ARCHITECTURE -->
 <section id="architecture">
+  <div class="orb orb-1" style="top:auto;bottom:-100px;right:auto;left:-100px;animation-delay:-15s;"></div>
   <div class="container">
     <div class="section-label">// under the hood</div>
     <h2>Architecture</h2>
     <p class="lead">Three components: a CLI that manages config, a Telegram bot that handles user interaction, and an MCP server that agents use to communicate.</p>
 
-    <div class="arch-diagram">
-<span class="h">Operator (Telegram)</span>       <span class="h">Conductor Workspace</span>
-        <span class="s">|</span>                          <span class="s">|</span>
-        <span class="s">|</span>  /run, /send, /review    <span class="s">|</span>  report_status
-        <span class="s">|</span>  /approve, /stop          <span class="s">|</span>  report_artifact
-        <span class="s">v</span>                          <span class="s">v</span>  request_human
-   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
-   <span class="s">|</span> <span class="h">Telegram</span>  <span class="s">|</span><span class="s">&lt;--------&gt;</span><span class="s">|</span> <span class="h">MCP Server</span><span class="s">|</span>
-   <span class="s">|</span> <span class="h">Bot</span>       <span class="s">|</span>          <span class="s">|</span>           <span class="s">|</span>
-   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
-        <span class="s">|</span>                          <span class="s">|</span>
-        <span class="s">v</span>                          <span class="s">v</span>
-   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
-   <span class="s">|</span> <span class="h">SQLite DB</span> <span class="s">|</span>          <span class="s">|</span> <span class="h">Claude</span>    <span class="s">|</span>
-   <span class="s">|</span> sessions  <span class="s">|</span>          <span class="s">|</span> <span class="h">Code</span>      <span class="s">|</span>
-   <span class="s">+-----------+</span>          <span class="s">+-----------+</span>
+    <div class="arch-svg-wrap">
+      <svg viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg">
+        <!-- Operator box -->
+        <rect x="20" y="30" width="160" height="70" rx="8" fill="#141416" stroke="#00D4AA" stroke-width="1.5"/>
+        <text x="100" y="58" text-anchor="middle" fill="#00D4AA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Operator</text>
+        <text x="100" y="78" text-anchor="middle" fill="#71717A" font-family="'DM Sans', sans-serif" font-size="11">(Telegram App)</text>
+
+        <!-- Telegram Bot box -->
+        <rect x="20" y="160" width="160" height="80" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
+        <text x="100" y="190" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Telegram Bot</text>
+        <text x="100" y="210" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Telegraf + Commands</text>
+        <!-- bot icon -->
+        <circle cx="100" cy="168" r="2.5" fill="#00D4AA"/>
+
+        <!-- SQLite box -->
+        <rect x="20" y="310" width="160" height="70" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
+        <text x="100" y="340" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">SQLite DB</text>
+        <text x="100" y="360" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Sessions &amp; State</text>
+
+        <!-- MCP Server box -->
+        <rect x="320" y="160" width="160" height="80" rx="8" fill="#141416" stroke="#00D4AA" stroke-width="1.5" stroke-dasharray="4 2"/>
+        <text x="400" y="190" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">MCP Server</text>
+        <text x="400" y="210" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">stdio protocol</text>
+        <circle cx="400" cy="168" r="2.5" fill="#3B82F6"/>
+
+        <!-- Claude Code box -->
+        <rect x="620" y="160" width="160" height="80" rx="8" fill="#141416" stroke="#3B82F6" stroke-width="1.5"/>
+        <text x="700" y="190" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Claude Code</text>
+        <text x="700" y="210" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">AI Agent Runtime</text>
+
+        <!-- Conductor Workspace box -->
+        <rect x="620" y="310" width="160" height="70" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
+        <text x="700" y="340" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Workspace</text>
+        <text x="700" y="360" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Git Repo + Worktree</text>
+
+        <!-- CLI box -->
+        <rect x="320" y="30" width="160" height="70" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
+        <text x="400" y="58" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">CLI</text>
+        <text x="400" y="78" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Setup &amp; Config</text>
+
+        <!-- Arrows: Operator -> Telegram Bot -->
+        <line x1="100" y1="100" x2="100" y2="160" stroke="#00D4AA" stroke-width="1.5" stroke-dasharray="6 3"/>
+        <polygon points="95,155 100,165 105,155" fill="#00D4AA" opacity="0.8"/>
+        <text x="115" y="135" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">/run /send</text>
+
+        <!-- Telegram Bot -> SQLite -->
+        <line x1="100" y1="240" x2="100" y2="310" stroke="#27272A" stroke-width="1.5"/>
+        <polygon points="95,305 100,315 105,305" fill="#71717A"/>
+        <text x="115" y="280" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">read/write</text>
+
+        <!-- Telegram Bot <-> MCP Server -->
+        <line x1="180" y1="195" x2="320" y2="195" stroke="#00D4AA" stroke-width="1.5"/>
+        <polygon points="315,190 325,195 315,200" fill="#00D4AA" opacity="0.8"/>
+        <line x1="320" y1="205" x2="180" y2="205" stroke="#00D4AA" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <polygon points="185,200 175,205 185,210" fill="#00D4AA" opacity="0.8"/>
+        <!-- animated data dots -->
+        <circle r="3" fill="#00D4AA" opacity="0.6">
+          <animateMotion dur="3s" repeatCount="indefinite" path="M180,195 L320,195"/>
+        </circle>
+        <circle r="3" fill="#00D4AA" opacity="0.4">
+          <animateMotion dur="3s" repeatCount="indefinite" path="M320,205 L180,205"/>
+        </circle>
+
+        <!-- MCP Server <-> Claude Code -->
+        <line x1="480" y1="195" x2="620" y2="195" stroke="#3B82F6" stroke-width="1.5"/>
+        <polygon points="615,190 625,195 615,200" fill="#3B82F6" opacity="0.8"/>
+        <line x1="620" y1="205" x2="480" y2="205" stroke="#3B82F6" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <polygon points="485,200 475,205 485,210" fill="#3B82F6" opacity="0.8"/>
+        <!-- animated data dots -->
+        <circle r="3" fill="#3B82F6" opacity="0.6">
+          <animateMotion dur="2.5s" repeatCount="indefinite" path="M480,195 L620,195"/>
+        </circle>
+        <circle r="3" fill="#3B82F6" opacity="0.4">
+          <animateMotion dur="2.5s" repeatCount="indefinite" path="M620,205 L480,205"/>
+        </circle>
+
+        <!-- Claude Code -> Workspace -->
+        <line x1="700" y1="240" x2="700" y2="310" stroke="#27272A" stroke-width="1.5"/>
+        <polygon points="695,305 700,315 705,305" fill="#71717A"/>
+        <text x="715" y="280" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">edit files</text>
+
+        <!-- CLI -> Telegram Bot (manages) -->
+        <path d="M320,65 L180,65 L180,160" stroke="#27272A" stroke-width="1" stroke-dasharray="4 4" fill="none"/>
+        <polygon points="175,155 180,165 185,155" fill="#71717A" opacity="0.6"/>
+        <text x="235" y="55" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">starts</text>
+
+        <!-- CLI -> MCP Server (manages) -->
+        <line x1="400" y1="100" x2="400" y2="160" stroke="#27272A" stroke-width="1" stroke-dasharray="4 4"/>
+        <polygon points="395,155 400,165 405,155" fill="#71717A" opacity="0.6"/>
+        <text x="415" y="135" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">starts</text>
+
+        <!-- Tool labels on MCP -->
+        <rect x="290" y="260" width="220" height="55" rx="6" fill="#141416" stroke="#27272A" stroke-width="1" stroke-dasharray="3 2"/>
+        <text x="400" y="278" text-anchor="middle" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9" font-weight="600">MCP TOOLS</text>
+        <text x="400" y="296" text-anchor="middle" fill="#00D4AA" font-family="'JetBrains Mono', monospace" font-size="10">report_status  report_artifact</text>
+        <text x="400" y="308" text-anchor="middle" fill="#00D4AA" font-family="'JetBrains Mono', monospace" font-size="10">request_human</text>
+        <line x1="400" y1="240" x2="400" y2="260" stroke="#27272A" stroke-width="1" stroke-dasharray="3 2"/>
+      </svg>
     </div>
 
     <div style="margin-top:24px;">
@@ -762,6 +1041,7 @@ src/
 
 <!-- CONTRIBUTING -->
 <section id="contributing">
+  <div class="grid-bg" style="animation-delay:-4s;"></div>
   <div class="container">
     <div class="section-label">// get involved</div>
     <h2>Contributing</h2>
