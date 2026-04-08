@@ -118,7 +118,7 @@ Respond with ONLY a JSON object:
 }`;
 }
 
-async function transcribeVoiceMessage(voicePath: string): Promise<string | null> {
+export async function transcribeVoiceMessage(voicePath: string): Promise<string | null> {
   if (!existsSync(voicePath)) {
     console.log(`[ai-router] Voice file not found: ${voicePath}`);
     return null;
