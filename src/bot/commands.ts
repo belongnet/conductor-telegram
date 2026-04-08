@@ -363,6 +363,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^decide:(\d+):(.+)$/, handleDecisionCallback);
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
   bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
+  bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
 
   // Media and text handlers
   bot.on("photo", handlePhotoMessage);
@@ -1626,6 +1627,106 @@ async function handleDecisionCallback(ctx: Context): Promise<void> {
 
   await ctx.answerCbQuery(`Answered: ${answer}`);
   await ctx.editMessageReplyMarkup(undefined);
+}
+
+// ── Post-done: Review Changes / Generate PR ─────────────────
+
+function buildPrPrompt(): string {
+  return [
+    "Review all changes in this workspace and create a pull request.",
+    "Write a clear PR title and description summarizing the changes.",
+    "Use /commit to create any needed commits, then create the PR.",
+  ].join("\n");
+}
+
+async function handlePostDoneCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const action = match?.[1] as "review" | "pr";
+  const workspaceId = match?.[2];
+  if (!action || !workspaceId) return;
+
+  const workspace = getWorkspace(workspaceId);
+  if (!workspace?.conductorWorkspaceName) {
+    await ctx.answerCbQuery("Workspace not found");
+    return;
+  }
+
+  const conductorName = workspace.conductorWorkspaceName;
+  const actionLabel = action === "review" ? "Review" : "PR generation";
+
+  await ctx.answerCbQuery(`Starting ${actionLabel}...`);
+  await ctx.editMessageReplyMarkup(undefined);
+
+  // Reopen forum topic if needed
+  if (
+    workspace.telegramThreadId &&
+    (workspace.status === "done" || workspace.status === "stopped" || workspace.status === "failed")
+  ) {
+    await reopenWorkspaceTopic(
+      ctx.telegram,
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  }
+
+  const prompt = action === "review"
+    ? buildReviewPrompt("")
+    : buildPrPrompt();
+
+  const trackedWorkspace = ensureTrackedWorkspace(ctx, {
+    conductorName,
+    trackedWorkspace: workspace,
+    repoPath: workspace.repoPath,
+    repoName: workspace.repoPath ? path.basename(workspace.repoPath) : null,
+    targetBranch: null,
+  }, prompt);
+
+  if (!trackedWorkspace) {
+    await ctx.reply(`Could not resolve workspace details for <b>${escHtml(conductorName)}</b>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const threadOpts = workspace.telegramThreadId
+    ? { message_thread_id: workspace.telegramThreadId }
+    : {};
+
+  const progress = await ctx.reply(
+    `Starting ${actionLabel.toLowerCase()} for <b>${escHtml(conductorName)}</b> using secondary review model...`,
+    { parse_mode: "HTML", ...threadOpts }
+  );
+  updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
+
+  const result = await launchWorkspaceSession(conductorName, prompt, {
+    launchMode: "review",
+    title: action === "review" ? "Review Changes" : "Generate PR",
+  });
+
+  if ("error" in result) {
+    updateWorkspaceStatus(trackedWorkspace.id, "failed");
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `Failed to start ${actionLabel.toLowerCase()} for <b>${escHtml(conductorName)}</b>:\n${escHtml(result.error)}`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  updateWorkspaceConductorName(trackedWorkspace.id, conductorName);
+  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
+  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  updateWorkspaceStatus(trackedWorkspace.id, "running");
+
+  await ctx.telegram.editMessageText(
+    ctx.chat!.id,
+    progress.message_id,
+    undefined,
+    `🟢 ${actionLabel} running for <b>${escHtml(conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
+    { parse_mode: "HTML" }
+  );
 }
 
 function getReplyTargetWorkspace(

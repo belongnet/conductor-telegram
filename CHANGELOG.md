@@ -2,6 +2,13 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.1.0] - 2026-04-08
+
+### Added
+- Post-completion "Review Changes" and "Generate PR" buttons on finished workspace messages
+- Dual-model review flow: primary model does the work, secondary review model reviews or creates PRs
+- New callback handler for post-done actions with automatic forum topic reopening
+
 ## [0.3.0.1] - 2026-04-08
 
 ### Changed
