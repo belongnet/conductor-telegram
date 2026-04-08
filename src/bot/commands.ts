@@ -40,6 +40,9 @@ import https from "node:https";
 // Map Telegram message IDs to decision IDs (for reply-based answering)
 const messageToDecision = new Map<number, number>();
 
+// Track repo-selection confirmation messages so replies create a workspace directly
+const messageToRepoSelection = new Map<string, string>(); // chatId:messageId → repoName
+
 /**
  * Register a Telegram message ID as associated with a decision,
  * so that replies to that message can answer the decision.
@@ -811,8 +814,17 @@ async function handleRepos(ctx: Context): Promise<void> {
   );
 }
 
+interface PendingRepoSelection {
+  repoNum: number;
+  confirmationMessageKey: string;
+}
+
 // Last selected repo per user (for two-step /run flow)
-const pendingRepoSelection = new Map<string, number>();
+const pendingRepoSelection = new Map<string, PendingRepoSelection>();
+
+function getRepoSelectionMessageKey(chatId: string, messageId: number): string {
+  return `${chatId}:${messageId}`;
+}
 
 function getPendingRepoSelectionKey(ctx: Context): string | null {
   const chatId = ctx.chat?.id?.toString();
@@ -837,13 +849,17 @@ async function handleRunRepoCallback(ctx: Context): Promise<void> {
   const selectionKey = getPendingRepoSelectionKey(ctx);
   if (!selectionKey) return;
 
-  pendingRepoSelection.set(selectionKey, repoNum);
-
   await ctx.answerCbQuery(`Selected: ${repoName}`);
-  await ctx.reply(
-    `Selected <b>${escHtml(repoName)}</b>. Now send your prompt as a message, or use:\n<code>/run ${repoNum} your prompt here</code>`,
+  const confirmMsg = await ctx.reply(
+    `Selected <b>${escHtml(repoName)}</b>. Now send your prompt as a message (or reply to this message), or use:\n<code>/run ${repoNum} your prompt here</code>`,
     { parse_mode: "HTML" }
   );
+  const confirmationMessageKey = getRepoSelectionMessageKey(
+    ctx.chat!.id.toString(),
+    confirmMsg.message_id
+  );
+  messageToRepoSelection.set(confirmationMessageKey, repoName);
+  pendingRepoSelection.set(selectionKey, { repoNum, confirmationMessageKey });
 }
 
 // ── Reply-to-decision helper ─────────────────────────────────
@@ -1071,6 +1087,20 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;
 
+  // Check if this is a reply to a repo-selection confirmation message
+  const replyToMsgId = (ctx.message as any)?.reply_to_message?.message_id;
+  if (replyToMsgId) {
+    const replyMessageKey = getRepoSelectionMessageKey(chatId, replyToMsgId);
+    const repoName = messageToRepoSelection.get(replyMessageKey);
+    if (repoName) {
+      messageToRepoSelection.delete(replyMessageKey);
+      // Also clear pending selection if any
+      if (selectionKey) pendingRepoSelection.delete(selectionKey);
+      await startWorkspaceFromMessage(ctx, repoName, text);
+      return;
+    }
+  }
+
   const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
   if (repliedWorkspace) {
     await sendMessageToWorkspace(ctx, repliedWorkspace, text);
@@ -1089,16 +1119,17 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
   if (!selectionKey) return;
 
-  const repoNum = pendingRepoSelection.get(selectionKey);
-  if (!repoNum) return; // No pending selection, ignore
+  const pendingSelection = pendingRepoSelection.get(selectionKey);
+  if (!pendingSelection) return; // No pending selection, ignore
 
   const prompt = text;
 
   // Clear the pending selection
   pendingRepoSelection.delete(selectionKey);
+  messageToRepoSelection.delete(pendingSelection.confirmationMessageKey);
 
   const repos = getRepoList();
-  const repoName = repos[repoNum - 1];
+  const repoName = repos[pendingSelection.repoNum - 1];
   if (!repoName) return;
 
   await startWorkspaceFromMessage(ctx, repoName, prompt);
