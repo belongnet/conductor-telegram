@@ -2,6 +2,16 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.0.1] - 2026-04-08
+
+### Changed
+- Replace ASCII architecture diagram with interactive Mermaid.js flowchart on GitHub Pages site
+- Add animated background effects (grid, floating orbs, particles) and scroll-triggered fade-in animations
+- Add SVG hero illustration showing terminal-to-phone connection flow
+- Upgrade feature cards with SVG icons, hover effects, and accent glow borders
+- Add glassmorphism nav bar with backdrop blur
+- Color terminal dots (red/yellow/green) and gradient avatar in Telegram mockup
+
 ## [0.3.0.0] - 2026-04-08
 
 ### Added
