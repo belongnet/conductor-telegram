@@ -3,7 +3,8 @@ export type WorkspaceStatus =
   | "running"
   | "done"
   | "failed"
-  | "stopped";
+  | "stopped"
+  | "archived";
 
 export interface Workspace {
   id: string;
@@ -18,6 +19,7 @@ export interface Workspace {
   conductorSessionId: string | null;
   lastForwardedMessageRowid: number;
   telegramThreadId: number | null;
+  archivedAt: string | null;
 }
 
 export type EventType =

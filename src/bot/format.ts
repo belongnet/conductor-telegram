@@ -39,7 +39,7 @@ export function maybeExpandableQuote(text: string, minLength = 120): string {
 // Telegraf v4 doesn't expose the `style` field from Bot API 9.4.
 // We build reply_markup JSON directly so we can set button colors.
 
-export type ButtonStyle = "primary" | "success" | "danger";
+export type ButtonStyle = "primary" | "success" | "danger" | "secondary";
 
 interface StyledButton {
   text: string;
@@ -145,6 +145,8 @@ export function statusIcon(status: string): string {
       return "🔴";
     case "stopped":
       return "⏹";
+    case "archived":
+      return "🗄";
     default:
       return "⚪";
   }

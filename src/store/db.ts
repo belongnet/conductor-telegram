@@ -74,6 +74,7 @@ export function getDb(dbPath?: string): Database.Database {
     "INTEGER NOT NULL DEFAULT 0"
   );
   ensureColumn(_db, "workspaces", "telegram_thread_id", "INTEGER");
+  ensureColumn(_db, "workspaces", "archived_at", "TEXT");
   return _db;
 }
 

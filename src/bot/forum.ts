@@ -97,6 +97,7 @@ function parseArtifactTopicState(workspace: Workspace): TopicVisualState | null 
 
 function getWorkspaceTopicState(workspace: Workspace): TopicVisualState {
   if (
+    workspace.status === "archived" ||
     workspace.status === "done" ||
     workspace.status === "failed" ||
     workspace.status === "stopped"
@@ -236,6 +237,22 @@ export async function renameWorkspaceTopics(
     } catch (err: any) {
       console.log(`[forum] could not rename topic ${ws.telegramThreadId}: ${err.message}`);
     }
+  }
+}
+
+export async function deleteWorkspaceTopic(
+  telegram: Telegram,
+  chatId: string,
+  threadId: number
+): Promise<void> {
+  try {
+    await telegram.callApi("deleteForumTopic", {
+      chat_id: chatId,
+      message_thread_id: threadId,
+    });
+  } catch (err: any) {
+    console.log(`[forum] could not delete topic: ${err.message}`);
+    await closeWorkspaceTopic(telegram, chatId, threadId);
   }
 }
 

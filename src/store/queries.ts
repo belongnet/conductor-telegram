@@ -38,6 +38,7 @@ export function createWorkspace(opts: {
     conductorSessionId: null,
     lastForwardedMessageRowid: 0,
     telegramThreadId: null,
+    archivedAt: null,
   };
 }
 
@@ -54,7 +55,9 @@ export function getWorkspaceByName(
 ): Workspace | undefined {
   const db = getDb();
   const row = db
-    .prepare("SELECT * FROM workspaces WHERE conductor_workspace_name = ?")
+    .prepare(
+      "SELECT * FROM workspaces WHERE conductor_workspace_name = ? AND archived_at IS NULL"
+    )
     .get(conductorName) as any;
   return row ? mapWorkspaceRow(row) : undefined;
 }
@@ -63,7 +66,7 @@ export function getActiveWorkspaces(): Workspace[] {
   const db = getDb();
   const rows = db
     .prepare(
-      "SELECT * FROM workspaces WHERE status IN ('starting', 'running') ORDER BY created_at DESC"
+      "SELECT * FROM workspaces WHERE archived_at IS NULL AND status IN ('starting', 'running') ORDER BY created_at DESC"
     )
     .all() as any[];
   return rows.map(mapWorkspaceRow);
@@ -72,7 +75,9 @@ export function getActiveWorkspaces(): Workspace[] {
 export function getAllWorkspaces(limit = 10): Workspace[] {
   const db = getDb();
   const rows = db
-    .prepare("SELECT * FROM workspaces ORDER BY created_at DESC LIMIT ?")
+    .prepare(
+      "SELECT * FROM workspaces WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT ?"
+    )
     .all(limit) as any[];
   return rows.map(mapWorkspaceRow);
 }
@@ -81,7 +86,7 @@ export function getAllThreadedWorkspaces(): Workspace[] {
   const db = getDb();
   const rows = db
     .prepare(
-      "SELECT * FROM workspaces WHERE telegram_thread_id IS NOT NULL ORDER BY created_at DESC"
+      "SELECT * FROM workspaces WHERE archived_at IS NULL AND telegram_thread_id IS NOT NULL ORDER BY created_at DESC"
     )
     .all() as any[];
   return rows.map(mapWorkspaceRow);
@@ -93,6 +98,13 @@ export function updateWorkspaceStatus(
 ): void {
   const db = getDb();
   db.prepare("UPDATE workspaces SET status = ? WHERE id = ?").run(status, id);
+}
+
+export function archiveWorkspace(id: string): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE workspaces SET status = 'archived', archived_at = datetime('now') WHERE id = ?"
+  ).run(id);
 }
 
 export function updateWorkspaceTelegramMessage(
@@ -143,7 +155,7 @@ export function getWorkspaceByThreadId(
   const db = getDb();
   const row = db
     .prepare(
-      "SELECT * FROM workspaces WHERE telegram_chat_id = ? AND telegram_thread_id = ? ORDER BY created_at DESC LIMIT 1"
+      "SELECT * FROM workspaces WHERE archived_at IS NULL AND telegram_chat_id = ? AND telegram_thread_id = ? ORDER BY created_at DESC LIMIT 1"
     )
     .get(chatId, threadId) as any;
   return row ? mapWorkspaceRow(row) : undefined;
@@ -182,7 +194,7 @@ export function getWorkspaceByTelegramMessage(
       `SELECT w.*
        FROM telegram_message_links tml
        JOIN workspaces w ON w.id = tml.workspace_id
-       WHERE tml.chat_id = ? AND tml.telegram_message_id = ?`
+       WHERE tml.chat_id = ? AND tml.telegram_message_id = ? AND w.archived_at IS NULL`
     )
     .get(chatId, telegramMessageId) as any;
   return row ? mapWorkspaceRow(row) : undefined;
@@ -202,6 +214,7 @@ function mapWorkspaceRow(row: any): Workspace {
     conductorSessionId: row.conductor_session_id ?? null,
     lastForwardedMessageRowid: Number(row.last_forwarded_message_rowid ?? 0),
     telegramThreadId: row.telegram_thread_id ?? null,
+    archivedAt: row.archived_at ?? null,
   };
 }
 

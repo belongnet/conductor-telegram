@@ -9,6 +9,7 @@ import {
   stopAgent,
 } from "./launcher.js";
 import {
+  archiveWorkspace,
   createWorkspace,
   getActiveWorkspaces,
   getAllWorkspaces,
@@ -28,6 +29,7 @@ import {
 import {
   createWorkspaceTopic,
   closeWorkspaceTopic,
+  deleteWorkspaceTopic,
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
@@ -364,6 +366,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
   bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
   bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
+  bot.action(/^archive:(.+)$/, handleArchiveCallback);
 
   // Media and text handlers
   bot.on("photo", handlePhotoMessage);
@@ -732,10 +735,23 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
         "danger"
       ),
     ]);
+  const archiveRows = workspaces
+    .filter((ws) => ws.status === "done" || ws.status === "failed" || ws.status === "stopped")
+    .map((ws) => [
+      btn(
+        `Archive ${ws.conductorWorkspaceName ?? ws.name}`,
+        `archive:${ws.id}`,
+        "secondary"
+      ),
+    ]);
 
   await ctx.reply(lines.join("\n\n"), {
     parse_mode: "HTML",
-    ...(stopRows.length > 0 ? styledKeyboard(stopRows) : {}),
+    ...(
+      stopRows.length > 0 || archiveRows.length > 0
+        ? styledKeyboard([...stopRows, ...archiveRows])
+        : {}
+    ),
   });
 }
 
@@ -804,7 +820,10 @@ async function handleStop(ctx: Context): Promise<void> {
   }
   await ctx.reply(
     `⏹ <b>${escHtml(wsName)}</b> stopped.${killed ? "" : "\n<i>Agent process was not running.</i>"}`,
-    { parse_mode: "HTML" }
+    {
+      parse_mode: "HTML",
+      ...styledButtons([btn("Archive", `archive:${workspace.id}`, "secondary")]),
+    }
   );
 }
 
@@ -1618,11 +1637,40 @@ async function handleStopCallback(ctx: Context): Promise<void> {
     );
   }
   await ctx.answerCbQuery("Agent stopped");
-  await ctx.editMessageReplyMarkup(undefined);
+  await ctx
+    .editMessageReplyMarkup(
+      styledButtons([btn("Archive", `archive:${workspaceId}`, "secondary")]).reply_markup
+    )
+    .catch(() => undefined);
 }
 
 async function handleOpenCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Open workspace in Conductor UI");
+}
+
+async function handleArchiveCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const workspaceId = match?.[1];
+  if (!workspaceId) return;
+
+  const workspace = getWorkspace(workspaceId);
+  if (!workspace) {
+    await ctx.answerCbQuery("Workspace not found");
+    return;
+  }
+
+  archiveWorkspace(workspaceId);
+
+  if (workspace.telegramThreadId) {
+    await deleteWorkspaceTopic(
+      ctx.telegram,
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  }
+
+  await ctx.answerCbQuery("Workspace archived");
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
 }
 
 async function handleDecisionCallback(ctx: Context): Promise<void> {

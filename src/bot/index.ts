@@ -192,6 +192,7 @@ function startSessionPoller(): void {
               btn("🔍 Review Changes", `postdone:review:${ws.id}`, "primary"),
               btn("🔀 Generate PR", `postdone:pr:${ws.id}`, "success"),
             ],
+            [btn("Archive", `archive:${ws.id}`, "secondary")],
           ]);
 
           bot.telegram
@@ -217,6 +218,7 @@ function startSessionPoller(): void {
               `🔴 <b>${esc(name)}</b> encountered an error.`,
               {
                 parse_mode: "HTML",
+                ...styledButtons([btn("Archive", `archive:${ws.id}`, "secondary")]),
                 ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
               }
             )
