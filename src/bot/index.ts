@@ -14,6 +14,7 @@ import {
   type SessionMessage,
 } from "./launcher.js";
 import {
+  getAllThreadedWorkspaces,
   getAllWorkspaces,
   getMaxEventId,
   getNewEvents,
@@ -34,7 +35,7 @@ import {
   styledButtons,
   truncate as trunc,
 } from "./format.js";
-import { closeWorkspaceTopic } from "./forum.js";
+import { closeWorkspaceTopic, renameWorkspaceTopics } from "./forum.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
@@ -341,6 +342,15 @@ async function main(): Promise<void> {
 
   await syncTelegramCommands();
   bot.launch();
+
+  // Rename existing forum topics to new "workspace · repo" format
+  const topicsWithThreads = getAllThreadedWorkspaces();
+  if (topicsWithThreads.length > 0) {
+    renameWorkspaceTopics(bot.telegram, topicsWithThreads).catch((err) =>
+      console.error("[startup] topic rename error:", err)
+    );
+  }
+
   startSessionPoller();
   startEventPoller();
   console.log("  Status: Connected · Polling every 5s");
