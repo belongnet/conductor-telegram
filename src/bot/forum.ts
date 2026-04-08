@@ -27,8 +27,7 @@ type TopicVisualState =
   | "awaiting_pr_review"
   | "ready_to_submit_pr"
   | "ready_to_merge"
-  | "failed"
-  | "stopped";
+  | "archived";
 
 const TOPIC_ICON_EMOJIS: Record<TopicVisualState, readonly string[]> = {
   in_progress: ["⏳", "⌛", "⚙️", "🔄"],
@@ -36,8 +35,7 @@ const TOPIC_ICON_EMOJIS: Record<TopicVisualState, readonly string[]> = {
   awaiting_pr_review: ["👀", "🔎", "📝"],
   ready_to_submit_pr: ["📤", "📝", "🚀"],
   ready_to_merge: ["✅", "🎯", "🚀"],
-  failed: ["❌", "⛔", "🚫"],
-  stopped: ["⏹️", "⏸️", "🛑"],
+  archived: ["🗂️", "🗄️", "📦", "🧺"],
 };
 
 let topicIconCache: Promise<Map<string, string> | null> | null = null;
@@ -98,8 +96,13 @@ function parseArtifactTopicState(workspace: Workspace): TopicVisualState | null 
 }
 
 function getWorkspaceTopicState(workspace: Workspace): TopicVisualState {
-  if (workspace.status === "failed") return "failed";
-  if (workspace.status === "stopped") return "stopped";
+  if (
+    workspace.status === "done" ||
+    workspace.status === "failed" ||
+    workspace.status === "stopped"
+  ) {
+    return "archived";
+  }
   if (getPendingDecision(workspace.id)) return "needs_input";
 
   const reportedState = parseStatusTopicState(workspace);
@@ -107,10 +110,6 @@ function getWorkspaceTopicState(workspace: Workspace): TopicVisualState {
 
   const artifactState = parseArtifactTopicState(workspace);
   if (artifactState) return artifactState;
-
-  if (workspace.status === "done") {
-    return "ready_to_submit_pr";
-  }
 
   return "in_progress";
 }
