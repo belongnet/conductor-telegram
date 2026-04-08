@@ -1,10 +1,24 @@
 import { spawn } from "node:child_process";
+import { existsSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Workspace } from "../types/index.js";
 
 const CLAUDE_BIN =
   process.env.CLAUDE_BIN ??
   `${process.env.HOME}/Library/Application Support/com.conductor.app/bin/claude`;
+const WHISPER_CPP_DIR =
+  process.env.TELEGRAM_WHISPER_CPP_DIR ??
+  `${process.env.HOME}/.conductor-telegram/tools/whisper.cpp`;
+const WHISPER_BIN =
+  process.env.TELEGRAM_WHISPER_BIN ??
+  path.join(WHISPER_CPP_DIR, "build/bin/whisper-cli");
+const WHISPER_MODEL =
+  process.env.TELEGRAM_WHISPER_MODEL ??
+  path.join(WHISPER_CPP_DIR, "models-local/ggml-base.bin");
+const AFCONVERT_BIN =
+  process.env.AFCONVERT_BIN ??
+  "/usr/bin/afconvert";
 
 const ROUTER_MODEL = "sonnet";
 
@@ -30,17 +44,20 @@ export async function routeVoiceMessage(
   repos: string[],
   activeWorkspaces: Workspace[]
 ): Promise<RouteResult | null> {
+  const transcript = await transcribeVoiceMessage(voicePath);
+  if (!transcript) {
+    return null;
+  }
+
   const context = buildContext(repos, activeWorkspaces);
   const prompt = `${context}
 
-The user sent a voice message. The audio file is at: ${voicePath}
-Please read/transcribe the audio file, then route it to the appropriate repo or workspace.
+The user sent a voice message.
+It was transcribed as: ${JSON.stringify(transcript)}
+Route it to the appropriate repo or workspace.
 Respond with ONLY a JSON object (no markdown, no code fences).`;
 
-  return runClaudeRouter(prompt, {
-    addDirs: [path.dirname(voicePath)],
-    maxTurns: 3,
-  });
+  return runClaudeRouter(prompt);
 }
 
 /**
@@ -99,6 +116,70 @@ Respond with ONLY a JSON object:
   "workspaceId": "workspace-uuid (when action is existing)",
   "prompt": "clean actionable prompt for the agent"
 }`;
+}
+
+async function transcribeVoiceMessage(voicePath: string): Promise<string | null> {
+  if (!existsSync(voicePath)) {
+    console.log(`[ai-router] Voice file not found: ${voicePath}`);
+    return null;
+  }
+  if (!existsSync(AFCONVERT_BIN)) {
+    console.log(`[ai-router] afconvert not found at ${AFCONVERT_BIN}`);
+    return null;
+  }
+  if (!existsSync(WHISPER_BIN)) {
+    console.log(`[ai-router] whisper-cli not found at ${WHISPER_BIN}`);
+    return null;
+  }
+  if (!existsSync(WHISPER_MODEL)) {
+    console.log(`[ai-router] Whisper model not found at ${WHISPER_MODEL}`);
+    return null;
+  }
+
+  const wavPath = path.join(
+    tmpdir(),
+    `telegram-voice-${Date.now()}-${Math.random().toString(36).slice(2)}.wav`
+  );
+
+  try {
+    const convert = await runCommand(AFCONVERT_BIN, [
+      "-f", "WAVE",
+      "-d", "LEI16@16000",
+      voicePath,
+      wavPath,
+    ]);
+    if (convert.code !== 0) {
+      console.log(`[ai-router] afconvert failed: ${convert.stderr.slice(0, 300)}`);
+      return null;
+    }
+
+    const whisper = await runCommand(WHISPER_BIN, [
+      "-m", WHISPER_MODEL,
+      "-l", "auto",
+      "-np",
+      "-nt",
+      "-f", wavPath,
+    ], { cwd: WHISPER_CPP_DIR });
+    if (whisper.code !== 0) {
+      console.log(`[ai-router] whisper transcription failed: ${whisper.stderr.slice(0, 300)}`);
+      return null;
+    }
+
+    const transcript = whisper.stdout.trim();
+    if (!transcript) {
+      console.log("[ai-router] Whisper returned an empty transcript");
+      return null;
+    }
+
+    console.log(`[ai-router] Transcribed voice message: ${transcript.slice(0, 200)}`);
+    return transcript;
+  } finally {
+    try {
+      unlinkSync(wavPath);
+    } catch {
+      // Ignore temp-file cleanup failures.
+    }
+  }
 }
 
 function runClaudeRouter(
@@ -168,6 +249,45 @@ function runClaudeRouter(
       }
 
       finish(parseCliOutput(stdout));
+    });
+  });
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  options: {
+    cwd?: string;
+  } = {}
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, HOME: process.env.HOME },
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", (err) => {
+      resolve({
+        code: -1,
+        stdout,
+        stderr: stderr || String(err),
+      });
+    });
+
+    child.on("close", (code) => {
+      resolve({ code, stdout, stderr });
     });
   });
 }
