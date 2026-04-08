@@ -20,7 +20,7 @@
     --text-dim: #52525B;
     --accent: #00D4AA;
     --accent-dim: #00D4AA22;
-    --accent-glow: #00D4AA15;
+    --accent-glow: #00D4AA33;
     --warning: #F59E0B;
     --error: #EF4444;
     --success: #22C55E;
@@ -33,7 +33,6 @@
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
-
   html { scroll-behavior: smooth; }
 
   body {
@@ -43,6 +42,7 @@
     font-size: 15px;
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
   }
 
   a { color: var(--accent); text-decoration: none; }
@@ -54,35 +54,95 @@
     padding: 0 24px;
   }
 
-  /* ANIMATIONS */
-  @keyframes float {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-8px); }
+  /* ===== ANIMATED BACKGROUND ===== */
+  .bg-grid {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: -2;
+    background-image:
+      linear-gradient(rgba(0, 212, 170, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 212, 170, 0.03) 1px, transparent 1px);
+    background-size: 60px 60px;
+    animation: gridShift 20s linear infinite;
   }
-  @keyframes pulse-glow {
-    0%, 100% { opacity: 0.4; }
-    50% { opacity: 0.8; }
-  }
-  @keyframes drift {
-    0% { transform: translate(0, 0); }
-    25% { transform: translate(10px, -5px); }
-    50% { transform: translate(-5px, -10px); }
-    75% { transform: translate(-10px, 5px); }
-    100% { transform: translate(0, 0); }
-  }
-  @keyframes grid-pulse {
-    0%, 100% { opacity: 0.03; }
-    50% { opacity: 0.06; }
-  }
-  @keyframes fade-in-up {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  @keyframes dash-flow {
-    to { stroke-dashoffset: -20; }
+  @keyframes gridShift {
+    0% { background-position: 0 0; }
+    100% { background-position: 60px 60px; }
   }
 
-  /* NAV */
+  .bg-gradient-orb {
+    position: fixed;
+    z-index: -1;
+    border-radius: 50%;
+    filter: blur(100px);
+    opacity: 0.4;
+    pointer-events: none;
+  }
+  .bg-orb-1 {
+    width: 600px; height: 600px;
+    top: -200px; left: -100px;
+    background: radial-gradient(circle, #00D4AA12, transparent 70%);
+    animation: orbFloat1 15s ease-in-out infinite;
+  }
+  .bg-orb-2 {
+    width: 500px; height: 500px;
+    top: 40%; right: -150px;
+    background: radial-gradient(circle, #3B82F610, transparent 70%);
+    animation: orbFloat2 18s ease-in-out infinite;
+  }
+  .bg-orb-3 {
+    width: 400px; height: 400px;
+    bottom: 10%; left: 20%;
+    background: radial-gradient(circle, #00D4AA08, transparent 70%);
+    animation: orbFloat3 22s ease-in-out infinite;
+  }
+  @keyframes orbFloat1 {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    33% { transform: translate(40px, 30px) scale(1.05); }
+    66% { transform: translate(-20px, 50px) scale(0.95); }
+  }
+  @keyframes orbFloat2 {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    50% { transform: translate(-30px, -40px) scale(1.08); }
+  }
+  @keyframes orbFloat3 {
+    0%, 100% { transform: translate(0, 0); }
+    50% { transform: translate(30px, -20px); }
+  }
+
+  /* Floating particles */
+  .particles {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: -1;
+    pointer-events: none;
+    overflow: hidden;
+  }
+  .particle {
+    position: absolute;
+    width: 2px; height: 2px;
+    background: var(--accent);
+    border-radius: 50%;
+    opacity: 0;
+    animation: particleFloat linear infinite;
+  }
+  .particle:nth-child(1) { left: 10%; animation-duration: 12s; animation-delay: 0s; }
+  .particle:nth-child(2) { left: 25%; animation-duration: 15s; animation-delay: 2s; }
+  .particle:nth-child(3) { left: 40%; animation-duration: 11s; animation-delay: 4s; }
+  .particle:nth-child(4) { left: 55%; animation-duration: 14s; animation-delay: 1s; }
+  .particle:nth-child(5) { left: 70%; animation-duration: 13s; animation-delay: 3s; }
+  .particle:nth-child(6) { left: 85%; animation-duration: 16s; animation-delay: 5s; }
+  .particle:nth-child(7) { left: 15%; animation-duration: 10s; animation-delay: 6s; }
+  .particle:nth-child(8) { left: 60%; animation-duration: 17s; animation-delay: 7s; }
+
+  @keyframes particleFloat {
+    0% { transform: translateY(100vh); opacity: 0; }
+    10% { opacity: 0.6; }
+    90% { opacity: 0.6; }
+    100% { transform: translateY(-20px); opacity: 0; }
+  }
+
+  /* ===== NAV ===== */
   nav {
     position: sticky;
     top: 0;
@@ -112,31 +172,17 @@
   .nav-links a {
     font-size: 14px;
     color: var(--text-muted);
-    transition: color 0.12s;
+    transition: color 0.2s;
   }
   .nav-links a:hover { color: var(--text); text-decoration: none; }
 
-  /* HERO */
+  /* ===== HERO ===== */
   .hero {
     padding: 80px 0 64px;
     text-align: center;
     border-bottom: 1px solid var(--border);
     position: relative;
-    overflow: hidden;
   }
-  .hero::before {
-    content: '';
-    position: absolute;
-    top: -50%;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 600px;
-    height: 600px;
-    background: radial-gradient(circle, var(--accent-glow) 0%, transparent 70%);
-    animation: pulse-glow 6s ease-in-out infinite;
-    pointer-events: none;
-  }
-  .hero .container { position: relative; z-index: 1; }
   .hero-badge {
     display: inline-block;
     font-family: var(--font-mono);
@@ -147,6 +193,11 @@
     border-radius: 9999px;
     padding: 4px 14px;
     margin-bottom: 24px;
+    animation: badgePulse 3s ease-in-out infinite;
+  }
+  @keyframes badgePulse {
+    0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
+    50% { box-shadow: 0 0 20px 4px var(--accent-glow); }
   }
   .hero h1 {
     font-family: var(--font-body);
@@ -156,7 +207,13 @@
     line-height: 1.15;
     margin-bottom: 16px;
   }
-  .hero h1 span { color: var(--accent); }
+  .hero h1 span {
+    color: var(--accent);
+    background: linear-gradient(135deg, #00D4AA, #3B82F6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
   .hero p {
     font-size: 17px;
     color: var(--text-muted);
@@ -170,6 +227,17 @@
     justify-content: center;
     flex-wrap: wrap;
   }
+
+  /* Hero illustration */
+  .hero-illustration {
+    margin: 40px auto 0;
+    max-width: 480px;
+  }
+  .hero-illustration svg {
+    width: 100%;
+    height: auto;
+  }
+
   .btn {
     display: inline-flex;
     align-items: center;
@@ -181,7 +249,7 @@
     border-radius: var(--radius-md);
     border: 1px solid transparent;
     cursor: pointer;
-    transition: all 0.12s;
+    transition: all 0.2s;
     text-decoration: none;
   }
   .btn:hover { text-decoration: none; }
@@ -190,7 +258,10 @@
     color: #0A0A0B;
     border-color: var(--accent);
   }
-  .btn-primary:hover { opacity: 0.9; }
+  .btn-primary:hover {
+    opacity: 0.9;
+    box-shadow: 0 0 20px var(--accent-glow);
+  }
   .btn-secondary {
     background: transparent;
     color: var(--text);
@@ -198,7 +269,7 @@
   }
   .btn-secondary:hover { border-color: var(--text-muted); }
 
-  /* INSTALL BLOCK */
+  /* ===== INSTALL BLOCK ===== */
   .install-block {
     max-width: 480px;
     margin: 32px auto 0;
@@ -229,7 +300,7 @@
     border-radius: var(--radius-sm);
     padding: 2px 8px;
     cursor: pointer;
-    transition: all 0.12s;
+    transition: all 0.2s;
   }
   .copy-btn:hover { color: var(--accent); border-color: var(--accent); }
   .install-code {
@@ -243,15 +314,13 @@
   .install-code .prompt { color: var(--text-dim); user-select: none; }
   .install-code .cmd { color: var(--accent); }
 
-  /* SECTIONS */
+  /* ===== SECTIONS ===== */
   section {
     padding: 64px 0;
     border-bottom: 1px solid var(--border);
     position: relative;
-    overflow: hidden;
   }
   section:last-of-type { border-bottom: none; }
-  section .container { position: relative; z-index: 1; }
   .section-label {
     font-family: var(--font-mono);
     font-size: 11px;
@@ -273,54 +342,7 @@
     max-width: 640px;
   }
 
-  /* SECTION ILLUSTRATIONS */
-  .section-illustration {
-    position: absolute;
-    pointer-events: none;
-    opacity: 0.06;
-  }
-
-  /* ANIMATED GRID BACKGROUND */
-  .grid-bg {
-    position: absolute;
-    inset: 0;
-    background-image:
-      linear-gradient(var(--accent) 1px, transparent 1px),
-      linear-gradient(90deg, var(--accent) 1px, transparent 1px);
-    background-size: 60px 60px;
-    opacity: 0.03;
-    animation: grid-pulse 8s ease-in-out infinite;
-    pointer-events: none;
-  }
-
-  /* FLOATING ORBS */
-  .orb {
-    position: absolute;
-    border-radius: 50%;
-    filter: blur(60px);
-    pointer-events: none;
-    animation: drift 20s ease-in-out infinite;
-  }
-  .orb-1 {
-    width: 300px;
-    height: 300px;
-    background: var(--accent);
-    opacity: 0.04;
-    top: 10%;
-    right: -100px;
-    animation-delay: -5s;
-  }
-  .orb-2 {
-    width: 200px;
-    height: 200px;
-    background: var(--info);
-    opacity: 0.03;
-    bottom: 20%;
-    left: -50px;
-    animation-delay: -10s;
-  }
-
-  /* FEATURES GRID */
+  /* ===== FEATURES GRID ===== */
   .features-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -331,46 +353,47 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     padding: 24px;
-    transition: border-color 0.2s, transform 0.2s;
+    transition: all 0.3s ease;
     position: relative;
     overflow: hidden;
   }
-  .feature-card:hover {
-    border-color: var(--accent);
-    transform: translateY(-2px);
-  }
-  .feature-card::after {
+  .feature-card::before {
     content: '';
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 1px;
+    top: 0; left: 0; right: 0;
+    height: 2px;
     background: linear-gradient(90deg, transparent, var(--accent), transparent);
     opacity: 0;
-    transition: opacity 0.2s;
+    transition: opacity 0.3s;
   }
-  .feature-card:hover::after { opacity: 0.6; }
-  .feature-icon {
-    width: 40px;
-    height: 40px;
-    border-radius: var(--radius-md);
+  .feature-card:hover {
+    border-color: var(--accent-glow);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(0, 212, 170, 0.06);
+  }
+  .feature-card:hover::before { opacity: 1; }
+
+  .feature-icon-wrap {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
     background: var(--accent-dim);
-    border: 1px solid #00D4AA33;
+    border: 1px solid rgba(0, 212, 170, 0.15);
     display: flex;
     align-items: center;
     justify-content: center;
-    margin-bottom: 12px;
+    margin-bottom: 14px;
   }
-  .feature-icon svg {
-    width: 20px;
-    height: 20px;
+  .feature-icon-wrap svg {
+    width: 22px;
+    height: 22px;
     stroke: var(--accent);
     fill: none;
-    stroke-width: 2;
+    stroke-width: 1.5;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
+
   .feature-card h3 {
     font-size: 16px;
     font-weight: 600;
@@ -382,7 +405,7 @@
     line-height: 1.6;
   }
 
-  /* TERMINAL MOCKUP */
+  /* ===== TERMINAL MOCKUP ===== */
   .terminal {
     background: var(--bg);
     border: 1px solid var(--border);
@@ -399,11 +422,12 @@
     border-bottom: 1px solid var(--border);
   }
   .terminal-dot {
-    width: 10px;
-    height: 10px;
+    width: 10px; height: 10px;
     border-radius: 50%;
-    background: var(--border);
   }
+  .terminal-dot:nth-child(1) { background: #EF4444; }
+  .terminal-dot:nth-child(2) { background: #F59E0B; }
+  .terminal-dot:nth-child(3) { background: #22C55E; }
   .terminal-title {
     font-family: var(--font-mono);
     font-size: 12px;
@@ -424,7 +448,7 @@
   .terminal-body .ok { color: var(--success); }
   .terminal-body .w { color: var(--warning); }
 
-  /* TELEGRAM MOCKUP */
+  /* ===== TELEGRAM MOCKUP ===== */
   .telegram-mock {
     background: #0E0E10;
     border: 1px solid var(--border);
@@ -441,10 +465,9 @@
     border-bottom: 1px solid #27272A;
   }
   .tg-avatar {
-    width: 36px;
-    height: 36px;
+    width: 36px; height: 36px;
     border-radius: 50%;
-    background: var(--accent);
+    background: linear-gradient(135deg, var(--accent), #3B82F6);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -491,7 +514,7 @@
     margin-top: 4px;
   }
 
-  /* SIDE BY SIDE */
+  /* ===== SIDE BY SIDE ===== */
   .side-by-side {
     display: grid;
     grid-template-columns: 1fr 400px;
@@ -503,7 +526,7 @@
     .telegram-mock { max-width: 100%; }
   }
 
-  /* STEPS */
+  /* ===== STEPS ===== */
   .steps {
     display: flex;
     flex-direction: column;
@@ -517,8 +540,7 @@
     align-items: start;
   }
   .step-num {
-    width: 48px;
-    height: 48px;
+    width: 48px; height: 48px;
     border-radius: 50%;
     background: var(--surface);
     border: 1px solid var(--border);
@@ -530,6 +552,11 @@
     font-weight: 600;
     color: var(--accent);
     flex-shrink: 0;
+    transition: all 0.3s;
+  }
+  .step:hover .step-num {
+    border-color: var(--accent);
+    box-shadow: 0 0 16px var(--accent-glow);
   }
   .step h3 {
     font-size: 17px;
@@ -551,7 +578,7 @@
     color: var(--accent);
   }
 
-  /* CONFIG TABLE */
+  /* ===== CONFIG TABLE ===== */
   .config-table {
     width: 100%;
     border-collapse: collapse;
@@ -583,72 +610,76 @@
     color: var(--text-dim);
   }
 
-  /* ARCHITECTURE - MERMAID */
-  .arch-container {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 32px;
+  /* ===== ARCHITECTURE — MERMAID ===== */
+  .arch-section {
     position: relative;
-    overflow: hidden;
   }
-  .arch-container::before {
+  .arch-section::before {
     content: '';
     position: absolute;
-    inset: 0;
-    background:
-      radial-gradient(circle at 20% 50%, var(--accent-glow) 0%, transparent 50%),
-      radial-gradient(circle at 80% 50%, #3B82F615 0%, transparent 50%);
+    top: 50%; left: 50%;
+    width: 600px; height: 600px;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(circle, var(--accent-glow), transparent 70%);
     pointer-events: none;
+    opacity: 0.3;
   }
-  .arch-container .mermaid {
+
+  .mermaid-container {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 40px 32px;
+    overflow-x: auto;
     position: relative;
-    z-index: 1;
   }
-  .arch-container .mermaid svg {
+  .mermaid-container .mermaid {
+    display: flex;
+    justify-content: center;
+  }
+  .mermaid-container .mermaid svg {
     max-width: 100%;
     height: auto;
   }
 
-  /* ARCHITECTURE - CUSTOM SVG DIAGRAM */
-  .arch-svg-wrap {
+  .arch-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 12px;
+    margin-top: 24px;
+  }
+  .arch-card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    padding: 40px 24px;
-    position: relative;
-    overflow: hidden;
+    padding: 16px;
+    transition: border-color 0.2s;
   }
-  .arch-svg-wrap::before {
-    content: '';
-    position: absolute;
-    inset: 0;
-    background:
-      radial-gradient(circle at 20% 40%, var(--accent-glow) 0%, transparent 50%),
-      radial-gradient(circle at 80% 60%, #3B82F610 0%, transparent 50%);
-    pointer-events: none;
+  .arch-card:hover { border-color: var(--accent-glow); }
+  .arch-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
   }
-  .arch-svg-wrap svg {
-    display: block;
-    width: 100%;
-    max-width: 800px;
-    margin: 0 auto;
-    position: relative;
-    z-index: 1;
+  .arch-card-header svg {
+    width: 18px; height: 18px;
+    stroke: var(--accent);
+    fill: none;
+    stroke-width: 1.5;
   }
-
-  /* FOOTER */
-  footer {
-    padding: 32px 0;
-    text-align: center;
+  .arch-card h4 {
+    font-family: var(--font-mono);
     font-size: 13px;
-    color: var(--text-dim);
-    border-top: 1px solid var(--border);
+    font-weight: 600;
   }
-  footer a { color: var(--text-muted); }
-  footer a:hover { color: var(--accent); }
+  .arch-card p {
+    font-size: 13px;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
 
-  /* CODE BLOCKS */
+  /* ===== CODE BLOCKS ===== */
   .code-block {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -662,20 +693,54 @@
     color: var(--text);
   }
 
-  /* DATA FLOW ANIMATION on arch diagram */
-  .data-dot {
-    animation: dash-flow 1.5s linear infinite;
+  /* ===== FOOTER ===== */
+  footer {
+    padding: 32px 0;
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-dim);
+    border-top: 1px solid var(--border);
+  }
+  footer a { color: var(--text-muted); }
+  footer a:hover { color: var(--accent); }
+
+  /* ===== SCROLL ANIMATIONS ===== */
+  .fade-in {
+    opacity: 0;
+    transform: translateY(20px);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+  }
+  .fade-in.visible {
+    opacity: 1;
+    transform: translateY(0);
   }
 
-  /* RESPONSIVE */
+  /* ===== RESPONSIVE ===== */
   @media (max-width: 640px) {
-    .nav-links { gap: 14px; }
-    .nav-links a { font-size: 12px; }
+    .nav-links { gap: 16px; }
     .hero { padding: 48px 0 40px; }
+    .features-grid { grid-template-columns: 1fr; }
+    .arch-cards { grid-template-columns: 1fr 1fr; }
   }
 </style>
 </head>
 <body>
+
+<!-- Animated background layers -->
+<div class="bg-grid"></div>
+<div class="bg-gradient-orb bg-orb-1"></div>
+<div class="bg-gradient-orb bg-orb-2"></div>
+<div class="bg-gradient-orb bg-orb-3"></div>
+<div class="particles">
+  <div class="particle"></div>
+  <div class="particle"></div>
+  <div class="particle"></div>
+  <div class="particle"></div>
+  <div class="particle"></div>
+  <div class="particle"></div>
+  <div class="particle"></div>
+  <div class="particle"></div>
+</div>
 
 <nav>
   <div class="container">
@@ -700,6 +765,78 @@
       <a href="#setup" class="btn btn-primary">Get Started</a>
       <a href="https://github.com/belongnet/conductor-telegram" class="btn btn-secondary">View on GitHub</a>
     </div>
+
+    <!-- Hero SVG illustration: phone + terminal connected by signal lines -->
+    <div class="hero-illustration">
+      <svg viewBox="0 0 480 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <!-- Terminal -->
+        <rect x="20" y="30" width="160" height="120" rx="8" stroke="#27272A" stroke-width="1.5" fill="#141416"/>
+        <rect x="20" y="30" width="160" height="24" rx="8" fill="#1C1C1F"/>
+        <circle cx="36" cy="42" r="4" fill="#EF4444" opacity="0.7"/>
+        <circle cx="50" cy="42" r="4" fill="#F59E0B" opacity="0.7"/>
+        <circle cx="64" cy="42" r="4" fill="#22C55E" opacity="0.7"/>
+        <text x="36" y="76" font-family="monospace" font-size="9" fill="#52525B">$</text>
+        <text x="46" y="76" font-family="monospace" font-size="9" fill="#00D4AA">conductor-telegram</text>
+        <text x="36" y="92" font-family="monospace" font-size="9" fill="#22C55E">&#x2713;</text>
+        <text x="48" y="92" font-family="monospace" font-size="9" fill="#71717A">Bot connected</text>
+        <text x="36" y="108" font-family="monospace" font-size="9" fill="#22C55E">&#x2713;</text>
+        <text x="48" y="108" font-family="monospace" font-size="9" fill="#71717A">MCP server ready</text>
+        <text x="36" y="124" font-family="monospace" font-size="9" fill="#22C55E">&#x2713;</text>
+        <text x="48" y="124" font-family="monospace" font-size="9" fill="#71717A">Listening...</text>
+
+        <!-- Connection lines with animation -->
+        <line x1="190" y1="90" x2="295" y2="90" stroke="#00D4AA" stroke-width="1" stroke-dasharray="6 4" opacity="0.5">
+          <animate attributeName="stroke-dashoffset" from="0" to="-20" dur="2s" repeatCount="indefinite"/>
+        </line>
+        <circle cx="240" cy="90" r="3" fill="#00D4AA" opacity="0.6">
+          <animate attributeName="cx" from="200" to="290" dur="1.5s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0;0.8;0" dur="1.5s" repeatCount="indefinite"/>
+        </circle>
+
+        <!-- Signal waves -->
+        <path d="M255 70 Q260 65 265 70" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.3">
+          <animate attributeName="opacity" values="0.1;0.5;0.1" dur="2s" repeatCount="indefinite"/>
+        </path>
+        <path d="M250 62 Q258 55 266 62" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.2">
+          <animate attributeName="opacity" values="0.1;0.4;0.1" dur="2s" repeatCount="indefinite" begin="0.3s"/>
+        </path>
+        <path d="M245 54 Q256 45 267 54" stroke="#00D4AA" stroke-width="1" fill="none" opacity="0.15">
+          <animate attributeName="opacity" values="0.05;0.3;0.05" dur="2s" repeatCount="indefinite" begin="0.6s"/>
+        </path>
+
+        <!-- Phone -->
+        <rect x="300" y="20" width="90" height="140" rx="12" stroke="#27272A" stroke-width="1.5" fill="#141416"/>
+        <rect x="308" y="36" width="74" height="108" rx="4" fill="#0E0E10"/>
+        <rect x="332" y="26" width="26" height="4" rx="2" fill="#27272A"/>
+        <!-- Telegram messages in phone -->
+        <rect x="314" y="44" width="56" height="18" rx="6" fill="#1E1E22"/>
+        <text x="320" y="56" font-family="monospace" font-size="6" fill="#00D4AA">status</text>
+        <rect x="330" y="68" width="44" height="18" rx="6" fill="#00D4AA22" stroke="#00D4AA44" stroke-width="0.5"/>
+        <text x="336" y="80" font-family="monospace" font-size="6" fill="#FAFAFA">Approve</text>
+        <rect x="314" y="92" width="56" height="18" rx="6" fill="#1E1E22"/>
+        <text x="320" y="104" font-family="monospace" font-size="6" fill="#00D4AA">PR #48</text>
+        <!-- Notification dot -->
+        <circle cx="384" cy="28" r="5" fill="#00D4AA" opacity="0.8">
+          <animate attributeName="r" values="4;6;4" dur="2s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="0.6;1;0.6" dur="2s" repeatCount="indefinite"/>
+        </circle>
+
+        <!-- Labels -->
+        <text x="66" y="168" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Your Machine</text>
+        <text x="345" y="168" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Your Phone</text>
+
+        <!-- Conductor agent icon -->
+        <rect x="410" y="50" width="56" height="80" rx="6" stroke="#27272A" stroke-width="1" fill="#141416" stroke-dasharray="3 2"/>
+        <text x="438" y="78" font-family="monospace" font-size="8" fill="#3B82F6" text-anchor="middle">Agent</text>
+        <text x="438" y="92" font-family="monospace" font-size="7" fill="#52525B" text-anchor="middle">Claude</text>
+        <text x="438" y="104" font-family="monospace" font-size="7" fill="#52525B" text-anchor="middle">Code</text>
+        <line x1="390" y1="90" x2="408" y2="90" stroke="#3B82F6" stroke-width="1" stroke-dasharray="4 3" opacity="0.4">
+          <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="2s" repeatCount="indefinite"/>
+        </line>
+        <text x="438" y="145" font-family="'DM Sans', sans-serif" font-size="10" fill="#52525B" text-anchor="middle">Workspace</text>
+      </svg>
+    </div>
+
     <div class="install-block">
       <div class="install-header">
         <span>Terminal</span>
@@ -716,51 +853,50 @@
 
 <!-- FEATURES -->
 <section id="features">
-  <div class="orb orb-1"></div>
   <div class="container">
     <div class="section-label">// what it does</div>
     <h2>Control your AI agents from anywhere</h2>
     <p class="lead">conductor-telegram bridges your Conductor workspaces to Telegram. Start workspaces, review PRs, and approve agent decisions without opening a laptop.</p>
 
     <div class="features-grid">
-      <div class="feature-card">
-        <div class="feature-icon">
+      <div class="feature-card fade-in">
+        <div class="feature-icon-wrap">
           <svg viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
         </div>
         <h3>Launch workspaces remotely</h3>
         <p>Start new AI agent workspaces from Telegram. Pick a repo, describe the task, and the agent gets to work.</p>
       </div>
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+      <div class="feature-card fade-in">
+        <div class="feature-icon-wrap">
+          <svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
         </div>
         <h3>Approve decisions</h3>
         <p>Agents ask for permission before risky operations. Approve or reject from your phone with a quick reply.</p>
       </div>
-      <div class="feature-card">
-        <div class="feature-icon">
+      <div class="feature-card fade-in">
+        <div class="feature-icon-wrap">
           <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
         </div>
         <h3>Real-time status</h3>
         <p>Get progress reports as agents work. See what files changed, what PRs were created, and when things go wrong.</p>
       </div>
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <div class="feature-card fade-in">
+        <div class="feature-icon-wrap">
+          <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
         </div>
         <h3>Forum topics per workspace</h3>
         <p>Each workspace gets its own Telegram forum topic. Clean separation, easy to follow, no noise.</p>
       </div>
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      <div class="feature-card fade-in">
+        <div class="feature-icon-wrap">
+          <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
         </div>
         <h3>MCP server</h3>
         <p>Three tools for agents: report_status, report_artifact, and request_human. Agents talk to you through the protocol.</p>
       </div>
-      <div class="feature-card">
-        <div class="feature-icon">
-          <svg viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+      <div class="feature-card fade-in">
+        <div class="feature-icon-wrap">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
         </div>
         <h3>Self-diagnosing</h3>
         <p>Run <code>doctor</code> to check Node.js, config, bot token, database, Conductor, MCP plugin, and repos. All at once.</p>
@@ -771,7 +907,6 @@
 
 <!-- HOW IT WORKS -->
 <section id="how-it-works">
-  <div class="orb orb-2"></div>
   <div class="container">
     <div class="section-label">// how it works</div>
     <h2>CLI meets Telegram</h2>
@@ -851,21 +986,20 @@
 
 <!-- SETUP -->
 <section id="setup">
-  <div class="grid-bg"></div>
   <div class="container">
     <div class="section-label">// getting started</div>
     <h2>Setup in 3 minutes</h2>
     <p class="lead">The setup wizard handles everything. You just need a Telegram bot token.</p>
 
     <div class="steps">
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">1</div>
         <div>
           <h3>Create a Telegram bot</h3>
           <p>Open <a href="https://t.me/BotFather">@BotFather</a> in Telegram, send <code>/newbot</code>, and copy the token. That's your <code>BOT_TOKEN</code>.</p>
         </div>
       </div>
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">2</div>
         <div>
           <h3>Install and run setup</h3>
@@ -876,7 +1010,7 @@
           </div>
         </div>
       </div>
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">3</div>
         <div>
           <h3>Start the bot</h3>
@@ -886,7 +1020,7 @@
           </div>
         </div>
       </div>
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">4</div>
         <div>
           <h3>Install the MCP plugin</h3>
@@ -919,121 +1053,78 @@
 </section>
 
 <!-- ARCHITECTURE -->
-<section id="architecture">
-  <div class="orb orb-1" style="top:auto;bottom:-100px;right:auto;left:-100px;animation-delay:-15s;"></div>
+<section id="architecture" class="arch-section">
   <div class="container">
     <div class="section-label">// under the hood</div>
     <h2>Architecture</h2>
     <p class="lead">Three components: a CLI that manages config, a Telegram bot that handles user interaction, and an MCP server that agents use to communicate.</p>
 
-    <div class="arch-svg-wrap">
-      <svg viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg">
-        <!-- Operator box -->
-        <rect x="20" y="30" width="160" height="70" rx="8" fill="#141416" stroke="#00D4AA" stroke-width="1.5"/>
-        <text x="100" y="58" text-anchor="middle" fill="#00D4AA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Operator</text>
-        <text x="100" y="78" text-anchor="middle" fill="#71717A" font-family="'DM Sans', sans-serif" font-size="11">(Telegram App)</text>
+    <div class="mermaid-container">
+      <div class="mermaid">
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#1C1C1F', 'primaryBorderColor': '#00D4AA', 'primaryTextColor': '#FAFAFA', 'lineColor': '#00D4AA', 'secondaryColor': '#141416', 'tertiaryColor': '#0A0A0B', 'edgeLabelBackground': '#141416', 'clusterBkg': '#141416', 'clusterBorder': '#27272A', 'fontSize': '14px' }}}%%
+graph TB
+    subgraph operator["Operator"]
+        TG["Telegram App<br/><small>Commands &amp; Approvals</small>"]
+    end
 
-        <!-- Telegram Bot box -->
-        <rect x="20" y="160" width="160" height="80" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
-        <text x="100" y="190" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Telegram Bot</text>
-        <text x="100" y="210" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Telegraf + Commands</text>
-        <!-- bot icon -->
-        <circle cx="100" cy="168" r="2.5" fill="#00D4AA"/>
+    subgraph server["Your Machine"]
+        BOT["Telegram Bot<br/><small>Telegraf · Commands · Middleware</small>"]
+        CLI["CLI<br/><small>Setup · Doctor · Config</small>"]
+        DB[("SQLite<br/><small>Sessions · State</small>")]
+    end
 
-        <!-- SQLite box -->
-        <rect x="20" y="310" width="160" height="70" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
-        <text x="100" y="340" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">SQLite DB</text>
-        <text x="100" y="360" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Sessions &amp; State</text>
+    subgraph workspace["Conductor Workspace"]
+        MCP["MCP Server<br/><small>stdio transport</small>"]
+        AGENT["Claude Code<br/><small>AI Agent</small>"]
+    end
 
-        <!-- MCP Server box -->
-        <rect x="320" y="160" width="160" height="80" rx="8" fill="#141416" stroke="#00D4AA" stroke-width="1.5" stroke-dasharray="4 2"/>
-        <text x="400" y="190" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">MCP Server</text>
-        <text x="400" y="210" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">stdio protocol</text>
-        <circle cx="400" cy="168" r="2.5" fill="#3B82F6"/>
+    TG -- "/run · /send · /approve" --> BOT
+    BOT -- "Status · Artifacts · Questions" --> TG
+    CLI -. "manages" .-> BOT
+    BOT <--> DB
+    MCP -- "report_status<br/>report_artifact<br/>request_human" --> BOT
+    AGENT <--> MCP
 
-        <!-- Claude Code box -->
-        <rect x="620" y="160" width="160" height="80" rx="8" fill="#141416" stroke="#3B82F6" stroke-width="1.5"/>
-        <text x="700" y="190" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Claude Code</text>
-        <text x="700" y="210" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">AI Agent Runtime</text>
-
-        <!-- Conductor Workspace box -->
-        <rect x="620" y="310" width="160" height="70" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
-        <text x="700" y="340" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">Workspace</text>
-        <text x="700" y="360" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Git Repo + Worktree</text>
-
-        <!-- CLI box -->
-        <rect x="320" y="30" width="160" height="70" rx="8" fill="#141416" stroke="#27272A" stroke-width="1.5"/>
-        <text x="400" y="58" text-anchor="middle" fill="#FAFAFA" font-family="'JetBrains Mono', monospace" font-size="13" font-weight="600">CLI</text>
-        <text x="400" y="78" text-anchor="middle" fill="#52525B" font-family="'DM Sans', sans-serif" font-size="11">Setup &amp; Config</text>
-
-        <!-- Arrows: Operator -> Telegram Bot -->
-        <line x1="100" y1="100" x2="100" y2="160" stroke="#00D4AA" stroke-width="1.5" stroke-dasharray="6 3"/>
-        <polygon points="95,155 100,165 105,155" fill="#00D4AA" opacity="0.8"/>
-        <text x="115" y="135" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">/run /send</text>
-
-        <!-- Telegram Bot -> SQLite -->
-        <line x1="100" y1="240" x2="100" y2="310" stroke="#27272A" stroke-width="1.5"/>
-        <polygon points="95,305 100,315 105,305" fill="#71717A"/>
-        <text x="115" y="280" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">read/write</text>
-
-        <!-- Telegram Bot <-> MCP Server -->
-        <line x1="180" y1="195" x2="320" y2="195" stroke="#00D4AA" stroke-width="1.5"/>
-        <polygon points="315,190 325,195 315,200" fill="#00D4AA" opacity="0.8"/>
-        <line x1="320" y1="205" x2="180" y2="205" stroke="#00D4AA" stroke-width="1.5" stroke-dasharray="4 3"/>
-        <polygon points="185,200 175,205 185,210" fill="#00D4AA" opacity="0.8"/>
-        <!-- animated data dots -->
-        <circle r="3" fill="#00D4AA" opacity="0.6">
-          <animateMotion dur="3s" repeatCount="indefinite" path="M180,195 L320,195"/>
-        </circle>
-        <circle r="3" fill="#00D4AA" opacity="0.4">
-          <animateMotion dur="3s" repeatCount="indefinite" path="M320,205 L180,205"/>
-        </circle>
-
-        <!-- MCP Server <-> Claude Code -->
-        <line x1="480" y1="195" x2="620" y2="195" stroke="#3B82F6" stroke-width="1.5"/>
-        <polygon points="615,190 625,195 615,200" fill="#3B82F6" opacity="0.8"/>
-        <line x1="620" y1="205" x2="480" y2="205" stroke="#3B82F6" stroke-width="1.5" stroke-dasharray="4 3"/>
-        <polygon points="485,200 475,205 485,210" fill="#3B82F6" opacity="0.8"/>
-        <!-- animated data dots -->
-        <circle r="3" fill="#3B82F6" opacity="0.6">
-          <animateMotion dur="2.5s" repeatCount="indefinite" path="M480,195 L620,195"/>
-        </circle>
-        <circle r="3" fill="#3B82F6" opacity="0.4">
-          <animateMotion dur="2.5s" repeatCount="indefinite" path="M620,205 L480,205"/>
-        </circle>
-
-        <!-- Claude Code -> Workspace -->
-        <line x1="700" y1="240" x2="700" y2="310" stroke="#27272A" stroke-width="1.5"/>
-        <polygon points="695,305 700,315 705,305" fill="#71717A"/>
-        <text x="715" y="280" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">edit files</text>
-
-        <!-- CLI -> Telegram Bot (manages) -->
-        <path d="M320,65 L180,65 L180,160" stroke="#27272A" stroke-width="1" stroke-dasharray="4 4" fill="none"/>
-        <polygon points="175,155 180,165 185,155" fill="#71717A" opacity="0.6"/>
-        <text x="235" y="55" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">starts</text>
-
-        <!-- CLI -> MCP Server (manages) -->
-        <line x1="400" y1="100" x2="400" y2="160" stroke="#27272A" stroke-width="1" stroke-dasharray="4 4"/>
-        <polygon points="395,155 400,165 405,155" fill="#71717A" opacity="0.6"/>
-        <text x="415" y="135" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9">starts</text>
-
-        <!-- Tool labels on MCP -->
-        <rect x="290" y="260" width="220" height="55" rx="6" fill="#141416" stroke="#27272A" stroke-width="1" stroke-dasharray="3 2"/>
-        <text x="400" y="278" text-anchor="middle" fill="#52525B" font-family="'JetBrains Mono', monospace" font-size="9" font-weight="600">MCP TOOLS</text>
-        <text x="400" y="296" text-anchor="middle" fill="#00D4AA" font-family="'JetBrains Mono', monospace" font-size="10">report_status  report_artifact</text>
-        <text x="400" y="308" text-anchor="middle" fill="#00D4AA" font-family="'JetBrains Mono', monospace" font-size="10">request_human</text>
-        <line x1="400" y1="240" x2="400" y2="260" stroke="#27272A" stroke-width="1" stroke-dasharray="3 2"/>
-      </svg>
+    style operator fill:#0A0A0B,stroke:#27272A,stroke-width:1px,color:#71717A
+    style server fill:#0A0A0B,stroke:#27272A,stroke-width:1px,color:#71717A
+    style workspace fill:#0A0A0B,stroke:#27272A,stroke-width:1px,color:#71717A
+    style TG fill:#1C1C1F,stroke:#3B82F6,stroke-width:1.5px,color:#FAFAFA
+    style BOT fill:#1C1C1F,stroke:#00D4AA,stroke-width:1.5px,color:#FAFAFA
+    style CLI fill:#1C1C1F,stroke:#71717A,stroke-width:1px,color:#FAFAFA
+    style DB fill:#1C1C1F,stroke:#F59E0B,stroke-width:1.5px,color:#FAFAFA
+    style MCP fill:#1C1C1F,stroke:#00D4AA,stroke-width:1.5px,color:#FAFAFA
+    style AGENT fill:#1C1C1F,stroke:#3B82F6,stroke-width:1.5px,color:#FAFAFA
+      </div>
     </div>
 
-    <div style="margin-top:24px;">
-      <div class="code-block">
-src/
-  bot/         # Telegram bot: commands, middleware, formatting, forum topics
-  cli/         # CLI: setup wizard, doctor, banner, config management
-  mcp/         # MCP server: report_status, report_artifact, request_human
-  store/       # SQLite: database setup and query layer
-  types/       # Shared TypeScript types
+    <div class="arch-cards">
+      <div class="arch-card fade-in">
+        <div class="arch-card-header">
+          <svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6" stroke-linecap="round"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          <h4>src/bot/</h4>
+        </div>
+        <p>Telegram bot: commands, middleware, formatting, forum topics</p>
+      </div>
+      <div class="arch-card fade-in">
+        <div class="arch-card-header">
+          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <h4>src/cli/</h4>
+        </div>
+        <p>CLI: setup wizard, doctor, banner, config management</p>
+      </div>
+      <div class="arch-card fade-in">
+        <div class="arch-card-header">
+          <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+          <h4>src/mcp/</h4>
+        </div>
+        <p>MCP server: report_status, report_artifact, request_human</p>
+      </div>
+      <div class="arch-card fade-in">
+        <div class="arch-card-header">
+          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          <h4>src/store/</h4>
+        </div>
+        <p>SQLite: database setup and query layer</p>
       </div>
     </div>
   </div>
@@ -1041,14 +1132,13 @@ src/
 
 <!-- CONTRIBUTING -->
 <section id="contributing">
-  <div class="grid-bg" style="animation-delay:-4s;"></div>
   <div class="container">
     <div class="section-label">// get involved</div>
     <h2>Contributing</h2>
     <p class="lead">conductor-telegram is MIT licensed and open to contributions. Here's how to get started.</p>
 
     <div class="steps">
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">1</div>
         <div>
           <h3>Fork and clone</h3>
@@ -1059,7 +1149,7 @@ src/
           </div>
         </div>
       </div>
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">2</div>
         <div>
           <h3>Create a branch</h3>
@@ -1068,14 +1158,14 @@ src/
           </div>
         </div>
       </div>
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">3</div>
         <div>
           <h3>Make your changes</h3>
           <p>Run <code>npm run dev</code> for live reload during development. Run <code>npm run typecheck</code> before committing.</p>
         </div>
       </div>
-      <div class="step">
+      <div class="step fade-in">
         <div class="step-num">4</div>
         <div>
           <h3>Open a PR</h3>
@@ -1094,9 +1184,40 @@ src/
 
 <footer>
   <div class="container">
-    <p>Built by <a href="https://belong.net">Belong.net</a> · <a href="https://conductor.build">conductor.build</a> · MIT License</p>
+    <p>Built by <a href="https://belong.net">Belong.net</a> &middot; <a href="https://conductor.build">conductor.build</a> &middot; MIT License</p>
   </div>
 </footer>
+
+<!-- Mermaid.js for architecture diagram -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      primaryColor: '#1C1C1F',
+      primaryBorderColor: '#00D4AA',
+      primaryTextColor: '#FAFAFA',
+      lineColor: '#00D4AA',
+      fontSize: '14px'
+    },
+    flowchart: {
+      curve: 'basis',
+      padding: 20
+    }
+  });
+
+  // Scroll-triggered fade-in animations
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+      }
+    });
+  }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+
+  document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+</script>
 
 </body>
 </html>
