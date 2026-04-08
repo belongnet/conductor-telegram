@@ -11,7 +11,7 @@ const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
 
 function dim(s: string): string {
-  return noColor ? s : `\x1b[2m${s}\x1b[0m`;
+  return noColor ? s : `\x1b[2m${s}\x1b[22m`;
 }
 const trueColor =
   process.env.COLORTERM === "truecolor" ||
