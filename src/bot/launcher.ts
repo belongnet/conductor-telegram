@@ -607,8 +607,8 @@ function buildCodexReviewArgs(
 
   if (reviewBaseBranch?.trim()) {
     args.push("--base", reviewBaseBranch.trim());
-  }
-  if (prompt.trim()) {
+    // Codex CLI does not allow --base and a positional prompt together
+  } else if (prompt.trim()) {
     args.push(prompt);
   }
   return args;
