@@ -34,7 +34,9 @@ import {
   maybeExpandableQuote,
   styledButtons,
   styledKeyboard,
+  TELEGRAM_MAX_TEXT,
   truncate as trunc,
+  truncateHtml,
 } from "./format.js";
 import {
   closeWorkspaceTopic,
@@ -181,9 +183,13 @@ function startSessionPoller(): void {
             const stats = formatStats(result);
             if (stats) msg += `  <code>${stats}</code>`;
             if (result.resultText) {
-              msg += `\n\n${maybeExpandableQuote(
-                markdownToTelegramHtml(trunc(result.resultText, 800))
-              )}`;
+              const resultHtml = maybeExpandableQuote(
+                markdownToTelegramHtml(trunc(result.resultText, 3200))
+              );
+              msg += `\n\n${resultHtml}`;
+              if (msg.length > TELEGRAM_MAX_TEXT) {
+                msg = truncateHtml(msg, TELEGRAM_MAX_TEXT);
+              }
             }
           }
 
@@ -311,8 +317,13 @@ function formatForwardedMessage(
   const text = extractAssistantText(message.content);
   if (!text) return null;
 
-  const formatted = markdownToTelegramHtml(trunc(text, 1200));
-  return `🤖 <b>${esc(workspaceName)}</b>\n\n${maybeExpandableQuote(formatted)}`;
+  const header = `🤖 <b>${esc(workspaceName)}</b>\n\n`;
+  const formatted = markdownToTelegramHtml(trunc(text, 3200));
+  const body = maybeExpandableQuote(formatted);
+  const full = header + body;
+  return full.length <= TELEGRAM_MAX_TEXT
+    ? full
+    : truncateHtml(full, TELEGRAM_MAX_TEXT);
 }
 
 function extractAssistantText(content: string): string | null {

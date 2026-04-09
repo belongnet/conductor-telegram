@@ -1723,7 +1723,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
 
   const result = await launchWorkspaceSession(conductorName, prompt, {
-    launchMode: "review",
+    launchMode: action === "review" ? "review" : "prompt",
     title: action === "review" ? "Review Changes" : "Generate PR",
   });
 
