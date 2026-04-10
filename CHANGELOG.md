@@ -2,6 +2,12 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.2.1] - 2026-04-10
+
+### Fixed
+- Fix /gstack command: was incorrectly telling agents to look for Graphite CLI tools instead of using GStack skills
+- Add safety guard: /gstack without instructions now lists available skills instead of auto-selecting one
+
 ## [0.3.1.0] - 2026-04-08
 
 ### Added
