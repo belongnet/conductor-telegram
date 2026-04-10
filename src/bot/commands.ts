@@ -152,7 +152,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "send", description: "Send a follow-up to a workspace" },
   { command: "skills", description: "List workspace skill routes" },
   { command: "skill", description: "Invoke a workspace skill by name" },
-  { command: "gstack", description: "Ask the agent to use the GStack workflow" },
+  { command: "gstack", description: "Ask the agent to use GStack skills" },
   { command: "workspaces", description: "List tracked workspaces" },
   { command: "status", description: "Show active workspace status" },
   { command: "stop", description: "Stop a running workspace" },
@@ -280,14 +280,27 @@ function buildSkillPrompt(skill: string, extraInstructions: string): string {
 
 function buildGstackPrompt(extraInstructions: string): string {
   const lines = [
-    "Use the GStack or Graphite workflow in this workspace.",
-    "If `gstack`, `gt`, or the Graphite CLI is available, use it.",
-    "If the tooling is missing, explain exactly what is unavailable and stop.",
+    "Use the GStack skills available in this workspace.",
+    "GStack provides Claude Code skills such as /ship, /qa, /browse, /review, /health, /investigate, /design-review, and others.",
   ];
 
   if (extraInstructions.trim()) {
-    lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
+    lines.push(
+      "Choose the appropriate skill based on the instructions below.",
+      "",
+      `Additional instructions:\n${extraInstructions.trim()}`
+    );
+  } else {
+    lines.push(
+      "List the available GStack skills in this workspace and ask which one to run.",
+      "Do NOT invoke any skill automatically without explicit instructions."
+    );
   }
+
+  lines.push(
+    "",
+    "If no GStack skills are available, explain what is missing and stop."
+  );
 
   return lines.join("\n");
 }
@@ -1449,7 +1462,7 @@ async function handleSkills(ctx: Context): Promise<void> {
     `Use <code>/skill ${escHtml(target.conductorName)} ${escHtml(routes[0]!.skill)}</code> to invoke one.`
   );
   lines.push(
-    `Use <code>/gstack ${escHtml(target.conductorName)}</code> for the Graphite/GStack workflow.`
+    `Use <code>/gstack ${escHtml(target.conductorName)}</code> for the GStack workflow.`
   );
 
   await ctx.reply(
@@ -1556,7 +1569,7 @@ Commands:
 /review &lt;workspace&gt; [instructions] — Start a review session
 /skills &lt;workspace&gt; — List invoke-style skills from the workspace
 /skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
-/gstack &lt;workspace&gt; [instructions] — Ask the agent to use the GStack/Graphite workflow
+/gstack &lt;workspace&gt; [instructions] — Ask the agent to use GStack skills
 /workspaces — List all tracked workspaces
 /status — Show active workspace summary
 /stop &lt;name&gt; — Stop a workspace
