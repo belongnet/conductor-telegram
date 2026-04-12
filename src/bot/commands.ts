@@ -1197,12 +1197,22 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // If sent inside a forum topic, skip — thread tabs already receive
-  // pre-transcribed messages from the general tab (transcript only, no file).
+  // If sent inside a forum topic, transcribe and send transcript only (no file
+  // attachment) — thread tabs already receive pre-transcribed messages, so avoid
+  // redundant attachments.
   const threadId = (ctx.message as any)?.message_thread_id;
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
-    if (threadWorkspace) return;
+    if (threadWorkspace) {
+      const transcript = await transcribeVoiceMessage(localPath);
+      if (transcript) {
+        await sendMessageToWorkspace(ctx, threadWorkspace, transcript);
+      } else {
+        const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+        await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      }
+      return;
+    }
   }
 
   // Auto-route: use AI to transcribe and determine the target repo/workspace
