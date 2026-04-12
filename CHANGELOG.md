@@ -2,6 +2,12 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.1.1] - 2026-04-12
+
+### Changed
+- Voice messages in the general tab now send only the transcript to the workspace, without the audio file attachment
+- Voice messages in forum thread tabs skip transcription entirely, since they already receive pre-transcribed messages from the general tab
+
 ## [0.3.1.0] - 2026-04-08
 
 ### Added
