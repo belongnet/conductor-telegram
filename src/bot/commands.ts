@@ -1189,7 +1189,7 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
   if (repliedWorkspace) {
     const transcript = await transcribeVoiceMessage(localPath);
     if (transcript) {
-      await sendMessageToWorkspace(ctx, repliedWorkspace, transcript, [localPath]);
+      await sendMessageToWorkspace(ctx, repliedWorkspace, transcript);
     } else {
       const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
       await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
@@ -1197,20 +1197,12 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // If sent inside a forum topic, transcribe and route to that workspace
+  // If sent inside a forum topic, skip — thread tabs already receive
+  // pre-transcribed messages from the general tab (transcript only, no file).
   const threadId = (ctx.message as any)?.message_thread_id;
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
-    if (threadWorkspace) {
-      const transcript = await transcribeVoiceMessage(localPath);
-      if (transcript) {
-        await sendMessageToWorkspace(ctx, threadWorkspace, transcript, [localPath]);
-      } else {
-        const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
-        await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
-      }
-      return;
-    }
+    if (threadWorkspace) return;
   }
 
   // Auto-route: use AI to transcribe and determine the target repo/workspace
