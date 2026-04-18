@@ -2,6 +2,16 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.2.0] - 2026-04-18
+
+### Added
+- Contribute-to-the-stack section on website with prominent NPM and GitHub CTA cards
+- Interactive fireworks celebration animation triggered by a "Simulate PR Merged" button
+- Bot sends a celebratory fireworks message in Telegram when a PR artifact is reported
+
+### Changed
+- Revamped Contributing section with new copy, layout, and streamlined contribution steps
+
 ## [0.3.1.1] - 2026-04-12
 
 ### Changed
