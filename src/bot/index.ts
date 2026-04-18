@@ -24,7 +24,7 @@ import {
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
 } from "../store/queries.js";
-import type { HumanRequestPayload } from "../types/index.js";
+import type { ArtifactPayload, HumanRequestPayload } from "../types/index.js";
 import {
   btn,
   escHtml as esc,
@@ -290,6 +290,42 @@ function startEventPoller(): void {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
             .catch((err) => console.error(`[event-poller] send error:`, err));
+        }
+
+        // ── PR celebration: fireworks when a merge request is submitted ──
+        if (event.type === "artifact" && ws) {
+          try {
+            const artifact: ArtifactPayload = JSON.parse(event.payload);
+            if (artifact.type === "pr") {
+              const chatId = ws.telegramChatId ?? getOwnerChatId()!;
+              const wsName = ws.conductorWorkspaceName ?? ws.name ?? "unknown";
+              const threadOpts = ws.telegramThreadId
+                ? { message_thread_id: ws.telegramThreadId }
+                : {};
+
+              const celebrationLines = [
+                `🎆🎇🎆🎇🎆🎇🎆🎇`,
+                ``,
+                `🎉 <b>New PR submitted!</b>`,
+                ``,
+                `<b>${esc(wsName)}</b> just opened a pull request:`,
+                `${esc(artifact.description)}`,
+                artifact.url ? `\n🔗 <a href="${esc(artifact.url).replace(/"/g, "&quot;")}">${esc(artifact.url)}</a>` : "",
+                ``,
+                `🎆🎇🎆🎇🎆🎇🎆🎇`,
+              ];
+              const celebrationMsg = celebrationLines.filter(Boolean).join("\n");
+
+              bot.telegram
+                .sendMessage(chatId, celebrationMsg, {
+                  parse_mode: "HTML",
+                  ...threadOpts,
+                })
+                .catch((err) => console.error(`[event-poller] celebration send error:`, err));
+            }
+          } catch {
+            // Ignore malformed artifact payloads
+          }
         }
 
         if (ws?.telegramThreadId && (
