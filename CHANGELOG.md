@@ -2,6 +2,14 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.2.0] - 2026-04-19
+
+### Added
+- Hashtag-based skill invocation: tag `#ship`, `#qa`, `#investigate`, or any skill name anywhere in a message (text or voice) and the bot rewrites it into a skill-invocation prompt for the target workspace
+- Slash-command shortcuts for well-known skills: `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` — visible in Telegram's slash menu via `setMyCommands`
+- `/skills` now lists built-in skills alongside workspace skills, with a "how to invoke" section explaining hashtag and slash syntax
+- Skill commands honor forum-topic context, so firing `/ship` inside a workspace's topic targets that workspace without a reply
+
 ## [0.3.1.1] - 2026-04-12
 
 ### Changed
