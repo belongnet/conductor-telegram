@@ -16,6 +16,7 @@ import {
 import {
   getAllThreadedWorkspaces,
   getAllWorkspaces,
+  getArtifactEvents,
   getMaxEventId,
   getNewEvents,
   getWorkspace,
@@ -24,7 +25,7 @@ import {
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
 } from "../store/queries.js";
-import type { HumanRequestPayload } from "../types/index.js";
+import type { ArtifactPayload, HumanRequestPayload, StatusPayload } from "../types/index.js";
 import {
   btn,
   escHtml as esc,
@@ -282,6 +283,49 @@ function startEventPoller(): void {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
             .catch((err) => console.error(`[event-poller] send error:`, err));
+        }
+
+        // ── Merge congratulation ──────────────────────────────
+        if (event.type === "status" && ws) {
+          try {
+            const payload: StatusPayload = JSON.parse(event.payload);
+            const text = `${payload.status} ${payload.message}`.toLowerCase();
+            if (
+              text.includes("merged") ||
+              text.includes("merge complete") ||
+              text.includes("successfully merged") ||
+              text.includes("pr merged") ||
+              text.includes("pull request merged")
+            ) {
+              const wsName = ws.conductorWorkspaceName ?? ws.name;
+              const chatId = ws.telegramChatId ?? getOwnerChatId()!;
+
+              // Find any PR artifact URL for this workspace
+              let prLink = "";
+              const artifacts = getArtifactEvents(ws.id);
+              for (const art of artifacts) {
+                try {
+                  const artPayload: ArtifactPayload = JSON.parse(art.payload);
+                  if (artPayload.type === "pr" && artPayload.url) {
+                    prLink = `\n\n🔗 <a href="${esc(artPayload.url)}">${esc(artPayload.description || "View PR")}</a>`;
+                    break;
+                  }
+                } catch { /* skip malformed */ }
+              }
+
+              const congratsMsg =
+                `🎉🎉🎉\n\n` +
+                `<b>${esc(wsName)}</b> — PR merged successfully!` +
+                prLink;
+
+              const threadOpts = ws.telegramThreadId
+                ? { message_thread_id: ws.telegramThreadId }
+                : {};
+              bot.telegram
+                .sendMessage(chatId, congratsMsg, { parse_mode: "HTML", ...threadOpts })
+                .catch((err) => console.error(`[event-poller] merge congrats error:`, err));
+            }
+          } catch { /* skip malformed status payload */ }
         }
 
         if (ws?.telegramThreadId && (
