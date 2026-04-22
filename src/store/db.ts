@@ -46,6 +46,17 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_telegram_message_links_workspace
     ON telegram_message_links(workspace_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS bot_heartbeat (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pid INTEGER NOT NULL,
+    version TEXT,
+    started_at TEXT NOT NULL,
+    last_beat_at TEXT NOT NULL,
+    last_known_alive_at TEXT,
+    boot_count INTEGER NOT NULL DEFAULT 1,
+    last_exit_reason TEXT
+  );
 `;
 
 let _db: Database.Database | null = null;
