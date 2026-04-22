@@ -2,6 +2,19 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.4.0] - 2026-04-22
+
+### Added
+- Self-recovery: the bot now writes a heartbeat every 10s, exits cleanly on unhandled crashes, and records the exit reason so a supervisor can restart it without losing context
+- `conductor-telegram service` subcommand manages a macOS launchd LaunchAgent that keeps the bot alive across reboots, logouts, and crashes, plus a sibling watchdog agent that kickstarts the main agent if its heartbeat goes stale for more than 120s
+- `/ping` Telegram command reports bot uptime, last heartbeat age, version, pid, boot count, and last exit reason
+- Boot announcement DM to the owner chat on every restart, showing how long since the bot was last alive and (if known) why it exited
+- Timestamped structured logs for all lifecycle events so post-mortems are possible from `~/.conductor-telegram/bot.log`
+
+### Changed
+- Poll loops are now restart-proof: a single Telegram API error can no longer silently kill the forwarder or event poller
+- Shutdown path consolidated into the crash-handler module so SIGTERM, SIGINT, unhandledRejection, and uncaughtException all release resources and record an exit reason before exiting
+
 ## [0.3.3.0] - 2026-04-19
 
 ### Added
