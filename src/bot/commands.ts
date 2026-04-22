@@ -25,6 +25,7 @@ import {
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
   getWorkspaceByTelegramMessage,
+  getHeartbeat,
 } from "../store/queries.js";
 import {
   createWorkspaceTopic,
@@ -182,6 +183,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "status", description: "Show active workspace status" },
   { command: "stop", description: "Stop a running workspace" },
   { command: "repos", description: "List available repos" },
+  { command: "ping", description: "Bot liveness (uptime, heartbeat, version)" },
   { command: "help", description: "Show bot help" },
 ];
 
@@ -430,6 +432,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   for (const spec of WELL_KNOWN_SKILLS) {
     bot.command(spec.command, (ctx) => handleWellKnownSkillCommand(ctx, spec));
   }
+  bot.command("ping", handlePing);
   bot.command("help", handleHelp);
 
   // Inline button callbacks
@@ -1677,6 +1680,38 @@ async function handleSetup(ctx: Context): Promise<void> {
 
 // ── /help ───────────────────────────────────────────────────
 
+function formatAgoSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m ${seconds % 60}s`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ${mins % 60}m`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ${hrs % 24}h`;
+}
+
+async function handlePing(ctx: Context): Promise<void> {
+  const hb = getHeartbeat();
+  const uptimeSecs = Math.round(process.uptime());
+  const now = Date.now();
+
+  const lines = [`🏓 <b>pong</b>`];
+  lines.push(`<code>pid ${process.pid} · node ${process.versions.node}</code>`);
+  if (hb?.version) lines.push(`<code>v${escHtml(hb.version)}</code>`);
+  lines.push(`uptime: ${formatAgoSeconds(uptimeSecs)}`);
+
+  if (hb) {
+    const beatAgo = Math.max(0, Math.round((now - Date.parse(hb.lastBeatAt)) / 1000));
+    lines.push(`last heartbeat: ${beatAgo}s ago`);
+    lines.push(`boot #${hb.bootCount}`);
+    if (hb.lastExitReason) {
+      lines.push(`<i>last exit: ${escHtml(hb.lastExitReason)}</i>`);
+    }
+  }
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+}
+
 async function handleHelp(ctx: Context): Promise<void> {
   await ctx.reply(
     `<b>Conductor Telegram Bot</b>
@@ -1695,6 +1730,7 @@ Commands:
 /status — Show active workspace summary
 /stop &lt;name&gt; — Stop a workspace
 /repos — List repos (tap to select)
+/ping — Bot liveness (uptime, heartbeat, version)
 /help — Show this message
 
 <b>Invoking skills</b>
