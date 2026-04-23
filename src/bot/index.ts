@@ -133,10 +133,18 @@ async function syncTelegramCommands(): Promise<void> {
     scope: { type: "all_private_chats" },
   });
   const ownerChatId = getOwnerChatId();
-  if (ownerChatId !== "0") {
-    await bot.telegram.callApi("deleteMyCommands", {
-      scope: { type: "chat", chat_id: ownerChatId! },
-    });
+  // scope: "chat" only accepts private-chat or channel IDs. Supergroup IDs
+  // (starting with -100) will 400 here. Best-effort: try it for private
+  // chats only, and tolerate any failure so startup is never blocked by a
+  // commands-sync hiccup.
+  if (ownerChatId && ownerChatId !== "0" && !ownerChatId.startsWith("-")) {
+    try {
+      await bot.telegram.callApi("deleteMyCommands", {
+        scope: { type: "chat", chat_id: ownerChatId },
+      });
+    } catch (err) {
+      lifecycleLog.warn("per-chat deleteMyCommands skipped:", err);
+    }
   }
   await bot.telegram.setMyCommands(commands);
 }
@@ -508,7 +516,11 @@ async function main(): Promise<void> {
     lifecycleLog.error("telegraf error:", err);
   });
 
-  await syncTelegramCommands();
+  try {
+    await syncTelegramCommands();
+  } catch (err) {
+    lifecycleLog.warn("syncTelegramCommands failed, continuing without it:", err);
+  }
   bot.launch();
 
   // Rename existing forum topics to new "workspace · repo" format
