@@ -36,11 +36,24 @@ import {
 } from "./forum.js";
 import type { Decision, Workspace } from "../types/index.js";
 import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
-import { routeVoiceMessage, routeTextMessage, transcribeVoiceMessage } from "./ai-router.js";
+import { routeVoiceMessage, routeTextMessage, transcribeVoiceMessage, type RouteResult } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import https from "node:https";
+
+const AUTO_ROUTE_FAILURE_MESSAGE =
+  "Couldn't auto-route that. Use /run <repo> to start a workspace, or reply inside an existing workspace's topic.";
+
+function describeWorkspaceRejection(
+  workspace: Workspace | undefined,
+  chatId: string
+): string {
+  if (!workspace) return "unknown id";
+  if (workspace.telegramChatId !== chatId) return "wrong chat";
+  if (workspace.status !== "running") return `status=${workspace.status}`;
+  return "no conductor name";
+}
 
 // Map Telegram message IDs to decision IDs (for reply-based answering)
 const messageToDecision = new Map<number, number>();
@@ -1223,12 +1236,12 @@ async function tryAutoRouteText(
 async function executeRouteResult(
   ctx: Context,
   chatId: string,
-  result: { action: string; repoName?: string; workspaceId?: string; prompt: string; transcript: string },
+  result: RouteResult,
   attachments: string[] = []
 ): Promise<boolean> {
-  const promptPreview = result.prompt.slice(0, 120);
+  const promptPreview = JSON.stringify(result.prompt.slice(0, 120));
   console.log(
-    `[ai-router] decision: action=${result.action} repo=${result.repoName ?? "-"} workspaceId=${result.workspaceId ?? "-"} prompt="${promptPreview}"`
+    `[ai-router] decision: action=${result.action} repo=${result.repoName ?? "-"} workspaceId=${result.workspaceId ?? "-"} prompt=${promptPreview}`
   );
   if (result.action === "existing" && result.workspaceId) {
     const workspace = getWorkspace(result.workspaceId);
@@ -1241,14 +1254,9 @@ async function executeRouteResult(
       await sendMessageToWorkspace(ctx, workspace, result.prompt, attachments);
       return true;
     }
-    const reason = !workspace
-      ? "unknown id"
-      : workspace.telegramChatId !== chatId
-        ? "wrong chat"
-        : workspace.status !== "running"
-          ? `status=${workspace.status}`
-          : "no conductor name";
-    console.log(`[ai-router] existing rejected (${reason}); falling back to new`);
+    console.log(
+      `[ai-router] existing rejected (${describeWorkspaceRejection(workspace, chatId)}); falling back to new`
+    );
   }
 
   if (result.repoName) {
@@ -1380,9 +1388,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
     // try AI auto-routing for general-thread messages.
     const routed = await tryAutoRouteText(ctx, chatId, text);
     if (!routed) {
-      await ctx.reply(
-        "Couldn't auto-route that. Use /run <repo> to start a workspace, or reply inside an existing workspace's topic."
-      );
+      await ctx.reply(AUTO_ROUTE_FAILURE_MESSAGE);
     }
     return;
   }
@@ -1392,9 +1398,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
     // Has a selection key but no pending selection — try AI auto-routing
     const routed = await tryAutoRouteText(ctx, chatId, text);
     if (!routed) {
-      await ctx.reply(
-        "Couldn't auto-route that. Use /run <repo> to start a workspace, or reply inside an existing workspace's topic."
-      );
+      await ctx.reply(AUTO_ROUTE_FAILURE_MESSAGE);
     }
     return;
   }
