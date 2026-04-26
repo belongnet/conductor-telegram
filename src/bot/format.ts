@@ -15,6 +15,38 @@ export function truncate(s: string, maxLen: number): string {
   return s.length > maxLen ? s.slice(0, maxLen - 3) + "..." : s;
 }
 
+/** Telegram message text limit (characters). */
+export const TELEGRAM_MAX_TEXT = 4096;
+
+/**
+ * Truncate an HTML string so the total message (header + body) fits within
+ * Telegram's 4096-char limit. Strips from the end to the last complete line,
+ * closes any open tags, and appends "…".
+ */
+export function truncateHtml(html: string, maxLen: number): string {
+  if (html.length <= maxLen) return html;
+  // Cut to last newline before maxLen to avoid splitting HTML tags mid-tag
+  let cut = html.lastIndexOf("\n", maxLen - 4);
+  if (cut < maxLen * 0.3) cut = maxLen - 4; // fallback if no good newline
+  let result = html.slice(0, cut) + "\n…";
+  // Close any open tags
+  const openTags = (result.match(/<(b|i|s|u|code|pre|blockquote)[^>]*>/gi) ?? []).map(
+    (t) => t.match(/<(\w+)/)?.[1] ?? ""
+  );
+  const closeTags = (result.match(/<\/(b|i|s|u|code|pre|blockquote)>/gi) ?? []).map(
+    (t) => t.match(/<\/(\w+)/)?.[1] ?? ""
+  );
+  // Count open vs close for each tag
+  for (const tag of [...new Set(openTags)]) {
+    const opens = openTags.filter((t) => t === tag).length;
+    const closes = closeTags.filter((t) => t === tag).length;
+    for (let j = 0; j < opens - closes; j++) {
+      result += `</${tag}>`;
+    }
+  }
+  return result;
+}
+
 /**
  * Wrap text in an expandable blockquote (collapsed by default, ~3 lines shown).
  * Only wraps if the text exceeds `minLength` characters.
@@ -39,7 +71,7 @@ export function maybeExpandableQuote(text: string, minLength = 120): string {
 // Telegraf v4 doesn't expose the `style` field from Bot API 9.4.
 // We build reply_markup JSON directly so we can set button colors.
 
-export type ButtonStyle = "primary" | "success" | "danger";
+export type ButtonStyle = "primary" | "success" | "danger" | "secondary";
 
 interface StyledButton {
   text: string;
@@ -145,6 +177,8 @@ export function statusIcon(status: string): string {
       return "🔴";
     case "stopped":
       return "⏹";
+    case "archived":
+      return "🗄";
     default:
       return "⚪";
   }

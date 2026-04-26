@@ -607,8 +607,8 @@ function buildCodexReviewArgs(
 
   if (reviewBaseBranch?.trim()) {
     args.push("--base", reviewBaseBranch.trim());
-  }
-  if (prompt.trim()) {
+    // Codex CLI does not allow --base and a positional prompt together
+  } else if (prompt.trim()) {
     args.push(prompt);
   }
   return args;
@@ -1047,6 +1047,24 @@ function pickCityName(existingDirs: Set<string>): string {
   return available[Math.floor(Math.random() * available.length)];
 }
 
+async function getExistingWorkspaceBranchNames(repoPath: string): Promise<Set<string>> {
+  try {
+    const output = await execAsync(
+      `cd "${repoPath}" && git branch --format='%(refname:short)' --list 'belongcond/*'`
+    );
+    return new Set(
+      output
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("belongcond/"))
+        .map((line) => line.slice("belongcond/".length))
+        .filter((line) => line.length > 0)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 /**
  * Create a workspace programmatically: git worktree + Conductor DB records.
  * No deeplinks needed — works even when Conductor UI is busy or unresponsive.
@@ -1072,17 +1090,20 @@ export async function launchWorkspace(
 
   console.log(`[launcher] launchWorkspace called: repoPath=${repoPath}`);
 
-  // Find existing workspace directories
-  let existingDirs: Set<string>;
+  // Reserve city names already used by workspace directories or workspace branches.
+  let reservedNames: Set<string>;
   try {
     const entries = await readdir(workspacesDir);
-    existingDirs = new Set(entries);
+    reservedNames = new Set(entries);
   } catch {
-    existingDirs = new Set();
+    reservedNames = new Set();
+  }
+  for (const branchName of await getExistingWorkspaceBranchNames(repoPath)) {
+    reservedNames.add(branchName);
   }
 
   // Pick a city name for the workspace
-  const cityName = pickCityName(existingDirs);
+  const cityName = pickCityName(reservedNames);
   const branchName = `belongcond/${cityName}`;
   const workspaceDir = path.join(workspacesDir, cityName);
 
@@ -1098,13 +1119,6 @@ export async function launchWorkspace(
   // 2. Create git worktree
   try {
     const defaultBranch = repoInfo.defaultBranch ?? "main";
-    // Delete stale branch if it exists (left over from a previously deleted workspace)
-    try {
-      await execAsync(`cd "${repoPath}" && git branch -D "${branchName}" 2>/dev/null`);
-      console.log(`[launcher] Deleted stale branch ${branchName}`);
-    } catch {
-      // Branch doesn't exist — expected path
-    }
     await execAsync(`cd "${repoPath}" && git worktree add -b "${branchName}" "${workspaceDir}" "${defaultBranch}"`);
     console.log(`[launcher] Git worktree created at ${workspaceDir}`);
   } catch (err) {

@@ -7,6 +7,16 @@ import {
   trackDecisionMessage,
 } from "./commands.js";
 import {
+  installCrashHandlers,
+  startHeartbeat,
+  supervisedInterval,
+  getLogger,
+} from "./supervisor.js";
+import { initHeartbeat } from "../store/queries.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import {
   getMaxSessionMessageRowId,
   getSessionMessagesAfter,
   getSessionResult,
@@ -35,7 +45,9 @@ import {
   maybeExpandableQuote,
   styledButtons,
   styledKeyboard,
+  TELEGRAM_MAX_TEXT,
   truncate as trunc,
+  truncateHtml,
 } from "./format.js";
 import {
   closeWorkspaceTopic,
@@ -45,6 +57,25 @@ import {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
+
+const lifecycleLog = getLogger("bot");
+const pollerLog = getLogger("poller");
+const eventPollerLog = getLogger("event-poller");
+const forumLog = getLogger("forum");
+
+function readBotVersion(): string | null {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    // dist/bot/index.js → ../.. → project root
+    const pkgPath = path.resolve(here, "..", "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    return pkg.version ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export const BOT_VERSION = readBotVersion();
 
 function getOwnerChatId(): string | undefined {
   return process.env.OWNER_CHAT_ID;
@@ -103,10 +134,18 @@ async function syncTelegramCommands(): Promise<void> {
     scope: { type: "all_private_chats" },
   });
   const ownerChatId = getOwnerChatId();
-  if (ownerChatId !== "0") {
-    await bot.telegram.callApi("deleteMyCommands", {
-      scope: { type: "chat", chat_id: ownerChatId! },
-    });
+  // scope: "chat" only accepts private-chat or channel IDs. Supergroup IDs
+  // (starting with -100) will 400 here. Best-effort: try it for private
+  // chats only, and tolerate any failure so startup is never blocked by a
+  // commands-sync hiccup.
+  if (ownerChatId && ownerChatId !== "0" && !ownerChatId.startsWith("-")) {
+    try {
+      await bot.telegram.callApi("deleteMyCommands", {
+        scope: { type: "chat", chat_id: ownerChatId },
+      });
+    } catch (err) {
+      lifecycleLog.warn("per-chat deleteMyCommands skipped:", err);
+    }
   }
   await bot.telegram.setMyCommands(commands);
 }
@@ -116,8 +155,7 @@ async function syncTelegramCommands(): Promise<void> {
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 function startSessionPoller(): void {
-  pollTimer = setInterval(() => {
-    try {
+  pollTimer = supervisedInterval("poller", () => {
       const tracked = getAllWorkspaces(100);
       for (const ws of tracked) {
         if (!ws.conductorWorkspaceName) continue;
@@ -154,7 +192,7 @@ function startSessionPoller(): void {
                   ws.id
                 );
               })
-              .catch((err) => console.error(`[poller] forward error:`, err));
+              .catch((err) => pollerLog.error("forward error:", err));
           }
           updateWorkspaceForwardCursor(
             ws.id,
@@ -167,7 +205,7 @@ function startSessionPoller(): void {
           updateWorkspaceStatus(ws.id, "running");
           if (ws.telegramThreadId) {
             syncWorkspaceTopic(bot.telegram, { ...ws, status: "running" }).catch((err) =>
-              console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+              forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
             );
           }
         }
@@ -182,9 +220,13 @@ function startSessionPoller(): void {
             const stats = formatStats(result);
             if (stats) msg += `  <code>${stats}</code>`;
             if (result.resultText) {
-              msg += `\n\n${maybeExpandableQuote(
-                markdownToTelegramHtml(trunc(result.resultText, 800))
-              )}`;
+              const resultHtml = maybeExpandableQuote(
+                markdownToTelegramHtml(trunc(result.resultText, 3200))
+              );
+              msg += `\n\n${resultHtml}`;
+              if (msg.length > TELEGRAM_MAX_TEXT) {
+                msg = truncateHtml(msg, TELEGRAM_MAX_TEXT);
+              }
             }
           }
 
@@ -193,6 +235,7 @@ function startSessionPoller(): void {
               btn("🔍 Review Changes", `postdone:review:${ws.id}`, "primary"),
               btn("🔀 Generate PR", `postdone:pr:${ws.id}`, "success"),
             ],
+            [btn("Archive", `archive:${ws.id}`, "secondary")],
           ]);
 
           bot.telegram
@@ -204,11 +247,11 @@ function startSessionPoller(): void {
             .then(() => {
               if (ws.telegramThreadId) {
                 syncWorkspaceTopic(bot.telegram, { ...ws, status: "done" }).catch((err) =>
-                  console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+                  forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
                 );
               }
             })
-            .catch((err) => console.error(`[poller] notify error:`, err));
+            .catch((err) => pollerLog.error("notify error:", err));
         } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
           const name = ws.conductorWorkspaceName ?? ws.name;
@@ -218,23 +261,21 @@ function startSessionPoller(): void {
               `🔴 <b>${esc(name)}</b> encountered an error.`,
               {
                 parse_mode: "HTML",
+                ...styledButtons([btn("Archive", `archive:${ws.id}`, "secondary")]),
                 ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
               }
             )
             .then(() => {
               if (ws.telegramThreadId) {
                 syncWorkspaceTopic(bot.telegram, { ...ws, status: "failed" }).catch((err) =>
-                  console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+                  forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
                 );
                 closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
               }
             })
-            .catch((err) => console.error(`[poller] notify error:`, err));
+            .catch((err) => pollerLog.error("notify error:", err));
         }
       }
-    } catch (err) {
-      console.error("[poller] error:", err);
-    }
   }, POLL_INTERVAL_MS);
 }
 
@@ -246,8 +287,7 @@ let lastEventId = 0;
 function startEventPoller(): void {
   lastEventId = getMaxEventId();
 
-  eventPollTimer = setInterval(() => {
-    try {
+  eventPollTimer = supervisedInterval("event-poller", () => {
       const events = getNewEvents(lastEventId);
       for (const event of events) {
         lastEventId = event.id;
@@ -282,7 +322,43 @@ function startEventPoller(): void {
             .then((sentMsg) => {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
-            .catch((err) => console.error(`[event-poller] send error:`, err));
+            .catch((err) => eventPollerLog.error("send error:", err));
+        }
+
+        // ── PR celebration: fireworks when a merge request is submitted ──
+        if (event.type === "artifact" && ws) {
+          try {
+            const artifact: ArtifactPayload = JSON.parse(event.payload);
+            if (artifact.type === "pr") {
+              const chatId = ws.telegramChatId ?? getOwnerChatId()!;
+              const wsName = ws.conductorWorkspaceName ?? ws.name ?? "unknown";
+              const threadOpts = ws.telegramThreadId
+                ? { message_thread_id: ws.telegramThreadId }
+                : {};
+
+              const celebrationLines = [
+                `🎆🎇🎆🎇🎆🎇🎆🎇`,
+                ``,
+                `🎉 <b>New PR submitted!</b>`,
+                ``,
+                `<b>${esc(wsName)}</b> just opened a pull request:`,
+                `${esc(artifact.description)}`,
+                artifact.url ? `\n🔗 <a href="${esc(artifact.url).replace(/"/g, "&quot;")}">${esc(artifact.url)}</a>` : "",
+                ``,
+                `🎆🎇🎆🎇🎆🎇🎆🎇`,
+              ];
+              const celebrationMsg = celebrationLines.filter(Boolean).join("\n");
+
+              bot.telegram
+                .sendMessage(chatId, celebrationMsg, {
+                  parse_mode: "HTML",
+                  ...threadOpts,
+                })
+                .catch((err) => eventPollerLog.error("celebration send error:", err));
+            }
+          } catch {
+            // Ignore malformed artifact payloads
+          }
         }
 
         // ── Merge congratulation ──────────────────────────────
@@ -323,7 +399,7 @@ function startEventPoller(): void {
                 : {};
               bot.telegram
                 .sendMessage(chatId, congratsMsg, { parse_mode: "HTML", ...threadOpts })
-                .catch((err) => console.error(`[event-poller] merge congrats error:`, err));
+                .catch((err) => eventPollerLog.error("merge congrats error:", err));
             }
           } catch { /* skip malformed status payload */ }
         }
@@ -334,13 +410,10 @@ function startEventPoller(): void {
           event.type === "artifact"
         )) {
           syncWorkspaceTopic(bot.telegram, ws).catch((err) =>
-            console.error(`[forum] topic sync error ${ws.telegramThreadId}:`, err)
+            forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
           );
         }
       }
-    } catch (err) {
-      console.error("[event-poller] error:", err);
-    }
   }, POLL_INTERVAL_MS);
 }
 
@@ -355,8 +428,13 @@ function formatForwardedMessage(
   const text = extractAssistantText(message.content);
   if (!text) return null;
 
-  const formatted = markdownToTelegramHtml(trunc(text, 1200));
-  return `🤖 <b>${esc(workspaceName)}</b>\n\n${maybeExpandableQuote(formatted)}`;
+  const header = `🤖 <b>${esc(workspaceName)}</b>\n\n`;
+  const formatted = markdownToTelegramHtml(trunc(text, 3200));
+  const body = maybeExpandableQuote(formatted);
+  const full = header + body;
+  return full.length <= TELEGRAM_MAX_TEXT
+    ? full
+    : truncateHtml(full, TELEGRAM_MAX_TEXT);
 }
 
 function extractAssistantText(content: string): string | null {
@@ -403,49 +481,113 @@ function extractTextParts(content: unknown): string {
 }
 
 function logSetupHints(): void {
-  console.log("[setup] Use /setup for guided private-chat and forum-topic configuration.");
+  lifecycleLog.info("Use /setup for guided private-chat and forum-topic configuration.");
   if (getOwnerChatId() === "0") {
-    console.log(
-      "[setup] Bootstrap mode is enabled because OWNER_CHAT_ID=0. /start, /help, and /setup are temporarily allowed before auth so the bot can configure the active chat for you."
+    lifecycleLog.info(
+      "Bootstrap mode enabled (OWNER_CHAT_ID=0). /start, /help, and /setup are allowed before auth so the bot can configure the active chat."
     );
   }
 }
+
+function formatAgo(fromIso: string | null | undefined, nowMs: number): string {
+  if (!fromIso) return "never";
+  const then = Date.parse(fromIso);
+  if (!Number.isFinite(then)) return fromIso;
+  const secs = Math.max(0, Math.round((nowMs - then) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+async function sendBootAnnouncement(
+  previous: { lastKnownAliveAt: string | null; lastExitReason: string | null } | undefined,
+  bootCount: number
+): Promise<void> {
+  const ownerChatId = getOwnerChatId();
+  if (!ownerChatId || ownerChatId === "0") return;
+
+  const version = BOT_VERSION ?? "unknown";
+  const pid = process.pid;
+  const now = Date.now();
+
+  const lines = [
+    `🟢 <b>conductor-telegram</b> online`,
+    `<code>v${esc(version)} · pid ${pid} · boot #${bootCount}</code>`,
+  ];
+
+  if (previous?.lastKnownAliveAt) {
+    const ago = formatAgo(previous.lastKnownAliveAt, now);
+    const reason = previous.lastExitReason
+      ? ` (${esc(previous.lastExitReason)})`
+      : "";
+    lines.push(`Last alive: ${ago}${reason}`);
+  }
+
+  try {
+    await bot.telegram.sendMessage(ownerChatId, lines.join("\n"), {
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    lifecycleLog.warn("boot announcement failed:", err);
+  }
+}
+
 // ── Start ───────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  bot.catch((err: any) => {
-    console.error("[bot] error:", err);
+  const { previous, bootCount } = initHeartbeat({
+    pid: process.pid,
+    version: BOT_VERSION,
   });
 
-  await syncTelegramCommands();
+  const heartbeat = startHeartbeat();
+
+  installCrashHandlers(() => {
+    heartbeat.stop();
+    if (pollTimer) clearInterval(pollTimer);
+    if (eventPollTimer) clearInterval(eventPollTimer);
+    try {
+      bot.stop("SIGTERM");
+    } catch {
+      // best-effort
+    }
+  });
+
+  bot.catch((err: any) => {
+    lifecycleLog.error("telegraf error:", err);
+  });
+
+  try {
+    await syncTelegramCommands();
+  } catch (err) {
+    lifecycleLog.warn("syncTelegramCommands failed, continuing without it:", err);
+  }
   bot.launch();
 
   // Rename existing forum topics to new "workspace · repo" format
   const topicsWithThreads = getAllThreadedWorkspaces();
   if (topicsWithThreads.length > 0) {
     renameWorkspaceTopics(bot.telegram, topicsWithThreads).catch((err) =>
-      console.error("[startup] topic rename error:", err)
+      lifecycleLog.error("topic rename error:", err)
     );
   }
 
   startSessionPoller();
   startEventPoller();
-  console.log("  Status: Connected · Polling every 5s");
+  lifecycleLog.info(
+    `connected · polling every ${POLL_INTERVAL_MS / 1000}s · v${BOT_VERSION ?? "?"} · pid ${process.pid} · boot #${bootCount}`
+  );
   logSetupHints();
 
-  // Graceful shutdown
-  const shutdown = () => {
-    console.log("Shutting down...");
-    if (pollTimer) clearInterval(pollTimer);
-    if (eventPollTimer) clearInterval(eventPollTimer);
-    bot.stop("SIGTERM");
-    process.exit(0);
-  };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  sendBootAnnouncement(previous, bootCount).catch((err) =>
+    lifecycleLog.warn("boot announcement error:", err)
+  );
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
+  lifecycleLog.error("fatal:", err);
   process.exit(1);
 });

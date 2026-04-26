@@ -693,6 +693,135 @@
     color: var(--text);
   }
 
+  /* ===== CONTRIBUTE CTA CARDS ===== */
+  .contribute-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  @media (max-width: 640px) {
+    .contribute-grid { grid-template-columns: 1fr; }
+  }
+  .contribute-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 32px 28px;
+    text-align: center;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .contribute-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .contribute-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--accent-glow);
+  }
+  .contribute-card:hover::before { opacity: 1; }
+  .contribute-card.npm-card::before {
+    background: linear-gradient(90deg, transparent, #CB3837, transparent);
+  }
+  .contribute-card.github-card::before {
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  }
+  .contribute-card-icon {
+    width: 56px;
+    height: 56px;
+    margin: 0 auto 16px;
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .npm-card .contribute-card-icon {
+    background: rgba(203, 56, 55, 0.12);
+    border: 1px solid rgba(203, 56, 55, 0.2);
+  }
+  .github-card .contribute-card-icon {
+    background: var(--accent-dim);
+    border: 1px solid rgba(0, 212, 170, 0.15);
+  }
+  .contribute-card-icon svg {
+    width: 28px;
+    height: 28px;
+  }
+  .contribute-card h3 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .contribute-card p {
+    font-size: 14px;
+    color: var(--text-muted);
+    line-height: 1.6;
+    margin-bottom: 16px;
+  }
+  .contribute-card .btn { width: 100%; justify-content: center; }
+
+  /* ===== PR CELEBRATION BANNER ===== */
+  .pr-celebration {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 32px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
+    transition: all 0.3s;
+  }
+  .pr-celebration:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 30px var(--accent-glow);
+  }
+  .pr-celebration h3 {
+    font-size: 20px;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+  .pr-celebration p {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin-bottom: 16px;
+  }
+  .pr-celebration .pr-demo-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    background: var(--accent-dim);
+    border: 1px solid rgba(0, 212, 170, 0.3);
+    border-radius: var(--radius-md);
+    padding: 10px 24px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .pr-celebration .pr-demo-btn:hover {
+    background: rgba(0, 212, 170, 0.15);
+    box-shadow: 0 0 20px var(--accent-glow);
+  }
+
+  /* ===== FIREWORKS CANVAS ===== */
+  #fireworks-canvas {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 9999;
+  }
+
   /* ===== FOOTER ===== */
   footer {
     padding: 32px 0;
@@ -1133,10 +1262,35 @@ graph TB
 <!-- CONTRIBUTING -->
 <section id="contributing">
   <div class="container">
-    <div class="section-label">// get involved</div>
-    <h2>Contributing</h2>
-    <p class="lead">conductor-telegram is MIT licensed and open to contributions. Here's how to get started.</p>
+    <div class="section-label">// contribute to the stack</div>
+    <h2>Help build conductor-telegram</h2>
+    <p class="lead">MIT licensed and open to contributions. Install it, star it, fork it, ship a PR. Every merge gets celebrated.</p>
 
+    <!-- NPM + GitHub CTA cards -->
+    <div class="contribute-grid fade-in">
+      <div class="contribute-card npm-card">
+        <div class="contribute-card-icon">
+          <svg viewBox="0 0 256 256" fill="none"><path d="M0 256V0h256v256H0z" fill="#CB3837"/><path d="M48 48v160h80V88h48v120h32V48H48z" fill="#fff"/></svg>
+        </div>
+        <h3>Install from NPM</h3>
+        <p>Get the latest release, try it out, report bugs, suggest features. Every install matters.</p>
+        <div class="code-block" style="text-align:left;margin-bottom:16px;">
+          <span style="color:var(--text-dim);">$</span> <span style="color:var(--accent);">npm i -g conductor-telegram</span>
+        </div>
+        <a href="https://www.npmjs.com/package/conductor-telegram" class="btn btn-secondary" style="border-color:#CB3837;color:#CB3837;">View on NPM</a>
+      </div>
+      <div class="contribute-card github-card">
+        <div class="contribute-card-icon">
+          <svg viewBox="0 0 24 24" fill="var(--accent)"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        </div>
+        <h3>Contribute on GitHub</h3>
+        <p>Star the repo, open issues, submit PRs. Check out good first issues to get started quickly.</p>
+        <a href="https://github.com/belongnet/conductor-telegram" class="btn btn-primary" style="margin-bottom:8px;">Star on GitHub</a>
+        <a href="https://github.com/belongnet/conductor-telegram/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22" class="btn btn-secondary" style="font-size:13px;">Browse good first issues</a>
+      </div>
+    </div>
+
+    <!-- PR steps -->
     <div class="steps">
       <div class="step fade-in">
         <div class="step-num">1</div>
@@ -1168,16 +1322,20 @@ graph TB
       <div class="step fade-in">
         <div class="step-num">4</div>
         <div>
-          <h3>Open a PR</h3>
-          <p>Push your branch and open a pull request. Describe what you changed and why. We review everything.</p>
+          <h3>Open a PR and watch the fireworks</h3>
+          <p>Push your branch and open a pull request. Every merged PR triggers a celebration across the community.</p>
         </div>
       </div>
     </div>
 
-    <div style="margin-top:32px;">
-      <h3 style="margin-bottom:12px;">Good first issues</h3>
-      <p style="color:var(--text-muted);font-size:14px;margin-bottom:16px;">Look for issues labeled <code>good first issue</code> on GitHub. These are scoped, well-described, and a great way to get familiar with the codebase.</p>
-      <a href="https://github.com/belongnet/conductor-telegram/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22" class="btn btn-secondary">Browse good first issues</a>
+    <!-- PR Celebration demo -->
+    <div class="pr-celebration fade-in" style="margin-top:32px;">
+      <h3>Every PR gets celebrated</h3>
+      <p>When you submit a merge request, the whole community sees fireworks. Try it.</p>
+      <button class="pr-demo-btn" onclick="launchFireworks()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v8"/><path d="m4.93 10.93 1.41 1.41"/><path d="M2 18h2"/><path d="M20 18h2"/><path d="m19.07 10.93-1.41 1.41"/><path d="M22 22H2"/><path d="m9 22 3-8 3 8"/><path d="M12 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg>
+        Simulate PR Merged
+      </button>
     </div>
   </div>
 </section>
@@ -1187,6 +1345,9 @@ graph TB
     <p>Built by <a href="https://belong.net">Belong.net</a> &middot; <a href="https://conductor.build">conductor.build</a> &middot; MIT License</p>
   </div>
 </footer>
+
+<!-- Fireworks canvas -->
+<canvas id="fireworks-canvas"></canvas>
 
 <!-- Mermaid.js for architecture diagram -->
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
@@ -1217,6 +1378,131 @@ graph TB
   }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
 
   document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+
+  // ── Fireworks celebration system ──────────────────────────
+  const fwCanvas = document.getElementById('fireworks-canvas');
+  const fwCtx = fwCanvas.getContext('2d');
+  let fwParticles = [];
+  let fwAnimating = false;
+
+  function resizeFwCanvas() {
+    fwCanvas.width = window.innerWidth;
+    fwCanvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resizeFwCanvas);
+  resizeFwCanvas();
+
+  const FW_COLORS = [
+    '#00D4AA', '#3B82F6', '#F59E0B', '#22C55E', '#EF4444',
+    '#A855F7', '#EC4899', '#06B6D4', '#FAFAFA'
+  ];
+
+  class FwParticle {
+    constructor(x, y, color, angle, speed, life) {
+      this.x = x;
+      this.y = y;
+      this.color = color;
+      this.angle = angle;
+      this.speed = speed;
+      this.life = life;
+      this.maxLife = life;
+      this.vx = Math.cos(angle) * speed;
+      this.vy = Math.sin(angle) * speed;
+      this.size = Math.random() * 3 + 1;
+      this.gravity = 0.03;
+      this.friction = 0.98;
+    }
+
+    update() {
+      this.vx *= this.friction;
+      this.vy *= this.friction;
+      this.vy += this.gravity;
+      this.x += this.vx;
+      this.y += this.vy;
+      this.life--;
+    }
+
+    draw(ctx) {
+      const alpha = Math.max(0, this.life / this.maxLife);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = this.color;
+      ctx.shadowColor = this.color;
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.size * alpha, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  function createBurst(x, y) {
+    const count = 60 + Math.floor(Math.random() * 40);
+    const color = FW_COLORS[Math.floor(Math.random() * FW_COLORS.length)];
+    const color2 = FW_COLORS[Math.floor(Math.random() * FW_COLORS.length)];
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.3;
+      const speed = 2 + Math.random() * 4;
+      const life = 60 + Math.floor(Math.random() * 40);
+      const c = Math.random() > 0.5 ? color : color2;
+      fwParticles.push(new FwParticle(x, y, c, angle, speed, life));
+    }
+  }
+
+  function animateFireworks() {
+    if (!fwAnimating && fwParticles.length === 0) return;
+    fwCtx.clearRect(0, 0, fwCanvas.width, fwCanvas.height);
+
+    for (let i = fwParticles.length - 1; i >= 0; i--) {
+      fwParticles[i].update();
+      fwParticles[i].draw(fwCtx);
+      if (fwParticles[i].life <= 0) {
+        fwParticles.splice(i, 1);
+      }
+    }
+
+    if (fwParticles.length > 0 || fwAnimating) {
+      requestAnimationFrame(animateFireworks);
+    } else {
+      fwCtx.clearRect(0, 0, fwCanvas.width, fwCanvas.height);
+    }
+  }
+
+  function launchFireworks() {
+    fwAnimating = true;
+    const w = fwCanvas.width;
+    const h = fwCanvas.height;
+
+    // Initial burst cluster
+    for (let i = 0; i < 5; i++) {
+      setTimeout(() => {
+        createBurst(
+          w * 0.2 + Math.random() * w * 0.6,
+          h * 0.15 + Math.random() * h * 0.4
+        );
+      }, i * 200);
+    }
+
+    // Second wave
+    for (let i = 0; i < 4; i++) {
+      setTimeout(() => {
+        createBurst(
+          w * 0.1 + Math.random() * w * 0.8,
+          h * 0.1 + Math.random() * h * 0.5
+        );
+      }, 1200 + i * 250);
+    }
+
+    // Final grand burst
+    setTimeout(() => {
+      for (let i = 0; i < 3; i++) {
+        createBurst(w * 0.5 + (Math.random() - 0.5) * w * 0.3, h * 0.3);
+      }
+    }, 2400);
+
+    setTimeout(() => { fwAnimating = false; }, 3000);
+    animateFireworks();
+  }
 </script>
 
 </body>

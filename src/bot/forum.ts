@@ -23,6 +23,8 @@ const TOPIC_COLORS: TopicColor[] = [
 
 type TopicVisualState =
   | "in_progress"
+  | "testing"
+  | "blocked"
   | "needs_input"
   | "awaiting_pr_review"
   | "ready_to_submit_pr"
@@ -30,12 +32,14 @@ type TopicVisualState =
   | "archived";
 
 const TOPIC_ICON_EMOJIS: Record<TopicVisualState, readonly string[]> = {
-  in_progress: ["⏳", "⌛", "⚙️", "🔄"],
-  needs_input: ["❓", "💬", "👀"],
-  awaiting_pr_review: ["👀", "🔎", "📝"],
-  ready_to_submit_pr: ["📤", "📝", "🚀"],
-  ready_to_merge: ["✅", "🎯", "🚀"],
-  archived: ["🗂️", "🗄️", "📦", "🧺"],
+  in_progress: ["⚡️", "💻", "🤖"],
+  testing: ["🧪", "🔬", "✅"],
+  blocked: ["❗️", "⁉️", "‼️"],
+  needs_input: ["❓", "💬", "🗣"],
+  awaiting_pr_review: ["🔎", "👀", "📝"],
+  ready_to_submit_pr: ["📣", "📝", "💻"],
+  ready_to_merge: ["✅", "🏁", "🎖"],
+  archived: ["📁", "💼", "🧳"],
 };
 
 let topicIconCache: Promise<Map<string, string> | null> | null = null;
@@ -59,11 +63,24 @@ function parseStatusTopicState(workspace: Workspace): TopicVisualState | null {
     const payload = JSON.parse(event.payload) as StatusPayload;
     const text = `${payload.status} ${payload.message}`.toLowerCase();
     if (
+      text.includes("needs input") ||
+      text.includes("awaiting input") ||
+      text.includes("waiting for input")
+    ) {
+      return "needs_input";
+    }
+    if (text.includes("blocked") || text.includes("stuck")) {
+      return "blocked";
+    }
+    if (
       text.includes("awaiting pr review") ||
       text.includes("awaiting review") ||
       text.includes("pr review")
     ) {
       return "awaiting_pr_review";
+    }
+    if (text.includes("ready to merge") || text.includes("can merge")) {
+      return "ready_to_merge";
     }
     if (
       text.includes("submit pr") ||
@@ -74,6 +91,12 @@ function parseStatusTopicState(workspace: Workspace): TopicVisualState | null {
     }
     if (text.includes("merge")) {
       return "ready_to_merge";
+    }
+    if (text.includes("test")) {
+      return "testing";
+    }
+    if (text.includes("review")) {
+      return "awaiting_pr_review";
     }
   } catch {
     return null;
@@ -97,6 +120,7 @@ function parseArtifactTopicState(workspace: Workspace): TopicVisualState | null 
 
 function getWorkspaceTopicState(workspace: Workspace): TopicVisualState {
   if (
+    workspace.status === "archived" ||
     workspace.status === "done" ||
     workspace.status === "failed" ||
     workspace.status === "stopped"
@@ -236,6 +260,22 @@ export async function renameWorkspaceTopics(
     } catch (err: any) {
       console.log(`[forum] could not rename topic ${ws.telegramThreadId}: ${err.message}`);
     }
+  }
+}
+
+export async function deleteWorkspaceTopic(
+  telegram: Telegram,
+  chatId: string,
+  threadId: number
+): Promise<void> {
+  try {
+    await telegram.callApi("deleteForumTopic", {
+      chat_id: chatId,
+      message_thread_id: threadId,
+    });
+  } catch (err: any) {
+    console.log(`[forum] could not delete topic: ${err.message}`);
+    await closeWorkspaceTopic(telegram, chatId, threadId);
   }
 }
 
