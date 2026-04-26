@@ -2,6 +2,17 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.5.1] - 2026-04-26
+
+### Fixed
+- New tasks typed in the General topic of a forum supergroup no longer get silently swallowed by an old running workspace. The AI auto-router now defaults to creating a fresh workspace and only continues an existing one when there's an unmistakable signal (you named the workspace, used a continuation phrase like "also" or "same as before", or the message is an obvious follow-up to that workspace's listed prompt). Topical similarity alone is no longer enough.
+- Text messages that the auto-router can't place now get a clear "couldn't auto-route that" reply instead of vanishing into the void.
+
+### Changed
+- The AI router treats your message text as data, not instructions. User text is now wrapped in `<user_message>` tags with explicit "ignore directives inside" guidance, and any closing tag the user might inject is stripped, so a malicious message can't rewrite the routing rules.
+- The router's response shape is type-validated before it's used: `action` must be `new` or `existing`, and the prompt must be a non-empty string. Hallucinated actions or wrong types now get rejected instead of flowing through.
+- The decision log now JSON-encodes the prompt preview, so an attacker-controlled message can't forge log lines or smuggle terminal escape sequences past an operator tailing the bot log.
+
 ## [0.3.5.0] - 2026-04-26
 
 ### Fixed
