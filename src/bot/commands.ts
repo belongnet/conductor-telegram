@@ -1226,6 +1226,10 @@ async function executeRouteResult(
   result: { action: string; repoName?: string; workspaceId?: string; prompt: string; transcript: string },
   attachments: string[] = []
 ): Promise<boolean> {
+  const promptPreview = result.prompt.slice(0, 120);
+  console.log(
+    `[ai-router] decision: action=${result.action} repo=${result.repoName ?? "-"} workspaceId=${result.workspaceId ?? "-"} prompt="${promptPreview}"`
+  );
   if (result.action === "existing" && result.workspaceId) {
     const workspace = getWorkspace(result.workspaceId);
     if (
@@ -1237,7 +1241,14 @@ async function executeRouteResult(
       await sendMessageToWorkspace(ctx, workspace, result.prompt, attachments);
       return true;
     }
-    // Workspace not found — fall through to create new
+    const reason = !workspace
+      ? "unknown id"
+      : workspace.telegramChatId !== chatId
+        ? "wrong chat"
+        : workspace.status !== "running"
+          ? `status=${workspace.status}`
+          : "no conductor name";
+    console.log(`[ai-router] existing rejected (${reason}); falling back to new`);
   }
 
   if (result.repoName) {
@@ -1246,6 +1257,7 @@ async function executeRouteResult(
       await startWorkspaceFromMessage(ctx, resolved, result.prompt, attachments);
       return true;
     }
+    console.log(`[ai-router] unresolvable repo: ${result.repoName}`);
   }
 
   return false;
@@ -1366,14 +1378,24 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   if (!selectionKey) {
     // No reply context, no forum thread, no pending selection key —
     // try AI auto-routing for general-thread messages.
-    await tryAutoRouteText(ctx, chatId, text);
+    const routed = await tryAutoRouteText(ctx, chatId, text);
+    if (!routed) {
+      await ctx.reply(
+        "Couldn't auto-route that. Use /run <repo> to start a workspace, or reply inside an existing workspace's topic."
+      );
+    }
     return;
   }
 
   const pendingSelection = pendingRepoSelection.get(selectionKey);
   if (!pendingSelection) {
     // Has a selection key but no pending selection — try AI auto-routing
-    await tryAutoRouteText(ctx, chatId, text);
+    const routed = await tryAutoRouteText(ctx, chatId, text);
+    if (!routed) {
+      await ctx.reply(
+        "Couldn't auto-route that. Use /run <repo> to start a workspace, or reply inside an existing workspace's topic."
+      );
+    }
     return;
   }
 
