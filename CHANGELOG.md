@@ -2,6 +2,12 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.5.0] - 2026-04-26
+
+### Fixed
+- Deleted forum topics now come back. If you (or anyone) deletes a workspace's topic in Telegram, the bot detects the failure on the next message, recreates the topic with the correct status icon, updates its records, and delivers the message to the new thread. No more silent black holes.
+- Failed workspaces no longer get their topic auto-closed. The topic stays open with the red icon so you can reply, retry, or investigate, the same way completed workspaces do. Topics still close on `/stop` or the Stop button (the cases where you actually meant to put it away).
+
 ## [0.3.4.0] - 2026-04-22
 
 ### Added
