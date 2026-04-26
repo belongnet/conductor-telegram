@@ -1037,9 +1037,9 @@
 <!-- HOW IT WORKS -->
 <section id="how-it-works">
   <div class="container">
-    <div class="section-label">// how it works</div>
-    <h2>CLI meets Telegram</h2>
-    <p class="lead">The CLI runs the bot process. Telegram is the interface. Agents communicate through MCP.</p>
+    <div class="section-label">// dogfooded</div>
+    <h2>Built with itself</h2>
+    <p class="lead">The merge-congrats feature on this very bot? Shipped from a single voice message. Voice prompt &rarr; working feature &rarr; PR &rarr; merged &mdash; all from the phone, without ever opening a laptop. <a href="https://github.com/belongnet/conductor-telegram/pull/29" style="color:var(--accent);">See PR&nbsp;#29 &rarr;</a></p>
 
     <div class="side-by-side">
       <div>
@@ -1083,29 +1083,29 @@
           </div>
         </div>
         <div class="tg-messages">
+          <div class="tg-msg user">
+            <div class="label">&#127908; voice &middot; 0:09</div>
+            "Build a feature that sends a congratulatory message when a successful merge request is completed."
+            <div class="time">14:02</div>
+          </div>
           <div class="tg-msg bot">
-            <div class="label">conductor / api-refactor</div>
-            Agent started on <code>conductor-telegram</code>
-            <div class="time">20:41</div>
+            <div class="label">conductor-telegram / windhoek</div>
+            Agent started. Routing voice prompt to a fresh workspace.
+            <div class="time">14:02</div>
           </div>
           <div class="tg-msg bot">
             <div class="label">status</div>
-            Analyzing codebase. Found 12 source files across 5 modules. Planning refactor...
-            <div class="time">20:42</div>
-          </div>
-          <div class="tg-msg bot">
-            <div class="label">&#9888; approval needed</div>
-            Agent wants to restructure <code>commands.ts</code> into 4 smaller modules. Approve?
-            <div class="time">20:44</div>
-          </div>
-          <div class="tg-msg user">
-            Yes, go ahead. Keep the existing exports.
-            <div class="time">20:45</div>
+            Detecting merge keywords in the event poller. Adding <code>getArtifactEvents()</code> to surface the PR link.
+            <div class="time">14:08</div>
           </div>
           <div class="tg-msg bot">
             <div class="label">artifact</div>
-            PR #48 created: <code>refactor: split commands</code><br>+412 -389 across 6 files
-            <div class="time">20:51</div>
+            PR #29 opened: <code>feat: send congrats message when workspace reports a merge</code><br>+61 &minus;1 across 2 files
+            <div class="time">14:14</div>
+          </div>
+          <div class="tg-msg bot">
+            &#127881;&#127881;&#127881;<br><br><b>windhoek</b> &mdash; PR merged successfully!
+            <div class="time">14:21</div>
           </div>
         </div>
       </div>

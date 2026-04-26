@@ -294,6 +294,22 @@ export function getLatestEventByType(
     : undefined;
 }
 
+export function getArtifactEvents(workspaceId: string): WorkspaceEvent[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM events WHERE workspace_id = ? AND type = 'artifact' ORDER BY id DESC"
+    )
+    .all(workspaceId) as any[];
+  return rows.map((r) => ({
+    id: r.id,
+    workspaceId: r.workspace_id,
+    type: r.type as EventType,
+    payload: r.payload,
+    createdAt: r.created_at,
+  }));
+}
+
 // ── Decisions ───────────────────────────────────────────────
 
 export function createDecision(
