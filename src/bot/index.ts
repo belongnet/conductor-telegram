@@ -35,7 +35,12 @@ import {
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
 } from "../store/queries.js";
-import type { ArtifactPayload, HumanRequestPayload, StatusPayload } from "../types/index.js";
+import type {
+  ArtifactPayload,
+  HumanRequestPayload,
+  StatusPayload,
+  Workspace,
+} from "../types/index.js";
 import {
   btn,
   escHtml as esc,
@@ -50,7 +55,7 @@ import {
   truncateHtml,
 } from "./format.js";
 import {
-  closeWorkspaceTopic,
+  ensureWorkspaceTopic,
   renameWorkspaceTopics,
   syncWorkspaceTopic,
 } from "./forum.js";
@@ -150,6 +155,43 @@ async function syncTelegramCommands(): Promise<void> {
   await bot.telegram.setMyCommands(commands);
 }
 
+// ── Topic-safe message sending ───────────────────────────────
+
+/**
+ * Send a message to a workspace's topic, recreating the topic if it was deleted.
+ */
+async function sendToWorkspaceTopic(
+  ws: Workspace,
+  text: string,
+  extra: Record<string, any> = {}
+): ReturnType<typeof bot.telegram.sendMessage> {
+  const threadOpts = ws.telegramThreadId
+    ? { message_thread_id: ws.telegramThreadId }
+    : {};
+  try {
+    return await bot.telegram.sendMessage(ws.telegramChatId, text, {
+      ...extra,
+      ...threadOpts,
+    });
+  } catch (err: any) {
+    const msg = String(err?.message ?? "").toLowerCase();
+    const isDeleted =
+      msg.includes("message_thread_not_found") ||
+      msg.includes("topic_deleted") ||
+      msg.includes("thread not found") ||
+      (msg.includes("bad request") && msg.includes("thread"));
+
+    if (!isDeleted || !ws.telegramThreadId) throw err;
+
+    const newThreadId = await ensureWorkspaceTopic(bot.telegram, ws);
+    const newThreadOpts = newThreadId ? { message_thread_id: newThreadId } : {};
+    return await bot.telegram.sendMessage(ws.telegramChatId, text, {
+      ...extra,
+      ...newThreadOpts,
+    });
+  }
+}
+
 // ── Conductor session status polling ─────────────────────────
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -180,11 +222,7 @@ function startSessionPoller(): void {
               message
             );
             if (!forwarded) continue;
-            bot.telegram
-              .sendMessage(ws.telegramChatId, forwarded, {
-                parse_mode: "HTML",
-                ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
-              })
+            sendToWorkspaceTopic(ws, forwarded, { parse_mode: "HTML" })
               .then((sent) => {
                 linkTelegramMessage(
                   ws.telegramChatId,
@@ -238,11 +276,9 @@ function startSessionPoller(): void {
             [btn("Archive", `archive:${ws.id}`, "secondary")],
           ]);
 
-          bot.telegram
-            .sendMessage(ws.telegramChatId, msg, {
+          sendToWorkspaceTopic(ws, msg, {
               parse_mode: "HTML",
               ...postDoneButtons,
-              ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
             })
             .then(() => {
               if (ws.telegramThreadId) {
@@ -255,22 +291,15 @@ function startSessionPoller(): void {
         } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
           const name = ws.conductorWorkspaceName ?? ws.name;
-          bot.telegram
-            .sendMessage(
-              ws.telegramChatId,
-              `🔴 <b>${esc(name)}</b> encountered an error.`,
-              {
-                parse_mode: "HTML",
-                ...styledButtons([btn("Archive", `archive:${ws.id}`, "secondary")]),
-                ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
-              }
-            )
+          sendToWorkspaceTopic(ws, `🔴 <b>${esc(name)}</b> encountered an error.`, {
+              parse_mode: "HTML",
+              ...styledButtons([btn("Archive", `archive:${ws.id}`, "secondary")]),
+            })
             .then(() => {
               if (ws.telegramThreadId) {
                 syncWorkspaceTopic(bot.telegram, { ...ws, status: "failed" }).catch((err) =>
                   forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
                 );
-                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
               }
             })
             .catch((err) => pollerLog.error("notify error:", err));
@@ -314,11 +343,10 @@ function startEventPoller(): void {
               )
             : {};
 
-          const threadOpts = ws?.telegramThreadId
-            ? { message_thread_id: ws.telegramThreadId }
-            : {};
-          bot.telegram
-            .sendMessage(chatId, text, { parse_mode: "HTML", ...buttons, ...threadOpts })
+          const sendFn = ws
+            ? sendToWorkspaceTopic(ws, text, { parse_mode: "HTML", ...buttons })
+            : bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML", ...buttons });
+          sendFn
             .then((sentMsg) => {
               trackDecisionMessage(sentMsg.message_id, payload.decisionId);
             })
@@ -330,11 +358,7 @@ function startEventPoller(): void {
           try {
             const artifact: ArtifactPayload = JSON.parse(event.payload);
             if (artifact.type === "pr") {
-              const chatId = ws.telegramChatId ?? getOwnerChatId()!;
               const wsName = ws.conductorWorkspaceName ?? ws.name ?? "unknown";
-              const threadOpts = ws.telegramThreadId
-                ? { message_thread_id: ws.telegramThreadId }
-                : {};
 
               const celebrationLines = [
                 `🎆🎇🎆🎇🎆🎇🎆🎇`,
@@ -349,11 +373,7 @@ function startEventPoller(): void {
               ];
               const celebrationMsg = celebrationLines.filter(Boolean).join("\n");
 
-              bot.telegram
-                .sendMessage(chatId, celebrationMsg, {
-                  parse_mode: "HTML",
-                  ...threadOpts,
-                })
+              sendToWorkspaceTopic(ws, celebrationMsg, { parse_mode: "HTML" })
                 .catch((err) => eventPollerLog.error("celebration send error:", err));
             }
           } catch {
@@ -374,7 +394,6 @@ function startEventPoller(): void {
               text.includes("pull request merged")
             ) {
               const wsName = ws.conductorWorkspaceName ?? ws.name;
-              const chatId = ws.telegramChatId ?? getOwnerChatId()!;
 
               // Find any PR artifact URL for this workspace
               let prLink = "";
@@ -394,11 +413,7 @@ function startEventPoller(): void {
                 `<b>${esc(wsName)}</b> — PR merged successfully!` +
                 prLink;
 
-              const threadOpts = ws.telegramThreadId
-                ? { message_thread_id: ws.telegramThreadId }
-                : {};
-              bot.telegram
-                .sendMessage(chatId, congratsMsg, { parse_mode: "HTML", ...threadOpts })
+              sendToWorkspaceTopic(ws, congratsMsg, { parse_mode: "HTML" })
                 .catch((err) => eventPollerLog.error("merge congrats error:", err));
             }
           } catch { /* skip malformed status payload */ }
