@@ -2,6 +2,12 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.5.1] - 2026-04-28
+
+### Fixed
+- Inline keyboard buttons (decision options on `❓` questions, post-done Review/PR buttons, /list stop+archive, /run repo selection, setup "Use This Chat") were being rejected by Telegram with `400 Bad Request: can't parse inline keyboard button: invalid button style specified`, which dropped the entire `sendMessage` call. The result was that questions arrived without their answer buttons, or didn't arrive at all. Telegram's Bot API does not accept the `style` field that v0.3.0 added in pursuit of "Bot API 9.4 button styles." The field is now gone from the wire format and from `btn()`'s signature.
+- AskUserQuestion forwarding read the wrong shape from the agent's tool input, so every `❓` request landed on Telegram with the placeholder text "Agent is asking a question" and no answer buttons, even when the agent supplied a real question and a list of choices. Claude Code now ships the prompt as `questions: [{ question, options: [{ label, description }] }]` (with up to four questions per call); the launcher's detector previously expected the long-deprecated flat shape `{ question, options: string[] }`. The detector now reads the new shape, falls back to the legacy one, and unwraps option objects to their `label` for button text. Multi-question calls collapse to the first question with the others appended to the body so they remain visible.
+
 ## [0.3.5.0] - 2026-04-26
 
 ### Fixed
