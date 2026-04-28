@@ -2,6 +2,17 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.6.0] - 2026-04-28
+
+### Added
+- Photos, voice notes, documents, audio, video, and animated GIFs sent from Telegram now all reach the agent as inline attachments. Documents/audio/video/animation paths previously fell on the floor; they're now downloaded, staged into the workspace's `.context/attachments/` directory, and exposed to the agent like photos already were.
+- Agent replies that reference local workspace files render as actual Telegram media instead of plain Markdown links. Markdown image syntax `![alt](path/to/file)` ships as a `sendPhoto`, plain `[name](path)` ships as a `sendDocument`, and the right call (`sendVideo` / `sendAudio` / `sendAnimation`) is picked from the file extension. When the agent emits 2-10 files in one message they ride on a single `sendMediaGroup`; >10 splits into successive groups.
+- `report_artifact` calls of type `file` now upload the actual file inline when the artifact's path resolves inside the workspace, with a caption summarizing the artifact. Remote URLs continue to render as a plain link.
+- Long agent text (>1024 chars) automatically falls out of the media caption and gets sent as a separate follow-up message so Telegram's caption cap never silently drops content.
+
+### Changed
+- The forwarder's `formatForwardedMessage` now returns both cleaned text and a media list, and the topic-recovery layer was extended to media (`sendPhoto` / `sendDocument` / `sendMediaGroup` all recreate a deleted forum topic on the fly, the same way the existing `sendToWorkspaceTopic` does).
+
 ## [0.3.5.1] - 2026-04-28
 
 ### Fixed
