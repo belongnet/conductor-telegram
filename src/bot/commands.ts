@@ -174,7 +174,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "send", description: "Send a follow-up to a workspace" },
   { command: "skills", description: "List available skills" },
   { command: "skill", description: "Invoke a workspace skill by name" },
-  { command: "gstack", description: "Run the GStack / Graphite workflow" },
+  { command: "gstack", description: "Ask the agent to use GStack skills" },
   ...WELL_KNOWN_SKILLS.map((s) => ({
     command: s.command,
     description: s.description,
@@ -352,14 +352,27 @@ function applySkillHashtag(text: string): string {
 
 function buildGstackPrompt(extraInstructions: string): string {
   const lines = [
-    "Use the GStack or Graphite workflow in this workspace.",
-    "If `gstack`, `gt`, or the Graphite CLI is available, use it.",
-    "If the tooling is missing, explain exactly what is unavailable and stop.",
+    "Use the GStack skills available in this workspace.",
+    "GStack provides Claude Code skills such as /ship, /qa, /browse, /review, /health, /investigate, /design-review, and others.",
   ];
 
   if (extraInstructions.trim()) {
-    lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
+    lines.push(
+      "Choose the appropriate skill based on the instructions below.",
+      "",
+      `Additional instructions:\n${extraInstructions.trim()}`
+    );
+  } else {
+    lines.push(
+      "List the available GStack skills in this workspace and ask which one to run.",
+      "Do NOT invoke any skill automatically without explicit instructions."
+    );
   }
+
+  lines.push(
+    "",
+    "If no GStack skills are available, explain what is missing and stop."
+  );
 
   return lines.join("\n");
 }
@@ -1520,7 +1533,7 @@ async function handleSkills(ctx: Context): Promise<void> {
 
   const sections: string[] = [];
   const builtInLines = [
-    `<code>gstack</code> — GStack / Graphite workflow`,
+    `<code>gstack</code> — Use the GStack skills available in this workspace`,
     ...WELL_KNOWN_SKILLS.map(
       (s) => `<code>${escHtml(s.skill)}</code> — ${escHtml(s.description)}`
     ),
@@ -1719,7 +1732,7 @@ Commands:
 /review &lt;workspace&gt; [instructions] — Start a review session
 /skills [workspace] — List built-in and workspace skills
 /skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
-/gstack [workspace] [instructions] — Run the GStack/Graphite workflow
+/gstack [workspace] [instructions] — Ask the agent to use GStack skills
 /ship, /qa, /investigate, /retro, /health, /checkpoint — Shortcut skills
 /workspaces — List all tracked workspaces
 /status — Show active workspace summary
