@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
+  CONDUCTOR_WORKSPACES_DIR,
   getMaxSessionMessageRowId,
   getSessionMessagesAfter,
   getSessionResult,
@@ -59,6 +60,15 @@ import {
   renameWorkspaceTopics,
   syncWorkspaceTopic,
 } from "./forum.js";
+import {
+  classifyByExtension,
+  extractInlineMedia,
+  TELEGRAM_CAPTION_MAX,
+  TELEGRAM_MEDIA_GROUP_MAX,
+  TELEGRAM_MAX_UPLOAD_BYTES,
+  type InlineMediaItem,
+} from "./media.js";
+import { existsSync, statSync } from "node:fs";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
@@ -192,6 +202,149 @@ async function sendToWorkspaceTopic(
   }
 }
 
+/**
+ * Send agent text plus any inline media items to a workspace's topic.
+ *
+ * - 0 media: same as `sendToWorkspaceTopic`.
+ * - 1 media: singular `sendPhoto`/`sendDocument`/`sendVideo`/`sendAudio`/`sendAnimation`
+ *   with the text as caption (or as a follow-up text message when text exceeds the
+ *   1024-char Telegram caption cap).
+ * - N media (2-10): one `sendMediaGroup` call with the caption attached to the first
+ *   item. >10 splits into successive groups; the caption only rides the first group.
+ * - HTML mode is forwarded for both the caption (when it fits) and the trailing text.
+ * - Topic-recovery semantics mirror `sendToWorkspaceTopic`.
+ */
+async function sendForwardToWorkspaceTopic(
+  ws: Workspace,
+  htmlText: string,
+  media: InlineMediaItem[]
+): Promise<void> {
+  if (media.length === 0) {
+    await sendToWorkspaceTopic(ws, htmlText, { parse_mode: "HTML" })
+      .then((sent) => {
+        linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id);
+      });
+    return;
+  }
+
+  const captionFits = htmlText.length > 0 && htmlText.length <= TELEGRAM_CAPTION_MAX;
+  const captionForFirst = captionFits ? htmlText : undefined;
+  const trailingText = captionFits ? "" : htmlText;
+
+  if (media.length === 1) {
+    const item = media[0];
+    const sentMessageId = await sendSingleMediaToWorkspaceTopic(
+      ws,
+      item,
+      captionForFirst
+    );
+    if (sentMessageId !== null) {
+      linkTelegramMessage(ws.telegramChatId, String(sentMessageId), ws.id);
+    }
+  } else {
+    // Split into chunks of 10 (Telegram's media-group cap). The caption rides the
+    // very first item of the very first group; the rest go captionless.
+    let isFirstChunk = true;
+    for (let i = 0; i < media.length; i += TELEGRAM_MEDIA_GROUP_MAX) {
+      const chunk = media.slice(i, i + TELEGRAM_MEDIA_GROUP_MAX);
+      const caption = isFirstChunk ? captionForFirst : undefined;
+      isFirstChunk = false;
+      const sentMessages = await sendMediaGroupToWorkspaceTopic(ws, chunk, caption);
+      for (const sent of sentMessages) {
+        linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id);
+      }
+    }
+  }
+
+  if (trailingText) {
+    await sendToWorkspaceTopic(ws, trailingText, { parse_mode: "HTML" }).then((sent) => {
+      linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id);
+    });
+  }
+}
+
+async function sendSingleMediaToWorkspaceTopic(
+  ws: Workspace,
+  item: InlineMediaItem,
+  captionHtml: string | undefined
+): Promise<number | null> {
+  const baseExtra: Record<string, any> = captionHtml
+    ? { caption: captionHtml, parse_mode: "HTML" }
+    : {};
+  const send = async (extra: Record<string, any>) => {
+    const file = { source: item.filePath, filename: item.filename };
+    switch (item.kind) {
+      case "photo":
+        return bot.telegram.sendPhoto(ws.telegramChatId, file as any, extra);
+      case "video":
+        return bot.telegram.sendVideo(ws.telegramChatId, file as any, extra);
+      case "audio":
+        return bot.telegram.sendAudio(ws.telegramChatId, file as any, extra);
+      case "animation":
+        return bot.telegram.sendAnimation(ws.telegramChatId, file as any, extra);
+      case "document":
+      default:
+        return bot.telegram.sendDocument(ws.telegramChatId, file as any, extra);
+    }
+  };
+
+  const threadOpts = ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {};
+  try {
+    const sent = await send({ ...baseExtra, ...threadOpts });
+    return sent.message_id;
+  } catch (err: any) {
+    if (!isDeletedThreadError(err) || !ws.telegramThreadId) {
+      eventPollerLog.error("media send error:", err);
+      return null;
+    }
+    const newThreadId = await ensureWorkspaceTopic(bot.telegram, ws);
+    const newThreadOpts = newThreadId ? { message_thread_id: newThreadId } : {};
+    const sent = await send({ ...baseExtra, ...newThreadOpts });
+    return sent.message_id;
+  }
+}
+
+async function sendMediaGroupToWorkspaceTopic(
+  ws: Workspace,
+  items: InlineMediaItem[],
+  captionHtml: string | undefined
+): Promise<{ message_id: number }[]> {
+  const group = items.map((item, index) => {
+    const base: any = {
+      type: item.kind === "animation" ? "document" : item.kind,
+      media: { source: item.filePath, filename: item.filename },
+    };
+    if (index === 0 && captionHtml) {
+      base.caption = captionHtml;
+      base.parse_mode = "HTML";
+    }
+    return base;
+  });
+
+  const threadOpts = ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {};
+  try {
+    return await bot.telegram.sendMediaGroup(ws.telegramChatId, group, threadOpts);
+  } catch (err: any) {
+    if (!isDeletedThreadError(err) || !ws.telegramThreadId) {
+      eventPollerLog.error("media group send error:", err);
+      return [];
+    }
+    const newThreadId = await ensureWorkspaceTopic(bot.telegram, ws);
+    const newThreadOpts = newThreadId ? { message_thread_id: newThreadId } : {};
+    return await bot.telegram.sendMediaGroup(ws.telegramChatId, group, newThreadOpts);
+  }
+}
+
+function isDeletedThreadError(err: any): boolean {
+  const msg = String(err?.message ?? "").toLowerCase();
+  return (
+    msg.includes("message_thread_not_found") ||
+    msg.includes("topic_deleted") ||
+    msg.includes("thread not found") ||
+    (msg.includes("bad request") && msg.includes("thread"))
+  );
+}
+
 // ── Conductor session status polling ─────────────────────────
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -216,20 +369,15 @@ function startSessionPoller(): void {
           ws.lastForwardedMessageRowid
         );
         if (newMessages.length > 0) {
+          const wsDir = workspaceDirFor(ws);
           for (const message of newMessages) {
             const forwarded = formatForwardedMessage(
               ws.conductorWorkspaceName,
-              message
+              message,
+              wsDir
             );
             if (!forwarded) continue;
-            sendToWorkspaceTopic(ws, forwarded, { parse_mode: "HTML" })
-              .then((sent) => {
-                linkTelegramMessage(
-                  ws.telegramChatId,
-                  String(sent.message_id),
-                  ws.id
-                );
-              })
+            sendForwardToWorkspaceTopic(ws, forwarded.text, forwarded.media)
               .catch((err) => pollerLog.error("forward error:", err));
           }
           updateWorkspaceForwardCursor(
@@ -375,6 +523,23 @@ function startEventPoller(): void {
 
               sendToWorkspaceTopic(ws, celebrationMsg, { parse_mode: "HTML" })
                 .catch((err) => eventPollerLog.error("celebration send error:", err));
+            } else if (artifact.type === "file") {
+              const wsName = ws.conductorWorkspaceName ?? ws.name ?? "unknown";
+              const wsDir = workspaceDirFor(ws);
+              const localItem = resolveArtifactFile(artifact, wsDir);
+              const captionHtml =
+                `📎 <b>${esc(wsName)}</b>: ${esc(artifact.description)}` +
+                (artifact.url && /^https?:\/\//i.test(artifact.url)
+                  ? `\n🔗 <a href="${esc(artifact.url).replace(/"/g, "&quot;")}">${esc(artifact.url)}</a>`
+                  : "");
+
+              if (localItem) {
+                sendForwardToWorkspaceTopic(ws, captionHtml, [localItem])
+                  .catch((err) => eventPollerLog.error("file artifact send error:", err));
+              } else {
+                sendToWorkspaceTopic(ws, captionHtml, { parse_mode: "HTML" })
+                  .catch((err) => eventPollerLog.error("file artifact send error:", err));
+              }
             }
           } catch {
             // Ignore malformed artifact payloads
@@ -434,8 +599,9 @@ function startEventPoller(): void {
 
 function formatForwardedMessage(
   workspaceName: string,
-  message: SessionMessage
-): string | null {
+  message: SessionMessage,
+  workspaceDir: string | null
+): { text: string; media: InlineMediaItem[] } | null {
   if (message.role !== "assistant") {
     return null;
   }
@@ -443,13 +609,58 @@ function formatForwardedMessage(
   const text = extractAssistantText(message.content);
   if (!text) return null;
 
-  const header = `🤖 <b>${esc(workspaceName)}</b>\n\n`;
-  const formatted = markdownToTelegramHtml(trunc(text, 3200));
+  // Strip markdown image/link refs that point at local files in the workspace,
+  // and ship them as real Telegram attachments instead.
+  const { cleanedText, media } = workspaceDir
+    ? extractInlineMedia(text, workspaceDir)
+    : { cleanedText: text, media: [] as InlineMediaItem[] };
+
+  const headerLine = `🤖 <b>${esc(workspaceName)}</b>`;
+  if (!cleanedText.trim()) {
+    // Assistant turn was nothing but file refs. Send media with a bare header
+    // (or nothing if there's also no media to ship).
+    if (media.length === 0) return null;
+    return { text: headerLine, media };
+  }
+
+  const formatted = markdownToTelegramHtml(trunc(cleanedText, 3200));
   const body = maybeExpandableQuote(formatted);
-  const full = header + body;
-  return full.length <= TELEGRAM_MAX_TEXT
-    ? full
-    : truncateHtml(full, TELEGRAM_MAX_TEXT);
+  const full = `${headerLine}\n\n${body}`;
+  const truncated =
+    full.length <= TELEGRAM_MAX_TEXT ? full : truncateHtml(full, TELEGRAM_MAX_TEXT);
+  return { text: truncated, media };
+}
+
+function workspaceDirFor(ws: Workspace): string | null {
+  if (!ws.conductorWorkspaceName) return null;
+  const repoName = path.basename(ws.repoPath);
+  const dir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, ws.conductorWorkspaceName);
+  return existsSync(dir) ? dir : null;
+}
+
+function resolveArtifactFile(
+  artifact: ArtifactPayload,
+  wsDir: string | null
+): InlineMediaItem | null {
+  // Reuse the same shape as text-extracted media: only honor local-file refs,
+  // skip remote URLs (they keep their <a href> link rendering above).
+  const url = artifact.url ?? "";
+  if (!url || /^https?:\/\//i.test(url)) return null;
+
+  let p = url.startsWith("file://") ? url.slice("file://".length) : url;
+  if (!path.isAbsolute(p) && wsDir) p = path.join(wsDir, p);
+  if (!existsSync(p)) return null;
+  try {
+    const stat = statSync(p);
+    if (!stat.isFile() || stat.size > TELEGRAM_MAX_UPLOAD_BYTES) return null;
+  } catch {
+    return null;
+  }
+  return {
+    kind: classifyByExtension(p),
+    filePath: p,
+    filename: path.basename(p),
+  };
 }
 
 function extractAssistantText(content: string): string | null {
