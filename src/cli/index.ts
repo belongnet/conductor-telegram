@@ -8,7 +8,11 @@ import { getVersionString, printBanner } from "./banner.js";
 import { exitWithConfigError } from "./errors.js";
 import type { CLIFlags } from "./config.js";
 
-function parseFlags(args: string[]): { command: string; flags: CLIFlags } {
+function parseFlags(args: string[]): {
+  command: string;
+  flags: CLIFlags;
+  rest: string[];
+} {
   let command = "start";
   const flags: CLIFlags = {};
 
@@ -39,7 +43,7 @@ function parseFlags(args: string[]): { command: string; flags: CLIFlags } {
     command = positionals[0];
   }
 
-  return { command, flags };
+  return { command, flags, rest: positionals.slice(1) };
 }
 
 function printHelp(): void {
@@ -53,6 +57,7 @@ function printHelp(): void {
     setup            Interactive first-run configuration wizard
     doctor           Validate configuration and connectivity
     status           Show configuration health
+    service SUBCMD   Manage launchd background service (install|uninstall|start|stop|restart|status|logs)
     install-plugin   Install MCP server plugin into Claude Code
     help             Show this help message
 
@@ -73,7 +78,7 @@ function printHelp(): void {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const { command, flags } = parseFlags(args);
+  const { command, flags, rest } = parseFlags(args);
 
   switch (command) {
     case "help":
@@ -102,6 +107,12 @@ async function main(): Promise<void> {
     case "install-plugin": {
       const { runInstallPlugin } = await import("./install-plugin.js");
       await runInstallPlugin();
+      break;
+    }
+
+    case "service": {
+      const { runService } = await import("./service.js");
+      await runService(rest);
       break;
     }
 

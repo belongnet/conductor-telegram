@@ -25,6 +25,7 @@ import {
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
   getWorkspaceByTelegramMessage,
+  getHeartbeat,
 } from "../store/queries.js";
 import {
   createWorkspaceTopic,
@@ -145,23 +146,69 @@ export interface TelegramCommandDefinition {
   description: string;
 }
 
+interface WellKnownSkill {
+  /** Slash command name (telegram-safe: lowercase letters, digits, underscores) */
+  command: string;
+  /** Actual skill name passed to the agent (may use hyphens) */
+  skill: string;
+  /** Shown in the slash menu */
+  description: string;
+}
+
+const WELL_KNOWN_SKILLS: WellKnownSkill[] = [
+  { command: "ship", skill: "ship", description: "Ship: tests, review, bump, PR, deploy" },
+  { command: "qa", skill: "qa", description: "QA test the app and fix bugs" },
+  { command: "investigate", skill: "investigate", description: "Root-cause investigation of a bug" },
+  { command: "retro", skill: "retro", description: "Weekly engineering retrospective" },
+  { command: "health", skill: "health", description: "Code quality / health dashboard" },
+  { command: "checkpoint", skill: "checkpoint", description: "Save or resume a checkpoint" },
+  { command: "document_release", skill: "document-release", description: "Update docs after shipping" },
+  { command: "office_hours", skill: "office-hours", description: "YC office-hours mode" },
+  { command: "design_review", skill: "design-review", description: "Designer's-eye visual QA" },
+];
+
 const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "setup", description: "Check setup and apply this chat" },
   { command: "run", description: "Start a new workspace run" },
   { command: "review", description: "Start a review session for a workspace" },
   { command: "send", description: "Send a follow-up to a workspace" },
-  { command: "skills", description: "List workspace skill routes" },
+  { command: "skills", description: "List available skills" },
   { command: "skill", description: "Invoke a workspace skill by name" },
   { command: "gstack", description: "Ask the agent to use GStack skills" },
+  ...WELL_KNOWN_SKILLS.map((s) => ({
+    command: s.command,
+    description: s.description,
+  })),
   { command: "workspaces", description: "List tracked workspaces" },
   { command: "status", description: "Show active workspace status" },
   { command: "stop", description: "Stop a running workspace" },
   { command: "repos", description: "List available repos" },
+  { command: "ping", description: "Bot liveness (uptime, heartbeat, version)" },
   { command: "help", description: "Show bot help" },
 ];
 
 export function getTelegramCommands(): TelegramCommandDefinition[] {
   return TELEGRAM_COMMANDS;
+}
+
+/**
+ * Parse a `#skill` mention from a message. Matches any whitespace-delimited
+ * hashtag whose body looks like a skill name (letters/digits/underscore/hyphen).
+ * Underscores are normalized to hyphens to match canonical skill names
+ * (e.g. `#design_review` → `design-review`). Returns the skill plus the
+ * message with the hashtag removed, or null if no skill tag is present.
+ */
+function parseSkillMention(text: string): { skill: string; remaining: string } | null {
+  const match = text.match(/(?:^|\s)#([a-z][a-z0-9_-]{0,48})(?=\s|[.,!?;:)]|$)/i);
+  if (!match || typeof match.index !== "number") return null;
+  const raw = match[1].toLowerCase();
+  const skill = raw.replace(/_/g, "-");
+  const start = match.index + (match[0].startsWith("#") ? 0 : 1);
+  const end = match.index + match[0].length;
+  const remaining = (text.slice(0, start) + " " + text.slice(end))
+    .replace(/\s+/g, " ")
+    .trim();
+  return { skill, remaining };
 }
 
 function findTrackedWorkspace(identifier: string): Workspace | undefined {
@@ -213,6 +260,21 @@ function getReplyWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
     return null;
   }
   return resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName);
+}
+
+function getThreadWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
+  const chatId = ctx.chat?.id?.toString();
+  const threadId = (ctx.message as any)?.message_thread_id;
+  if (!chatId || !threadId) return null;
+
+  const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
+  if (!threadWorkspace?.conductorWorkspaceName) return null;
+
+  return resolveWorkspaceTarget(threadWorkspace.conductorWorkspaceName);
+}
+
+function getContextualTarget(ctx: Context): WorkspaceTarget | null {
+  return getReplyWorkspaceTarget(ctx) ?? getThreadWorkspaceTarget(ctx);
 }
 
 function getWorkspaceDirectory(target: WorkspaceTarget): string | null {
@@ -276,6 +338,16 @@ function buildSkillPrompt(skill: string, extraInstructions: string): string {
     lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * If `text` contains a `#skill` mention, rewrite it as a skill-invocation
+ * prompt. Otherwise return the text unchanged.
+ */
+function applySkillHashtag(text: string): string {
+  const mention = parseSkillMention(text);
+  if (!mention) return text;
+  return buildSkillPrompt(mention.skill, mention.remaining);
 }
 
 function buildGstackPrompt(extraInstructions: string): string {
@@ -370,6 +442,10 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.command("skills", handleSkills);
   bot.command("skill", handleSkill);
   bot.command("gstack", handleGstack);
+  for (const spec of WELL_KNOWN_SKILLS) {
+    bot.command(spec.command, (ctx) => handleWellKnownSkillCommand(ctx, spec));
+  }
+  bot.command("ping", handlePing);
   bot.command("help", handleHelp);
 
   // Inline button callbacks
@@ -717,7 +793,7 @@ async function startWorkspaceFromMessage(
     {
       parse_mode: "HTML",
       ...styledKeyboard([
-        [btn("Stop", `stop:${workspace.id}`, "danger")],
+        [btn("Stop", `stop:${workspace.id}`)],
       ]),
     }
   );
@@ -742,19 +818,14 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
   const stopRows = workspaces
     .filter((ws) => ws.status === "running" || ws.status === "starting")
     .map((ws) => [
-      btn(
-        `Stop ${ws.conductorWorkspaceName ?? ws.name}`,
-        `stop:${ws.id}`,
-        "danger"
-      ),
+      btn(`Stop ${ws.conductorWorkspaceName ?? ws.name}`, `stop:${ws.id}`),
     ]);
   const archiveRows = workspaces
     .filter((ws) => ws.status === "done" || ws.status === "failed" || ws.status === "stopped")
     .map((ws) => [
       btn(
         `Archive ${ws.conductorWorkspaceName ?? ws.name}`,
-        `archive:${ws.id}`,
-        "secondary"
+        `archive:${ws.id}`
       ),
     ]);
 
@@ -835,7 +906,7 @@ async function handleStop(ctx: Context): Promise<void> {
     `⏹ <b>${escHtml(wsName)}</b> stopped.${killed ? "" : "\n<i>Agent process was not running.</i>"}`,
     {
       parse_mode: "HTML",
-      ...styledButtons([btn("Archive", `archive:${workspace.id}`, "secondary")]),
+      ...styledButtons([btn("Archive", `archive:${workspace.id}`)]),
     }
   );
 }
@@ -852,7 +923,7 @@ async function handleRepos(ctx: Context): Promise<void> {
 
   const lines = repos.map((r, i) => `${i + 1}. <code>${escHtml(r)}</code>`).join("\n");
   const repoButtons = repos.map((r, i) => [
-    btn(`${i + 1}. ${r}`, `run:${i + 1}`, "primary"),
+    btn(`${i + 1}. ${r}`, `run:${i + 1}`),
   ]);
 
   await ctx.reply(
@@ -1005,7 +1076,9 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
 
   const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
   if (repliedWorkspace) {
-    const message = caption || "The user sent a screenshot/image. Please review it.";
+    const message = caption
+      ? applySkillHashtag(caption)
+      : "The user sent a screenshot/image. Please review it.";
     await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
     return;
   }
@@ -1015,10 +1088,20 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
     if (threadWorkspace) {
-      const message = caption || "The user sent a screenshot/image. Please review it.";
+      const message = caption
+        ? applySkillHashtag(caption)
+        : "The user sent a screenshot/image. Please review it.";
       await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
       return;
     }
+  }
+
+  // General-chat fallback: if the caption has routing intent (repo/workspace
+  // name, skill hashtag, etc.), let the AI router pick the target and forward
+  // the image as an attachment.
+  if (caption) {
+    const routed = await tryAutoRouteText(ctx, chatId, caption, [localPath]);
+    if (routed) return;
   }
 
   await ctx.reply(
@@ -1119,18 +1202,26 @@ async function tryAutoRouteVoice(
 async function tryAutoRouteText(
   ctx: Context,
   chatId: string,
-  text: string
+  text: string,
+  attachments: string[] = []
 ): Promise<boolean> {
   const repos = getRepoList();
   if (repos.length === 0) return false;
 
   const activeWorkspaces = getAutoRoutableWorkspaces(chatId);
+  const skillMention = parseSkillMention(text);
+  const routingText =
+    skillMention && skillMention.remaining ? skillMention.remaining : text;
 
   try {
-    const result = await routeTextMessage(text, repos, activeWorkspaces);
+    const result = await routeTextMessage(routingText, repos, activeWorkspaces);
     if (!result) return false;
 
-    return await executeRouteResult(ctx, chatId, result);
+    if (skillMention) {
+      result.prompt = buildSkillPrompt(skillMention.skill, skillMention.remaining);
+    }
+
+    return await executeRouteResult(ctx, chatId, result, attachments);
   } catch (err) {
     console.error("[ai-router] text routing failed:", err);
     return false;
@@ -1202,7 +1293,7 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
   if (repliedWorkspace) {
     const transcript = await transcribeVoiceMessage(localPath);
     if (transcript) {
-      await sendMessageToWorkspace(ctx, repliedWorkspace, transcript, [localPath]);
+      await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(transcript));
     } else {
       const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
       await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
@@ -1210,14 +1301,16 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  // If sent inside a forum topic, transcribe and route to that workspace
+  // If sent inside a forum topic, transcribe and send transcript only (no file
+  // attachment) — thread tabs already receive pre-transcribed messages, so avoid
+  // redundant attachments.
   const threadId = (ctx.message as any)?.message_thread_id;
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
     if (threadWorkspace) {
       const transcript = await transcribeVoiceMessage(localPath);
       if (transcript) {
-        await sendMessageToWorkspace(ctx, threadWorkspace, transcript, [localPath]);
+        await sendMessageToWorkspace(ctx, threadWorkspace, applySkillHashtag(transcript));
       } else {
         const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
         await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
@@ -1264,7 +1357,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
   const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
   if (repliedWorkspace) {
-    await sendMessageToWorkspace(ctx, repliedWorkspace, text);
+    await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(text));
     return;
   }
 
@@ -1273,7 +1366,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
     if (threadWorkspace) {
-      await sendMessageToWorkspace(ctx, threadWorkspace, text);
+      await sendMessageToWorkspace(ctx, threadWorkspace, applySkillHashtag(text));
       return;
     }
   }
@@ -1436,39 +1529,40 @@ async function handleSkills(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/skills\s*/, "").trim();
   const target =
-    (args ? resolveWorkspaceTarget(args) : null) ?? getReplyWorkspaceTarget(ctx);
+    (args ? resolveWorkspaceTarget(args) : null) ?? getContextualTarget(ctx);
 
-  if (!target) {
-    await ctx.reply(
-      "Usage: /skills <workspace-name>\n\nYou can also reply to a workspace message with /skills."
-    );
-    return;
+  const sections: string[] = [];
+  const builtInLines = [
+    `<code>gstack</code> — Use the GStack skills available in this workspace`,
+    ...WELL_KNOWN_SKILLS.map(
+      (s) => `<code>${escHtml(s.skill)}</code> — ${escHtml(s.description)}`
+    ),
+  ];
+  sections.push(`<b>Built-in skills</b>\n${builtInLines.join("\n")}`);
+
+  if (target) {
+    const routes = getWorkspaceSkillRoutes(target);
+    if (routes.length > 0) {
+      const lines = routes.map(
+        (route) => `<code>${escHtml(route.skill)}</code> — ${escHtml(route.description)}`
+      );
+      sections.push(
+        `<b>Workspace skills (${escHtml(target.conductorName)})</b>\n${lines.join("\n")}`
+      );
+    }
   }
 
-  const routes = getWorkspaceSkillRoutes(target);
-  if (routes.length === 0) {
-    await ctx.reply(
-      `No invoke-style skills were found for <b>${escHtml(target.conductorName)}</b>.`,
-      { parse_mode: "HTML" }
-    );
-    return;
-  }
-
-  const lines = routes.map(
-    (route) => `<code>${escHtml(route.skill)}</code> — ${escHtml(route.description)}`
-  );
-  lines.push("");
-  lines.push(
-    `Use <code>/skill ${escHtml(target.conductorName)} ${escHtml(routes[0]!.skill)}</code> to invoke one.`
-  );
-  lines.push(
-    `Use <code>/gstack ${escHtml(target.conductorName)}</code> for the GStack workflow.`
+  const firstSkill = WELL_KNOWN_SKILLS[0]!.skill;
+  const targetHint = target ? escHtml(target.conductorName) : "&lt;workspace&gt;";
+  sections.push(
+    `<b>How to invoke</b>\n` +
+      `• Tag a hashtag anywhere: <code>#${escHtml(firstSkill)} fix the flaky test</code>\n` +
+      `• Slash command: <code>/${escHtml(firstSkill)} ${targetHint} [instructions]</code>\n` +
+      `• Reply to a workspace message with <code>#${escHtml(firstSkill)}</code> or a slash command\n` +
+      `• Custom skill: <code>/skill ${targetHint} &lt;skill-name&gt; [instructions]</code>`
   );
 
-  await ctx.reply(
-    `<b>Skills for ${escHtml(target.conductorName)}</b>\n\n${lines.join("\n")}`,
-    { parse_mode: "HTML" }
-  );
+  await ctx.reply(sections.join("\n\n"), { parse_mode: "HTML" });
 }
 
 // ── /skill <workspace> <skill> [instructions] ──────────────
@@ -1476,11 +1570,11 @@ async function handleSkills(ctx: Context): Promise<void> {
 async function handleSkill(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/skill\s*/, "").trim();
-  const replyTarget = getReplyWorkspaceTarget(ctx);
+  const replyTarget = getContextualTarget(ctx);
 
   if (!args) {
     await ctx.reply(
-      "Usage: /skill <workspace-name> <skill> [instructions]\n\nYou can also reply to a workspace message with /skill <skill>."
+      "Usage: /skill <workspace-name> <skill> [instructions]\n\nYou can also reply to a workspace message or send in a workspace topic with /skill <skill>."
     );
     return;
   }
@@ -1513,7 +1607,7 @@ async function handleSkill(ctx: Context): Promise<void> {
 async function handleGstack(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/gstack\s*/, "").trim();
-  const replyTarget = getReplyWorkspaceTarget(ctx);
+  const replyTarget = getContextualTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
   let extraInstructions = "";
@@ -1534,12 +1628,49 @@ async function handleGstack(ctx: Context): Promise<void> {
 
   if (!target) {
     await ctx.reply(
-      "Usage: /gstack <workspace-name> [instructions]\n\nYou can also reply to a workspace message with /gstack."
+      "Usage: /gstack <workspace-name> [instructions]\n\nYou can also reply to a workspace message, send in a workspace topic, or tag #gstack in any message."
     );
     return;
   }
 
   await sendPromptToTarget(ctx, target, buildGstackPrompt(extraInstructions));
+}
+
+// ── /<well-known-skill> [workspace] [instructions] ──────────
+
+async function handleWellKnownSkillCommand(
+  ctx: Context,
+  spec: WellKnownSkill
+): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/[\w@]+\s*/, "").trim();
+  const replyTarget = getContextualTarget(ctx);
+
+  let target: WorkspaceTarget | null = null;
+  let extraInstructions = "";
+
+  if (!args) {
+    target = replyTarget;
+  } else {
+    const [head, tail] = splitHead(args);
+    const explicitTarget = resolveWorkspaceTarget(head);
+    if (explicitTarget) {
+      target = explicitTarget;
+      extraInstructions = tail;
+    } else if (replyTarget) {
+      target = replyTarget;
+      extraInstructions = args;
+    }
+  }
+
+  if (!target) {
+    await ctx.reply(
+      `Usage: /${spec.command} <workspace-name> [instructions]\n\nYou can also reply to a workspace message, send in a workspace topic, or tag #${spec.skill} in a message.`
+    );
+    return;
+  }
+
+  await sendPromptToTarget(ctx, target, buildSkillPrompt(spec.skill, extraInstructions));
 }
 
 // ── /setup, /start ──────────────────────────────────────────
@@ -1550,12 +1681,44 @@ async function handleSetup(ctx: Context): Promise<void> {
   await ctx.reply(response.message, {
     parse_mode: "HTML",
     ...(response.showApplyButton && setupUserId
-      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`, "success")])
+      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`)])
       : {}),
   });
 }
 
 // ── /help ───────────────────────────────────────────────────
+
+function formatAgoSeconds(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m ${seconds % 60}s`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ${mins % 60}m`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ${hrs % 24}h`;
+}
+
+async function handlePing(ctx: Context): Promise<void> {
+  const hb = getHeartbeat();
+  const uptimeSecs = Math.round(process.uptime());
+  const now = Date.now();
+
+  const lines = [`🏓 <b>pong</b>`];
+  lines.push(`<code>pid ${process.pid} · node ${process.versions.node}</code>`);
+  if (hb?.version) lines.push(`<code>v${escHtml(hb.version)}</code>`);
+  lines.push(`uptime: ${formatAgoSeconds(uptimeSecs)}`);
+
+  if (hb) {
+    const beatAgo = Math.max(0, Math.round((now - Date.parse(hb.lastBeatAt)) / 1000));
+    lines.push(`last heartbeat: ${beatAgo}s ago`);
+    lines.push(`boot #${hb.bootCount}`);
+    if (hb.lastExitReason) {
+      lines.push(`<i>last exit: ${escHtml(hb.lastExitReason)}</i>`);
+    }
+  }
+
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+}
 
 async function handleHelp(ctx: Context): Promise<void> {
   await ctx.reply(
@@ -1567,18 +1730,24 @@ Commands:
 /run &lt;number&gt; &lt;prompt&gt; — Start using repo number
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
 /review &lt;workspace&gt; [instructions] — Start a review session
-/skills &lt;workspace&gt; — List invoke-style skills from the workspace
+/skills [workspace] — List built-in and workspace skills
 /skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
-/gstack &lt;workspace&gt; [instructions] — Ask the agent to use GStack skills
+/gstack [workspace] [instructions] — Ask the agent to use GStack skills
+/ship, /qa, /investigate, /retro, /health, /checkpoint — Shortcut skills
 /workspaces — List all tracked workspaces
 /status — Show active workspace summary
 /stop &lt;name&gt; — Stop a workspace
 /repos — List repos (tap to select)
+/ping — Bot liveness (uptime, heartbeat, version)
 /help — Show this message
 
-Use <code>/setup</code> to check the current chat and let the bot configure it for you.
+<b>Invoking skills</b>
+• Tag <code>#skill</code> anywhere in a message: <code>#ship</code>, <code>#qa find auth bugs</code>, <code>#gstack</code>.
+• Inside a workspace topic or reply, the hashtag targets that workspace automatically.
+• Slash shortcuts (like <code>/ship</code>) accept an optional workspace name and instructions.
+• Use <code>/skills</code> any time to see the full list.
+
 Tap a repo from /repos, then type your prompt.
-Reply to a forwarded workspace message to target that workspace with /send, /review, /skills, /skill, or /gstack.
 Reply with a photo, screenshot, or voice note to send it to the agent.`,
     { parse_mode: "HTML" }
   );
@@ -1652,7 +1821,7 @@ async function handleStopCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Agent stopped");
   await ctx
     .editMessageReplyMarkup(
-      styledButtons([btn("Archive", `archive:${workspaceId}`, "secondary")]).reply_markup
+      styledButtons([btn("Archive", `archive:${workspaceId}`)]).reply_markup
     )
     .catch(() => undefined);
 }

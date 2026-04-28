@@ -3,6 +3,7 @@ import type { Telegram } from "telegraf";
 import {
   getLatestEventByType,
   getPendingDecision,
+  updateWorkspaceThreadId,
 } from "../store/queries.js";
 import type {
   ArtifactPayload,
@@ -23,6 +24,8 @@ const TOPIC_COLORS: TopicColor[] = [
 
 type TopicVisualState =
   | "in_progress"
+  | "testing"
+  | "blocked"
   | "needs_input"
   | "awaiting_pr_review"
   | "ready_to_submit_pr"
@@ -30,12 +33,14 @@ type TopicVisualState =
   | "archived";
 
 const TOPIC_ICON_EMOJIS: Record<TopicVisualState, readonly string[]> = {
-  in_progress: ["⏳", "⌛", "⚙️", "🔄"],
-  needs_input: ["❓", "💬", "👀"],
-  awaiting_pr_review: ["👀", "🔎", "📝"],
-  ready_to_submit_pr: ["📤", "📝", "🚀"],
-  ready_to_merge: ["✅", "🎯", "🚀"],
-  archived: ["🗂️", "🗄️", "📦", "🧺"],
+  in_progress: ["⚡️", "💻", "🤖"],
+  testing: ["🧪", "🔬", "✅"],
+  blocked: ["❗️", "⁉️", "‼️"],
+  needs_input: ["❓", "💬", "🗣"],
+  awaiting_pr_review: ["🔎", "👀", "📝"],
+  ready_to_submit_pr: ["📣", "📝", "💻"],
+  ready_to_merge: ["✅", "🏁", "🎖"],
+  archived: ["📁", "💼", "🧳"],
 };
 
 let topicIconCache: Promise<Map<string, string> | null> | null = null;
@@ -59,11 +64,24 @@ function parseStatusTopicState(workspace: Workspace): TopicVisualState | null {
     const payload = JSON.parse(event.payload) as StatusPayload;
     const text = `${payload.status} ${payload.message}`.toLowerCase();
     if (
+      text.includes("needs input") ||
+      text.includes("awaiting input") ||
+      text.includes("waiting for input")
+    ) {
+      return "needs_input";
+    }
+    if (text.includes("blocked") || text.includes("stuck")) {
+      return "blocked";
+    }
+    if (
       text.includes("awaiting pr review") ||
       text.includes("awaiting review") ||
       text.includes("pr review")
     ) {
       return "awaiting_pr_review";
+    }
+    if (text.includes("ready to merge") || text.includes("can merge")) {
+      return "ready_to_merge";
     }
     if (
       text.includes("submit pr") ||
@@ -74,6 +92,12 @@ function parseStatusTopicState(workspace: Workspace): TopicVisualState | null {
     }
     if (text.includes("merge")) {
       return "ready_to_merge";
+    }
+    if (text.includes("test")) {
+      return "testing";
+    }
+    if (text.includes("review")) {
+      return "awaiting_pr_review";
     }
   } catch {
     return null;
@@ -215,11 +239,22 @@ export async function syncWorkspaceTopic(
   }
 
   if (!extra.name && !extra.icon_custom_emoji_id) return;
-  await telegram.editForumTopic(
-    workspace.telegramChatId,
-    workspace.telegramThreadId,
-    extra
-  );
+  try {
+    await telegram.editForumTopic(
+      workspace.telegramChatId,
+      workspace.telegramThreadId,
+      extra
+    );
+  } catch (err: any) {
+    if (isTopicDeletedError(err)) {
+      console.log(
+        `[forum] topic ${workspace.telegramThreadId} was deleted during sync, recreating`
+      );
+      await ensureWorkspaceTopic(telegram, workspace);
+    } else {
+      throw err;
+    }
+  }
 }
 
 /**
@@ -284,4 +319,73 @@ export async function reopenWorkspaceTopic(
   } catch (err: any) {
     console.log(`[forum] could not reopen topic: ${err.message}`);
   }
+}
+
+function isTopicDeletedError(err: any): boolean {
+  const msg = String(err?.message ?? "").toLowerCase();
+  return (
+    msg.includes("message_thread_not_found") ||
+    msg.includes("topic_deleted") ||
+    msg.includes("thread not found") ||
+    (msg.includes("bad request") && msg.includes("thread"))
+  );
+}
+
+/**
+ * Ensure a workspace has a valid topic. If the existing topic was deleted,
+ * create a new one and update the database.
+ * Returns the (possibly new) thread ID, or null if topics aren't supported.
+ */
+export async function ensureWorkspaceTopic(
+  telegram: Telegram,
+  workspace: Workspace
+): Promise<number | null> {
+  if (!workspace.telegramThreadId) return null;
+
+  try {
+    // Probe: try editing the topic (no-op name update) to see if it still exists
+    await telegram.editForumTopic(
+      workspace.telegramChatId,
+      workspace.telegramThreadId,
+      {}
+    );
+    return workspace.telegramThreadId;
+  } catch (err: any) {
+    if (!isTopicDeletedError(err)) {
+      // Some other error (permissions, rate limit, etc.) — assume topic exists
+      return workspace.telegramThreadId;
+    }
+  }
+
+  // Topic was deleted — recreate it
+  console.log(
+    `[forum] topic ${workspace.telegramThreadId} was deleted, recreating for workspace ${workspace.id}`
+  );
+  const repoName = path.basename(workspace.repoPath);
+  const wsName = workspace.conductorWorkspaceName ?? workspace.name;
+  const newThreadId = await createWorkspaceTopic(
+    telegram,
+    workspace.telegramChatId,
+    repoName,
+    wsName
+  );
+  if (newThreadId) {
+    updateWorkspaceThreadId(workspace.id, newThreadId);
+    workspace.telegramThreadId = newThreadId;
+    // Apply the workspace's current visual state to the new topic
+    const desiredIcon = await getTopicIconId(
+      telegram,
+      getWorkspaceTopicState(workspace)
+    );
+    if (desiredIcon) {
+      try {
+        await telegram.editForumTopic(workspace.telegramChatId, newThreadId, {
+          icon_custom_emoji_id: desiredIcon,
+        });
+      } catch (err: any) {
+        console.log(`[forum] could not set initial icon on recreated topic: ${err.message}`);
+      }
+    }
+  }
+  return newThreadId;
 }

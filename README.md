@@ -65,16 +65,23 @@ src/
 | `/run` | `/run <repo> <prompt>` | Start a new workspace with an AI agent |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
-| `/skills` | `/skills <workspace>` | List skill routes parsed from CLAUDE.md |
+| `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md |
 | `/skill` | `/skill <workspace> <name> [instructions]` | Invoke a specific workspace skill |
 | `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
+| `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
 | `/workspaces` | `/workspaces` | List all tracked workspaces |
 | `/status` | `/status` | Show active workspace summary |
 | `/stop` | `/stop <name>` | Stop a running workspace |
 | `/repos` | `/repos` | List available repositories (tap to select) |
 | `/help` | `/help` | Show help message |
 
-You can also reply to a forwarded workspace message to target that workspace with `/send`, `/review`, `/skills`, `/skill`, or `/gstack`. Photos, screenshots, and voice notes sent as replies are staged to the workspace for the agent.
+Three ways to target a workspace with skill or follow-up commands:
+
+1. **Reply** to any forwarded workspace message with `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut.
+2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically.
+3. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
+
+Photos, screenshots, and voice notes sent as replies are staged to the workspace for the agent.
 
 ## Manual Telegram setup
 

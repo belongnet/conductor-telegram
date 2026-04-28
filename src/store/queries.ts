@@ -294,6 +294,22 @@ export function getLatestEventByType(
     : undefined;
 }
 
+export function getArtifactEvents(workspaceId: string): WorkspaceEvent[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM events WHERE workspace_id = ? AND type = 'artifact' ORDER BY id DESC"
+    )
+    .all(workspaceId) as any[];
+  return rows.map((r) => ({
+    id: r.id,
+    workspaceId: r.workspace_id,
+    type: r.type as EventType,
+    payload: r.payload,
+    createdAt: r.created_at,
+  }));
+}
+
 // ── Decisions ───────────────────────────────────────────────
 
 export function createDecision(
@@ -345,4 +361,82 @@ function mapDecisionRow(row: any): Decision {
     createdAt: row.created_at,
     answeredAt: row.answered_at,
   };
+}
+
+// ── Heartbeat ───────────────────────────────────────────────
+
+export interface Heartbeat {
+  pid: number;
+  version: string | null;
+  startedAt: string;
+  lastBeatAt: string;
+  lastKnownAliveAt: string | null;
+  bootCount: number;
+  lastExitReason: string | null;
+}
+
+export function getHeartbeat(): Heartbeat | undefined {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM bot_heartbeat WHERE id = 1")
+    .get() as any;
+  if (!row) return undefined;
+  return {
+    pid: row.pid,
+    version: row.version,
+    startedAt: row.started_at,
+    lastBeatAt: row.last_beat_at,
+    lastKnownAliveAt: row.last_known_alive_at,
+    bootCount: row.boot_count,
+    lastExitReason: row.last_exit_reason,
+  };
+}
+
+export function initHeartbeat(opts: {
+  pid: number;
+  version: string | null;
+}): { previous: Heartbeat | undefined; bootCount: number } {
+  const db = getDb();
+  const previous = getHeartbeat();
+  const now = new Date().toISOString();
+  const bootCount = (previous?.bootCount ?? 0) + 1;
+
+  if (previous) {
+    db.prepare(
+      `UPDATE bot_heartbeat
+       SET pid = ?, version = ?, started_at = ?, last_beat_at = ?,
+           last_known_alive_at = ?, boot_count = ?
+       WHERE id = 1`
+    ).run(
+      opts.pid,
+      opts.version,
+      now,
+      now,
+      previous.lastBeatAt,
+      bootCount
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO bot_heartbeat
+         (id, pid, version, started_at, last_beat_at, last_known_alive_at, boot_count, last_exit_reason)
+       VALUES (1, ?, ?, ?, ?, NULL, 1, NULL)`
+    ).run(opts.pid, opts.version, now, now);
+  }
+
+  return { previous, bootCount };
+}
+
+export function touchHeartbeat(): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    "UPDATE bot_heartbeat SET last_beat_at = ?, last_known_alive_at = ? WHERE id = 1"
+  ).run(now, now);
+}
+
+export function recordExitReason(reason: string): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE bot_heartbeat SET last_exit_reason = ? WHERE id = 1"
+  ).run(reason);
 }

@@ -741,6 +741,53 @@ export function sendInputToAgent(workspaceName: string, input: string): boolean 
 }
 
 /**
+ * Pull the question text and option labels out of an AskUserQuestion tool_use input.
+ *
+ * Claude Code's AskUserQuestion tool ships the prompt as `questions: [{ question, options: [{ label, description }] }]`
+ * (1-4 questions per call). Older variants used a flat `{ question, options: string[] }`. We accept both so the
+ * Telegram surface keeps working across SDK versions. Multi-question calls collapse to the first question for now,
+ * with the rest mentioned in the body so the operator at least sees them.
+ */
+function extractAskUserQuestion(input: any): { question: string; options: string[] | undefined } {
+  const fallback = "Agent is asking a question";
+
+  const questions = Array.isArray(input?.questions) ? input.questions : null;
+  if (questions && questions.length > 0) {
+    const first = questions[0];
+    const primary: string = typeof first?.question === "string" ? first.question : fallback;
+    const opts = Array.isArray(first?.options)
+      ? first.options
+          .map((o: any) => (typeof o === "string" ? o : typeof o?.label === "string" ? o.label : null))
+          .filter((s: string | null): s is string => Boolean(s))
+      : undefined;
+
+    if (questions.length > 1) {
+      const extras = questions
+        .slice(1)
+        .map((q: any, i: number) => {
+          const text = typeof q?.question === "string" ? q.question : "";
+          return text ? `Q${i + 2}: ${text}` : "";
+        })
+        .filter(Boolean)
+        .join("\n");
+      const combined = extras ? `${primary}\n\n${extras}` : primary;
+      return { question: combined, options: opts && opts.length > 0 ? opts : undefined };
+    }
+
+    return { question: primary, options: opts && opts.length > 0 ? opts : undefined };
+  }
+
+  const legacyQuestion: string = typeof input?.question === "string" ? input.question : fallback;
+  const legacyOptions = Array.isArray(input?.options)
+    ? input.options.filter((o: any): o is string => typeof o === "string")
+    : undefined;
+  return {
+    question: legacyQuestion,
+    options: legacyOptions && legacyOptions.length > 0 ? legacyOptions : undefined,
+  };
+}
+
+/**
  * Check if a decision has a pending stdin answer and send it.
  */
 export function answerPendingStdinDecision(decisionId: number, answer: string): boolean {
@@ -816,8 +863,7 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
           !seenToolUseIds.has(block.id)
         ) {
           seenToolUseIds.add(block.id);
-          const question = block.input?.question ?? "Agent is asking a question";
-          const options: string[] | undefined = block.input?.options;
+          const { question, options } = extractAskUserQuestion(block.input);
 
           // Look up workspace in conductor-telegram DB
           const trackedWs = getTrackedWorkspaceByName(workspaceName);
@@ -1047,6 +1093,24 @@ function pickCityName(existingDirs: Set<string>): string {
   return available[Math.floor(Math.random() * available.length)];
 }
 
+async function getExistingWorkspaceBranchNames(repoPath: string): Promise<Set<string>> {
+  try {
+    const output = await execAsync(
+      `cd "${repoPath}" && git branch --format='%(refname:short)' --list 'belongcond/*'`
+    );
+    return new Set(
+      output
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("belongcond/"))
+        .map((line) => line.slice("belongcond/".length))
+        .filter((line) => line.length > 0)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 /**
  * Create a workspace programmatically: git worktree + Conductor DB records.
  * No deeplinks needed — works even when Conductor UI is busy or unresponsive.
@@ -1072,17 +1136,20 @@ export async function launchWorkspace(
 
   console.log(`[launcher] launchWorkspace called: repoPath=${repoPath}`);
 
-  // Find existing workspace directories
-  let existingDirs: Set<string>;
+  // Reserve city names already used by workspace directories or workspace branches.
+  let reservedNames: Set<string>;
   try {
     const entries = await readdir(workspacesDir);
-    existingDirs = new Set(entries);
+    reservedNames = new Set(entries);
   } catch {
-    existingDirs = new Set();
+    reservedNames = new Set();
+  }
+  for (const branchName of await getExistingWorkspaceBranchNames(repoPath)) {
+    reservedNames.add(branchName);
   }
 
   // Pick a city name for the workspace
-  const cityName = pickCityName(existingDirs);
+  const cityName = pickCityName(reservedNames);
   const branchName = `belongcond/${cityName}`;
   const workspaceDir = path.join(workspacesDir, cityName);
 
@@ -1098,13 +1165,6 @@ export async function launchWorkspace(
   // 2. Create git worktree
   try {
     const defaultBranch = repoInfo.defaultBranch ?? "main";
-    // Delete stale branch if it exists (left over from a previously deleted workspace)
-    try {
-      await execAsync(`cd "${repoPath}" && git branch -D "${branchName}" 2>/dev/null`);
-      console.log(`[launcher] Deleted stale branch ${branchName}`);
-    } catch {
-      // Branch doesn't exist — expected path
-    }
     await execAsync(`cd "${repoPath}" && git worktree add -b "${branchName}" "${workspaceDir}" "${defaultBranch}"`);
     console.log(`[launcher] Git worktree created at ${workspaceDir}`);
   } catch (err) {
