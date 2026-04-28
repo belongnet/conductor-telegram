@@ -780,7 +780,7 @@ async function startWorkspaceFromMessage(
     {
       parse_mode: "HTML",
       ...styledKeyboard([
-        [btn("Stop", `stop:${workspace.id}`, "danger")],
+        [btn("Stop", `stop:${workspace.id}`)],
       ]),
     }
   );
@@ -805,19 +805,14 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
   const stopRows = workspaces
     .filter((ws) => ws.status === "running" || ws.status === "starting")
     .map((ws) => [
-      btn(
-        `Stop ${ws.conductorWorkspaceName ?? ws.name}`,
-        `stop:${ws.id}`,
-        "danger"
-      ),
+      btn(`Stop ${ws.conductorWorkspaceName ?? ws.name}`, `stop:${ws.id}`),
     ]);
   const archiveRows = workspaces
     .filter((ws) => ws.status === "done" || ws.status === "failed" || ws.status === "stopped")
     .map((ws) => [
       btn(
         `Archive ${ws.conductorWorkspaceName ?? ws.name}`,
-        `archive:${ws.id}`,
-        "secondary"
+        `archive:${ws.id}`
       ),
     ]);
 
@@ -898,7 +893,7 @@ async function handleStop(ctx: Context): Promise<void> {
     `⏹ <b>${escHtml(wsName)}</b> stopped.${killed ? "" : "\n<i>Agent process was not running.</i>"}`,
     {
       parse_mode: "HTML",
-      ...styledButtons([btn("Archive", `archive:${workspace.id}`, "secondary")]),
+      ...styledButtons([btn("Archive", `archive:${workspace.id}`)]),
     }
   );
 }
@@ -915,7 +910,7 @@ async function handleRepos(ctx: Context): Promise<void> {
 
   const lines = repos.map((r, i) => `${i + 1}. <code>${escHtml(r)}</code>`).join("\n");
   const repoButtons = repos.map((r, i) => [
-    btn(`${i + 1}. ${r}`, `run:${i + 1}`, "primary"),
+    btn(`${i + 1}. ${r}`, `run:${i + 1}`),
   ]);
 
   await ctx.reply(
@@ -1673,7 +1668,7 @@ async function handleSetup(ctx: Context): Promise<void> {
   await ctx.reply(response.message, {
     parse_mode: "HTML",
     ...(response.showApplyButton && setupUserId
-      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`, "success")])
+      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`)])
       : {}),
   });
 }
@@ -1813,7 +1808,7 @@ async function handleStopCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Agent stopped");
   await ctx
     .editMessageReplyMarkup(
-      styledButtons([btn("Archive", `archive:${workspaceId}`, "secondary")]).reply_markup
+      styledButtons([btn("Archive", `archive:${workspaceId}`)]).reply_markup
     )
     .catch(() => undefined);
 }

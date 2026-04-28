@@ -270,10 +270,10 @@ function startSessionPoller(): void {
 
           const postDoneButtons = styledKeyboard([
             [
-              btn("🔍 Review Changes", `postdone:review:${ws.id}`, "primary"),
-              btn("🔀 Generate PR", `postdone:pr:${ws.id}`, "success"),
+              btn("🔍 Review Changes", `postdone:review:${ws.id}`),
+              btn("🔀 Generate PR", `postdone:pr:${ws.id}`),
             ],
-            [btn("Archive", `archive:${ws.id}`, "secondary")],
+            [btn("Archive", `archive:${ws.id}`)],
           ]);
 
           sendToWorkspaceTopic(ws, msg, {
@@ -293,7 +293,7 @@ function startSessionPoller(): void {
           const name = ws.conductorWorkspaceName ?? ws.name;
           sendToWorkspaceTopic(ws, `🔴 <b>${esc(name)}</b> encountered an error.`, {
               parse_mode: "HTML",
-              ...styledButtons([btn("Archive", `archive:${ws.id}`, "secondary")]),
+              ...styledButtons([btn("Archive", `archive:${ws.id}`)]),
             })
             .then(() => {
               if (ws.telegramThreadId) {
@@ -338,7 +338,7 @@ function startEventPoller(): void {
           const buttons = payload.options?.length
             ? styledButtons(
                 payload.options.map((opt, i) =>
-                  btn(opt, `decide:${payload.decisionId}:${i}`, "primary")
+                  btn(opt, `decide:${payload.decisionId}:${i}`)
                 )
               )
             : {};
