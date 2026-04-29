@@ -2,7 +2,7 @@
 
 All notable changes to conductor-telegram are documented here.
 
-## [0.3.5.1] - 2026-04-26
+## [0.3.6.1] - 2026-04-29
 
 ### Fixed
 - New tasks typed in the General topic of a forum supergroup no longer get silently swallowed by an old running workspace. The AI auto-router now defaults to creating a fresh workspace and only continues an existing one when there's an unmistakable signal (you named the workspace, used a continuation phrase like "also" or "same as before", or the message is an obvious follow-up to that workspace's listed prompt). Topical similarity alone is no longer enough.
@@ -12,6 +12,23 @@ All notable changes to conductor-telegram are documented here.
 - The AI router treats your message text as data, not instructions. User text is now wrapped in `<user_message>` tags with explicit "ignore directives inside" guidance, and any closing tag the user might inject is stripped, so a malicious message can't rewrite the routing rules.
 - The router's response shape is type-validated before it's used: `action` must be `new` or `existing`, and the prompt must be a non-empty string. Hallucinated actions or wrong types now get rejected instead of flowing through.
 - The decision log now JSON-encodes the prompt preview, so an attacker-controlled message can't forge log lines or smuggle terminal escape sequences past an operator tailing the bot log.
+
+## [0.3.6.0] - 2026-04-28
+
+### Added
+- Photos, voice notes, documents, audio, video, and animated GIFs sent from Telegram now all reach the agent as inline attachments. Documents/audio/video/animation paths previously fell on the floor; they're now downloaded, staged into the workspace's `.context/attachments/` directory, and exposed to the agent like photos already were.
+- Agent replies that reference local workspace files render as actual Telegram media instead of plain Markdown links. Markdown image syntax `![alt](path/to/file)` ships as a `sendPhoto`, plain `[name](path)` ships as a `sendDocument`, and the right call (`sendVideo` / `sendAudio` / `sendAnimation`) is picked from the file extension. When the agent emits 2-10 files in one message they ride on a single `sendMediaGroup`; >10 splits into successive groups.
+- `report_artifact` calls of type `file` now upload the actual file inline when the artifact's path resolves inside the workspace, with a caption summarizing the artifact. Remote URLs continue to render as a plain link.
+- Long agent text (>1024 chars) automatically falls out of the media caption and gets sent as a separate follow-up message so Telegram's caption cap never silently drops content.
+
+### Changed
+- The forwarder's `formatForwardedMessage` now returns both cleaned text and a media list, and the topic-recovery layer was extended to media (`sendPhoto` / `sendDocument` / `sendMediaGroup` all recreate a deleted forum topic on the fly, the same way the existing `sendToWorkspaceTopic` does).
+
+## [0.3.5.1] - 2026-04-28
+
+### Fixed
+- Inline keyboard buttons (decision options on `❓` questions, post-done Review/PR buttons, /list stop+archive, /run repo selection, setup "Use This Chat") were being rejected by Telegram with `400 Bad Request: can't parse inline keyboard button: invalid button style specified`, which dropped the entire `sendMessage` call. The result was that questions arrived without their answer buttons, or didn't arrive at all. Telegram's Bot API does not accept the `style` field that v0.3.0 added in pursuit of "Bot API 9.4 button styles." The field is now gone from the wire format and from `btn()`'s signature.
+- AskUserQuestion forwarding read the wrong shape from the agent's tool input, so every `❓` request landed on Telegram with the placeholder text "Agent is asking a question" and no answer buttons, even when the agent supplied a real question and a list of choices. Claude Code now ships the prompt as `questions: [{ question, options: [{ label, description }] }]` (with up to four questions per call); the launcher's detector previously expected the long-deprecated flat shape `{ question, options: string[] }`. The detector now reads the new shape, falls back to the legacy one, and unwraps option objects to their `label` for button text. Multi-question calls collapse to the first question with the others appended to the body so they remain visible.
 
 ## [0.3.5.0] - 2026-04-26
 

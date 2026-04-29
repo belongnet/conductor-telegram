@@ -187,7 +187,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "send", description: "Send a follow-up to a workspace" },
   { command: "skills", description: "List available skills" },
   { command: "skill", description: "Invoke a workspace skill by name" },
-  { command: "gstack", description: "Run the GStack / Graphite workflow" },
+  { command: "gstack", description: "Ask the agent to use GStack skills" },
   ...WELL_KNOWN_SKILLS.map((s) => ({
     command: s.command,
     description: s.description,
@@ -365,14 +365,27 @@ function applySkillHashtag(text: string): string {
 
 function buildGstackPrompt(extraInstructions: string): string {
   const lines = [
-    "Use the GStack or Graphite workflow in this workspace.",
-    "If `gstack`, `gt`, or the Graphite CLI is available, use it.",
-    "If the tooling is missing, explain exactly what is unavailable and stop.",
+    "Use the GStack skills available in this workspace.",
+    "GStack provides Claude Code skills such as /ship, /qa, /browse, /review, /health, /investigate, /design-review, and others.",
   ];
 
   if (extraInstructions.trim()) {
-    lines.push("", `Additional instructions:\n${extraInstructions.trim()}`);
+    lines.push(
+      "Choose the appropriate skill based on the instructions below.",
+      "",
+      `Additional instructions:\n${extraInstructions.trim()}`
+    );
+  } else {
+    lines.push(
+      "List the available GStack skills in this workspace and ask which one to run.",
+      "Do NOT invoke any skill automatically without explicit instructions."
+    );
   }
+
+  lines.push(
+    "",
+    "If no GStack skills are available, explain what is missing and stop."
+  );
 
   return lines.join("\n");
 }
@@ -460,6 +473,10 @@ export function registerCommands(bot: Telegraf<Context>): void {
   // Media and text handlers
   bot.on("photo", handlePhotoMessage);
   bot.on("voice", handleVoiceMessage);
+  bot.on("document", (ctx) => handleAttachmentMessage(ctx, "document"));
+  bot.on("audio", (ctx) => handleAttachmentMessage(ctx, "audio"));
+  bot.on("video", (ctx) => handleAttachmentMessage(ctx, "video"));
+  bot.on("animation", (ctx) => handleAttachmentMessage(ctx, "animation"));
   bot.on("text", handleTextMessage);
 }
 
@@ -793,7 +810,7 @@ async function startWorkspaceFromMessage(
     {
       parse_mode: "HTML",
       ...styledKeyboard([
-        [btn("Stop", `stop:${workspace.id}`, "danger")],
+        [btn("Stop", `stop:${workspace.id}`)],
       ]),
     }
   );
@@ -818,19 +835,14 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
   const stopRows = workspaces
     .filter((ws) => ws.status === "running" || ws.status === "starting")
     .map((ws) => [
-      btn(
-        `Stop ${ws.conductorWorkspaceName ?? ws.name}`,
-        `stop:${ws.id}`,
-        "danger"
-      ),
+      btn(`Stop ${ws.conductorWorkspaceName ?? ws.name}`, `stop:${ws.id}`),
     ]);
   const archiveRows = workspaces
     .filter((ws) => ws.status === "done" || ws.status === "failed" || ws.status === "stopped")
     .map((ws) => [
       btn(
         `Archive ${ws.conductorWorkspaceName ?? ws.name}`,
-        `archive:${ws.id}`,
-        "secondary"
+        `archive:${ws.id}`
       ),
     ]);
 
@@ -911,7 +923,7 @@ async function handleStop(ctx: Context): Promise<void> {
     `⏹ <b>${escHtml(wsName)}</b> stopped.${killed ? "" : "\n<i>Agent process was not running.</i>"}`,
     {
       parse_mode: "HTML",
-      ...styledButtons([btn("Archive", `archive:${workspace.id}`, "secondary")]),
+      ...styledButtons([btn("Archive", `archive:${workspace.id}`)]),
     }
   );
 }
@@ -928,7 +940,7 @@ async function handleRepos(ctx: Context): Promise<void> {
 
   const lines = repos.map((r, i) => `${i + 1}. <code>${escHtml(r)}</code>`).join("\n");
   const repoButtons = repos.map((r, i) => [
-    btn(`${i + 1}. ${r}`, `run:${i + 1}`, "primary"),
+    btn(`${i + 1}. ${r}`, `run:${i + 1}`),
   ]);
 
   await ctx.reply(
@@ -1111,6 +1123,109 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
 
   await ctx.reply(
     "Got your image. Reply to a question from an agent, or use /send to forward to a workspace."
+  );
+}
+
+// ── Generic attachment handler (document/audio/video/animation) ──────
+
+type AttachmentKind = "document" | "audio" | "video" | "animation";
+
+interface TelegramFileSpec {
+  fileId: string;
+  ext: string;
+  label: string;
+  fallbackPrompt: string;
+}
+
+function describeAttachment(ctx: Context, kind: AttachmentKind): TelegramFileSpec | null {
+  const msg = ctx.message as any;
+  const meta = msg?.[kind];
+  if (!meta?.file_id) return null;
+
+  const fileName: string | undefined = meta.file_name;
+  const mimeType: string | undefined = meta.mime_type;
+  const duration: number | undefined = meta.duration;
+
+  let ext = "";
+  if (fileName) ext = path.extname(fileName);
+  if (!ext && mimeType) {
+    const slash = mimeType.indexOf("/");
+    if (slash >= 0) ext = "." + mimeType.slice(slash + 1).split(";")[0].trim();
+  }
+  if (!ext) {
+    ext = kind === "audio" ? ".mp3" : kind === "video" ? ".mp4" : kind === "animation" ? ".mp4" : ".bin";
+  }
+
+  const niceName = fileName ? `: ${fileName}` : "";
+  const dur = duration ? ` (${duration}s)` : "";
+  const prettyKind = kind === "animation" ? "Animation" : capitalize(kind);
+
+  return {
+    fileId: meta.file_id,
+    ext,
+    label: `${prettyKind}${dur}${niceName}`,
+    fallbackPrompt: `The user sent a ${kind}${dur}${niceName}. Please review the attached file.`,
+  };
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return;
+
+  const spec = describeAttachment(ctx, kind);
+  if (!spec) return;
+
+  const msg = ctx.message as any;
+  const caption = msg?.caption?.trim() ?? "";
+
+  // Caption-as-command path mirrors the photo handler.
+  if (caption.startsWith("/")) {
+    const localPath = await downloadTelegramFile(ctx, spec.fileId, spec.ext);
+    await handleCaptionCommand(ctx, caption, localPath);
+    return;
+  }
+
+  const localPath = await downloadTelegramFile(ctx, spec.fileId, spec.ext);
+
+  // Decision-reply path: stage and forward as `[<Label>: <path>]`.
+  if (
+    await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
+      const stagedPath = stageDecisionAttachment(decision, localPath);
+      const head = `[${spec.label}: ${stagedPath}]`;
+      return caption ? `${head}\n${caption}` : head;
+    })
+  ) {
+    return;
+  }
+
+  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedWorkspace) {
+    const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
+    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+    return;
+  }
+
+  const threadId = (ctx.message as any)?.message_thread_id;
+  if (threadId) {
+    const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
+    if (threadWorkspace) {
+      const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
+      await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      return;
+    }
+  }
+
+  if (caption) {
+    const routed = await tryAutoRouteText(ctx, chatId, caption, [localPath]);
+    if (routed) return;
+  }
+
+  await ctx.reply(
+    `Got your ${kind}. Reply to a question from an agent, or use /send to forward to a workspace.`
   );
 }
 
@@ -1551,7 +1666,7 @@ async function handleSkills(ctx: Context): Promise<void> {
 
   const sections: string[] = [];
   const builtInLines = [
-    `<code>gstack</code> — GStack / Graphite workflow`,
+    `<code>gstack</code> — Use the GStack skills available in this workspace`,
     ...WELL_KNOWN_SKILLS.map(
       (s) => `<code>${escHtml(s.skill)}</code> — ${escHtml(s.description)}`
     ),
@@ -1699,7 +1814,7 @@ async function handleSetup(ctx: Context): Promise<void> {
   await ctx.reply(response.message, {
     parse_mode: "HTML",
     ...(response.showApplyButton && setupUserId
-      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`, "success")])
+      ? styledButtons([btn("Use This Chat", `setup:apply:${setupUserId}`)])
       : {}),
   });
 }
@@ -1750,7 +1865,7 @@ Commands:
 /review &lt;workspace&gt; [instructions] — Start a review session
 /skills [workspace] — List built-in and workspace skills
 /skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
-/gstack [workspace] [instructions] — Run the GStack/Graphite workflow
+/gstack [workspace] [instructions] — Ask the agent to use GStack skills
 /ship, /qa, /investigate, /retro, /health, /checkpoint — Shortcut skills
 /workspaces — List all tracked workspaces
 /status — Show active workspace summary
@@ -1839,7 +1954,7 @@ async function handleStopCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Agent stopped");
   await ctx
     .editMessageReplyMarkup(
-      styledButtons([btn("Archive", `archive:${workspaceId}`, "secondary")]).reply_markup
+      styledButtons([btn("Archive", `archive:${workspaceId}`)]).reply_markup
     )
     .catch(() => undefined);
 }

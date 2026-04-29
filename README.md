@@ -67,7 +67,7 @@ src/
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
 | `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md |
 | `/skill` | `/skill <workspace> <name> [instructions]` | Invoke a specific workspace skill |
-| `/gstack` | `/gstack <workspace> [instructions]` | Use the GStack/Graphite workflow |
+| `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
 | `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
 | `/workspaces` | `/workspaces` | List all tracked workspaces |
 | `/status` | `/status` | Show active workspace summary |

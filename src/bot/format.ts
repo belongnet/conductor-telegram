@@ -66,45 +66,32 @@ export function maybeExpandableQuote(text: string, minLength = 120): string {
   return /<(?:a|code|pre)\b/i.test(text) ? text : expandableQuote(text, minLength);
 }
 
-// ── Styled inline buttons ────────────────────────────────────
-//
-// Telegraf v4 doesn't expose the `style` field from Bot API 9.4.
-// We build reply_markup JSON directly so we can set button colors.
+// ── Inline buttons ───────────────────────────────────────────
 
-export type ButtonStyle = "primary" | "success" | "danger" | "secondary";
-
-interface StyledButton {
+interface InlineButton {
   text: string;
   callback_data: string;
-  style?: ButtonStyle;
 }
 
 /**
- * Create a styled inline keyboard.
+ * Create an inline keyboard.
  * Each inner array is a row of buttons.
  */
-export function styledKeyboard(rows: StyledButton[][]): {
-  reply_markup: { inline_keyboard: StyledButton[][] };
+export function styledKeyboard(rows: InlineButton[][]): {
+  reply_markup: { inline_keyboard: InlineButton[][] };
 } {
   return { reply_markup: { inline_keyboard: rows } };
 }
 
 /** Shorthand: one button per row. */
-export function styledButtons(buttons: StyledButton[]): {
-  reply_markup: { inline_keyboard: StyledButton[][] };
+export function styledButtons(buttons: InlineButton[]): {
+  reply_markup: { inline_keyboard: InlineButton[][] };
 } {
   return styledKeyboard(buttons.map((b) => [b]));
 }
 
-/** Single styled button (convenience). */
-export function btn(
-  text: string,
-  callbackData: string,
-  style?: ButtonStyle
-): StyledButton {
-  const b: StyledButton = { text, callback_data: callbackData };
-  if (style) b.style = style;
-  return b;
+export function btn(text: string, callbackData: string): InlineButton {
+  return { text, callback_data: callbackData };
 }
 
 // ── Markdown → Telegram HTML ─────────────────────────────────
