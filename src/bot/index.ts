@@ -35,7 +35,7 @@ import {
   styledButtons,
   truncate as trunc,
 } from "./format.js";
-import { closeWorkspaceTopic, renameWorkspaceTopics } from "./forum.js";
+import { renameWorkspaceTopics } from "./forum.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
@@ -182,11 +182,6 @@ function startSessionPoller(): void {
               parse_mode: "HTML",
               ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
             })
-            .then(() => {
-              if (ws.telegramThreadId) {
-                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
-              }
-            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         } else if (sessionStatus === "error" && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
@@ -200,11 +195,6 @@ function startSessionPoller(): void {
                 ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}),
               }
             )
-            .then(() => {
-              if (ws.telegramThreadId) {
-                closeWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId);
-              }
-            })
             .catch((err) => console.error(`[poller] notify error:`, err));
         }
       }
