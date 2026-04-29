@@ -354,7 +354,13 @@ function startSessionPoller(): void {
       const tracked = getAllWorkspaces(100);
       for (const ws of tracked) {
         if (!ws.conductorWorkspaceName) continue;
-        const sessionInfo = getWorkspaceSessionInfo(ws.conductorWorkspaceName);
+        // Scope by repo_path so two repos with the same workspace city name
+        // (e.g. both have a "rotterdam") don't get their Conductor sessions
+        // and forwarded messages cross-routed into each other's Telegram topics.
+        const sessionInfo = getWorkspaceSessionInfo(
+          ws.conductorWorkspaceName,
+          ws.repoPath
+        );
         if (!sessionInfo) continue;
 
         if (ws.conductorSessionId !== sessionInfo.sessionId) {
@@ -399,7 +405,7 @@ function startSessionPoller(): void {
         if (sessionStatus === "idle" && ws.status === "running") {
           updateWorkspaceStatus(ws.id, "done");
           const name = ws.conductorWorkspaceName ?? ws.name;
-          const result = getSessionResult(ws.conductorWorkspaceName!);
+          const result = getSessionResult(ws.conductorWorkspaceName!, ws.repoPath);
 
           let msg = `✅ <b>${esc(name)}</b> finished`;
           if (result) {

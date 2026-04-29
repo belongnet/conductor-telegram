@@ -2,6 +2,13 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.6.2] - 2026-04-29
+
+### Fixed
+- Workspaces from different repos no longer get their chats, sessions, and agent messages mixed up. The bot's name pool reuses city names per repo, so two repos can each have a "rotterdam" workspace at the same time. Every workspace-name lookup was unscoped, so the first match in the DB won regardless of which repo it belonged to. The session poller would then bind the wrong Conductor session to a tracked workspace and start forwarding the other repo's agent output into the wrong Telegram topic. The MCP server's `report_status` / `report_artifact` / `request_human` calls would write events to the wrong tracked workspace. Reply inference would route a message to a workspace from a different chat. The `runningAgents` and `pendingStdinDecisions` maps were keyed by workspace name alone, so two same-named agents could overwrite each other and `/stop` could kill the wrong process.
+- All workspace-name lookups now require a disambiguator: `repo_path` everywhere repo path is known (the launcher, the poller, every `sendToSession` / `launchWorkspaceSession` call), `telegram_chat_id` for Telegram-side reply inference and `/send` / `/stop` / `/skill` lookups, and `repo_basename` derived from `process.cwd()` for the MCP server. The `runningAgents` and `pendingStdinDecisions` maps are now keyed by `(repo_path, workspace_name)` so collisions can no longer alias.
+- `getWorkspaceFromConductorDb`, `getSessionStatus`, and `getSessionResult` now JOIN against Conductor's `repos` table and filter by `r.root_path = ?` so a workspace lookup in Conductor's own DB can no longer cross repos either.
+
 ## [0.3.6.1] - 2026-04-29
 
 ### Fixed

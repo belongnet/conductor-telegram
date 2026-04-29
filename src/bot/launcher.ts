@@ -51,13 +51,21 @@ const CITY_NAMES = [
   "yerevan", "zanzibar", "zurich",
 ];
 
-// Track running agents by workspace name
+// Track running agents by composite (repoPath, workspaceName) key so two repos
+// with the same workspace city name (e.g. both have "rotterdam") never alias.
 const runningAgents = new Map<string, ChildProcess>();
 const lastAssistantSdkMessageIds = new Map<string, string>();
 // Track seen tool_use IDs to avoid duplicate question forwarding
 const seenToolUseIds = new Set<string>();
-// Map decision IDs to workspace names for stdin piping
-const pendingStdinDecisions = new Map<number, string>();
+// Map decision IDs to (repoPath, workspaceName) for stdin piping
+const pendingStdinDecisions = new Map<
+  number,
+  { workspaceName: string; repoPath: string }
+>();
+
+function agentKey(repoPath: string, workspaceName: string): string {
+  return `${repoPath}::${workspaceName}`;
+}
 
 // ── Agent result interface ──────────────────────────────────
 
@@ -308,6 +316,7 @@ function spawnAgent(
   model: string,
   agentType: AgentType,
   workspaceName: string,
+  repoPath: string,
   options: {
     agentSessionId?: string | null;
     isFollowUp?: boolean;
@@ -323,6 +332,7 @@ function spawnAgent(
       prompt,
       model,
       workspaceName,
+      repoPath,
       options
     );
   }
@@ -333,6 +343,7 @@ function spawnAgent(
     prompt,
     model,
     workspaceName,
+    repoPath,
     options
   );
 }
@@ -343,11 +354,13 @@ function spawnClaudeAgent(
   prompt: string,
   model: string,
   workspaceName: string,
+  repoPath: string,
   options: {
     isFollowUp?: boolean;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
   const isFollowUp = options.isFollowUp ?? false;
+  const key = agentKey(repoPath, workspaceName);
   const sessionFlag = isFollowUp ? "--resume" : "--session-id";
   const args = [
     "-p", prompt,
@@ -372,7 +385,7 @@ function spawnClaudeAgent(
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
 
-  runningAgents.set(workspaceName, child);
+  runningAgents.set(key, child);
 
   // Mark session as working
   updateSessionStatus(conductorSessionId, "working");
@@ -393,7 +406,7 @@ function spawnClaudeAgent(
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          processStreamMessage(conductorSessionId, msg, model, workspaceName);
+          processStreamMessage(conductorSessionId, msg, model, workspaceName, repoPath);
 
           // Extract result info
           if (msg.type === "result") {
@@ -420,7 +433,7 @@ function spawnClaudeAgent(
       if (code !== 0 && !result.resultText) {
         result.isError = true;
       }
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(key);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -429,7 +442,7 @@ function spawnClaudeAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(key);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -444,6 +457,7 @@ function spawnCodexAgent(
   prompt: string,
   model: string,
   workspaceName: string,
+  repoPath: string,
   options: {
     agentSessionId?: string | null;
     isFollowUp?: boolean;
@@ -452,6 +466,7 @@ function spawnCodexAgent(
     reviewBaseBranch?: string | null;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
+  const key = agentKey(repoPath, workspaceName);
   const launchMode = options.launchMode ?? "prompt";
   const agentSessionId = options.agentSessionId ?? null;
   const args =
@@ -471,7 +486,7 @@ function spawnCodexAgent(
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
 
-  runningAgents.set(workspaceName, child);
+  runningAgents.set(key, child);
   updateSessionStatus(conductorSessionId, "working");
 
   const done = new Promise<AgentResult>((resolve) => {
@@ -537,7 +552,7 @@ function spawnCodexAgent(
         );
       }
 
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(key);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -547,7 +562,7 @@ function spawnCodexAgent(
       result.isError = true;
       result.exitCode = -1;
       result.durationMs = Date.now() - startedAt;
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(key);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -733,8 +748,12 @@ function insertSessionMessage(
  * Send text input to a running agent's stdin (for answering AskUserQuestion).
  * Returns true if the write succeeded.
  */
-export function sendInputToAgent(workspaceName: string, input: string): boolean {
-  const child = runningAgents.get(workspaceName);
+export function sendInputToAgent(
+  repoPath: string,
+  workspaceName: string,
+  input: string
+): boolean {
+  const child = runningAgents.get(agentKey(repoPath, workspaceName));
   if (!child?.stdin?.writable) return false;
   child.stdin.write(input + "\n");
   return true;
@@ -791,16 +810,22 @@ function extractAskUserQuestion(input: any): { question: string; options: string
  * Check if a decision has a pending stdin answer and send it.
  */
 export function answerPendingStdinDecision(decisionId: number, answer: string): boolean {
-  const workspaceName = pendingStdinDecisions.get(decisionId);
-  if (!workspaceName) return false;
+  const target = pendingStdinDecisions.get(decisionId);
+  if (!target) return false;
   pendingStdinDecisions.delete(decisionId);
-  return sendInputToAgent(workspaceName, answer);
+  return sendInputToAgent(target.repoPath, target.workspaceName, answer);
 }
 
 /**
  * Process a streaming JSON message from Claude CLI and mirror to Conductor's DB.
  */
-function processStreamMessage(sessionId: string, msg: any, model: string, workspaceName?: string): void {
+function processStreamMessage(
+  sessionId: string,
+  msg: any,
+  model: string,
+  workspaceName?: string,
+  repoPath?: string
+): void {
   // Mirror the same message families Conductor persists for Claude sessions.
   if (
     msg.type !== "user" &&
@@ -844,12 +869,12 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
   );
 
   // Detect AskUserQuestion tool_use blocks and create Telegram decisions
-  if (msg.type === "assistant" && workspaceName) {
+  if (msg.type === "assistant" && workspaceName && repoPath) {
     const contentBlocks = msg.message?.content;
     if (Array.isArray(contentBlocks)) {
       for (const block of contentBlocks) {
         if (block.type === "tool_use") {
-          console.log(`[agent] tool_use block: name="${block.name}" id="${block.id}" workspace="${workspaceName}"`);
+          console.log(`[agent] tool_use block: name="${block.name}" id="${block.id}" workspace="${workspaceName}" repo="${repoPath}"`);
         }
         const isAskUser =
           block.type === "tool_use" &&
@@ -865,8 +890,9 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
           seenToolUseIds.add(block.id);
           const { question, options } = extractAskUserQuestion(block.input);
 
-          // Look up workspace in conductor-telegram DB
-          const trackedWs = getTrackedWorkspaceByName(workspaceName);
+          // Scope by (workspaceName, repoPath) so two repos with the same
+          // workspace city name don't get their questions cross-routed.
+          const trackedWs = getTrackedWorkspaceByName(workspaceName, repoPath);
           if (trackedWs) {
             const decisionId = createDecision(
               trackedWs.id,
@@ -879,13 +905,13 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
               options: options ?? [],
             });
             addEvent(trackedWs.id, "human_request", eventPayload);
-            pendingStdinDecisions.set(decisionId, workspaceName);
+            pendingStdinDecisions.set(decisionId, { workspaceName, repoPath });
             console.log(
-              `[agent] AskUserQuestion detected for ${workspaceName}: "${question.slice(0, 80)}..." → decision ${decisionId}`
+              `[agent] AskUserQuestion detected for ${workspaceName} (${repoPath}): "${question.slice(0, 80)}..." → decision ${decisionId}`
             );
           } else {
             console.warn(
-              `[agent] AskUserQuestion found but no tracked workspace for "${workspaceName}" — question will be lost`
+              `[agent] AskUserQuestion found but no tracked workspace for "${workspaceName}" in repo "${repoPath}" — question will be lost`
             );
           }
         }
@@ -1222,6 +1248,7 @@ export async function launchWorkspace(
     launchConfig.model,
     launchConfig.agentType,
     cityName,
+    repoPath,
     {
       attachmentPaths: stagedAttachmentPaths,
       launchMode: launchConfig.launchMode,
@@ -1242,15 +1269,22 @@ export async function launchWorkspace(
 
 /**
  * Send a follow-up prompt to an existing workspace session.
+ *
+ * `repoPath` disambiguates workspace names that collide across repos
+ * (e.g. two repos each containing a "rotterdam" workspace). It must be
+ * the canonical source repo path stored on the tracked workspace.
  */
 export async function sendToSession(
   workspaceName: string,
+  repoPath: string,
   prompt: string,
   attachmentSourcePaths: string[] = []
 ): Promise<{ ok: true; done: Promise<AgentResult> } | { error: string }> {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, repoPath);
   if (!wsInfo) {
-    return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
+    return {
+      error: `Workspace "${workspaceName}" not found in Conductor DB for repo ${repoPath}.`,
+    };
   }
 
   const repoName = wsInfo.repoName ?? workspaceName;
@@ -1268,6 +1302,7 @@ export async function sendToSession(
     normalizeModelForCli(wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt")),
     wsInfo.agentType,
     workspaceName,
+    repoPath,
     {
       agentSessionId: wsInfo.agentSessionId,
       isFollowUp: true,
@@ -1281,6 +1316,7 @@ export async function sendToSession(
 
 export async function launchWorkspaceSession(
   workspaceName: string,
+  repoPath: string,
   prompt: string,
   options: SessionLaunchOptions & {
     attachmentSourcePaths?: string[];
@@ -1294,9 +1330,11 @@ export async function launchWorkspaceSession(
     model: string;
   } | { error: string }
 > {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, repoPath);
   if (!wsInfo) {
-    return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
+    return {
+      error: `Workspace "${workspaceName}" not found in Conductor DB for repo ${repoPath}.`,
+    };
   }
 
   const repoName = wsInfo.repoName ?? workspaceName;
@@ -1347,6 +1385,7 @@ export async function launchWorkspaceSession(
     launchConfig.model,
     launchConfig.agentType,
     workspaceName,
+    repoPath,
     {
       attachmentPaths: stagedAttachmentPaths,
       launchMode: launchConfig.launchMode,
@@ -1364,10 +1403,11 @@ export async function launchWorkspaceSession(
 }
 
 /**
- * Stop a running agent by workspace name.
+ * Stop a running agent by (repoPath, workspace name).
  */
-export function stopAgent(workspaceName: string): boolean {
-  const child = runningAgents.get(workspaceName);
+export function stopAgent(repoPath: string, workspaceName: string): boolean {
+  const key = agentKey(repoPath, workspaceName);
+  const child = runningAgents.get(key);
   if (!child) return false;
 
   child.kill("SIGTERM");
@@ -1376,15 +1416,15 @@ export function stopAgent(workspaceName: string): boolean {
     if (!child.killed) child.kill("SIGKILL");
   }, 5000);
 
-  runningAgents.delete(workspaceName);
+  runningAgents.delete(key);
   return true;
 }
 
 /**
  * Check if an agent is currently running.
  */
-export function isAgentRunning(workspaceName: string): boolean {
-  return runningAgents.has(workspaceName);
+export function isAgentRunning(repoPath: string, workspaceName: string): boolean {
+  return runningAgents.has(agentKey(repoPath, workspaceName));
 }
 
 // ── Conductor DB helpers ────────────────────────────────────
@@ -1421,7 +1461,14 @@ interface ConductorWorkspaceInfo {
   targetBranch: string | null;
 }
 
-function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceInfo | null {
+// Scoped by repoPath: Conductor's directory_name (the city name) only has
+// to be unique per-repo, so two repos can both contain a workspace named
+// "rotterdam". Looking up by directory_name alone returns whichever row
+// happens to come back first and silently aliases sessions across repos.
+function getWorkspaceFromConductorDb(
+  directoryName: string,
+  repoPath: string
+): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const row = db.prepare(
@@ -1438,8 +1485,8 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
        FROM workspaces w
        LEFT JOIN sessions s ON s.id = w.active_session_id
        LEFT JOIN repos r ON r.id = w.repository_id
-       WHERE w.directory_name = ?`
-    ).get(directoryName) as any;
+       WHERE w.directory_name = ? AND r.root_path = ?`
+    ).get(directoryName, repoPath) as any;
     db.close();
 
     if (!row?.workspace_id || !row?.session_id) return null;
@@ -1460,22 +1507,27 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
 }
 
 export function getWorkspaceSessionInfo(
-  workspaceName: string
+  workspaceName: string,
+  repoPath: string
 ): ConductorWorkspaceInfo | null {
-  return getWorkspaceFromConductorDb(workspaceName);
+  return getWorkspaceFromConductorDb(workspaceName, repoPath);
 }
 
 /**
  * Get session status from Conductor's DB.
  */
-export function getSessionStatus(workspaceName: string): string | null {
+export function getSessionStatus(
+  workspaceName: string,
+  repoPath: string
+): string | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const row = db.prepare(
       `SELECT s.status FROM sessions s
        JOIN workspaces w ON w.active_session_id = s.id
-       WHERE w.directory_name = ?`
-    ).get(workspaceName) as any;
+       JOIN repos r ON r.id = w.repository_id
+       WHERE w.directory_name = ? AND r.root_path = ?`
+    ).get(workspaceName, repoPath) as any;
     db.close();
     return row?.status ?? null;
   } catch {
@@ -1502,16 +1554,20 @@ export interface SessionMessage {
   sentAt: string | null;
 }
 
-export function getSessionResult(workspaceName: string): SessionResult | null {
+export function getSessionResult(
+  workspaceName: string,
+  repoPath: string
+): SessionResult | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const rows = db.prepare(
       `SELECT sm.content FROM session_messages sm
        JOIN sessions s ON s.id = sm.session_id
        JOIN workspaces w ON w.active_session_id = s.id
-       WHERE w.directory_name = ? AND sm.role = 'assistant'
+       JOIN repos r ON r.id = w.repository_id
+       WHERE w.directory_name = ? AND r.root_path = ? AND sm.role = 'assistant'
        ORDER BY sm.created_at DESC LIMIT 5`
-    ).all(workspaceName) as any[];
+    ).all(workspaceName, repoPath) as any[];
     db.close();
 
     for (const row of rows) {
@@ -1581,8 +1637,11 @@ export function getSessionMessagesAfter(
  * Get the filesystem path for a workspace by its directory name.
  * Looks up the repo name from Conductor's DB to build the full path.
  */
-export function getWorkspaceDir(workspaceName: string): string | null {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+export function getWorkspaceDir(
+  workspaceName: string,
+  repoPath: string
+): string | null {
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, repoPath);
   if (!wsInfo?.repoName) return null;
   return path.join(CONDUCTOR_WORKSPACES_DIR, wsInfo.repoName, workspaceName);
 }

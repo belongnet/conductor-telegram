@@ -50,16 +50,68 @@ export function getWorkspace(id: string): Workspace | undefined {
   return row ? mapWorkspaceRow(row) : undefined;
 }
 
+// Scoped by repo_path so workspaces named the same in different repos
+// (e.g. two repos each with a "rotterdam" workspace) never alias.
 export function getWorkspaceByName(
-  conductorName: string
+  conductorName: string,
+  repoPath: string
 ): Workspace | undefined {
   const db = getDb();
   const row = db
     .prepare(
-      "SELECT * FROM workspaces WHERE conductor_workspace_name = ? AND archived_at IS NULL"
+      "SELECT * FROM workspaces WHERE conductor_workspace_name = ? AND repo_path = ? AND archived_at IS NULL ORDER BY created_at DESC LIMIT 1"
     )
-    .get(conductorName) as any;
+    .get(conductorName, repoPath) as any;
   return row ? mapWorkspaceRow(row) : undefined;
+}
+
+// MCP servers know their cwd but may not know the canonical repo_path,
+// so we fall back to matching the trailing path segment.
+export function findActiveWorkspaceByNameAndRepoBasename(
+  conductorName: string,
+  repoBasename: string
+): Workspace | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT * FROM workspaces
+       WHERE conductor_workspace_name = ?
+         AND (repo_path = ? OR repo_path LIKE '%/' || ?)
+         AND archived_at IS NULL
+       ORDER BY created_at DESC LIMIT 1`
+    )
+    .get(conductorName, repoBasename, repoBasename) as any;
+  return row ? mapWorkspaceRow(row) : undefined;
+}
+
+// Used by Telegram reply inference where chat_id is the only scoper available.
+export function findActiveWorkspaceByNameAndChat(
+  conductorName: string,
+  chatId: string
+): Workspace | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT * FROM workspaces
+       WHERE conductor_workspace_name = ?
+         AND telegram_chat_id = ?
+         AND archived_at IS NULL
+       ORDER BY created_at DESC LIMIT 1`
+    )
+    .get(conductorName, chatId) as any;
+  return row ? mapWorkspaceRow(row) : undefined;
+}
+
+export function findActiveWorkspacesByChat(chatId: string): Workspace[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT * FROM workspaces
+       WHERE telegram_chat_id = ? AND archived_at IS NULL
+       ORDER BY created_at DESC`
+    )
+    .all(chatId) as any[];
+  return rows.map(mapWorkspaceRow);
 }
 
 export function getActiveWorkspaces(): Workspace[] {

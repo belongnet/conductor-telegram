@@ -1,10 +1,11 @@
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { getDb } from "../store/db.js";
 import {
   addEvent,
-  getWorkspaceByName,
+  findActiveWorkspaceByNameAndRepoBasename,
   createDecision,
   getDecision,
 } from "../store/queries.js";
@@ -20,9 +21,17 @@ if (!WORKSPACE_NAME) {
   process.exit(1);
 }
 
-// Resolve workspace ID from the conductor workspace name
+// Conductor places workspace dirs at <workspacesDir>/<repoName>/<cityName>.
+// We disambiguate via the repo basename so two repos that both happen to have
+// a workspace named the same city (e.g. "rotterdam") never alias to each other.
+const REPO_BASENAME = path.basename(path.dirname(process.cwd()));
+
+// Resolve workspace ID from the conductor workspace name + repo basename.
 function getWorkspaceId(): string | null {
-  const ws = getWorkspaceByName(WORKSPACE_NAME!);
+  const ws = findActiveWorkspaceByNameAndRepoBasename(
+    WORKSPACE_NAME!,
+    REPO_BASENAME
+  );
   return ws?.id ?? null;
 }
 
@@ -195,7 +204,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `conductor-telegram MCP server running for workspace: ${WORKSPACE_NAME}`
+    `conductor-telegram MCP server running for workspace: ${WORKSPACE_NAME} (repo: ${REPO_BASENAME})`
   );
 }
 

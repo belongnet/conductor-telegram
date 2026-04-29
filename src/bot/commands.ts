@@ -11,10 +11,11 @@ import {
 import {
   archiveWorkspace,
   createWorkspace,
+  findActiveWorkspaceByNameAndChat,
+  findActiveWorkspacesByChat,
   getActiveWorkspaces,
   getAllWorkspaces,
   getWorkspace,
-  getWorkspaceByName,
   getWorkspaceByThreadId,
   getDecision,
   updateWorkspaceStatus,
@@ -224,20 +225,33 @@ function parseSkillMention(text: string): { skill: string; remaining: string } |
   return { skill, remaining };
 }
 
-function findTrackedWorkspace(identifier: string): Workspace | undefined {
+function findTrackedWorkspace(
+  identifier: string,
+  chatId?: string
+): Workspace | undefined {
   let workspace = getWorkspace(identifier);
   if (workspace) {
     return workspace;
   }
 
-  const all = getAllWorkspaces(100);
-  return all.find((ws) => ws.conductorWorkspaceName === identifier);
+  // Scope by chat when we have it so a /send rotterdam ... in chat A can't
+  // accidentally hit a "rotterdam" workspace tracked in chat B.
+  const candidates = chatId ? findActiveWorkspacesByChat(chatId) : getAllWorkspaces(100);
+  return candidates.find((ws) => ws.conductorWorkspaceName === identifier);
 }
 
-function resolveWorkspaceTarget(identifier: string): WorkspaceTarget | null {
-  const trackedWorkspace = findTrackedWorkspace(identifier) ?? null;
+function resolveWorkspaceTarget(
+  identifier: string,
+  chatId?: string
+): WorkspaceTarget | null {
+  const trackedWorkspace = findTrackedWorkspace(identifier, chatId) ?? null;
   const conductorName = trackedWorkspace?.conductorWorkspaceName ?? identifier;
-  const sessionInfo = getWorkspaceSessionInfo(conductorName);
+  // Without a tracked workspace we have no canonical repo_path, so we cannot
+  // safely cross the Conductor DB without risking a cross-repo collision.
+  if (!trackedWorkspace) {
+    return null;
+  }
+  const sessionInfo = getWorkspaceSessionInfo(conductorName, trackedWorkspace.repoPath);
   if (!sessionInfo) {
     return null;
   }
@@ -245,7 +259,7 @@ function resolveWorkspaceTarget(identifier: string): WorkspaceTarget | null {
   return {
     conductorName,
     trackedWorkspace,
-    repoPath: sessionInfo.repoPath,
+    repoPath: sessionInfo.repoPath ?? trackedWorkspace.repoPath,
     repoName: sessionInfo.repoName,
     targetBranch: sessionInfo.targetBranch,
   };
@@ -272,7 +286,7 @@ function getReplyWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
   if (!repliedWorkspace?.conductorWorkspaceName) {
     return null;
   }
-  return resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName);
+  return resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName, chatId);
 }
 
 function getThreadWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
@@ -283,7 +297,7 @@ function getThreadWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
   const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
   if (!threadWorkspace?.conductorWorkspaceName) return null;
 
-  return resolveWorkspaceTarget(threadWorkspace.conductorWorkspaceName);
+  return resolveWorkspaceTarget(threadWorkspace.conductorWorkspaceName, chatId);
 }
 
 function getContextualTarget(ctx: Context): WorkspaceTarget | null {
@@ -426,11 +440,19 @@ async function sendPromptToTarget(
     return;
   }
 
+  if (!target.repoPath) {
+    await ctx.reply(
+      `Could not resolve repo for <b>${escHtml(target.conductorName)}</b>.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
   await ctx.reply(`Sending message to <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(prompt, 200))}</i>`, {
     parse_mode: "HTML",
   });
 
-  const result = await sendToSession(target.conductorName, prompt);
+  const result = await sendToSession(target.conductorName, target.repoPath, prompt);
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
     return;
@@ -859,7 +881,10 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
 // ── /status ─────────────────────────────────────────────────
 
 async function handleStatus(ctx: Context): Promise<void> {
-  const active = getActiveWorkspaces();
+  const chatId = ctx.chat?.id?.toString();
+  const active = getActiveWorkspaces().filter(
+    (ws) => !chatId || ws.telegramChatId === chatId
+  );
 
   if (active.length === 0) {
     await ctx.reply("No active workspaces. All quiet.");
@@ -883,27 +908,25 @@ async function handleStatus(ctx: Context): Promise<void> {
 async function handleStop(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const idOrName = text.replace(/^\/stop\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
 
   if (!idOrName) {
     await ctx.reply("Usage: /stop <workspace-id or conductor-name>");
     return;
   }
 
-  // Try to find by ID first, then by conductor name
-  let workspace = getWorkspace(idOrName);
-  if (!workspace) {
-    const all = getAllWorkspaces(50);
-    workspace = all.find((ws) => ws.conductorWorkspaceName === idOrName);
-  }
+  // Scope name lookups to this chat so /stop in chat A can't kill an
+  // agent in chat B that happens to share the same workspace city name.
+  const workspace = findTrackedWorkspace(idOrName, chatId);
 
   if (!workspace) {
-    await ctx.reply(`Workspace "${idOrName}" not found.`);
+    await ctx.reply(`Workspace "${idOrName}" not found in this chat.`);
     return;
   }
 
   const wsName = workspace.conductorWorkspaceName ?? workspace.name;
   const killed = workspace.conductorWorkspaceName
-    ? stopAgent(workspace.conductorWorkspaceName)
+    ? stopAgent(workspace.repoPath, workspace.conductorWorkspaceName)
     : false;
 
   updateWorkspaceStatus(workspace.id, "stopped");
@@ -1277,15 +1300,12 @@ async function handleCaptionCommand(
     const wsName = spaceIdx === -1 ? args : args.slice(0, spaceIdx);
     const message = spaceIdx === -1 ? "" : args.slice(spaceIdx + 1).trim();
 
-    let workspace = getWorkspace(wsName);
-    if (!workspace) {
-      const all = getAllWorkspaces(50);
-      workspace = all.find((ws) => ws.conductorWorkspaceName === wsName);
-    }
+    const chatId = ctx.chat?.id?.toString();
+    const workspace = findTrackedWorkspace(wsName, chatId);
     if (workspace) {
       await sendMessageToWorkspace(ctx, workspace, message, [attachmentPath]);
     } else {
-      await ctx.reply(`Workspace "${escHtml(wsName)}" not found.`, { parse_mode: "HTML" });
+      await ctx.reply(`Workspace "${escHtml(wsName)}" not found in this chat.`, { parse_mode: "HTML" });
     }
     return;
   }
@@ -1550,31 +1570,18 @@ async function handleSend(ctx: Context): Promise<void> {
 
   const wsName = args.slice(0, spaceIdx);
   const message = args.slice(spaceIdx + 1).trim();
+  const chatId = ctx.chat?.id?.toString();
 
-  // Find workspace by conductor name
-  let workspace = getWorkspace(wsName);
+  // Find workspace by conductor name, scoped to this chat so two repos with
+  // the same workspace name in different chats can't collide here.
+  const workspace = findTrackedWorkspace(wsName, chatId);
   if (!workspace) {
-    const all = getAllWorkspaces(50);
-    workspace = all.find((ws) => ws.conductorWorkspaceName === wsName);
-  }
-
-  const conductorName = workspace?.conductorWorkspaceName ?? wsName;
-  if (!workspace) {
-    await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(message, 200))}</i>`, {
-      parse_mode: "HTML",
-    });
-    const result = await sendToSession(conductorName, message);
-    if ("error" in result) {
-      await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
-      return;
-    }
     await ctx.reply(
-      `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(message, 200))}</i>`,
+      `No tracked workspace named <b>${escHtml(wsName)}</b> in this chat. Start one with /run first.`,
       { parse_mode: "HTML" }
     );
     return;
   }
-
   await sendMessageToWorkspace(ctx, workspace, message);
 }
 
@@ -1583,6 +1590,7 @@ async function handleSend(ctx: Context): Promise<void> {
 async function handleReview(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/review\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getReplyWorkspaceTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
@@ -1592,7 +1600,7 @@ async function handleReview(ctx: Context): Promise<void> {
     target = replyTarget;
   } else {
     const [head, tail] = splitHead(args);
-    const explicitTarget = resolveWorkspaceTarget(head);
+    const explicitTarget = resolveWorkspaceTarget(head, chatId);
     if (explicitTarget) {
       target = explicitTarget;
       instructions = tail;
@@ -1624,7 +1632,7 @@ async function handleReview(ctx: Context): Promise<void> {
   );
   updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
 
-  const result = await launchWorkspaceSession(target.conductorName, reviewPrompt, {
+  const result = await launchWorkspaceSession(target.conductorName, trackedWorkspace.repoPath, reviewPrompt, {
     launchMode: "review",
     title: "Review Changes",
     reviewBaseBranch: target.targetBranch,
@@ -1661,8 +1669,9 @@ async function handleReview(ctx: Context): Promise<void> {
 async function handleSkills(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/skills\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const target =
-    (args ? resolveWorkspaceTarget(args) : null) ?? getContextualTarget(ctx);
+    (args ? resolveWorkspaceTarget(args, chatId) : null) ?? getContextualTarget(ctx);
 
   const sections: string[] = [];
   const builtInLines = [
@@ -1703,6 +1712,7 @@ async function handleSkills(ctx: Context): Promise<void> {
 async function handleSkill(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/skill\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getContextualTarget(ctx);
 
   if (!args) {
@@ -1713,7 +1723,7 @@ async function handleSkill(ctx: Context): Promise<void> {
   }
 
   const [head, tail] = splitHead(args);
-  let target = resolveWorkspaceTarget(head);
+  let target = resolveWorkspaceTarget(head, chatId);
   let skill = "";
   let extraInstructions = "";
 
@@ -1740,6 +1750,7 @@ async function handleSkill(ctx: Context): Promise<void> {
 async function handleGstack(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/gstack\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getContextualTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
@@ -1749,7 +1760,7 @@ async function handleGstack(ctx: Context): Promise<void> {
     target = replyTarget;
   } else {
     const [head, tail] = splitHead(args);
-    const explicitTarget = resolveWorkspaceTarget(head);
+    const explicitTarget = resolveWorkspaceTarget(head, chatId);
     if (explicitTarget) {
       target = explicitTarget;
       extraInstructions = tail;
@@ -1777,6 +1788,7 @@ async function handleWellKnownSkillCommand(
 ): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/[\w@]+\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getContextualTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
@@ -1786,7 +1798,7 @@ async function handleWellKnownSkillCommand(
     target = replyTarget;
   } else {
     const [head, tail] = splitHead(args);
-    const explicitTarget = resolveWorkspaceTarget(head);
+    const explicitTarget = resolveWorkspaceTarget(head, chatId);
     if (explicitTarget) {
       target = explicitTarget;
       extraInstructions = tail;
@@ -1935,7 +1947,7 @@ async function handleStopCallback(ctx: Context): Promise<void> {
 
   const workspace = getWorkspace(workspaceId);
   if (workspace?.conductorWorkspaceName) {
-    stopAgent(workspace.conductorWorkspaceName);
+    stopAgent(workspace.repoPath, workspace.conductorWorkspaceName);
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
@@ -2085,7 +2097,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   );
   updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
 
-  const result = await launchWorkspaceSession(conductorName, prompt, {
+  const result = await launchWorkspaceSession(conductorName, workspace.repoPath, prompt, {
     launchMode: action === "review" ? "review" : "prompt",
     title: action === "review" ? "Review Changes" : "Generate PR",
   });
@@ -2132,7 +2144,7 @@ function getReplyTargetWorkspace(
     return linked;
   }
 
-  const inferred = inferWorkspaceFromReply(reply);
+  const inferred = inferWorkspaceFromReply(reply, chatId);
   if (inferred) {
     console.log(
       `[reply-route] inferred from replied text ${replyToMessageId} -> ${inferred.conductorWorkspaceName ?? inferred.name}`
@@ -2143,7 +2155,7 @@ function getReplyTargetWorkspace(
   return inferred;
 }
 
-function inferWorkspaceFromReply(reply: any): Workspace | undefined {
+function inferWorkspaceFromReply(reply: any, chatId: string): Workspace | undefined {
   const text = [reply?.text, reply?.caption]
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .join("\n");
@@ -2158,7 +2170,10 @@ function inferWorkspaceFromReply(reply: any): Workspace | undefined {
   const workspaceName = firstLine.replace(/^[^\p{L}\p{N}]*/u, "").trim();
   if (!workspaceName) return undefined;
 
-  return getWorkspaceByName(workspaceName);
+  // Scope to this Telegram chat. Two repos managed from the same supergroup
+  // could still both have a "rotterdam" workspace, but at least the inferrer
+  // will not pull in workspaces from a totally different chat.
+  return findActiveWorkspaceByNameAndChat(workspaceName, chatId);
 }
 
 async function sendMessageToWorkspace(
@@ -2186,7 +2201,12 @@ async function sendMessageToWorkspace(
     parse_mode: "HTML",
   });
 
-  const result = await sendToSession(conductorName, message, attachmentSourcePaths);
+  const result = await sendToSession(
+    conductorName,
+    workspace.repoPath,
+    message,
+    attachmentSourcePaths
+  );
 
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
