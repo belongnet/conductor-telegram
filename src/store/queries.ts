@@ -50,16 +50,41 @@ export function getWorkspace(id: string): Workspace | undefined {
   return row ? mapWorkspaceRow(row) : undefined;
 }
 
+export interface WorkspaceLookupScope {
+  chatId?: string;
+  repoPath?: string;
+}
+
+// Conductor city names are unique per repo, NOT globally. Two repos can both pick
+// "maputo" and end up as separate rows in this table that share a conductor_workspace_name.
+// Always pass a chatId or repoPath to scope this lookup, otherwise messages, status
+// updates, and AskUserQuestion decisions can land in the wrong chat.
 export function getWorkspaceByName(
-  conductorName: string
+  conductorName: string,
+  scope: WorkspaceLookupScope = {}
 ): Workspace | undefined {
   const db = getDb();
-  const row = db
+  const where = ["conductor_workspace_name = ?", "archived_at IS NULL"];
+  const params: any[] = [conductorName];
+  if (scope.chatId !== undefined) {
+    where.push("telegram_chat_id = ?");
+    params.push(scope.chatId);
+  }
+  if (scope.repoPath !== undefined) {
+    where.push("repo_path = ?");
+    params.push(scope.repoPath);
+  }
+  const rows = db
     .prepare(
-      "SELECT * FROM workspaces WHERE conductor_workspace_name = ? AND archived_at IS NULL"
+      `SELECT * FROM workspaces WHERE ${where.join(" AND ")} ORDER BY created_at DESC`
     )
-    .get(conductorName) as any;
-  return row ? mapWorkspaceRow(row) : undefined;
+    .all(...params) as any[];
+  if (rows.length > 1) {
+    console.warn(
+      `[queries] getWorkspaceByName("${conductorName}") matched ${rows.length} workspaces (scope: chatId=${scope.chatId ?? "—"} repoPath=${scope.repoPath ?? "—"}). Using most recent. Pass a stricter scope to disambiguate.`
+    );
+  }
+  return rows[0] ? mapWorkspaceRow(rows[0]) : undefined;
 }
 
 export function getActiveWorkspaces(): Workspace[] {

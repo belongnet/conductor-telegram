@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import {
   createDecision,
   addEvent,
-  getWorkspaceByName as getTrackedWorkspaceByName,
+  getWorkspace as getTrackedWorkspace,
 } from "../store/queries.js";
 
 export const CONDUCTOR_WORKSPACES_DIR =
@@ -51,12 +51,14 @@ const CITY_NAMES = [
   "yerevan", "zanzibar", "zurich",
 ];
 
-// Track running agents by workspace name
+// Track running agents by tracked workspace UUID — Conductor city names are not
+// globally unique (two repos can both pick "maputo"), so keying these maps by
+// city name caused stdin and stop signals to land on the wrong agent.
 const runningAgents = new Map<string, ChildProcess>();
 const lastAssistantSdkMessageIds = new Map<string, string>();
 // Track seen tool_use IDs to avoid duplicate question forwarding
 const seenToolUseIds = new Set<string>();
-// Map decision IDs to workspace names for stdin piping
+// Map decision IDs to tracked workspace UUIDs for stdin piping
 const pendingStdinDecisions = new Map<number, string>();
 
 // ── Agent result interface ──────────────────────────────────
@@ -308,6 +310,7 @@ function spawnAgent(
   model: string,
   agentType: AgentType,
   workspaceName: string,
+  trackedWorkspaceId: string,
   options: {
     agentSessionId?: string | null;
     isFollowUp?: boolean;
@@ -323,6 +326,7 @@ function spawnAgent(
       prompt,
       model,
       workspaceName,
+      trackedWorkspaceId,
       options
     );
   }
@@ -333,6 +337,7 @@ function spawnAgent(
     prompt,
     model,
     workspaceName,
+    trackedWorkspaceId,
     options
   );
 }
@@ -343,6 +348,7 @@ function spawnClaudeAgent(
   prompt: string,
   model: string,
   workspaceName: string,
+  trackedWorkspaceId: string,
   options: {
     isFollowUp?: boolean;
   } = {}
@@ -372,7 +378,7 @@ function spawnClaudeAgent(
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
 
-  runningAgents.set(workspaceName, child);
+  runningAgents.set(trackedWorkspaceId, child);
 
   // Mark session as working
   updateSessionStatus(conductorSessionId, "working");
@@ -393,7 +399,7 @@ function spawnClaudeAgent(
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          processStreamMessage(conductorSessionId, msg, model, workspaceName);
+          processStreamMessage(conductorSessionId, msg, model, trackedWorkspaceId);
 
           // Extract result info
           if (msg.type === "result") {
@@ -420,7 +426,7 @@ function spawnClaudeAgent(
       if (code !== 0 && !result.resultText) {
         result.isError = true;
       }
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(trackedWorkspaceId);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -429,7 +435,7 @@ function spawnClaudeAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(trackedWorkspaceId);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -444,6 +450,7 @@ function spawnCodexAgent(
   prompt: string,
   model: string,
   workspaceName: string,
+  trackedWorkspaceId: string,
   options: {
     agentSessionId?: string | null;
     isFollowUp?: boolean;
@@ -471,7 +478,7 @@ function spawnCodexAgent(
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
 
-  runningAgents.set(workspaceName, child);
+  runningAgents.set(trackedWorkspaceId, child);
   updateSessionStatus(conductorSessionId, "working");
 
   const done = new Promise<AgentResult>((resolve) => {
@@ -537,7 +544,7 @@ function spawnCodexAgent(
         );
       }
 
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(trackedWorkspaceId);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -547,7 +554,7 @@ function spawnCodexAgent(
       result.isError = true;
       result.exitCode = -1;
       result.durationMs = Date.now() - startedAt;
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(trackedWorkspaceId);
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -733,8 +740,8 @@ function insertSessionMessage(
  * Send text input to a running agent's stdin (for answering AskUserQuestion).
  * Returns true if the write succeeded.
  */
-export function sendInputToAgent(workspaceName: string, input: string): boolean {
-  const child = runningAgents.get(workspaceName);
+export function sendInputToAgent(trackedWorkspaceId: string, input: string): boolean {
+  const child = runningAgents.get(trackedWorkspaceId);
   if (!child?.stdin?.writable) return false;
   child.stdin.write(input + "\n");
   return true;
@@ -791,16 +798,16 @@ function extractAskUserQuestion(input: any): { question: string; options: string
  * Check if a decision has a pending stdin answer and send it.
  */
 export function answerPendingStdinDecision(decisionId: number, answer: string): boolean {
-  const workspaceName = pendingStdinDecisions.get(decisionId);
-  if (!workspaceName) return false;
+  const trackedWorkspaceId = pendingStdinDecisions.get(decisionId);
+  if (!trackedWorkspaceId) return false;
   pendingStdinDecisions.delete(decisionId);
-  return sendInputToAgent(workspaceName, answer);
+  return sendInputToAgent(trackedWorkspaceId, answer);
 }
 
 /**
  * Process a streaming JSON message from Claude CLI and mirror to Conductor's DB.
  */
-function processStreamMessage(sessionId: string, msg: any, model: string, workspaceName?: string): void {
+function processStreamMessage(sessionId: string, msg: any, model: string, trackedWorkspaceId?: string): void {
   // Mirror the same message families Conductor persists for Claude sessions.
   if (
     msg.type !== "user" &&
@@ -844,12 +851,12 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
   );
 
   // Detect AskUserQuestion tool_use blocks and create Telegram decisions
-  if (msg.type === "assistant" && workspaceName) {
+  if (msg.type === "assistant" && trackedWorkspaceId) {
     const contentBlocks = msg.message?.content;
     if (Array.isArray(contentBlocks)) {
       for (const block of contentBlocks) {
         if (block.type === "tool_use") {
-          console.log(`[agent] tool_use block: name="${block.name}" id="${block.id}" workspace="${workspaceName}"`);
+          console.log(`[agent] tool_use block: name="${block.name}" id="${block.id}" workspaceId="${trackedWorkspaceId}"`);
         }
         const isAskUser =
           block.type === "tool_use" &&
@@ -865,8 +872,9 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
           seenToolUseIds.add(block.id);
           const { question, options } = extractAskUserQuestion(block.input);
 
-          // Look up workspace in conductor-telegram DB
-          const trackedWs = getTrackedWorkspaceByName(workspaceName);
+          // Look up workspace by its UUID — never by city name, since names
+          // collide across repos and the wrong chat would receive the question.
+          const trackedWs = getTrackedWorkspace(trackedWorkspaceId);
           if (trackedWs) {
             const decisionId = createDecision(
               trackedWs.id,
@@ -879,13 +887,13 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
               options: options ?? [],
             });
             addEvent(trackedWs.id, "human_request", eventPayload);
-            pendingStdinDecisions.set(decisionId, workspaceName);
+            pendingStdinDecisions.set(decisionId, trackedWorkspaceId);
             console.log(
-              `[agent] AskUserQuestion detected for ${workspaceName}: "${question.slice(0, 80)}..." → decision ${decisionId}`
+              `[agent] AskUserQuestion detected for ${trackedWs.conductorWorkspaceName ?? trackedWs.name}: "${question.slice(0, 80)}..." → decision ${decisionId}`
             );
           } else {
             console.warn(
-              `[agent] AskUserQuestion found but no tracked workspace for "${workspaceName}" — question will be lost`
+              `[agent] AskUserQuestion found but no tracked workspace for id "${trackedWorkspaceId}" — question will be lost`
             );
           }
         }
@@ -1118,6 +1126,7 @@ async function getExistingWorkspaceBranchNames(repoPath: string): Promise<Set<st
 export async function launchWorkspace(
   repoPath: string,
   prompt: string,
+  trackedWorkspaceId: string,
   onOutput?: (data: string) => void,
   attachmentSourcePaths: string[] = [],
   options: SessionLaunchOptions = {}
@@ -1222,6 +1231,7 @@ export async function launchWorkspace(
     launchConfig.model,
     launchConfig.agentType,
     cityName,
+    trackedWorkspaceId,
     {
       attachmentPaths: stagedAttachmentPaths,
       launchMode: launchConfig.launchMode,
@@ -1245,10 +1255,12 @@ export async function launchWorkspace(
  */
 export async function sendToSession(
   workspaceName: string,
+  trackedWorkspaceId: string,
   prompt: string,
   attachmentSourcePaths: string[] = []
 ): Promise<{ ok: true; done: Promise<AgentResult> } | { error: string }> {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  const trackedWs = getTrackedWorkspace(trackedWorkspaceId);
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, trackedWs?.repoPath);
   if (!wsInfo) {
     return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
   }
@@ -1268,6 +1280,7 @@ export async function sendToSession(
     normalizeModelForCli(wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt")),
     wsInfo.agentType,
     workspaceName,
+    trackedWorkspaceId,
     {
       agentSessionId: wsInfo.agentSessionId,
       isFollowUp: true,
@@ -1281,6 +1294,7 @@ export async function sendToSession(
 
 export async function launchWorkspaceSession(
   workspaceName: string,
+  trackedWorkspaceId: string,
   prompt: string,
   options: SessionLaunchOptions & {
     attachmentSourcePaths?: string[];
@@ -1294,7 +1308,8 @@ export async function launchWorkspaceSession(
     model: string;
   } | { error: string }
 > {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  const trackedWs = getTrackedWorkspace(trackedWorkspaceId);
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, trackedWs?.repoPath);
   if (!wsInfo) {
     return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
   }
@@ -1347,6 +1362,7 @@ export async function launchWorkspaceSession(
     launchConfig.model,
     launchConfig.agentType,
     workspaceName,
+    trackedWorkspaceId,
     {
       attachmentPaths: stagedAttachmentPaths,
       launchMode: launchConfig.launchMode,
@@ -1364,10 +1380,10 @@ export async function launchWorkspaceSession(
 }
 
 /**
- * Stop a running agent by workspace name.
+ * Stop a running agent by tracked workspace UUID.
  */
-export function stopAgent(workspaceName: string): boolean {
-  const child = runningAgents.get(workspaceName);
+export function stopAgent(trackedWorkspaceId: string): boolean {
+  const child = runningAgents.get(trackedWorkspaceId);
   if (!child) return false;
 
   child.kill("SIGTERM");
@@ -1376,15 +1392,15 @@ export function stopAgent(workspaceName: string): boolean {
     if (!child.killed) child.kill("SIGKILL");
   }, 5000);
 
-  runningAgents.delete(workspaceName);
+  runningAgents.delete(trackedWorkspaceId);
   return true;
 }
 
 /**
  * Check if an agent is currently running.
  */
-export function isAgentRunning(workspaceName: string): boolean {
-  return runningAgents.has(workspaceName);
+export function isAgentRunning(trackedWorkspaceId: string): boolean {
+  return runningAgents.has(trackedWorkspaceId);
 }
 
 // ── Conductor DB helpers ────────────────────────────────────
@@ -1421,11 +1437,17 @@ interface ConductorWorkspaceInfo {
   targetBranch: string | null;
 }
 
-function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceInfo | null {
+function getWorkspaceFromConductorDb(
+  directoryName: string,
+  repoPath?: string | null
+): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const row = db.prepare(
-      `SELECT
+    // City directory names ("maputo", "algiers", ...) are unique per repo, not
+    // globally. Without a repoPath filter this lookup can return the wrong repo's
+    // workspace, which is what caused agent messages to be forwarded into the
+    // wrong Telegram chat.
+    const baseQuery = `SELECT
           w.id as workspace_id,
           w.active_session_id as session_id,
           s.model,
@@ -1438,8 +1460,10 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
        FROM workspaces w
        LEFT JOIN sessions s ON s.id = w.active_session_id
        LEFT JOIN repos r ON r.id = w.repository_id
-       WHERE w.directory_name = ?`
-    ).get(directoryName) as any;
+       WHERE w.directory_name = ?`;
+    const row = repoPath
+      ? db.prepare(`${baseQuery} AND r.root_path = ?`).get(directoryName, repoPath) as any
+      : db.prepare(baseQuery).get(directoryName) as any;
     db.close();
 
     if (!row?.workspace_id || !row?.session_id) return null;
@@ -1460,9 +1484,10 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
 }
 
 export function getWorkspaceSessionInfo(
-  workspaceName: string
+  workspaceName: string,
+  repoPath?: string | null
 ): ConductorWorkspaceInfo | null {
-  return getWorkspaceFromConductorDb(workspaceName);
+  return getWorkspaceFromConductorDb(workspaceName, repoPath);
 }
 
 /**

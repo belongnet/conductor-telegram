@@ -354,7 +354,13 @@ function startSessionPoller(): void {
       const tracked = getAllWorkspaces(100);
       for (const ws of tracked) {
         if (!ws.conductorWorkspaceName) continue;
-        const sessionInfo = getWorkspaceSessionInfo(ws.conductorWorkspaceName);
+        // Scope by repo_path: city names like "maputo" can collide across
+        // repos, so without scoping the poller would pull messages from a
+        // different repo's session and forward them to the wrong chat.
+        const sessionInfo = getWorkspaceSessionInfo(
+          ws.conductorWorkspaceName,
+          ws.repoPath
+        );
         if (!sessionInfo) continue;
 
         if (ws.conductorSessionId !== sessionInfo.sessionId) {

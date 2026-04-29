@@ -2,6 +2,18 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.6.2] - 2026-04-29
+
+### Fixed
+- Critical: messages, status updates, and questions from one chat were leaking into other chats whenever two repos happened to spawn workspaces with the same Conductor city name (e.g., both ended up with a `maputo`). Conductor picks city names per-repo, not globally, so collisions are routine across separate repos. Every lookup that resolved a city name to a tracked workspace, a Conductor session, or a running agent process is now scoped — by chat ID, repo path, or the workspace's own UUID — so traffic stays in the chat that owns it.
+- The session poller no longer cross-pollinates: it now passes the workspace's `repo_path` when reading from Conductor's DB, so it can't pull the wrong repo's session messages and forward them to the wrong Telegram chat.
+- `AskUserQuestion` decisions raised by the in-process Claude agent now resolve the target workspace by its UUID instead of the city name, so the question reaches the chat that asked for it even when another chat is running an agent with the same city name.
+- Reply-based routing in forum supergroups (`#skill`, `/send`, `/skill`, etc.) now scopes the "which workspace did you reply to?" inference to the current chat, so a reply in chat B can't be redirected to a same-named workspace in chat A.
+
+### Changed
+- `runningAgents` and `pendingStdinDecisions` in the launcher are keyed by the tracked workspace UUID instead of the Conductor city name. Two simultaneous agents with the same city name (across different repos/chats) no longer overwrite each other's child-process handles, and answering a question routes to the correct agent's stdin.
+- `getWorkspaceByName` now takes an explicit `{ chatId?, repoPath? }` scope and orders results deterministically. It logs a warning when an ambiguous lookup matches more than one workspace, so any remaining unscoped callers surface in the logs.
+
 ## [0.3.6.1] - 2026-04-29
 
 ### Fixed

@@ -1,3 +1,4 @@
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -20,9 +21,24 @@ if (!WORKSPACE_NAME) {
   process.exit(1);
 }
 
-// Resolve workspace ID from the conductor workspace name
+// Conductor city names (e.g. "maputo") are unique per repo, not globally — two
+// repos can both pick the same name. We scope the lookup to this MCP server's
+// repo by deriving the repo path from cwd: ~/conductor/workspaces/<repo>/<city>.
+const REPOS_DIR =
+  process.env.CONDUCTOR_REPOS_DIR ??
+  path.join(process.env.HOME ?? "", "conductor/repos");
+
+function getOwnRepoPath(): string | undefined {
+  const cwd = process.cwd();
+  const repoName = path.basename(path.dirname(cwd));
+  if (!repoName) return undefined;
+  return path.join(REPOS_DIR, repoName);
+}
+
+const REPO_PATH = getOwnRepoPath();
+
 function getWorkspaceId(): string | null {
-  const ws = getWorkspaceByName(WORKSPACE_NAME!);
+  const ws = getWorkspaceByName(WORKSPACE_NAME!, { repoPath: REPO_PATH });
   return ws?.id ?? null;
 }
 
