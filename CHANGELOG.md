@@ -2,6 +2,12 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.6.2] - 2026-05-03
+
+### Fixed
+- Voice messages with a caption now route correctly. When you forward a voice memo and add text on top (e.g., "kabul fix the deploy"), the bot used to silently drop the text and route on the raw transcript alone. The voice handler now reads `msg.caption`, threads it through the AI router as the user's explicit routing intent, and sends both the caption and the transcript to whichever workspace is picked. The same combine-with-transcript treatment applies on reply-target and forum-thread voice paths.
+- Long voice memos (5+ minutes) no longer silently fail. The whisper transcription subprocess previously had no timeout, so a stuck or pathologically slow run could block the bot indefinitely while the AI router timed out around it. Whisper is now bounded to 5 minutes and afconvert to 30 seconds; either failure logs a clear reason and falls through cleanly.
+
 ## [0.3.6.1] - 2026-04-29
 
 ### Fixed
