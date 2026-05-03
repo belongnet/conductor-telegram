@@ -1300,7 +1300,8 @@ async function handleCaptionCommand(
 async function tryAutoRouteVoice(
   ctx: Context,
   chatId: string,
-  voicePath: string
+  voicePath: string,
+  caption: string = ""
 ): Promise<boolean> {
   const repos = getRepoList();
   if (repos.length === 0) return false;
@@ -1309,7 +1310,12 @@ async function tryAutoRouteVoice(
 
   try {
     await ctx.reply("🎙 Listening...");
-    const result = await routeVoiceMessage(voicePath, repos, activeWorkspaces);
+    const result = await routeVoiceMessage(
+      voicePath,
+      repos,
+      activeWorkspaces,
+      caption
+    );
     if (!result) return false;
 
     return await executeRouteResult(ctx, chatId, result, [voicePath]);
@@ -1406,11 +1412,13 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
 
   const localPath = await downloadTelegramFile(ctx, msg.voice.file_id, ".ogg");
   const duration = msg.voice.duration ?? 0;
+  const caption = msg.caption?.trim() ?? "";
 
   if (
     await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
       const stagedPath = stageDecisionAttachment(decision, localPath);
-      return `[Voice message (${duration}s): ${stagedPath}]`;
+      const base = `[Voice message (${duration}s): ${stagedPath}]`;
+      return caption ? `${base}\n${caption}` : base;
     })
   ) {
     return;
@@ -1420,9 +1428,12 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
   if (repliedWorkspace) {
     const transcript = await transcribeVoiceMessage(localPath);
     if (transcript) {
-      await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(transcript));
+      const text = caption ? `${caption}\n\n${transcript}` : transcript;
+      await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(text));
     } else {
-      const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+      const message = caption
+        ? `${caption}\n\nThe user sent a voice message (${duration}s). Please review the attached recording.`
+        : `The user sent a voice message (${duration}s). Please review the attached recording.`;
       await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
     }
     return;
@@ -1437,17 +1448,22 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     if (threadWorkspace) {
       const transcript = await transcribeVoiceMessage(localPath);
       if (transcript) {
-        await sendMessageToWorkspace(ctx, threadWorkspace, applySkillHashtag(transcript));
+        const text = caption ? `${caption}\n\n${transcript}` : transcript;
+        await sendMessageToWorkspace(ctx, threadWorkspace, applySkillHashtag(text));
       } else {
-        const message = `The user sent a voice message (${duration}s). Please review the attached recording.`;
+        const message = caption
+          ? `${caption}\n\nThe user sent a voice message (${duration}s). Please review the attached recording.`
+          : `The user sent a voice message (${duration}s). Please review the attached recording.`;
         await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
       }
       return;
     }
   }
 
-  // Auto-route: use AI to transcribe and determine the target repo/workspace
-  const routed = await tryAutoRouteVoice(ctx, chatId, localPath);
+  // Auto-route: use AI to transcribe and determine the target repo/workspace.
+  // Caption (if any) is the user's explicit routing intent; the router sees
+  // both signals.
+  const routed = await tryAutoRouteVoice(ctx, chatId, localPath, caption);
   if (routed) return;
 
   await ctx.reply(
