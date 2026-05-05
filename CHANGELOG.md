@@ -2,6 +2,15 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.6.4] - 2026-05-05
+
+### Fixed
+- Auto-router no longer anchors on whichever repo dominates the active-workspace list. Messages with an explicit target like "long-events fix this" or "in belong-checkin: add X" used to silently route to conductor-telegram when the user's message also mentioned the bot in passing (e.g., "long-events fix this — conductor-telegram is dropping these"). The router now runs a deterministic pre-scan for explicit targets ("starts with {repo}", "in/for/on {repo}", "{repo} app/repo", "{repo}:") and surfaces the match as a hard hint that other passing mentions cannot override.
+- Active-workspace context capped at the 8 most recent. With many long-running meta-debug workspaces in one repo (39 conductor-telegram workspaces vs 4 long-events), the model treated the imbalance as routing evidence. The cap kills that anchoring bias while still showing the workspaces that actually matter for continuation phrases.
+
+### Changed
+- "Existing workspace" rule tightened: a repo-name mention alone is no longer "unmistakable" — it has to be paired with a continuation phrase or the workspace's Name/ID/nickname. Previously a fresh task that happened to name the right repo could get silently appended to a stale running workspace just because that workspace had the same Repo column.
+
 ## [0.3.6.3] - 2026-05-03
 
 ### Changed
