@@ -1,6 +1,8 @@
 import type { Context, Telegraf } from "telegraf";
 import {
   answerPendingStdinDecision,
+  archiveConductorWorkspace,
+  formatAttachmentReference,
   getWorkspaceSessionInfo,
   launchWorkspace,
   launchWorkspaceSession,
@@ -778,12 +780,27 @@ async function startWorkspaceFromMessage(
   });
 
   // Try to create a forum topic for this workspace
-  const threadId = await createWorkspaceTopic(
+  const topicResult = await createWorkspaceTopic(
     ctx.telegram,
     chatIdStr,
     repoName,
     workspace.name
   );
+  let threadId: number | undefined;
+  if (topicResult.ok) {
+    threadId = topicResult.threadId;
+  } else if (topicResult.kind !== "no_forum") {
+    const explanation =
+      topicResult.kind === "no_permission"
+        ? "The bot needs the <b>Manage Topics</b> admin permission in this chat."
+        : `Telegram returned: <code>${escHtml(topicResult.message)}</code>`;
+    updateWorkspaceStatus(workspace.id, "failed");
+    await ctx.reply(
+      `⚠️ Could not create a forum topic for <b>${escHtml(repoName)}</b>. ${explanation}\n\nWorkspace was not started.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
   if (threadId) {
     updateWorkspaceThreadId(workspace.id, threadId);
     workspace.telegramThreadId = threadId;
@@ -1172,9 +1189,8 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (
     await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
       const stagedPath = stageDecisionAttachment(decision, localPath);
-      return caption
-        ? `[Image: ${stagedPath}]\n${caption}`
-        : `[Image: ${stagedPath}]`;
+      const ref = formatAttachmentReference(stagedPath);
+      return caption ? `${ref}\n${caption}` : ref;
     })
   ) {
     return;
@@ -1280,12 +1296,13 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
 
   const localPath = await downloadTelegramFile(ctx, spec.fileId, spec.ext);
 
-  // Decision-reply path: stage and forward as `[<Label>: <path>]`.
+  // Decision-reply path: stage and forward as a markdown image/link ref so
+  // Conductor renders the file inline and agents can echo the same syntax back.
   if (
     await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
       const stagedPath = stageDecisionAttachment(decision, localPath);
-      const head = `[${spec.label}: ${stagedPath}]`;
-      return caption ? `${head}\n${caption}` : head;
+      const ref = formatAttachmentReference(stagedPath);
+      return caption ? `${ref}\n${caption}` : ref;
     })
   ) {
     return;
@@ -1515,8 +1532,8 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
   if (
     await tryAnswerDecisionReplyWithFormatter(ctx, (decision) => {
       const stagedPath = stageDecisionAttachment(decision, localPath);
-      const base = `[Voice message (${duration}s): ${stagedPath}]`;
-      return caption ? `${base}\n${caption}` : base;
+      const ref = formatAttachmentReference(stagedPath);
+      return caption ? `${ref}\n${caption}` : ref;
     })
   ) {
     return;
@@ -2133,6 +2150,9 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
   }
 
   archiveWorkspace(workspaceId);
+  if (workspace.conductorWorkspaceName) {
+    archiveConductorWorkspace(workspace.conductorWorkspaceName, workspace.repoPath);
+  }
 
   if (workspace.telegramThreadId) {
     await deleteWorkspaceTopic(
