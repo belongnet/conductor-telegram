@@ -2,6 +2,18 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.7.1] - 2026-05-14
+
+### Added
+- Agents now receive Telegram attachments as markdown image/link references, and Claude gets a short system prompt explaining how to send generated files back through the same inline media bridge.
+- Startup maintenance prunes old events and archived message links, checkpoints WAL, and periodically vacuums the bot database.
+- Tag pushes matching `v*` can publish the package to npm with provenance.
+
+### Fixed
+- Forum-topic creation failures are now visible when a supergroup lacks topic permissions instead of silently starting a workspace that will route messages into General.
+- Terminal workspaces no longer get the archived topic icon unless they were explicitly archived.
+- Telegram Archive now also archives the matching Conductor workspace row, scoped by repo path.
+
 ## [0.3.7.0] - 2026-05-14
 
 ### Added

@@ -120,12 +120,7 @@ function parseArtifactTopicState(workspace: Workspace): TopicVisualState | null 
 }
 
 function getWorkspaceTopicState(workspace: Workspace): TopicVisualState {
-  if (
-    workspace.status === "archived" ||
-    workspace.status === "done" ||
-    workspace.status === "failed" ||
-    workspace.status === "stopped"
-  ) {
+  if (workspace.status === "archived") {
     return "archived";
   }
   if (getPendingDecision(workspace.id)) return "needs_input";
@@ -172,16 +167,42 @@ async function getTopicIconId(
   return undefined;
 }
 
+export type CreateTopicResult =
+  | { ok: true; threadId: number }
+  | { ok: false; kind: CreateTopicFailureKind; message: string };
+
+type CreateTopicFailureKind = "no_forum" | "no_permission" | "other";
+
+function classifyTopicCreateError(err: any): CreateTopicFailureKind {
+  const msg = String(err?.message ?? "").toLowerCase();
+  if (
+    msg.includes("not enough rights") ||
+    msg.includes("can_manage_topics") ||
+    msg.includes("forbidden")
+  ) {
+    return "no_permission";
+  }
+  if (
+    msg.includes("not a forum") ||
+    msg.includes("forum") ||
+    msg.includes("topics_disabled") ||
+    msg.includes("supergroup")
+  ) {
+    return "no_forum";
+  }
+  return "other";
+}
+
 /**
- * Create a forum topic for a workspace. Returns the message_thread_id,
- * or null if the chat doesn't support topics.
+ * Create a forum topic for a workspace. Structured failures let callers
+ * distinguish private/non-forum chats from permission or Telegram errors.
  */
 export async function createWorkspaceTopic(
   telegram: Telegram,
   chatId: string,
   repoName: string,
   workspaceName: string
-): Promise<number | null> {
+): Promise<CreateTopicResult> {
   try {
     const topicName = buildTopicName(repoName, workspaceName);
     const iconId = await getTopicIconId(telegram, "in_progress");
@@ -192,11 +213,12 @@ export async function createWorkspaceTopic(
         ? { icon_custom_emoji_id: iconId }
         : { icon_color: pickColor(repoName) }
     );
-    return result.message_thread_id;
+    return { ok: true, threadId: result.message_thread_id };
   } catch (err: any) {
-    // Chat is not a forum-enabled supergroup, or bot lacks permissions
-    console.log(`[forum] could not create topic: ${err.message}`);
-    return null;
+    const message = String(err?.message ?? "unknown error");
+    const kind = classifyTopicCreateError(err);
+    console.log(`[forum] could not create topic (${kind}): ${message}`);
+    return { ok: false, kind, message };
   }
 }
 
@@ -363,28 +385,28 @@ export async function ensureWorkspaceTopic(
   );
   const repoName = path.basename(workspace.repoPath);
   const wsName = workspace.conductorWorkspaceName ?? workspace.name;
-  const newThreadId = await createWorkspaceTopic(
+  const result = await createWorkspaceTopic(
     telegram,
     workspace.telegramChatId,
     repoName,
     wsName
   );
-  if (newThreadId) {
-    updateWorkspaceThreadId(workspace.id, newThreadId);
-    workspace.telegramThreadId = newThreadId;
-    // Apply the workspace's current visual state to the new topic
-    const desiredIcon = await getTopicIconId(
-      telegram,
-      getWorkspaceTopicState(workspace)
-    );
-    if (desiredIcon) {
-      try {
-        await telegram.editForumTopic(workspace.telegramChatId, newThreadId, {
-          icon_custom_emoji_id: desiredIcon,
-        });
-      } catch (err: any) {
-        console.log(`[forum] could not set initial icon on recreated topic: ${err.message}`);
-      }
+  if (!result.ok) return null;
+  const newThreadId = result.threadId;
+  updateWorkspaceThreadId(workspace.id, newThreadId);
+  workspace.telegramThreadId = newThreadId;
+  // Apply the workspace's current visual state to the new topic
+  const desiredIcon = await getTopicIconId(
+    telegram,
+    getWorkspaceTopicState(workspace)
+  );
+  if (desiredIcon) {
+    try {
+      await telegram.editForumTopic(workspace.telegramChatId, newThreadId, {
+        icon_custom_emoji_id: desiredIcon,
+      });
+    } catch (err: any) {
+      console.log(`[forum] could not set initial icon on recreated topic: ${err.message}`);
     }
   }
   return newThreadId;

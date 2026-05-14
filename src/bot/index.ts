@@ -13,6 +13,10 @@ import {
   getLogger,
 } from "./supervisor.js";
 import { initHeartbeat } from "../store/queries.js";
+import {
+  runStartupMaintenance,
+  startMaintenanceTimer,
+} from "../store/maintenance.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -35,6 +39,7 @@ import {
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
+  updateWorkspaceThreadId,
 } from "../store/queries.js";
 import type {
   ArtifactPayload,
@@ -56,6 +61,7 @@ import {
   truncateHtml,
 } from "./format.js";
 import {
+  createWorkspaceTopic,
   ensureWorkspaceTopic,
   renameWorkspaceTopics,
   syncWorkspaceTopic,
@@ -178,6 +184,11 @@ async function sendToWorkspaceTopic(
   text: string,
   extra: Record<string, any> = {}
 ): ReturnType<typeof bot.telegram.sendMessage> {
+  if (!ws.telegramThreadId) {
+    const recovered = await recoverMissingWorkspaceTopic(ws);
+    if (recovered) ws.telegramThreadId = recovered;
+  }
+
   const threadOpts = ws.telegramThreadId
     ? { message_thread_id: ws.telegramThreadId }
     : {};
@@ -202,6 +213,38 @@ async function sendToWorkspaceTopic(
       ...extra,
       ...newThreadOpts,
     });
+  }
+}
+
+// Coalesce topic recovery so parallel poller/event sends cannot create
+// multiple topics once permissions are restored.
+const topicRecoveryInFlight = new Map<string, Promise<number | null>>();
+
+async function recoverMissingWorkspaceTopic(ws: Workspace): Promise<number | null> {
+  const existing = topicRecoveryInFlight.get(ws.id);
+  if (existing) return existing;
+
+  const attempt = (async () => {
+    const chat = await bot.telegram.getChat(ws.telegramChatId).catch(() => null);
+    if (!(chat as any)?.is_forum) return null;
+
+    const result = await createWorkspaceTopic(
+      bot.telegram,
+      ws.telegramChatId,
+      path.basename(ws.repoPath),
+      ws.conductorWorkspaceName ?? ws.name
+    );
+    if (!result.ok) return null;
+
+    updateWorkspaceThreadId(ws.id, result.threadId);
+    return result.threadId;
+  })();
+
+  topicRecoveryInFlight.set(ws.id, attempt);
+  try {
+    return await attempt;
+  } finally {
+    topicRecoveryInFlight.delete(ws.id);
   }
 }
 
@@ -271,6 +314,11 @@ async function sendSingleMediaToWorkspaceTopic(
   item: InlineMediaItem,
   captionHtml: string | undefined
 ): Promise<number | null> {
+  if (!ws.telegramThreadId) {
+    const recovered = await recoverMissingWorkspaceTopic(ws);
+    if (recovered) ws.telegramThreadId = recovered;
+  }
+
   const baseExtra: Record<string, any> = captionHtml
     ? { caption: captionHtml, parse_mode: "HTML" }
     : {};
@@ -312,6 +360,11 @@ async function sendMediaGroupToWorkspaceTopic(
   items: InlineMediaItem[],
   captionHtml: string | undefined
 ): Promise<{ message_id: number }[]> {
+  if (!ws.telegramThreadId) {
+    const recovered = await recoverMissingWorkspaceTopic(ws);
+    if (recovered) ws.telegramThreadId = recovered;
+  }
+
   const group = items.map((item, index) => {
     const base: any = {
       type: item.kind === "animation" ? "document" : item.kind,
@@ -794,10 +847,13 @@ async function main(): Promise<void> {
     version: BOT_VERSION,
   });
 
+  runStartupMaintenance();
+  const maintenance = startMaintenanceTimer();
   const heartbeat = startHeartbeat();
 
   installCrashHandlers(() => {
     heartbeat.stop();
+    maintenance.stop();
     if (pollTimer) clearInterval(pollTimer);
     if (eventPollTimer) clearInterval(eventPollTimer);
     try {

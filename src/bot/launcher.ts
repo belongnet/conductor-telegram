@@ -101,6 +101,19 @@ interface SessionCreateResult {
   model: string;
 }
 
+/**
+ * Format an attachment as a markdown file reference. Conductor renders image
+ * refs inline, and the Telegram outbound media extractor recognizes this same
+ * syntax when agents send generated files back.
+ */
+export function formatAttachmentReference(filePath: string): string {
+  const filename = path.basename(filePath);
+  if (isImageAttachment(filePath)) {
+    return `![${filename}](${filePath})`;
+  }
+  return `[${filename}](${filePath})`;
+}
+
 function buildPromptWithAttachments(
   prompt: string,
   attachmentPaths: string[]
@@ -110,7 +123,7 @@ function buildPromptWithAttachments(
     return trimmedPrompt;
   }
 
-  const attachmentLines = attachmentPaths.map((filePath) => `[Attached: ${filePath}]`);
+  const attachmentLines = attachmentPaths.map(formatAttachmentReference);
   if (!trimmedPrompt) {
     return attachmentLines.join("\n");
   }
@@ -266,8 +279,20 @@ function deriveSessionTitle(
   const firstLine = prompt
     .split("\n")
     .map((line) => line.trim())
-    .find((line) => line.length > 0 && !line.startsWith("[Attached:"));
+    .find(
+      (line) =>
+        line.length > 0 &&
+        !line.startsWith("[Attached:") &&
+        !isStandaloneAttachmentReference(line)
+    );
   return truncateTitle(firstLine ?? fallback, 80);
+}
+
+function isStandaloneAttachmentReference(line: string): boolean {
+  return (
+    /^!\[[^\]]*\]\([^)\s]+\)\s*$/.test(line) ||
+    /^\[[^\]]+\]\([^)\s]+\)\s*$/.test(line)
+  );
 }
 
 function truncateTitle(value: string, maxLen: number): string {
@@ -298,10 +323,17 @@ function resolveLaunchConfig(
 }
 
 function isImageAttachment(filePath: string): boolean {
-  return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].includes(
+  return [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic"].includes(
     path.extname(filePath).toLowerCase()
   );
 }
+
+const TELEGRAM_INLINE_MEDIA_SYSTEM_PROMPT = [
+  "Telegram inline file bridge:",
+  "- Files the user sends via Telegram arrive in your prompts as markdown image refs `![filename](/abs/path)` for images or markdown links `[filename](/abs/path)` for other files. Treat these as the user's real attachments.",
+  "- When you want the user to see a file you produced, reference it with the same syntax: `![name.png](/abs/path/to/name.png)` for images, `[name.ext](/abs/path/to/name.ext)` for everything else. The bridge will upload it to Telegram as a real attachment.",
+  "- Use absolute paths inside the workspace.",
+].join("\n");
 
 // ── Core: spawn Claude CLI + mirror to DB ───────────────────
 
@@ -365,6 +397,7 @@ function spawnClaudeAgent(
     "--max-turns", "1000",
     "--model", model,
     "--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE,
+    "--append-system-prompt", TELEGRAM_INLINE_MEDIA_SYSTEM_PROMPT,
   ];
 
   console.log(`[agent] Spawning: claude ${args.join(" ").slice(0, 100)}...`);
@@ -1420,6 +1453,36 @@ export function stopAgent(workspaceName: string, repoPath: string): boolean {
 
   runningAgents.delete(key);
   return true;
+}
+
+export function archiveConductorWorkspace(
+  workspaceName: string,
+  repoPath: string | null = null
+): boolean {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    const where = ["directory_name = ?"];
+    const params: any[] = [workspaceName];
+    if (repoPath) {
+      where.push(
+        `repository_id IN (
+          SELECT id FROM repos WHERE root_path = ?
+        )`
+      );
+      params.push(repoPath);
+    }
+    const result = db.prepare(
+      `UPDATE workspaces
+       SET state = 'archived',
+           updated_at = datetime('now')
+       WHERE ${where.join(" AND ")}`
+    ).run(...params);
+    db.close();
+    return result.changes > 0;
+  } catch (err) {
+    console.error(`[launcher] Failed to archive Conductor workspace ${workspaceName}:`, err);
+    return false;
+  }
 }
 
 /**
