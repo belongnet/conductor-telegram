@@ -181,6 +181,17 @@ function checkPlugin(): CheckResult {
   return { name: "MCP Plugin", ok: true, detail: `${pluginDir} installed` };
 }
 
+async function checkGithub(): Promise<CheckResult> {
+  const { checkGithubCli } = await import("../bot/github.js");
+  const result = await checkGithubCli();
+  return {
+    name: "GitHub CLI",
+    ok: result.ok,
+    detail: result.detail,
+    fix: result.fix,
+  };
+}
+
 function checkRepos(reposDir: string | undefined): CheckResult {
   const p = reposDir ?? path.join(os.homedir(), "conductor/repos");
   if (!fs.existsSync(p)) {
@@ -224,6 +235,7 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     await checkBotToken(config?.botToken),
     checkDatabase(config?.dbPath),
     checkConductor(config?.conductorDbPath),
+    await checkGithub(),
     checkPlugin(),
     checkRepos(config?.conductorReposDir),
   ];

@@ -2,6 +2,19 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.3.7.0] - 2026-05-14
+
+### Added
+- First-class PR status tracking. The bot now records GitHub PR state, check summary, mergeability, and stale branch signals in a `pr_records` table keyed by workspace.
+- `/prs` and `/ship_status` summarize PR/check/merge state for tracked workspaces. PR cards include approval-gated `Refresh`, `Ask Agent To Fix`, and `Merge PR` buttons; merge only appears for open, non-draft PRs with passing checks and a clean merge state.
+- `conductor-telegram doctor` now checks GitHub CLI availability/auth in addition to the existing MCP plugin check.
+- A Node test suite covers duplicate workspace-name lookup, PR state/check normalization, and PR card merge readiness.
+
+### Fixed
+- Workspace identity is now scoped by repo path or chat wherever Telegram talks to Conductor. City names like `rotterdam` can exist in multiple repos, so the poller, MCP event routing, follow-up sends, review/PR sessions, and running-agent maps no longer key on the city name alone.
+- Stale `starting`/`running` workspaces whose Conductor session disappeared are marked failed after a grace period so they stop attracting auto-routed work.
+- PR artifact events are verified through GitHub before Telegram presents them as submitted.
+
 ## [0.3.6.4] - 2026-05-05
 
 ### Fixed

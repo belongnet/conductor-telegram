@@ -69,9 +69,12 @@ import {
   type InlineMediaItem,
 } from "./media.js";
 import { existsSync, statSync } from "node:fs";
+import { refreshWorkspacePr } from "./github.js";
+import { formatPrCard, prKeyboard } from "./pr-ui.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
+const STALE_WORKSPACE_MS = 15 * 60 * 1000;
 
 const lifecycleLog = getLogger("bot");
 const pollerLog = getLogger("poller");
@@ -354,8 +357,14 @@ function startSessionPoller(): void {
       const tracked = getAllWorkspaces(100);
       for (const ws of tracked) {
         if (!ws.conductorWorkspaceName) continue;
-        const sessionInfo = getWorkspaceSessionInfo(ws.conductorWorkspaceName);
-        if (!sessionInfo) continue;
+        const sessionInfo = getWorkspaceSessionInfo(
+          ws.conductorWorkspaceName,
+          ws.repoPath
+        );
+        if (!sessionInfo) {
+          markWorkspaceStaleIfNeeded(ws);
+          continue;
+        }
 
         if (ws.conductorSessionId !== sessionInfo.sessionId) {
           updateWorkspaceConductorSession(ws.id, sessionInfo.sessionId);
@@ -399,7 +408,7 @@ function startSessionPoller(): void {
         if (sessionStatus === "idle" && ws.status === "running") {
           updateWorkspaceStatus(ws.id, "done");
           const name = ws.conductorWorkspaceName ?? ws.name;
-          const result = getSessionResult(ws.conductorWorkspaceName!);
+          const result = getSessionResult(ws.conductorWorkspaceName!, ws.repoPath);
 
           let msg = `✅ <b>${esc(name)}</b> finished`;
           if (result) {
@@ -456,6 +465,31 @@ function startSessionPoller(): void {
   }, POLL_INTERVAL_MS);
 }
 
+function markWorkspaceStaleIfNeeded(ws: Workspace): void {
+  if (ws.status !== "starting" && ws.status !== "running") return;
+  const createdAt = Date.parse(ws.createdAt);
+  if (!Number.isFinite(createdAt)) return;
+  if (Date.now() - createdAt < STALE_WORKSPACE_MS) return;
+
+  updateWorkspaceStatus(ws.id, "failed");
+  const name = ws.conductorWorkspaceName ?? ws.name;
+  const text =
+    `⚠️ <b>${esc(name)}</b> lost its Conductor session.\n\n` +
+    `<i>Marked failed so it no longer attracts new routed work. No branch or workspace cleanup was performed.</i>`;
+  sendToWorkspaceTopic(ws, text, {
+    parse_mode: "HTML",
+    ...styledButtons([btn("Archive", `archive:${ws.id}`)]),
+  })
+    .then(() => {
+      if (ws.telegramThreadId) {
+        syncWorkspaceTopic(bot.telegram, { ...ws, status: "failed" }).catch((err) =>
+          forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
+        );
+      }
+    })
+    .catch((err) => pollerLog.error("stale workspace notify error:", err));
+}
+
 // ── Event polling (human_request → Telegram) ────────────────
 
 let eventPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -506,23 +540,14 @@ function startEventPoller(): void {
           try {
             const artifact: ArtifactPayload = JSON.parse(event.payload);
             if (artifact.type === "pr") {
-              const wsName = ws.conductorWorkspaceName ?? ws.name ?? "unknown";
-
-              const celebrationLines = [
-                `🎆🎇🎆🎇🎆🎇🎆🎇`,
-                ``,
-                `🎉 <b>New PR submitted!</b>`,
-                ``,
-                `<b>${esc(wsName)}</b> just opened a pull request:`,
-                `${esc(artifact.description)}`,
-                artifact.url ? `\n🔗 <a href="${esc(artifact.url).replace(/"/g, "&quot;")}">${esc(artifact.url)}</a>` : "",
-                ``,
-                `🎆🎇🎆🎇🎆🎇🎆🎇`,
-              ];
-              const celebrationMsg = celebrationLines.filter(Boolean).join("\n");
-
-              sendToWorkspaceTopic(ws, celebrationMsg, { parse_mode: "HTML" })
-                .catch((err) => eventPollerLog.error("celebration send error:", err));
+              refreshWorkspacePr(ws)
+                .then(({ record }) =>
+                  sendToWorkspaceTopic(ws, formatPrCard(ws, record), {
+                    parse_mode: "HTML",
+                    ...prKeyboard(record, ws),
+                  })
+                )
+                .catch((err) => eventPollerLog.error("PR verification send error:", err));
             } else if (artifact.type === "file") {
               const wsName = ws.conductorWorkspaceName ?? ws.name ?? "unknown";
               const wsDir = workspaceDirFor(ws);

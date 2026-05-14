@@ -70,6 +70,7 @@ src/
 | `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
 | `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
 | `/workspaces` | `/workspaces` | List all tracked workspaces |
+| `/prs`, `/ship_status` | `/prs` | Show PR, check, merge, and stale-branch status for tracked workspaces |
 | `/status` | `/status` | Show active workspace summary |
 | `/stop` | `/stop <name>` | Stop a running workspace |
 | `/repos` | `/repos` | List available repositories (tap to select) |
@@ -183,6 +184,7 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `events` | Status updates, artifacts, and human requests from MCP |
 | `decisions` | Questions posed to the operator with answers |
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
+| `pr_records` | GitHub PR/check/merge state verified by repo + branch |
 
 ## Development
 
@@ -217,6 +219,7 @@ $ conductor-telegram doctor
   Bot token   ✓ @MyBot connected
   Database    ✓ ~/.conductor-telegram/conductor-telegram.db
   Conductor   ✓ ~/Library/Application Support/com.conductor.app/conductor.db
+  GitHub CLI  ✓ gh version 2.x.x
   MCP Plugin  ✓ ~/.claude/plugins/conductor-telegram-mcp installed
   Repos       ✓ ~/conductor/repos (4 repositories)
 ```
