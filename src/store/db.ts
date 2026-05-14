@@ -57,6 +57,32 @@ const SCHEMA = `
     boot_count INTEGER NOT NULL DEFAULT 1,
     last_exit_reason TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS pr_records (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id),
+    repo_path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    pr_number INTEGER,
+    pr_url TEXT,
+    title TEXT,
+    state TEXT NOT NULL DEFAULT 'unknown',
+    is_draft INTEGER NOT NULL DEFAULT 0,
+    head_ref TEXT,
+    base_ref TEXT,
+    review_decision TEXT,
+    merge_state_status TEXT,
+    mergeable TEXT,
+    checks_status TEXT NOT NULL DEFAULT 'unknown',
+    checks_summary TEXT,
+    branch_exists INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pr_records_repo_branch
+    ON pr_records(repo_path, branch);
 `;
 
 let _db: Database.Database | null = null;

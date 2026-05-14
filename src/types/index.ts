@@ -22,6 +22,32 @@ export interface Workspace {
   archivedAt: string | null;
 }
 
+export type PrState = "none" | "open" | "closed" | "merged" | "unknown";
+export type PrChecksStatus = "passing" | "pending" | "failing" | "unknown";
+
+export interface PrRecord {
+  workspaceId: string;
+  repoPath: string;
+  branch: string;
+  prNumber: number | null;
+  prUrl: string | null;
+  title: string | null;
+  state: PrState;
+  isDraft: boolean;
+  headRef: string | null;
+  baseRef: string | null;
+  reviewDecision: string | null;
+  mergeStateStatus: string | null;
+  mergeable: string | null;
+  checksStatus: PrChecksStatus;
+  checksSummary: string | null;
+  branchExists: boolean;
+  lastCheckedAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type EventType =
   | "status"
   | "artifact"

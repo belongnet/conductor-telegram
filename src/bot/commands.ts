@@ -13,6 +13,7 @@ import {
   createWorkspace,
   getActiveWorkspaces,
   getAllWorkspaces,
+  getAllWorkspacesForChat,
   getWorkspace,
   getWorkspaceByName,
   getWorkspaceByThreadId,
@@ -26,6 +27,7 @@ import {
   updateWorkspaceForwardCursor,
   getWorkspaceByTelegramMessage,
   getHeartbeat,
+  getPrRecordsForWorkspaces,
 } from "../store/queries.js";
 import {
   createWorkspaceTopic,
@@ -34,13 +36,15 @@ import {
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
-import type { Decision, Workspace } from "../types/index.js";
+import type { Decision, PrRecord, Workspace } from "../types/index.js";
 import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
 import { routeVoiceMessage, routeTextMessage, transcribeVoiceMessage, type RouteResult } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import https from "node:https";
+import { canMergePr, mergeWorkspacePr, refreshWorkspacePr } from "./github.js";
+import { compactPrBadge, formatPrCard, prKeyboard } from "./pr-ui.js";
 
 const AUTO_ROUTE_FAILURE_MESSAGE =
   "Couldn't auto-route that. Use /run <repo> to start a workspace, or reply inside an existing workspace's topic.";
@@ -193,6 +197,8 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
     description: s.description,
   })),
   { command: "workspaces", description: "List tracked workspaces" },
+  { command: "prs", description: "Show PR and branch ship status" },
+  { command: "ship_status", description: "Show PR and branch ship status" },
   { command: "status", description: "Show active workspace status" },
   { command: "stop", description: "Stop a running workspace" },
   { command: "repos", description: "List available repos" },
@@ -224,20 +230,32 @@ function parseSkillMention(text: string): { skill: string; remaining: string } |
   return { skill, remaining };
 }
 
-function findTrackedWorkspace(identifier: string): Workspace | undefined {
+function findTrackedWorkspace(
+  identifier: string,
+  chatId?: string
+): Workspace | undefined | "ambiguous" {
   let workspace = getWorkspace(identifier);
   if (workspace) {
+    if (chatId && workspace.telegramChatId !== chatId) return undefined;
     return workspace;
   }
 
-  const all = getAllWorkspaces(100);
-  return all.find((ws) => ws.conductorWorkspaceName === identifier);
+  const all = chatId ? getAllWorkspacesForChat(chatId, 100) : getAllWorkspaces(100);
+  const matches = all.filter((ws) => ws.conductorWorkspaceName === identifier);
+  if (matches.length > 1) return "ambiguous";
+  return matches[0];
 }
 
-function resolveWorkspaceTarget(identifier: string): WorkspaceTarget | null {
-  const trackedWorkspace = findTrackedWorkspace(identifier) ?? null;
+function resolveWorkspaceTarget(
+  identifier: string,
+  opts: { chatId?: string; repoPath?: string | null } = {}
+): WorkspaceTarget | null | "ambiguous" {
+  const tracked = findTrackedWorkspace(identifier, opts.chatId);
+  if (tracked === "ambiguous") return "ambiguous";
+  const trackedWorkspace = tracked ?? null;
   const conductorName = trackedWorkspace?.conductorWorkspaceName ?? identifier;
-  const sessionInfo = getWorkspaceSessionInfo(conductorName);
+  const repoPath = opts.repoPath ?? trackedWorkspace?.repoPath ?? null;
+  const sessionInfo = getWorkspaceSessionInfo(conductorName, repoPath);
   if (!sessionInfo) {
     return null;
   }
@@ -272,7 +290,11 @@ function getReplyWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
   if (!repliedWorkspace?.conductorWorkspaceName) {
     return null;
   }
-  return resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName);
+  const target = resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName, {
+    chatId,
+    repoPath: repliedWorkspace.repoPath,
+  });
+  return target === "ambiguous" ? null : target;
 }
 
 function getThreadWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
@@ -283,7 +305,11 @@ function getThreadWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
   const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
   if (!threadWorkspace?.conductorWorkspaceName) return null;
 
-  return resolveWorkspaceTarget(threadWorkspace.conductorWorkspaceName);
+  const target = resolveWorkspaceTarget(threadWorkspace.conductorWorkspaceName, {
+    chatId,
+    repoPath: threadWorkspace.repoPath,
+  });
+  return target === "ambiguous" ? null : target;
 }
 
 function getContextualTarget(ctx: Context): WorkspaceTarget | null {
@@ -430,7 +456,9 @@ async function sendPromptToTarget(
     parse_mode: "HTML",
   });
 
-  const result = await sendToSession(target.conductorName, prompt);
+  const result = await sendToSession(target.conductorName, prompt, [], {
+    repoPath: target.repoPath,
+  });
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
     return;
@@ -447,6 +475,8 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.command("setup", handleSetup);
   bot.command("run", handleRun);
   bot.command("workspaces", handleWorkspaces);
+  bot.command("prs", handlePrs);
+  bot.command("ship_status", handlePrs);
   bot.command("status", handleStatus);
   bot.command("stop", handleStop);
   bot.command("repos", handleRepos);
@@ -468,6 +498,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
   bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
   bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
+  bot.action(/^pr:(refresh|fix|merge):(.+)$/, handlePrCallback);
   bot.action(/^archive:(.+)$/, handleArchiveCallback);
 
   // Media and text handlers
@@ -819,17 +850,20 @@ async function startWorkspaceFromMessage(
 // ── /workspaces ─────────────────────────────────────────────
 
 async function handleWorkspaces(ctx: Context): Promise<void> {
-  const workspaces = getAllWorkspaces(20);
+  const chatId = ctx.chat?.id?.toString();
+  const workspaces = chatId ? getAllWorkspacesForChat(chatId, 20) : getAllWorkspaces(20);
 
   if (workspaces.length === 0) {
     await ctx.reply("No workspaces tracked yet. Use /run to start one.");
     return;
   }
 
+  const prRecords = getPrRecordsForWorkspaces(workspaces.map((ws) => ws.id));
   const lines = workspaces.map((ws) => {
     const icon = statusIcon(ws.status);
     const name = ws.conductorWorkspaceName ?? ws.name;
-    return `${icon} <b>${escHtml(name)}</b> — ${ws.status}\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
+    const pr = compactPrBadge(prRecords.get(ws.id));
+    return `${icon} <b>${escHtml(name)}</b> — ${ws.status} · <code>${escHtml(pr)}</code>\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
   });
 
   const stopRows = workspaces
@@ -856,10 +890,54 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
   });
 }
 
+async function handlePrs(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  const workspaces = chatId ? getAllWorkspacesForChat(chatId, 30) : getAllWorkspaces(30);
+  const shippable = workspaces.filter((ws) => ws.conductorWorkspaceName);
+  if (shippable.length === 0) {
+    await ctx.reply("No tracked workspaces with Conductor sessions yet.");
+    return;
+  }
+
+  const refreshed = await Promise.all(
+    shippable.map((ws) =>
+      refreshWorkspacePr(ws).catch((err) => {
+        console.error("[prs] refresh failed:", err);
+        return null;
+      })
+    )
+  );
+  const byWorkspace = new Map<string, PrRecord>();
+  for (const result of refreshed) {
+    if (result?.record) byWorkspace.set(result.record.workspaceId, result.record);
+  }
+
+  const lines = shippable.map((ws) => {
+    const name = ws.conductorWorkspaceName ?? ws.name;
+    const repo = path.basename(ws.repoPath);
+    const record = byWorkspace.get(ws.id);
+    const branch = record?.branch ?? `belongcond/${name}`;
+    const badge = compactPrBadge(record);
+    return `<b>${escHtml(name)}</b> · <code>${escHtml(repo)}</code>\n<code>${escHtml(branch)}</code> · ${escHtml(badge)}`;
+  });
+
+  const rows = shippable
+    .slice(0, 12)
+    .map((ws) => [btn(`Refresh ${ws.conductorWorkspaceName ?? ws.name}`, `pr:refresh:${ws.id}`)]);
+
+  await ctx.reply(`<b>PR / branch status</b>\n\n${lines.join("\n\n")}`, {
+    parse_mode: "HTML",
+    ...(rows.length > 0 ? styledKeyboard(rows) : {}),
+  });
+}
+
 // ── /status ─────────────────────────────────────────────────
 
 async function handleStatus(ctx: Context): Promise<void> {
-  const active = getActiveWorkspaces();
+  const chatId = ctx.chat?.id?.toString();
+  const active = getActiveWorkspaces().filter(
+    (workspace) => !chatId || workspace.telegramChatId === chatId
+  );
 
   if (active.length === 0) {
     await ctx.reply("No active workspaces. All quiet.");
@@ -883,6 +961,7 @@ async function handleStatus(ctx: Context): Promise<void> {
 async function handleStop(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const idOrName = text.replace(/^\/stop\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
 
   if (!idOrName) {
     await ctx.reply("Usage: /stop <workspace-id or conductor-name>");
@@ -891,9 +970,19 @@ async function handleStop(ctx: Context): Promise<void> {
 
   // Try to find by ID first, then by conductor name
   let workspace = getWorkspace(idOrName);
+  if (workspace && chatId && workspace.telegramChatId !== chatId) {
+    workspace = undefined;
+  }
   if (!workspace) {
-    const all = getAllWorkspaces(50);
-    workspace = all.find((ws) => ws.conductorWorkspaceName === idOrName);
+    const all = chatId ? getAllWorkspacesForChat(chatId, 50) : getAllWorkspaces(50);
+    const matches = all.filter((ws) => ws.conductorWorkspaceName === idOrName);
+    if (matches.length > 1) {
+      await ctx.reply(`Workspace "${escHtml(idOrName)}" is ambiguous in this chat. Use the workspace id instead.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    workspace = matches[0];
   }
 
   if (!workspace) {
@@ -903,7 +992,7 @@ async function handleStop(ctx: Context): Promise<void> {
 
   const wsName = workspace.conductorWorkspaceName ?? workspace.name;
   const killed = workspace.conductorWorkspaceName
-    ? stopAgent(workspace.conductorWorkspaceName)
+    ? stopAgent(workspace.conductorWorkspaceName, workspace.repoPath)
     : false;
 
   updateWorkspaceStatus(workspace.id, "stopped");
@@ -1272,15 +1361,24 @@ async function handleCaptionCommand(
 
   const sendMatch = caption.match(/^\/send\s+(.+)/);
   if (sendMatch) {
+    const chatId = ctx.chat?.id?.toString();
     const args = sendMatch[1].trim();
     const spaceIdx = args.indexOf(" ");
     const wsName = spaceIdx === -1 ? args : args.slice(0, spaceIdx);
     const message = spaceIdx === -1 ? "" : args.slice(spaceIdx + 1).trim();
 
     let workspace = getWorkspace(wsName);
+    if (workspace && chatId && workspace.telegramChatId !== chatId) {
+      workspace = undefined;
+    }
     if (!workspace) {
-      const all = getAllWorkspaces(50);
-      workspace = all.find((ws) => ws.conductorWorkspaceName === wsName);
+      const all = chatId ? getAllWorkspacesForChat(chatId, 50) : getAllWorkspaces(50);
+      const matches = all.filter((ws) => ws.conductorWorkspaceName === wsName);
+      if (matches.length > 1) {
+        await ctx.reply(`Workspace "${escHtml(wsName)}" is ambiguous in this chat. Use the workspace id instead.`, { parse_mode: "HTML" });
+        return;
+      }
+      workspace = matches[0];
     }
     if (workspace) {
       await sendMessageToWorkspace(ctx, workspace, message, [attachmentPath]);
@@ -1552,6 +1650,7 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 async function handleSend(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/send\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
 
   if (!args) {
     await ctx.reply("Usage: /send <workspace-name> <message>");
@@ -1569,25 +1668,26 @@ async function handleSend(ctx: Context): Promise<void> {
 
   // Find workspace by conductor name
   let workspace = getWorkspace(wsName);
+  if (workspace && chatId && workspace.telegramChatId !== chatId) {
+    workspace = undefined;
+  }
   if (!workspace) {
-    const all = getAllWorkspaces(50);
-    workspace = all.find((ws) => ws.conductorWorkspaceName === wsName);
+    const all = chatId ? getAllWorkspacesForChat(chatId, 50) : getAllWorkspaces(50);
+    const matches = all.filter((ws) => ws.conductorWorkspaceName === wsName);
+    if (matches.length > 1) {
+      await ctx.reply(`Workspace "${escHtml(wsName)}" is ambiguous in this chat. Use the workspace id instead.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    workspace = matches[0];
   }
 
   const conductorName = workspace?.conductorWorkspaceName ?? wsName;
   if (!workspace) {
-    await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(message, 200))}</i>`, {
+    await ctx.reply(`Workspace "${escHtml(conductorName)}" is not tracked in this chat. Use a workspace id, reply inside its topic, or start with /run.`, {
       parse_mode: "HTML",
     });
-    const result = await sendToSession(conductorName, message);
-    if ("error" in result) {
-      await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
-      return;
-    }
-    await ctx.reply(
-      `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(message, 200))}</i>`,
-      { parse_mode: "HTML" }
-    );
     return;
   }
 
@@ -1599,6 +1699,7 @@ async function handleSend(ctx: Context): Promise<void> {
 async function handleReview(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/review\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getReplyWorkspaceTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
@@ -1608,7 +1709,13 @@ async function handleReview(ctx: Context): Promise<void> {
     target = replyTarget;
   } else {
     const [head, tail] = splitHead(args);
-    const explicitTarget = resolveWorkspaceTarget(head);
+    const explicitTarget = resolveWorkspaceTarget(head, { chatId });
+    if (explicitTarget === "ambiguous") {
+      await ctx.reply(`Workspace "${escHtml(head)}" is ambiguous in this chat. Use the workspace id instead.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
     if (explicitTarget) {
       target = explicitTarget;
       instructions = tail;
@@ -1644,6 +1751,7 @@ async function handleReview(ctx: Context): Promise<void> {
     launchMode: "review",
     title: "Review Changes",
     reviewBaseBranch: target.targetBranch,
+    repoPath: target.repoPath,
   });
 
   if ("error" in result) {
@@ -1677,8 +1785,15 @@ async function handleReview(ctx: Context): Promise<void> {
 async function handleSkills(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/skills\s*/, "").trim();
-  const target =
-    (args ? resolveWorkspaceTarget(args) : null) ?? getContextualTarget(ctx);
+  const chatId = ctx.chat?.id?.toString();
+  const explicitTarget = args ? resolveWorkspaceTarget(args, { chatId }) : null;
+  if (explicitTarget === "ambiguous") {
+    await ctx.reply(`Workspace "${escHtml(args)}" is ambiguous in this chat. Use the workspace id instead.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  const target = explicitTarget ?? getContextualTarget(ctx);
 
   const sections: string[] = [];
   const builtInLines = [
@@ -1719,6 +1834,7 @@ async function handleSkills(ctx: Context): Promise<void> {
 async function handleSkill(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/skill\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getContextualTarget(ctx);
 
   if (!args) {
@@ -1729,7 +1845,15 @@ async function handleSkill(ctx: Context): Promise<void> {
   }
 
   const [head, tail] = splitHead(args);
-  let target = resolveWorkspaceTarget(head);
+  let target: WorkspaceTarget | null = null;
+  const explicitTarget = resolveWorkspaceTarget(head, { chatId });
+  if (explicitTarget === "ambiguous") {
+    await ctx.reply(`Workspace "${escHtml(head)}" is ambiguous in this chat. Use the workspace id instead.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  target = explicitTarget;
   let skill = "";
   let extraInstructions = "";
 
@@ -1756,6 +1880,7 @@ async function handleSkill(ctx: Context): Promise<void> {
 async function handleGstack(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/gstack\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getContextualTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
@@ -1765,7 +1890,13 @@ async function handleGstack(ctx: Context): Promise<void> {
     target = replyTarget;
   } else {
     const [head, tail] = splitHead(args);
-    const explicitTarget = resolveWorkspaceTarget(head);
+    const explicitTarget = resolveWorkspaceTarget(head, { chatId });
+    if (explicitTarget === "ambiguous") {
+      await ctx.reply(`Workspace "${escHtml(head)}" is ambiguous in this chat. Use the workspace id instead.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
     if (explicitTarget) {
       target = explicitTarget;
       extraInstructions = tail;
@@ -1793,6 +1924,7 @@ async function handleWellKnownSkillCommand(
 ): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const args = text.replace(/^\/[\w@]+\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
   const replyTarget = getContextualTarget(ctx);
 
   let target: WorkspaceTarget | null = null;
@@ -1802,7 +1934,13 @@ async function handleWellKnownSkillCommand(
     target = replyTarget;
   } else {
     const [head, tail] = splitHead(args);
-    const explicitTarget = resolveWorkspaceTarget(head);
+    const explicitTarget = resolveWorkspaceTarget(head, { chatId });
+    if (explicitTarget === "ambiguous") {
+      await ctx.reply(`Workspace "${escHtml(head)}" is ambiguous in this chat. Use the workspace id instead.`, {
+        parse_mode: "HTML",
+      });
+      return;
+    }
     if (explicitTarget) {
       target = explicitTarget;
       extraInstructions = tail;
@@ -1820,6 +1958,9 @@ async function handleWellKnownSkillCommand(
   }
 
   await sendPromptToTarget(ctx, target, buildSkillPrompt(spec.skill, extraInstructions));
+  if (spec.skill === "ship" && target.trackedWorkspace) {
+    await sendPrStatusCard(ctx, target.trackedWorkspace);
+  }
 }
 
 // ── /setup, /start ──────────────────────────────────────────
@@ -1884,6 +2025,7 @@ Commands:
 /gstack [workspace] [instructions] — Ask the agent to use GStack skills
 /ship, /qa, /investigate, /retro, /health, /checkpoint — Shortcut skills
 /workspaces — List all tracked workspaces
+/prs, /ship_status — Show PR and branch ship status
 /status — Show active workspace summary
 /stop &lt;name&gt; — Stop a workspace
 /repos — List repos (tap to select)
@@ -1951,7 +2093,7 @@ async function handleStopCallback(ctx: Context): Promise<void> {
 
   const workspace = getWorkspace(workspaceId);
   if (workspace?.conductorWorkspaceName) {
-    stopAgent(workspace.conductorWorkspaceName);
+    stopAgent(workspace.conductorWorkspaceName, workspace.repoPath);
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
@@ -2032,6 +2174,113 @@ async function handleDecisionCallback(ctx: Context): Promise<void> {
   await ctx.editMessageReplyMarkup(undefined);
 }
 
+// ── PR status and approval-gated actions ─────────────────────
+
+async function sendPrStatusCard(ctx: Context, workspace: Workspace): Promise<void> {
+  const { record } = await refreshWorkspacePr(workspace);
+  const threadOpts = workspace.telegramThreadId
+    ? { message_thread_id: workspace.telegramThreadId }
+    : {};
+  await ctx.telegram.sendMessage(workspace.telegramChatId, formatPrCard(workspace, record), {
+    parse_mode: "HTML",
+    ...threadOpts,
+    ...prKeyboard(record, workspace),
+  });
+}
+
+async function handlePrCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const action = match?.[1] as "refresh" | "fix" | "merge";
+  const workspaceId = match?.[2];
+  if (!action || !workspaceId) return;
+
+  const workspace = getWorkspace(workspaceId);
+  if (!workspace) {
+    await ctx.answerCbQuery("Workspace not found");
+    return;
+  }
+
+  if (action === "refresh") {
+    await ctx.answerCbQuery("Refreshing PR status...");
+    const { record } = await refreshWorkspacePr(workspace);
+    await editOrSendPrCard(ctx, workspace, record);
+    return;
+  }
+
+  if (action === "fix") {
+    await ctx.answerCbQuery("Asking agent to fix PR...");
+    const { record } = await refreshWorkspacePr(workspace);
+    if (!workspace.conductorWorkspaceName) {
+      await ctx.reply("Workspace is not linked to a Conductor session.");
+      return;
+    }
+    const prompt = buildFixPrPrompt(record);
+    const result = await sendToSession(
+      workspace.conductorWorkspaceName,
+      prompt,
+      [],
+      { repoPath: workspace.repoPath }
+    );
+    if ("error" in result) {
+      await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
+      return;
+    }
+    updateWorkspaceStatus(workspace.id, "running");
+    await sendPrStatusCard(ctx, { ...workspace, status: "running" });
+    return;
+  }
+
+  await ctx.answerCbQuery("Checking merge eligibility...");
+  const { record } = await refreshWorkspacePr(workspace);
+  if (!canMergePr(record)) {
+    await editOrSendPrCard(ctx, workspace, record);
+    await ctx.reply("PR is not eligible to merge yet. Refresh after checks pass.");
+    return;
+  }
+
+  const merged = await mergeWorkspacePr(workspace, record);
+  if (!merged.ok) {
+    await ctx.reply(`Merge failed: ${escHtml(merged.message)}`, { parse_mode: "HTML" });
+    const refreshed = await refreshWorkspacePr(workspace);
+    await editOrSendPrCard(ctx, workspace, refreshed.record);
+    return;
+  }
+
+  await ctx.reply(`Merged PR: ${escHtml(merged.message)}`, { parse_mode: "HTML" });
+  const refreshed = await refreshWorkspacePr(workspace);
+  await editOrSendPrCard(ctx, workspace, refreshed.record);
+}
+
+async function editOrSendPrCard(
+  ctx: Context,
+  workspace: Workspace,
+  record: PrRecord
+): Promise<void> {
+  const edit = (ctx as any).editMessageText?.bind(ctx);
+  if (edit) {
+    const edited = await edit(formatPrCard(workspace, record), {
+      parse_mode: "HTML",
+      ...prKeyboard(record, workspace),
+    }).then(() => true).catch(() => false);
+    if (edited) return;
+  }
+  await sendPrStatusCard(ctx, workspace);
+}
+
+function buildFixPrPrompt(record: PrRecord): string {
+  const lines = [
+    "The PR is not ready to merge from Telegram.",
+    "Inspect the current branch, GitHub PR, failing checks, and review comments.",
+    "Fix the issue, push the branch, and report the updated PR status.",
+    "",
+    `Branch: ${record.branch || "(unknown)"}`,
+  ];
+  if (record.prUrl) lines.push(`PR: ${record.prUrl}`);
+  if (record.checksSummary) lines.push(`Checks: ${record.checksSummary}`);
+  if (record.lastError) lines.push(`Verification error: ${record.lastError}`);
+  return lines.join("\n");
+}
+
 // ── Post-done: Review Changes / Generate PR ─────────────────
 
 function buildPrPrompt(): string {
@@ -2039,6 +2288,7 @@ function buildPrPrompt(): string {
     "Review all changes in this workspace and create a pull request.",
     "Write a clear PR title and description summarizing the changes.",
     "Use /commit to create any needed commits, then create the PR.",
+    "After the PR exists, report its URL if the conductor-telegram MCP tools are available.",
   ].join("\n");
 }
 
@@ -2104,6 +2354,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   const result = await launchWorkspaceSession(conductorName, prompt, {
     launchMode: action === "review" ? "review" : "prompt",
     title: action === "review" ? "Review Changes" : "Generate PR",
+    repoPath: workspace.repoPath,
   });
 
   if ("error" in result) {
@@ -2130,6 +2381,10 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     `🟢 ${actionLabel} running for <b>${escHtml(conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
     { parse_mode: "HTML" }
   );
+
+  if (action === "pr") {
+    await sendPrStatusCard(ctx, { ...workspace, status: "running" });
+  }
 }
 
 function getReplyTargetWorkspace(
@@ -2148,7 +2403,7 @@ function getReplyTargetWorkspace(
     return linked;
   }
 
-  const inferred = inferWorkspaceFromReply(reply);
+  const inferred = inferWorkspaceFromReply(reply, chatId);
   if (inferred) {
     console.log(
       `[reply-route] inferred from replied text ${replyToMessageId} -> ${inferred.conductorWorkspaceName ?? inferred.name}`
@@ -2159,7 +2414,7 @@ function getReplyTargetWorkspace(
   return inferred;
 }
 
-function inferWorkspaceFromReply(reply: any): Workspace | undefined {
+function inferWorkspaceFromReply(reply: any, chatId: string): Workspace | undefined {
   const text = [reply?.text, reply?.caption]
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .join("\n");
@@ -2174,7 +2429,7 @@ function inferWorkspaceFromReply(reply: any): Workspace | undefined {
   const workspaceName = firstLine.replace(/^[^\p{L}\p{N}]*/u, "").trim();
   if (!workspaceName) return undefined;
 
-  return getWorkspaceByName(workspaceName);
+  return getWorkspaceByName(workspaceName, { chatId });
 }
 
 async function sendMessageToWorkspace(
@@ -2202,7 +2457,9 @@ async function sendMessageToWorkspace(
     parse_mode: "HTML",
   });
 
-  const result = await sendToSession(conductorName, message, attachmentSourcePaths);
+  const result = await sendToSession(conductorName, message, attachmentSourcePaths, {
+    repoPath: workspace.repoPath,
+  });
 
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });

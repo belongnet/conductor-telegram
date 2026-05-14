@@ -1,15 +1,20 @@
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { getDb } from "../store/db.js";
 import {
   addEvent,
-  getWorkspaceByName,
+  findActiveWorkspaceByNameAndRepoBasename,
   createDecision,
   getDecision,
+  getWorkspaceByName,
 } from "../store/queries.js";
 
 const WORKSPACE_NAME = process.env.CONDUCTOR_WORKSPACE_NAME;
+const CONDUCTOR_REPOS_DIR =
+  process.env.CONDUCTOR_REPOS_DIR ?? `${process.env.HOME}/conductor/repos`;
+const CONDUCTOR_WORKSPACES_DIR =
+  process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -20,10 +25,37 @@ if (!WORKSPACE_NAME) {
   process.exit(1);
 }
 
-// Resolve workspace ID from the conductor workspace name
+// Conductor workspace names are city names and can repeat across repos. MCP
+// runs inside <workspacesDir>/<repo>/<city>, so derive the repo path from cwd.
+const WORKSPACE_CWD = process.cwd();
+const REPO_BASENAME = path.basename(path.dirname(WORKSPACE_CWD));
+const REPO_PATH = deriveRepoPath(WORKSPACE_CWD);
+
+// Resolve workspace ID from the conductor workspace name + repo.
 function getWorkspaceId(): string | null {
-  const ws = getWorkspaceByName(WORKSPACE_NAME!);
-  return ws?.id ?? null;
+  const exact = REPO_PATH
+    ? getWorkspaceByName(WORKSPACE_NAME!, { repoPath: REPO_PATH })
+    : undefined;
+  if (exact) return exact.id;
+
+  const fallback = findActiveWorkspaceByNameAndRepoBasename(
+    WORKSPACE_NAME!,
+    REPO_BASENAME
+  );
+  return fallback?.id ?? null;
+}
+
+function deriveRepoPath(cwd: string): string | null {
+  const relative = path.relative(CONDUCTOR_WORKSPACES_DIR, cwd);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return null;
+  }
+
+  const [repoName] = relative.split(path.sep);
+  if (!repoName) {
+    return null;
+  }
+  return path.join(CONDUCTOR_REPOS_DIR, repoName);
 }
 
 const server = new McpServer({
@@ -195,7 +227,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `conductor-telegram MCP server running for workspace: ${WORKSPACE_NAME}`
+    `conductor-telegram MCP server running for workspace: ${WORKSPACE_NAME} (repo: ${REPO_PATH ?? REPO_BASENAME})`
   );
 }
 

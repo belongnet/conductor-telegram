@@ -59,6 +59,10 @@ const seenToolUseIds = new Set<string>();
 // Map decision IDs to workspace names for stdin piping
 const pendingStdinDecisions = new Map<number, string>();
 
+function workspaceAgentKey(repoPath: string, workspaceName: string): string {
+  return `${repoPath}::${workspaceName}`;
+}
+
 // ── Agent result interface ──────────────────────────────────
 
 export interface AgentResult {
@@ -303,6 +307,7 @@ function isImageAttachment(filePath: string): boolean {
 
 function spawnAgent(
   conductorSessionId: string,
+  repoPath: string,
   workspaceDir: string,
   prompt: string,
   model: string,
@@ -319,6 +324,7 @@ function spawnAgent(
   if (agentType === "codex") {
     return spawnCodexAgent(
       conductorSessionId,
+      repoPath,
       workspaceDir,
       prompt,
       model,
@@ -329,6 +335,7 @@ function spawnAgent(
 
   return spawnClaudeAgent(
     conductorSessionId,
+    repoPath,
     workspaceDir,
     prompt,
     model,
@@ -339,6 +346,7 @@ function spawnAgent(
 
 function spawnClaudeAgent(
   conductorSessionId: string,
+  repoPath: string,
   workspaceDir: string,
   prompt: string,
   model: string,
@@ -372,7 +380,7 @@ function spawnClaudeAgent(
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
 
-  runningAgents.set(workspaceName, child);
+  runningAgents.set(workspaceAgentKey(repoPath, workspaceName), child);
 
   // Mark session as working
   updateSessionStatus(conductorSessionId, "working");
@@ -393,7 +401,7 @@ function spawnClaudeAgent(
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          processStreamMessage(conductorSessionId, msg, model, workspaceName);
+          processStreamMessage(conductorSessionId, msg, model, workspaceName, repoPath);
 
           // Extract result info
           if (msg.type === "result") {
@@ -420,7 +428,7 @@ function spawnClaudeAgent(
       if (code !== 0 && !result.resultText) {
         result.isError = true;
       }
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -429,7 +437,7 @@ function spawnClaudeAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -440,6 +448,7 @@ function spawnClaudeAgent(
 
 function spawnCodexAgent(
   conductorSessionId: string,
+  repoPath: string,
   workspaceDir: string,
   prompt: string,
   model: string,
@@ -471,7 +480,7 @@ function spawnCodexAgent(
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
 
-  runningAgents.set(workspaceName, child);
+  runningAgents.set(workspaceAgentKey(repoPath, workspaceName), child);
   updateSessionStatus(conductorSessionId, "working");
 
   const done = new Promise<AgentResult>((resolve) => {
@@ -537,7 +546,7 @@ function spawnCodexAgent(
         );
       }
 
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -547,7 +556,7 @@ function spawnCodexAgent(
       result.isError = true;
       result.exitCode = -1;
       result.durationMs = Date.now() - startedAt;
-      runningAgents.delete(workspaceName);
+      runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
     });
@@ -733,8 +742,8 @@ function insertSessionMessage(
  * Send text input to a running agent's stdin (for answering AskUserQuestion).
  * Returns true if the write succeeded.
  */
-export function sendInputToAgent(workspaceName: string, input: string): boolean {
-  const child = runningAgents.get(workspaceName);
+export function sendInputToAgent(agentKey: string, input: string): boolean {
+  const child = runningAgents.get(agentKey);
   if (!child?.stdin?.writable) return false;
   child.stdin.write(input + "\n");
   return true;
@@ -791,16 +800,22 @@ function extractAskUserQuestion(input: any): { question: string; options: string
  * Check if a decision has a pending stdin answer and send it.
  */
 export function answerPendingStdinDecision(decisionId: number, answer: string): boolean {
-  const workspaceName = pendingStdinDecisions.get(decisionId);
-  if (!workspaceName) return false;
+  const agentKey = pendingStdinDecisions.get(decisionId);
+  if (!agentKey) return false;
   pendingStdinDecisions.delete(decisionId);
-  return sendInputToAgent(workspaceName, answer);
+  return sendInputToAgent(agentKey, answer);
 }
 
 /**
  * Process a streaming JSON message from Claude CLI and mirror to Conductor's DB.
  */
-function processStreamMessage(sessionId: string, msg: any, model: string, workspaceName?: string): void {
+function processStreamMessage(
+  sessionId: string,
+  msg: any,
+  model: string,
+  workspaceName?: string,
+  repoPath?: string
+): void {
   // Mirror the same message families Conductor persists for Claude sessions.
   if (
     msg.type !== "user" &&
@@ -866,7 +881,9 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
           const { question, options } = extractAskUserQuestion(block.input);
 
           // Look up workspace in conductor-telegram DB
-          const trackedWs = getTrackedWorkspaceByName(workspaceName);
+          const trackedWs = repoPath
+            ? getTrackedWorkspaceByName(workspaceName, { repoPath })
+            : undefined;
           if (trackedWs) {
             const decisionId = createDecision(
               trackedWs.id,
@@ -879,7 +896,10 @@ function processStreamMessage(sessionId: string, msg: any, model: string, worksp
               options: options ?? [],
             });
             addEvent(trackedWs.id, "human_request", eventPayload);
-            pendingStdinDecisions.set(decisionId, workspaceName);
+            pendingStdinDecisions.set(
+              decisionId,
+              workspaceAgentKey(repoPath!, workspaceName)
+            );
             console.log(
               `[agent] AskUserQuestion detected for ${workspaceName}: "${question.slice(0, 80)}..." → decision ${decisionId}`
             );
@@ -1217,6 +1237,7 @@ export async function launchWorkspace(
   // 4. Spawn the configured agent
   const { done } = spawnAgent(
     sessionCreateResult.sessionId,
+    repoPath,
     workspaceDir,
     fullPrompt,
     launchConfig.model,
@@ -1246,14 +1267,23 @@ export async function launchWorkspace(
 export async function sendToSession(
   workspaceName: string,
   prompt: string,
-  attachmentSourcePaths: string[] = []
+  attachmentSourcePaths: string[] = [],
+  options: { repoPath?: string | null } = {}
 ): Promise<{ ok: true; done: Promise<AgentResult> } | { error: string }> {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
   if (!wsInfo) {
-    return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
+    return {
+      error: options.repoPath
+        ? `Workspace "${workspaceName}" not found in Conductor DB for ${options.repoPath}.`
+        : `Workspace "${workspaceName}" was ambiguous or not found in Conductor DB.`,
+    };
   }
 
   const repoName = wsInfo.repoName ?? workspaceName;
+  const repoPath = wsInfo.repoPath ?? options.repoPath;
+  if (!repoPath) {
+    return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
+  }
   const workspaceDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
@@ -1263,6 +1293,7 @@ export async function sendToSession(
 
   const { done } = spawnAgent(
     wsInfo.sessionId,
+    repoPath,
     workspaceDir,
     fullPrompt,
     normalizeModelForCli(wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt")),
@@ -1284,6 +1315,7 @@ export async function launchWorkspaceSession(
   prompt: string,
   options: SessionLaunchOptions & {
     attachmentSourcePaths?: string[];
+    repoPath?: string | null;
   } = {}
 ): Promise<
   {
@@ -1294,12 +1326,20 @@ export async function launchWorkspaceSession(
     model: string;
   } | { error: string }
 > {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
   if (!wsInfo) {
-    return { error: `Workspace "${workspaceName}" not found in Conductor DB.` };
+    return {
+      error: options.repoPath
+        ? `Workspace "${workspaceName}" not found in Conductor DB for ${options.repoPath}.`
+        : `Workspace "${workspaceName}" was ambiguous or not found in Conductor DB.`,
+    };
   }
 
   const repoName = wsInfo.repoName ?? workspaceName;
+  const repoPath = wsInfo.repoPath ?? options.repoPath;
+  if (!repoPath) {
+    return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
+  }
   const workspaceDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
@@ -1342,6 +1382,7 @@ export async function launchWorkspaceSession(
 
   const { done } = spawnAgent(
     sessionCreateResult.sessionId,
+    repoPath,
     workspaceDir,
     fullPrompt,
     launchConfig.model,
@@ -1366,8 +1407,9 @@ export async function launchWorkspaceSession(
 /**
  * Stop a running agent by workspace name.
  */
-export function stopAgent(workspaceName: string): boolean {
-  const child = runningAgents.get(workspaceName);
+export function stopAgent(workspaceName: string, repoPath: string): boolean {
+  const key = workspaceAgentKey(repoPath, workspaceName);
+  const child = runningAgents.get(key);
   if (!child) return false;
 
   child.kill("SIGTERM");
@@ -1376,15 +1418,15 @@ export function stopAgent(workspaceName: string): boolean {
     if (!child.killed) child.kill("SIGKILL");
   }, 5000);
 
-  runningAgents.delete(workspaceName);
+  runningAgents.delete(key);
   return true;
 }
 
 /**
  * Check if an agent is currently running.
  */
-export function isAgentRunning(workspaceName: string): boolean {
-  return runningAgents.has(workspaceName);
+export function isAgentRunning(workspaceName: string, repoPath: string): boolean {
+  return runningAgents.has(workspaceAgentKey(repoPath, workspaceName));
 }
 
 // ── Conductor DB helpers ────────────────────────────────────
@@ -1421,10 +1463,19 @@ interface ConductorWorkspaceInfo {
   targetBranch: string | null;
 }
 
-function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceInfo | null {
+function getWorkspaceFromConductorDb(
+  directoryName: string,
+  repoPath: string | null = null
+): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const row = db.prepare(
+    const where = ["w.directory_name = ?"];
+    const params: any[] = [directoryName];
+    if (repoPath) {
+      where.push("r.root_path = ?");
+      params.push(repoPath);
+    }
+    const rows = db.prepare(
       `SELECT
           w.id as workspace_id,
           w.active_session_id as session_id,
@@ -1438,10 +1489,18 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
        FROM workspaces w
        LEFT JOIN sessions s ON s.id = w.active_session_id
        LEFT JOIN repos r ON r.id = w.repository_id
-       WHERE w.directory_name = ?`
-    ).get(directoryName) as any;
+       WHERE ${where.join(" AND ")}
+       ORDER BY w.updated_at DESC`
+    ).all(...params) as any[];
     db.close();
 
+    if (!repoPath && rows.length > 1) {
+      console.warn(
+        `[launcher] ambiguous Conductor workspace "${directoryName}" matched ${rows.length} repos; caller must pass repoPath`
+      );
+      return null;
+    }
+    const row = rows[0];
     if (!row?.workspace_id || !row?.session_id) return null;
     return {
       workspaceId: row.workspace_id,
@@ -1460,23 +1519,37 @@ function getWorkspaceFromConductorDb(directoryName: string): ConductorWorkspaceI
 }
 
 export function getWorkspaceSessionInfo(
-  workspaceName: string
+  workspaceName: string,
+  repoPath: string | null = null
 ): ConductorWorkspaceInfo | null {
-  return getWorkspaceFromConductorDb(workspaceName);
+  return getWorkspaceFromConductorDb(workspaceName, repoPath);
 }
 
 /**
  * Get session status from Conductor's DB.
  */
-export function getSessionStatus(workspaceName: string): string | null {
+export function getSessionStatus(
+  workspaceName: string,
+  repoPath: string | null = null
+): string | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const row = db.prepare(
+    const where = ["w.directory_name = ?"];
+    const params: any[] = [workspaceName];
+    if (repoPath) {
+      where.push("r.root_path = ?");
+      params.push(repoPath);
+    }
+    const rows = db.prepare(
       `SELECT s.status FROM sessions s
        JOIN workspaces w ON w.active_session_id = s.id
-       WHERE w.directory_name = ?`
-    ).get(workspaceName) as any;
+       LEFT JOIN repos r ON r.id = w.repository_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY w.updated_at DESC`
+    ).all(...params) as any[];
     db.close();
+    if (!repoPath && rows.length > 1) return null;
+    const row = rows[0];
     return row?.status ?? null;
   } catch {
     return null;
@@ -1502,16 +1575,26 @@ export interface SessionMessage {
   sentAt: string | null;
 }
 
-export function getSessionResult(workspaceName: string): SessionResult | null {
+export function getSessionResult(
+  workspaceName: string,
+  repoPath: string | null = null
+): SessionResult | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const where = ["w.directory_name = ?", "sm.role = 'assistant'"];
+    const params: any[] = [workspaceName];
+    if (repoPath) {
+      where.push("r.root_path = ?");
+      params.push(repoPath);
+    }
     const rows = db.prepare(
       `SELECT sm.content FROM session_messages sm
        JOIN sessions s ON s.id = sm.session_id
        JOIN workspaces w ON w.active_session_id = s.id
-       WHERE w.directory_name = ? AND sm.role = 'assistant'
+       LEFT JOIN repos r ON r.id = w.repository_id
+       WHERE ${where.join(" AND ")}
        ORDER BY sm.created_at DESC LIMIT 5`
-    ).all(workspaceName) as any[];
+    ).all(...params) as any[];
     db.close();
 
     for (const row of rows) {

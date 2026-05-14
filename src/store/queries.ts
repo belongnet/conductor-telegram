@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import { getDb } from "./db.js";
 import type {
   EventType,
+  PrChecksStatus,
+  PrRecord,
+  PrState,
   Workspace,
   WorkspaceEvent,
   WorkspaceStatus,
@@ -51,15 +54,74 @@ export function getWorkspace(id: string): Workspace | undefined {
 }
 
 export function getWorkspaceByName(
-  conductorName: string
+  conductorName: string,
+  scope: { repoPath?: string; chatId?: string } = {}
 ): Workspace | undefined {
   const db = getDb();
-  const row = db
+  const where = ["conductor_workspace_name = ?", "archived_at IS NULL"];
+  const params: any[] = [conductorName];
+  if (scope.repoPath) {
+    where.push("repo_path = ?");
+    params.push(scope.repoPath);
+  }
+  if (scope.chatId) {
+    where.push("telegram_chat_id = ?");
+    params.push(scope.chatId);
+  }
+
+  const rows = db
     .prepare(
-      "SELECT * FROM workspaces WHERE conductor_workspace_name = ? AND archived_at IS NULL"
+      `SELECT * FROM workspaces WHERE ${where.join(" AND ")} ORDER BY created_at DESC`
     )
-    .get(conductorName) as any;
-  return row ? mapWorkspaceRow(row) : undefined;
+    .all(...params) as any[];
+
+  if (rows.length > 1) {
+    console.warn(
+      `[queries] ambiguous workspace name "${conductorName}" matched ${rows.length} rows (repoPath=${scope.repoPath ?? "unset"} chatId=${scope.chatId ?? "unset"})`
+    );
+    return undefined;
+  }
+  return rows[0] ? mapWorkspaceRow(rows[0]) : undefined;
+}
+
+export function findActiveWorkspaceByNameAndRepoBasename(
+  conductorName: string,
+  repoBasename: string
+): Workspace | undefined {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT * FROM workspaces
+       WHERE conductor_workspace_name = ?
+         AND (repo_path = ? OR repo_path LIKE '%/' || ?)
+         AND archived_at IS NULL
+       ORDER BY created_at DESC`
+    )
+    .all(conductorName, repoBasename, repoBasename) as any[];
+  if (rows.length > 1) {
+    console.warn(
+      `[queries] ambiguous workspace "${conductorName}" in repo basename "${repoBasename}" matched ${rows.length} rows`
+    );
+    return undefined;
+  }
+  return rows[0] ? mapWorkspaceRow(rows[0]) : undefined;
+}
+
+export function findActiveWorkspacesByNameAndChat(
+  conductorName: string,
+  chatId: string
+): Workspace[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT * FROM workspaces
+       WHERE conductor_workspace_name = ?
+         AND telegram_chat_id = ?
+         AND archived_at IS NULL
+       ORDER BY created_at DESC`
+    )
+    .all(conductorName, chatId) as any[];
+  return rows.map(mapWorkspaceRow);
 }
 
 export function getActiveWorkspaces(): Workspace[] {
@@ -79,6 +141,16 @@ export function getAllWorkspaces(limit = 10): Workspace[] {
       "SELECT * FROM workspaces WHERE archived_at IS NULL ORDER BY created_at DESC LIMIT ?"
     )
     .all(limit) as any[];
+  return rows.map(mapWorkspaceRow);
+}
+
+export function getAllWorkspacesForChat(chatId: string, limit = 50): Workspace[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM workspaces WHERE archived_at IS NULL AND telegram_chat_id = ? ORDER BY created_at DESC LIMIT ?"
+    )
+    .all(chatId, limit) as any[];
   return rows.map(mapWorkspaceRow);
 }
 
@@ -215,6 +287,143 @@ function mapWorkspaceRow(row: any): Workspace {
     lastForwardedMessageRowid: Number(row.last_forwarded_message_rowid ?? 0),
     telegramThreadId: row.telegram_thread_id ?? null,
     archivedAt: row.archived_at ?? null,
+  };
+}
+
+// ── PR records ──────────────────────────────────────────────
+
+export function upsertPrRecord(input: {
+  workspaceId: string;
+  repoPath: string;
+  branch: string;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  title?: string | null;
+  state?: PrState;
+  isDraft?: boolean;
+  headRef?: string | null;
+  baseRef?: string | null;
+  reviewDecision?: string | null;
+  mergeStateStatus?: string | null;
+  mergeable?: string | null;
+  checksStatus?: PrChecksStatus;
+  checksSummary?: string | null;
+  branchExists?: boolean;
+  lastCheckedAt?: string | null;
+  lastError?: string | null;
+}): PrRecord {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO pr_records
+      (workspace_id, repo_path, branch, pr_number, pr_url, title, state, is_draft,
+       head_ref, base_ref, review_decision, merge_state_status, mergeable,
+       checks_status, checks_summary, branch_exists, last_checked_at, last_error,
+       created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(workspace_id) DO UPDATE SET
+       repo_path = excluded.repo_path,
+       branch = excluded.branch,
+       pr_number = excluded.pr_number,
+       pr_url = excluded.pr_url,
+       title = excluded.title,
+       state = excluded.state,
+       is_draft = excluded.is_draft,
+       head_ref = excluded.head_ref,
+       base_ref = excluded.base_ref,
+       review_decision = excluded.review_decision,
+       merge_state_status = excluded.merge_state_status,
+       mergeable = excluded.mergeable,
+       checks_status = excluded.checks_status,
+       checks_summary = excluded.checks_summary,
+       branch_exists = excluded.branch_exists,
+       last_checked_at = excluded.last_checked_at,
+       last_error = excluded.last_error,
+       updated_at = excluded.updated_at`
+  ).run(
+    input.workspaceId,
+    input.repoPath,
+    input.branch,
+    input.prNumber ?? null,
+    input.prUrl ?? null,
+    input.title ?? null,
+    input.state ?? "unknown",
+    input.isDraft ? 1 : 0,
+    input.headRef ?? null,
+    input.baseRef ?? null,
+    input.reviewDecision ?? null,
+    input.mergeStateStatus ?? null,
+    input.mergeable ?? null,
+    input.checksStatus ?? "unknown",
+    input.checksSummary ?? null,
+    input.branchExists ? 1 : 0,
+    input.lastCheckedAt ?? now,
+    input.lastError ?? null,
+    now,
+    now
+  );
+
+  const record = getPrRecord(input.workspaceId);
+  if (!record) {
+    throw new Error(`Failed to upsert PR record for workspace ${input.workspaceId}`);
+  }
+  return record;
+}
+
+export function getPrRecord(workspaceId: string): PrRecord | undefined {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM pr_records WHERE workspace_id = ?")
+    .get(workspaceId) as any;
+  return row ? mapPrRecordRow(row) : undefined;
+}
+
+export function getPrRecordsForWorkspaces(workspaceIds: string[]): Map<string, PrRecord> {
+  const records = new Map<string, PrRecord>();
+  if (workspaceIds.length === 0) return records;
+
+  const db = getDb();
+  const placeholders = workspaceIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT * FROM pr_records WHERE workspace_id IN (${placeholders})`)
+    .all(...workspaceIds) as any[];
+  for (const row of rows) {
+    const record = mapPrRecordRow(row);
+    records.set(record.workspaceId, record);
+  }
+  return records;
+}
+
+export function getAllPrRecords(): PrRecord[] {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT * FROM pr_records ORDER BY updated_at DESC")
+    .all() as any[];
+  return rows.map(mapPrRecordRow);
+}
+
+function mapPrRecordRow(row: any): PrRecord {
+  return {
+    workspaceId: row.workspace_id,
+    repoPath: row.repo_path,
+    branch: row.branch,
+    prNumber: row.pr_number ?? null,
+    prUrl: row.pr_url ?? null,
+    title: row.title ?? null,
+    state: (row.state ?? "unknown") as PrState,
+    isDraft: Boolean(row.is_draft),
+    headRef: row.head_ref ?? null,
+    baseRef: row.base_ref ?? null,
+    reviewDecision: row.review_decision ?? null,
+    mergeStateStatus: row.merge_state_status ?? null,
+    mergeable: row.mergeable ?? null,
+    checksStatus: (row.checks_status ?? "unknown") as PrChecksStatus,
+    checksSummary: row.checks_summary ?? null,
+    branchExists: Boolean(row.branch_exists),
+    lastCheckedAt: row.last_checked_at ?? null,
+    lastError: row.last_error ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
