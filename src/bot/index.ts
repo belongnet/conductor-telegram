@@ -26,9 +26,11 @@ import {
   getSessionMessagesAfter,
   getSessionResult,
   getWorkspaceSessionInfo,
+  isConductorWorkspaceVisible,
   type SessionMessage,
 } from "./launcher.js";
 import {
+  archiveWorkspace,
   getAllThreadedWorkspaces,
   getAllWorkspaces,
   getArtifactEvents,
@@ -62,6 +64,7 @@ import {
 } from "./format.js";
 import {
   createWorkspaceTopic,
+  deleteWorkspaceTopic,
   ensureWorkspaceTopic,
   renameWorkspaceTopics,
   syncWorkspaceTopic,
@@ -418,6 +421,15 @@ function startSessionPoller(): void {
           markWorkspaceStaleIfNeeded(ws);
           continue;
         }
+        if (
+          !isConductorWorkspaceVisible(sessionInfo) &&
+          (sessionInfo.state === "archived" ||
+            sessionInfo.sessionHidden ||
+            ws.status !== "running")
+        ) {
+          syncHiddenConductorWorkspace(ws);
+          continue;
+        }
 
         if (ws.conductorSessionId !== sessionInfo.sessionId) {
           updateWorkspaceConductorSession(ws.id, sessionInfo.sessionId);
@@ -516,6 +528,17 @@ function startSessionPoller(): void {
         }
       }
   }, POLL_INTERVAL_MS);
+}
+
+function syncHiddenConductorWorkspace(ws: Workspace): void {
+  archiveWorkspace(ws.id);
+  const name = ws.conductorWorkspaceName ?? ws.name;
+  pollerLog.info(`archived hidden Conductor workspace ${name} locally`);
+  if (ws.telegramThreadId) {
+    deleteWorkspaceTopic(bot.telegram, ws.telegramChatId, ws.telegramThreadId).catch((err) =>
+      forumLog.error(`topic delete error ${ws.telegramThreadId}:`, err)
+    );
+  }
 }
 
 function markWorkspaceStaleIfNeeded(ws: Workspace): void {

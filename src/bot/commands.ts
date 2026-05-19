@@ -4,6 +4,7 @@ import {
   archiveConductorWorkspace,
   formatAttachmentReference,
   getWorkspaceSessionInfo,
+  isConductorWorkspaceVisible,
   launchWorkspace,
   launchWorkspaceSession,
   sendToSession,
@@ -259,6 +260,9 @@ function resolveWorkspaceTarget(
   const repoPath = opts.repoPath ?? trackedWorkspace?.repoPath ?? null;
   const sessionInfo = getWorkspaceSessionInfo(conductorName, repoPath);
   if (!sessionInfo) {
+    return null;
+  }
+  if (!isConductorWorkspaceVisible(sessionInfo)) {
     return null;
   }
 

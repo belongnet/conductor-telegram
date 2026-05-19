@@ -1311,6 +1311,11 @@ export async function sendToSession(
         : `Workspace "${workspaceName}" was ambiguous or not found in Conductor DB.`,
     };
   }
+  if (!isConductorWorkspaceVisible(wsInfo)) {
+    return {
+      error: `Workspace "${workspaceName}" is no longer visible in Conductor.`,
+    };
+  }
 
   const repoName = wsInfo.repoName ?? workspaceName;
   const repoPath = wsInfo.repoPath ?? options.repoPath;
@@ -1323,6 +1328,7 @@ export async function sendToSession(
     attachmentSourcePaths
   );
   const fullPrompt = buildPromptWithAttachments(prompt, stagedAttachmentPaths);
+  markConductorWorkspaceActive(wsInfo.workspaceId);
 
   const { done } = spawnAgent(
     wsInfo.sessionId,
@@ -1365,6 +1371,11 @@ export async function launchWorkspaceSession(
       error: options.repoPath
         ? `Workspace "${workspaceName}" not found in Conductor DB for ${options.repoPath}.`
         : `Workspace "${workspaceName}" was ambiguous or not found in Conductor DB.`,
+    };
+  }
+  if (!isConductorWorkspaceVisible(wsInfo)) {
+    return {
+      error: `Workspace "${workspaceName}" is no longer visible in Conductor.`,
     };
   }
 
@@ -1411,6 +1422,7 @@ export async function launchWorkspaceSession(
     return { error: `Failed to create session: ${err}` };
   }
 
+  markConductorWorkspaceActive(wsInfo.workspaceId);
   revealWorkspaceInConductor(workspaceDir);
 
   const { done } = spawnAgent(
@@ -1514,7 +1526,7 @@ function getRepoFromConductorDb(repoPath: string): ConductorRepoInfo | null {
   }
 }
 
-interface ConductorWorkspaceInfo {
+export interface ConductorWorkspaceInfo {
   workspaceId: string;
   sessionId: string;
   agentSessionId: string | null;
@@ -1523,7 +1535,39 @@ interface ConductorWorkspaceInfo {
   repoName: string | null;
   repoPath: string | null;
   status: string | null;
+  state: string | null;
+  derivedStatus: string | null;
+  pinnedAt: string | null;
+  sessionHidden: boolean;
   targetBranch: string | null;
+}
+
+export function isConductorWorkspaceVisible(
+  workspace: Pick<
+    ConductorWorkspaceInfo,
+    "state" | "derivedStatus" | "pinnedAt" | "sessionHidden"
+  >
+): boolean {
+  if (workspace.state === "archived") return false;
+  if (workspace.sessionHidden) return false;
+  return true;
+}
+
+function markConductorWorkspaceActive(workspaceId: string): void {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    db.prepare(
+      `UPDATE workspaces
+       SET state = CASE WHEN state = 'archived' THEN state ELSE 'ready' END,
+           derived_status = 'in-progress',
+           updated_at = datetime('now')
+       WHERE id = ?
+         AND state != 'archived'`
+    ).run(workspaceId);
+    db.close();
+  } catch (err) {
+    console.error(`[launcher] Failed to mark workspace ${workspaceId} active:`, err);
+  }
 }
 
 function getWorkspaceFromConductorDb(
@@ -1546,14 +1590,22 @@ function getWorkspaceFromConductorDb(
           s.status,
           s.agent_type,
           s.claude_session_id as agent_session_id,
+          s.is_hidden as session_hidden,
           r.name as repo_name,
           r.root_path as repo_path,
+          w.state,
+          w.derived_status,
+          w.pinned_at,
           COALESCE(w.intended_target_branch, w.initialization_parent_branch, r.default_branch) as target_branch
        FROM workspaces w
        LEFT JOIN sessions s ON s.id = w.active_session_id
        LEFT JOIN repos r ON r.id = w.repository_id
        WHERE ${where.join(" AND ")}
-       ORDER BY w.updated_at DESC`
+       ORDER BY
+         CASE WHEN w.state = 'archived' THEN 1 ELSE 0 END,
+         CASE WHEN s.is_hidden = 1 THEN 1 ELSE 0 END,
+         datetime(w.updated_at) DESC,
+         w.updated_at DESC`
     ).all(...params) as any[];
     db.close();
 
@@ -1574,6 +1626,10 @@ function getWorkspaceFromConductorDb(
       repoName: row.repo_name ?? null,
       repoPath: row.repo_path ?? null,
       status: row.status ?? null,
+      state: row.state ?? null,
+      derivedStatus: row.derived_status ?? null,
+      pinnedAt: row.pinned_at ?? null,
+      sessionHidden: row.session_hidden === 1,
       targetBranch: row.target_branch ?? null,
     };
   } catch {
