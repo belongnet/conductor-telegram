@@ -2,6 +2,11 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [Unreleased]
+
+### Fixed
+- Voice auto-routing no longer drops otherwise valid router decisions when Claude includes irrelevant optional fields as `null` or blank strings, or when an `"existing"` decision still has enough repo information to fall back to starting a new workspace.
+
 ## [0.3.7.1] - 2026-05-14
 
 ### Added
