@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { closeDb, getDb } from "../src/store/db.js";
-import { formatAttachmentReference } from "../src/bot/launcher.js";
+import {
+  formatAttachmentReference,
+  isConductorWorkspaceVisible,
+} from "../src/bot/launcher.js";
 import { runStartupMaintenance } from "../src/store/maintenance.js";
 
 test("attachment references use markdown syntax that inline media extractor understands", () => {
@@ -20,6 +25,129 @@ test("attachment references use markdown syntax that inline media extractor unde
     formatAttachmentReference("/tmp/photo.heic"),
     "![photo.heic](/tmp/photo.heic)"
   );
+});
+
+test("Conductor visibility hides archived or hidden workspaces", () => {
+  assert.equal(
+    isConductorWorkspaceVisible({
+      state: "ready",
+      derivedStatus: "in-progress",
+      pinnedAt: null,
+      sessionHidden: false,
+    }),
+    true
+  );
+  assert.equal(
+    isConductorWorkspaceVisible({
+      state: "archived",
+      derivedStatus: "in-progress",
+      pinnedAt: null,
+      sessionHidden: false,
+    }),
+    false
+  );
+  assert.equal(
+    isConductorWorkspaceVisible({
+      state: "ready",
+      derivedStatus: "done",
+      pinnedAt: null,
+      sessionHidden: false,
+    }),
+    true
+  );
+  assert.equal(
+    isConductorWorkspaceVisible({
+      state: "ready",
+      derivedStatus: "done",
+      pinnedAt: null,
+      sessionHidden: true,
+    }),
+    false
+  );
+});
+
+test("Conductor workspace lookup prefers the newest timestamp even across mixed SQLite formats", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-db-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES
+        ('old-session', 'idle', datetime('now'), 'old-ws', 0, 'gpt-5.4', 'codex'),
+        ('new-session', 'idle', datetime('now'), 'new-ws', 0, 'gpt-5.4', 'codex')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('old-ws', 'repo-1', 'same-name', 'old-session', '2026-05-19T00:01:00.000Z', 'ready', 'in-progress', NULL, NULL, NULL),
+        ('new-ws', 'repo-1', 'same-name', 'new-session', '2026-05-19 23:59:59', 'ready', 'in-progress', NULL, NULL, NULL)`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { getWorkspaceSessionInfo } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(getWorkspaceSessionInfo("same-name", "/tmp/repo")));
+      `,
+      { CONDUCTOR_DB_PATH: dbPath }
+    ) as { workspaceId: string; sessionId: string };
+
+    assert.equal(result.workspaceId, "new-ws");
+    assert.equal(result.sessionId, "new-session");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sendToSession does not mark Conductor workspaces active when launch preconditions fail", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-send-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'idle', datetime('now'), 'ws-1', 0, 'gpt-5.4', 'codex')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', NULL, 'missing-repo-path', 'session-1', '2026-05-19 00:00:00', 'ready', 'done', NULL, NULL, NULL)`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(await sendToSession("missing-repo-path", "hello")));
+      `,
+      { CONDUCTOR_DB_PATH: dbPath }
+    ) as { error: string };
+
+    assert.equal(
+      result.error,
+      'Workspace "missing-repo-path" is missing repo path metadata.'
+    );
+
+    const verifyDb = new Database(dbPath);
+    const after = verifyDb
+      .prepare("SELECT state, derived_status FROM workspaces WHERE id = 'ws-1'")
+      .get() as {
+      state: string;
+      derived_status: string;
+    };
+    verifyDb.close();
+    assert.equal(after.state, "ready");
+    assert.equal(after.derived_status, "done");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("startup maintenance prunes old events and archived message links", () => {
@@ -62,3 +190,58 @@ test("startup maintenance prunes old events and archived message links", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+function createConductorDb(dbPath: string): Database {
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE repos (
+      id TEXT PRIMARY KEY,
+      root_path TEXT,
+      name TEXT,
+      default_branch TEXT
+    );
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      status TEXT,
+      claude_session_id TEXT,
+      updated_at TEXT,
+      workspace_id TEXT,
+      is_hidden INTEGER DEFAULT 0,
+      model TEXT,
+      agent_type TEXT
+    );
+    CREATE TABLE workspaces (
+      id TEXT PRIMARY KEY,
+      repository_id TEXT,
+      directory_name TEXT,
+      active_session_id TEXT,
+      updated_at TEXT,
+      state TEXT,
+      derived_status TEXT,
+      pinned_at TEXT,
+      initialization_parent_branch TEXT,
+      intended_target_branch TEXT
+    );
+  `);
+  return db;
+}
+
+function runLauncherEval(
+  script: string,
+  env: Record<string, string>
+): unknown {
+  const output = execFileSync(
+    process.execPath,
+    ["--import", "tsx", "-e", script],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ...env },
+      encoding: "utf8",
+    }
+  );
+  const lines = output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return JSON.parse(lines[lines.length - 1] ?? "null");
+}
