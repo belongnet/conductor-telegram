@@ -1,6 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseCliOutput, parseRouteJson } from "../src/bot/ai-router.js";
+import {
+  parseCliOutput,
+  parseCliOutputDetailed,
+  parseRouteJson,
+  parseRouteJsonDetailed,
+  type RouteParseFailureReason,
+  type RouteParseResult,
+} from "../src/bot/ai-router.js";
+
+function assertParseFailure(
+  result: RouteParseResult,
+  reason: RouteParseFailureReason
+): void {
+  assert.equal(result.ok, false);
+  if (result.ok) assert.fail("expected route parser to reject the payload");
+  assert.equal(result.reason, reason);
+  assert.equal(typeof result.preview, "string");
+}
 
 test("CLI envelope accepts new route with blank irrelevant workspaceId", () => {
   const payload = {
@@ -126,4 +143,35 @@ test("router JSON inside markdown code fences still parses", () => {
     workspaceId: undefined,
     prompt: "Fix voice routing.",
   });
+});
+
+test("route parser reports stable failure reasons", () => {
+  const cases: Array<[RouteParseFailureReason, string]> = [
+    ["invalid_json", "not json"],
+    ["invalid_action", JSON.stringify({ action: "archive", prompt: "Do it." })],
+    ["missing_prompt", JSON.stringify({ action: "new", repoName: "conductor-telegram" })],
+    [
+      "invalid_optional_repo_name",
+      JSON.stringify({ action: "existing", repoName: 42, workspaceId: "workspace-1", prompt: "Do it." }),
+    ],
+    [
+      "invalid_optional_workspace_id",
+      JSON.stringify({ action: "new", repoName: "conductor-telegram", workspaceId: 42, prompt: "Do it." }),
+    ],
+    ["missing_new_repo", JSON.stringify({ action: "new", prompt: "Do it." })],
+    ["missing_existing_target", JSON.stringify({ action: "existing", prompt: "Do it." })],
+  ];
+
+  for (const [reason, payload] of cases) {
+    assertParseFailure(parseRouteJsonDetailed(payload), reason);
+  }
+});
+
+test("CLI envelope reports malformed result shape", () => {
+  const output = JSON.stringify({
+    type: "result",
+    result: { action: "new", repoName: "conductor-telegram", prompt: "Do it." },
+  });
+
+  assertParseFailure(parseCliOutputDetailed(output), "invalid_cli_envelope");
 });
