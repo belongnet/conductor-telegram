@@ -356,11 +356,13 @@ function runClaudeRouter(
         return;
       }
 
-      const result = parseCliOutput(stdout);
-      if (!result) {
-        console.log(`[ai-router] Could not parse router output: ${previewRouterOutput(stdout)}`);
+      const parsed = parseCliOutputDetailed(stdout);
+      if (!parsed.ok) {
+        console.log(
+          `[ai-router] Could not parse router output (${parsed.reason}): ${parsed.preview}`
+        );
       }
-      finish(result);
+      finish(parsed.ok ? parsed.result : null);
     });
   });
 }
@@ -439,53 +441,106 @@ function runCommand(
   });
 }
 
+export type RouteParseFailureReason =
+  | "invalid_json"
+  | "invalid_cli_envelope"
+  | "invalid_action"
+  | "missing_prompt"
+  | "invalid_optional_repo_name"
+  | "invalid_optional_workspace_id"
+  | "missing_new_repo"
+  | "missing_existing_target";
+
+export type RouteParseResult =
+  | { ok: true; result: RouteResult }
+  | { ok: false; reason: RouteParseFailureReason; preview: string };
+
 /** @internal exported for parser unit tests; not part of the public bot API. */
 export function parseCliOutput(output: string): RouteResult | null {
+  const parsed = parseCliOutputDetailed(output);
+  return parsed.ok ? parsed.result : null;
+}
+
+/** @internal exported for parser unit tests; not part of the public bot API. */
+export function parseCliOutputDetailed(output: string): RouteParseResult {
   try {
     // The CLI with --output-format json wraps the result in a JSON envelope
     const envelope = JSON.parse(output);
-    const text = envelope?.result ?? output;
-    return parseRouteJson(text);
+    if (envelope?.result !== undefined) {
+      if (typeof envelope.result !== "string") {
+        return parseFailure("invalid_cli_envelope", output);
+      }
+      return parseRouteJsonDetailed(envelope.result);
+    }
+    return parseRouteJsonDetailed(output);
   } catch {
     // Try parsing the raw output directly
-    return parseRouteJson(output);
+    return parseRouteJsonDetailed(output);
   }
 }
 
 /** @internal exported for parser unit tests; not part of the public bot API. */
 export function parseRouteJson(text: string): RouteResult | null {
+  const parsed = parseRouteJsonDetailed(text);
+  return parsed.ok ? parsed.result : null;
+}
+
+/** @internal exported for parser unit tests; not part of the public bot API. */
+export function parseRouteJsonDetailed(text: string): RouteParseResult {
+  let parsed: unknown;
   try {
     // Strip markdown code fences if present
     const cleaned = text.replace(/```json?\s*/g, "").replace(/```\s*/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    const action = parsed.action;
-    if (action !== "new" && action !== "existing") return null;
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return parseFailure("invalid_json", text);
+  }
 
-    const prompt = parsed.prompt;
-    if (typeof prompt !== "string" || !prompt) return null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return parseFailure("invalid_action", text);
+  }
 
-    const repoName = normalizeOptionalString(parsed.repoName);
-    if (repoName === INVALID_OPTIONAL_STRING) return null;
+  const route = parsed as Record<string, unknown>;
+  const action = route.action;
+  if (action !== "new" && action !== "existing") {
+    return parseFailure("invalid_action", text);
+  }
 
-    const workspaceId = normalizeOptionalString(parsed.workspaceId);
-    if (workspaceId === INVALID_OPTIONAL_STRING) return null;
+  const prompt = route.prompt;
+  if (typeof prompt !== "string" || !prompt) {
+    return parseFailure("missing_prompt", text);
+  }
 
-    if (action === "new" && !repoName) return null;
-    // Keep "existing" routes actionable when Claude picked the right repo
-    // but failed to identify a concrete workspace; executeRouteResult() will
-    // degrade those to a new workspace in the repo.
-    if (action === "existing" && !workspaceId && !repoName) return null;
+  const repoName = normalizeOptionalString(route.repoName);
+  if (repoName === INVALID_OPTIONAL_STRING) {
+    return parseFailure("invalid_optional_repo_name", text);
+  }
 
-    return {
-      transcript: typeof parsed.transcript === "string" ? parsed.transcript : prompt,
+  const workspaceId = normalizeOptionalString(route.workspaceId);
+  if (workspaceId === INVALID_OPTIONAL_STRING) {
+    return parseFailure("invalid_optional_workspace_id", text);
+  }
+
+  if (action === "new" && !repoName) {
+    return parseFailure("missing_new_repo", text);
+  }
+  // Keep "existing" routes actionable when Claude picked the right repo
+  // but failed to identify a concrete workspace; executeRouteResult() will
+  // degrade those to a new workspace in the repo.
+  if (action === "existing" && !workspaceId && !repoName) {
+    return parseFailure("missing_existing_target", text);
+  }
+
+  return {
+    ok: true,
+    result: {
+      transcript: typeof route.transcript === "string" ? route.transcript : prompt,
       action,
       repoName,
       workspaceId,
       prompt,
-    };
-  } catch {
-    return null;
-  }
+    },
+  };
 }
 
 const INVALID_OPTIONAL_STRING = Symbol("invalid optional string");
@@ -497,6 +552,13 @@ function normalizeOptionalString(
   if (typeof value !== "string") return INVALID_OPTIONAL_STRING;
   if (value.length === 0) return undefined;
   return value;
+}
+
+function parseFailure(
+  reason: RouteParseFailureReason,
+  output: string
+): RouteParseResult {
+  return { ok: false, reason, preview: previewRouterOutput(output) };
 }
 
 function previewRouterOutput(output: string, limit = 500): string {
