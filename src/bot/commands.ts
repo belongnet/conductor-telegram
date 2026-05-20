@@ -62,6 +62,58 @@ function describeWorkspaceRejection(
   return "no conductor name";
 }
 
+type RouteExecutionPlannerDeps = {
+  getWorkspace: (id: string) => Workspace | undefined;
+  resolveRepo: (input: string) => string | null;
+};
+
+export type RouteExecutionPlan =
+  | { kind: "existing"; workspace: Workspace }
+  | { kind: "new"; repoName: string; existingRejection?: string }
+  | {
+      kind: "unroutable";
+      reason: "missing_target" | "unresolvable_repo";
+      repoName?: string;
+      existingRejection?: string;
+    };
+
+/** @internal exported for route executor unit tests; not part of the public bot API. */
+export function resolveRouteExecutionPlan(
+  chatId: string,
+  result: RouteResult,
+  deps: RouteExecutionPlannerDeps = { getWorkspace, resolveRepo }
+): RouteExecutionPlan {
+  let existingRejection: string | undefined;
+
+  if (result.action === "existing" && result.workspaceId) {
+    const workspace = deps.getWorkspace(result.workspaceId);
+    if (
+      workspace &&
+      workspace.telegramChatId === chatId &&
+      workspace.status === "running" &&
+      workspace.conductorWorkspaceName
+    ) {
+      return { kind: "existing", workspace };
+    }
+    existingRejection = describeWorkspaceRejection(workspace, chatId);
+  }
+
+  if (result.repoName) {
+    const resolved = deps.resolveRepo(result.repoName);
+    if (resolved) {
+      return { kind: "new", repoName: resolved, existingRejection };
+    }
+    return {
+      kind: "unroutable",
+      reason: "unresolvable_repo",
+      repoName: result.repoName,
+      existingRejection,
+    };
+  }
+
+  return { kind: "unroutable", reason: "missing_target", existingRejection };
+}
+
 // Map Telegram message IDs to decision IDs (for reply-based answering)
 const messageToDecision = new Map<number, number>();
 
@@ -1483,29 +1535,26 @@ async function executeRouteResult(
   console.log(
     `[ai-router] decision: action=${result.action} repo=${result.repoName ?? "-"} workspaceId=${result.workspaceId ?? "-"} prompt=${promptPreview}`
   );
-  if (result.action === "existing" && result.workspaceId) {
-    const workspace = getWorkspace(result.workspaceId);
-    if (
-      workspace &&
-      workspace.telegramChatId === chatId &&
-      workspace.status === "running" &&
-      workspace.conductorWorkspaceName
-    ) {
-      await sendMessageToWorkspace(ctx, workspace, result.prompt, attachments);
-      return true;
-    }
+
+  const plan = resolveRouteExecutionPlan(chatId, result);
+  if ("existingRejection" in plan && plan.existingRejection) {
     console.log(
-      `[ai-router] existing rejected (${describeWorkspaceRejection(workspace, chatId)}); falling back to new`
+      `[ai-router] existing rejected (${plan.existingRejection}); falling back to new`
     );
   }
 
-  if (result.repoName) {
-    const resolved = resolveRepo(result.repoName);
-    if (resolved) {
-      await startWorkspaceFromMessage(ctx, resolved, result.prompt, attachments);
-      return true;
-    }
-    console.log(`[ai-router] unresolvable repo: ${result.repoName}`);
+  if (plan.kind === "existing") {
+    await sendMessageToWorkspace(ctx, plan.workspace, result.prompt, attachments);
+    return true;
+  }
+
+  if (plan.kind === "new") {
+    await startWorkspaceFromMessage(ctx, plan.repoName, result.prompt, attachments);
+    return true;
+  }
+
+  if (plan.reason === "unresolvable_repo" && plan.repoName) {
+    console.log(`[ai-router] unresolvable repo: ${plan.repoName}`);
   }
 
   return false;
