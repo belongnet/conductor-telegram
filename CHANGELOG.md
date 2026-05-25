@@ -4,6 +4,15 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-05-22
+
+### Changed
+- npm publishing now uses Trusted Publishing with GitHub OIDC instead of a long-lived `NPM_TOKEN` secret, and the release workflow runs on Node 24/npm 11 for OIDC support and automatic provenance.
+- The publish workflow now typechecks and runs tests before building and publishing the package.
+
+### Fixed
+- The `conductor-telegram-mcp` npm bin now has a Node shebang so global installs execute it as JavaScript instead of a shell script.
+
 ## [0.3.8] - 2026-05-20
 
 ### Fixed
