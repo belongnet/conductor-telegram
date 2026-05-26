@@ -89,6 +89,38 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_pr_records_repo_branch
     ON pr_records(repo_path, branch);
+
+  CREATE TABLE IF NOT EXISTS repo_topics (
+    chat_id TEXT NOT NULL,
+    repo_path TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    telegram_thread_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used_at TEXT,
+    PRIMARY KEY (chat_id, repo_path),
+    UNIQUE (chat_id, telegram_thread_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_repo_topics_thread
+    ON repo_topics(chat_id, telegram_thread_id);
+
+  CREATE TABLE IF NOT EXISTS route_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    telegram_thread_id INTEGER,
+    action TEXT,
+    repo_path TEXT,
+    repo_name TEXT,
+    workspace_id TEXT,
+    status TEXT NOT NULL,
+    failure_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_route_attempts_chat_created
+    ON route_attempts(chat_id, created_at);
 `;
 
 let _db: Database.Database | null = null;
