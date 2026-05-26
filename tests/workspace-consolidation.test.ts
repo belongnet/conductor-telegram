@@ -8,6 +8,7 @@ import Database from "better-sqlite3";
 import { closeDb, getDb } from "../src/store/db.js";
 import {
   formatAttachmentReference,
+  inferAgentTypeFromModel,
   isConductorWorkspaceVisible,
 } from "../src/bot/launcher.js";
 import { runStartupMaintenance } from "../src/store/maintenance.js";
@@ -64,6 +65,76 @@ test("Conductor visibility hides archived or hidden workspaces", () => {
     }),
     false
   );
+});
+
+test("model family detection recognizes Codex and Claude model names", () => {
+  assert.equal(inferAgentTypeFromModel("gpt-5.5"), "codex");
+  assert.equal(inferAgentTypeFromModel("o4-mini"), "codex");
+  assert.equal(inferAgentTypeFromModel("opus-1m"), "claude");
+  assert.equal(inferAgentTypeFromModel("claude-sonnet-4-5"), "claude");
+  assert.equal(inferAgentTypeFromModel("custom-router-model"), null);
+});
+
+test("OpenAI Conductor default model selects Codex when no Telegram agent is configured", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-model-default-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES ('default_model', 'gpt-5.5')"
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { resolveLaunchConfig } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(resolveLaunchConfig({})));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        TELEGRAM_DEFAULT_AGENT_TYPE: "",
+        TELEGRAM_DEFAULT_MODEL: "",
+      }
+    ) as { agentType: string; model: string };
+
+    assert.equal(result.agentType, "codex");
+    assert.equal(result.model, "gpt-5.5");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Claude launch skips incompatible OpenAI model history", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-model-skip-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      "INSERT INTO settings (key, value) VALUES ('default_model', 'gpt-5.5')"
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, model, agent_type)
+       VALUES ('bad-claude-session', 'idle', datetime('now'), 'ws-1', 'gpt-5.5', 'claude')`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { resolveLaunchConfig } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(resolveLaunchConfig({})));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        TELEGRAM_DEFAULT_AGENT_TYPE: "claude",
+        TELEGRAM_DEFAULT_MODEL: "",
+      }
+    ) as { agentType: string; model: string };
+
+    assert.equal(result.agentType, "claude");
+    assert.equal(result.model, "opus");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("Conductor workspace lookup prefers the newest timestamp even across mixed SQLite formats", () => {
@@ -204,11 +275,16 @@ function createConductorDb(dbPath: string): Database {
       id TEXT PRIMARY KEY,
       status TEXT,
       claude_session_id TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT,
       workspace_id TEXT,
       is_hidden INTEGER DEFAULT 0,
       model TEXT,
       agent_type TEXT
+    );
+    CREATE TABLE settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
     );
     CREATE TABLE workspaces (
       id TEXT PRIMARY KEY,

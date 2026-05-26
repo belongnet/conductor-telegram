@@ -64,7 +64,7 @@ const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {
     "Library/Application Support/com.conductor.app/bin/codex"
   ),
   permissionMode: "bypassPermissions",
-  defaultAgentType: "claude",
+  defaultAgentType: undefined,
   defaultModel: undefined,
   reviewAgentType: undefined,
   reviewModel: undefined,

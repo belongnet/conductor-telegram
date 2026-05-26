@@ -4,6 +4,9 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Launching with no `TELEGRAM_DEFAULT_AGENT_TYPE` now picks the agent that matches Conductor's configured `default_model` (and `TELEGRAM_DEFAULT_MODEL`), so an OpenAI model like `gpt-5.5` no longer launches the Claude CLI. Incompatible historical models are skipped when resolving the per-agent default.
+
 ## [0.3.10] - 2026-05-27
 
 ### Added
