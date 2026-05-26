@@ -222,6 +222,28 @@ export async function createWorkspaceTopic(
   }
 }
 
+export async function createRepoTopic(
+  telegram: Telegram,
+  chatId: string,
+  repoName: string
+): Promise<CreateTopicResult> {
+  try {
+    const result = await telegram.createForumTopic(chatId, buildRepoTopicName(repoName), {
+      icon_color: pickColor(repoName),
+    });
+    return { ok: true, threadId: result.message_thread_id };
+  } catch (err: any) {
+    const message = String(err?.message ?? "unknown error");
+    const kind = classifyTopicCreateError(err);
+    console.log(`[forum] could not create repo topic (${kind}): ${message}`);
+    return { ok: false, kind, message };
+  }
+}
+
+export function buildRepoTopicName(repoName: string): string {
+  return repoName;
+}
+
 /**
  * Build the canonical topic name for a workspace.
  */

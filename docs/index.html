@@ -1082,8 +1082,8 @@
         <div class="feature-icon-wrap">
           <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
         </div>
-        <h3>Forum topics per workspace</h3>
-        <p>Each workspace gets its own Telegram forum topic. Clean separation, easy to follow, no noise.</p>
+        <h3>Repo and workspace topics</h3>
+        <p>Each repo can have a durable launch topic, and each workspace gets its own follow-up topic. Clean separation, less guessing.</p>
       </div>
       <div class="feature-card fade-in">
         <div class="feature-icon-wrap">
@@ -1108,7 +1108,7 @@
   <div class="container">
     <div class="section-label">// dogfooded</div>
     <h2>Built with itself</h2>
-    <p class="lead">The merge-congrats feature on this very bot? Shipped from one voice message in the General topic. The bot picked the right repo from what was said, spun up a workspace, and &mdash; because the prompt mentioned <em>merge</em> &mdash; ran GStack ship straight through. Voice in, merged PR out. Useful for hotfixes on the go. <a href="https://github.com/belongnet/conductor-telegram/pull/29" style="color:var(--accent);">See PR&nbsp;#29 &rarr;</a></p>
+    <p class="lead">The merge-congrats feature on this very bot? Shipped from one voice message. Use a repo topic for deterministic routing, or let the General topic propose a target and confirm before it spins up a workspace. Voice in, reviewed route, merged PR out. Useful for hotfixes on the go. <a href="https://github.com/belongnet/conductor-telegram/pull/29" style="color:var(--accent);">See PR&nbsp;#29 &rarr;</a></p>
 
     <div class="side-by-side">
       <div>
@@ -1153,13 +1153,13 @@
         </div>
         <div class="tg-messages">
           <div class="tg-msg user">
-            <div class="label">&#127908; voice &middot; General topic &middot; 0:09</div>
+            <div class="label">&#127908; voice &middot; repo topic &middot; 0:09</div>
             "Build a feature that sends a congratulatory message when a merge request is completed &mdash; ship it."
             <div class="time">14:02</div>
           </div>
           <div class="tg-msg bot">
             <div class="label">&#129517; routed</div>
-            Matched repo <code>conductor-telegram</code> from voice content. New workspace: <code>windhoek</code>.
+            Repo topic <code>conductor-telegram</code> selected the target. New workspace: <code>windhoek</code>.
             <div class="time">14:02</div>
           </div>
           <div class="tg-msg bot">

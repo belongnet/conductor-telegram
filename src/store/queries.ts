@@ -9,6 +9,9 @@ import type {
   WorkspaceEvent,
   WorkspaceStatus,
   Decision,
+  RepoTopic,
+  RouteAttemptStatus,
+  RouteSource,
 } from "../types/index.js";
 
 // ── Workspaces ──────────────────────────────────────────────
@@ -270,6 +273,139 @@ export function getWorkspaceByTelegramMessage(
     )
     .get(chatId, telegramMessageId) as any;
   return row ? mapWorkspaceRow(row) : undefined;
+}
+
+// ── Repo Topics ────────────────────────────────────────────────
+
+export function upsertRepoTopic(input: {
+  chatId: string;
+  repoPath: string;
+  repoName: string;
+  telegramThreadId: number;
+}): RepoTopic {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO repo_topics
+      (chat_id, repo_path, repo_name, telegram_thread_id, created_at, updated_at, last_used_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chat_id, repo_path) DO UPDATE SET
+       repo_name = excluded.repo_name,
+       telegram_thread_id = excluded.telegram_thread_id,
+       updated_at = excluded.updated_at`
+  ).run(
+    input.chatId,
+    input.repoPath,
+    input.repoName,
+    input.telegramThreadId,
+    now,
+    now,
+    now
+  );
+
+  const topic = getRepoTopic(input.chatId, input.repoPath);
+  if (!topic) {
+    throw new Error(`Failed to upsert repo topic for ${input.repoPath}`);
+  }
+  return topic;
+}
+
+export function getRepoTopic(
+  chatId: string,
+  repoPath: string
+): RepoTopic | undefined {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT * FROM repo_topics WHERE chat_id = ? AND repo_path = ?")
+    .get(chatId, repoPath) as any;
+  return row ? mapRepoTopicRow(row) : undefined;
+}
+
+export function getRepoTopicByThreadId(
+  chatId: string,
+  threadId: number
+): RepoTopic | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      "SELECT * FROM repo_topics WHERE chat_id = ? AND telegram_thread_id = ?"
+    )
+    .get(chatId, threadId) as any;
+  return row ? mapRepoTopicRow(row) : undefined;
+}
+
+export function getRepoTopicsForChat(chatId: string): RepoTopic[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT * FROM repo_topics WHERE chat_id = ? ORDER BY repo_name ASC"
+    )
+    .all(chatId) as any[];
+  return rows.map(mapRepoTopicRow);
+}
+
+export function deleteRepoTopic(chatId: string, repoPath: string): void {
+  const db = getDb();
+  db.prepare("DELETE FROM repo_topics WHERE chat_id = ? AND repo_path = ?").run(
+    chatId,
+    repoPath
+  );
+}
+
+export function touchRepoTopic(chatId: string, repoPath: string): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE repo_topics
+     SET last_used_at = ?, updated_at = ?
+     WHERE chat_id = ? AND repo_path = ?`
+  ).run(new Date().toISOString(), new Date().toISOString(), chatId, repoPath);
+}
+
+function mapRepoTopicRow(row: any): RepoTopic {
+  return {
+    chatId: row.chat_id,
+    repoPath: row.repo_path,
+    repoName: row.repo_name,
+    telegramThreadId: Number(row.telegram_thread_id),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastUsedAt: row.last_used_at ?? null,
+  };
+}
+
+// ── Route Attempts ─────────────────────────────────────────────
+
+export function recordRouteAttempt(input: {
+  chatId: string;
+  source: RouteSource;
+  telegramThreadId?: number | null;
+  action?: string | null;
+  repoPath?: string | null;
+  repoName?: string | null;
+  workspaceId?: string | null;
+  status: RouteAttemptStatus;
+  failureReason?: string | null;
+}): number {
+  const db = getDb();
+  const result = db
+    .prepare(
+      `INSERT INTO route_attempts
+        (chat_id, source, telegram_thread_id, action, repo_path, repo_name,
+         workspace_id, status, failure_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      input.chatId,
+      input.source,
+      input.telegramThreadId ?? null,
+      input.action ?? null,
+      input.repoPath ?? null,
+      input.repoName ?? null,
+      input.workspaceId ?? null,
+      input.status,
+      input.failureReason ?? null
+    );
+  return Number(result.lastInsertRowid);
 }
 
 function mapWorkspaceRow(row: any): Workspace {
@@ -558,6 +694,24 @@ export function getPendingDecision(
     )
     .get(workspaceId) as any;
   return row ? mapDecisionRow(row) : undefined;
+}
+
+export function getPendingDecisionsForChat(
+  chatId: string,
+  limit = 20
+): Decision[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT d.*
+       FROM decisions d
+       JOIN workspaces w ON w.id = d.workspace_id
+       WHERE w.telegram_chat_id = ? AND d.answer IS NULL
+       ORDER BY d.id DESC
+       LIMIT ?`
+    )
+    .all(chatId, limit) as any[];
+  return rows.map(mapDecisionRow);
 }
 
 function mapDecisionRow(row: any): Decision {

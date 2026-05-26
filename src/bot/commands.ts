@@ -31,21 +31,30 @@ import {
   getWorkspaceByTelegramMessage,
   getHeartbeat,
   getPrRecordsForWorkspaces,
+  deleteRepoTopic,
+  getRepoTopic,
+  getRepoTopicByThreadId,
+  getPendingDecisionsForChat,
+  recordRouteAttempt,
+  touchRepoTopic,
+  upsertRepoTopic,
 } from "../store/queries.js";
 import {
   createWorkspaceTopic,
+  createRepoTopic,
   closeWorkspaceTopic,
   deleteWorkspaceTopic,
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
-import type { Decision, PrRecord, Workspace } from "../types/index.js";
+import type { Decision, PrRecord, RepoTopic, RouteSource, Workspace } from "../types/index.js";
 import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
-import { routeVoiceMessage, routeTextMessage, transcribeVoiceMessage, type RouteResult } from "./ai-router.js";
+import { detectExplicitTarget, routeVoiceMessage, routeTextMessage, transcribeVoiceMessage, type RouteResult } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import https from "node:https";
+import { randomUUID } from "node:crypto";
 import { canMergePr, mergeWorkspacePr, refreshWorkspacePr } from "./github.js";
 import { compactPrBadge, formatPrCard, prKeyboard } from "./pr-ui.js";
 
@@ -254,6 +263,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "workspaces", description: "List tracked workspaces" },
   { command: "prs", description: "Show PR and branch ship status" },
   { command: "ship_status", description: "Show PR and branch ship status" },
+  { command: "decisions", description: "Show pending agent questions" },
   { command: "status", description: "Show active workspace status" },
   { command: "stop", description: "Stop a running workspace" },
   { command: "repos", description: "List available repos" },
@@ -372,6 +382,12 @@ function getThreadWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
 
 function getContextualTarget(ctx: Context): WorkspaceTarget | null {
   return getReplyWorkspaceTarget(ctx) ?? getThreadWorkspaceTarget(ctx);
+}
+
+function getThreadRepoTopic(ctx: Context, chatId: string): RepoTopic | null {
+  const threadId = (ctx.message as any)?.message_thread_id;
+  if (!threadId) return null;
+  return getRepoTopicByThreadId(chatId, threadId) ?? null;
 }
 
 function getWorkspaceDirectory(target: WorkspaceTarget): string | null {
@@ -535,6 +551,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.command("workspaces", handleWorkspaces);
   bot.command("prs", handlePrs);
   bot.command("ship_status", handlePrs);
+  bot.command("decisions", handleDecisions);
   bot.command("status", handleStatus);
   bot.command("stop", handleStop);
   bot.command("repos", handleRepos);
@@ -554,6 +571,8 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^open:(.+)$/, handleOpenCallback);
   bot.action(/^decide:(\d+):(.+)$/, handleDecisionCallback);
   bot.action(/^run:(\d+)$/, handleRunRepoCallback);
+  bot.action(/^repotopic:(\d+)$/, handleRepoTopicCallback);
+  bot.action(/^routeconfirm:([a-f0-9]+):(yes|cancel)$/, handleRouteConfirmCallback);
   bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
   bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
   bot.action(/^pr:(refresh|fix|merge):(.+)$/, handlePrCallback);
@@ -920,6 +939,25 @@ async function startWorkspaceFromMessage(
   );
 }
 
+async function startWorkspaceFromRepoTopic(
+  ctx: Context,
+  topic: RepoTopic,
+  prompt: string,
+  attachmentSourcePaths: string[] = []
+): Promise<void> {
+  touchRepoTopic(topic.chatId, topic.repoPath);
+  recordRouteAttempt({
+    chatId: topic.chatId,
+    source: "repo_topic",
+    telegramThreadId: topic.telegramThreadId,
+    action: "new",
+    repoPath: topic.repoPath,
+    repoName: topic.repoName,
+    status: "routed",
+  });
+  await startWorkspaceFromMessage(ctx, topic.repoName, prompt, attachmentSourcePaths);
+}
+
 // ── /workspaces ─────────────────────────────────────────────
 
 async function handleWorkspaces(ctx: Context): Promise<void> {
@@ -1029,6 +1067,29 @@ async function handleStatus(ctx: Context): Promise<void> {
   });
 }
 
+async function handleDecisions(ctx: Context): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return;
+
+  const decisions = getPendingDecisionsForChat(chatId, 20);
+  if (decisions.length === 0) {
+    await ctx.reply("No pending agent questions.");
+    return;
+  }
+
+  const lines = decisions.map((decision) => {
+    const workspace = getWorkspace(decision.workspaceId);
+    const name = workspace?.conductorWorkspaceName ?? workspace?.name ?? "unknown";
+    const repo = workspace ? path.basename(workspace.repoPath) : "unknown";
+    return `<b>#${decision.id}</b> · <b>${escHtml(name)}</b> · <code>${escHtml(repo)}</code>\n<i>${escHtml(truncate(decision.question, 220))}</i>`;
+  });
+
+  await ctx.reply(
+    `<b>Pending questions (${decisions.length})</b>\n\n${lines.join("\n\n")}\n\nReply to the original question message, or tap its option buttons if present.`,
+    { parse_mode: "HTML" }
+  );
+}
+
 // ── /stop <workspace> ───────────────────────────────────────
 
 async function handleStop(ctx: Context): Promise<void> {
@@ -1101,12 +1162,15 @@ async function handleRepos(ctx: Context): Promise<void> {
   }
 
   const lines = repos.map((r, i) => `${i + 1}. <code>${escHtml(r)}</code>`).join("\n");
-  const repoButtons = repos.map((r, i) => [
-    btn(`${i + 1}. ${r}`, `run:${i + 1}`),
+  const repoButtons = repos.flatMap((r, i) => [
+    [
+      btn(`${i + 1}. ${r}`, `run:${i + 1}`),
+      btn("Topic", `repotopic:${i + 1}`),
+    ],
   ]);
 
   await ctx.reply(
-    `<b>Available repos:</b>\n\n${lines}\n\nTap a repo or use <code>/run 1 your prompt</code>`,
+    `<b>Available repos:</b>\n\n${lines}\n\nTap a repo for the two-step /run flow, or tap <b>Topic</b> to create a durable repo topic. Messages and voice notes in a repo topic always start new work in that repo.`,
     {
       parse_mode: "HTML",
       ...styledKeyboard(repoButtons),
@@ -1119,8 +1183,16 @@ interface PendingRepoSelection {
   confirmationMessageKey: string;
 }
 
+interface PendingRouteConfirmation {
+  chatId: string;
+  result: RouteResult;
+  attachments: string[];
+  createdAt: number;
+}
+
 // Last selected repo per user (for two-step /run flow)
 const pendingRepoSelection = new Map<string, PendingRepoSelection>();
+const pendingRouteConfirmations = new Map<string, PendingRouteConfirmation>();
 
 function getRepoSelectionMessageKey(chatId: string, messageId: number): string {
   return `${chatId}:${messageId}`;
@@ -1135,6 +1207,66 @@ function getPendingRepoSelectionKey(ctx: Context): string | null {
     typeof msg?.message_thread_id === "number" ? msg.message_thread_id : null;
 
   return threadId ? `${chatId}:${threadId}` : chatId;
+}
+
+function repoPathForName(repoName: string): string {
+  return path.join(CONDUCTOR_REPOS_DIR, repoName);
+}
+
+function isTelegramThreadMissingError(err: any): boolean {
+  const msg = String(err?.message ?? "").toLowerCase();
+  return (
+    msg.includes("message_thread_not_found") ||
+    msg.includes("topic_deleted") ||
+    msg.includes("thread not found") ||
+    (msg.includes("bad request") && msg.includes("thread"))
+  );
+}
+
+async function ensureRepoTopic(
+  ctx: Context,
+  chatId: string,
+  repoName: string
+): Promise<{ ok: true; threadId: number; created: boolean } | { ok: false; message: string }> {
+  const repoPath = repoPathForName(repoName);
+  const existing = getRepoTopic(chatId, repoPath);
+  if (existing) {
+    return { ok: true, threadId: existing.telegramThreadId, created: false };
+  }
+
+  const result = await createRepoTopic(ctx.telegram, chatId, repoName);
+  if (!result.ok) {
+    const message =
+      result.kind === "no_forum"
+        ? "Repo topics require a Telegram supergroup with Topics enabled."
+        : result.kind === "no_permission"
+          ? "The bot needs the Manage Topics admin permission to create repo topics."
+          : `Telegram returned: ${result.message}`;
+    return { ok: false, message };
+  }
+
+  upsertRepoTopic({
+    chatId,
+    repoPath,
+    repoName,
+    telegramThreadId: result.threadId,
+  });
+  return { ok: true, threadId: result.threadId, created: true };
+}
+
+async function sendRepoTopicReadyMessage(
+  ctx: Context,
+  repoName: string,
+  threadId: number
+): Promise<void> {
+  await ctx.telegram.sendMessage(
+    ctx.chat!.id,
+    `<b>${escHtml(repoName)}</b> repo topic is ready.\n\nSend a message or voice note here to start a new workspace in this repo. Workspace follow-ups still go in the workspace's own topic.`,
+    {
+      parse_mode: "HTML",
+      message_thread_id: threadId,
+    }
+  );
 }
 
 async function handleRunRepoCallback(ctx: Context): Promise<void> {
@@ -1160,6 +1292,47 @@ async function handleRunRepoCallback(ctx: Context): Promise<void> {
   );
   messageToRepoSelection.set(confirmationMessageKey, repoName);
   pendingRepoSelection.set(selectionKey, { repoNum, confirmationMessageKey });
+}
+
+async function handleRepoTopicCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const repoNum = parseInt(match?.[1], 10);
+  if (Number.isNaN(repoNum)) return;
+
+  const repos = getRepoList();
+  const repoName = repos[repoNum - 1];
+  const chatId = ctx.chat?.id?.toString();
+  if (!repoName || !chatId) return;
+
+  let topic = await ensureRepoTopic(ctx, chatId, repoName);
+  if (!topic.ok) {
+    await ctx.answerCbQuery("Could not create repo topic");
+    await ctx.reply(`Could not create a repo topic for <b>${escHtml(repoName)}</b>.\n\n${escHtml(topic.message)}`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  let recreated = false;
+  try {
+    await sendRepoTopicReadyMessage(ctx, repoName, topic.threadId);
+  } catch (err) {
+    if (!topic.created && isTelegramThreadMissingError(err)) {
+      deleteRepoTopic(chatId, repoPathForName(repoName));
+      topic = await ensureRepoTopic(ctx, chatId, repoName);
+      if (topic.ok) {
+        recreated = true;
+        await sendRepoTopicReadyMessage(ctx, repoName, topic.threadId);
+      }
+    }
+    if (!topic.ok || !recreated) {
+      throw err;
+    }
+  }
+
+  await ctx.answerCbQuery(
+    recreated ? "Repo topic recreated" : topic.created ? "Repo topic created" : "Repo topic ready"
+  );
 }
 
 // ── Reply-to-decision helper ─────────────────────────────────
@@ -1274,6 +1447,15 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     }
   }
 
+  const repoTopic = getThreadRepoTopic(ctx, chatId);
+  if (repoTopic) {
+    const message = caption
+      ? applySkillHashtag(caption)
+      : "The user sent a screenshot/image. Please review it.";
+    await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
+    return;
+  }
+
   // General-chat fallback: if the caption has routing intent (repo/workspace
   // name, skill hashtag, etc.), let the AI router pick the target and forward
   // the image as an attachment.
@@ -1379,6 +1561,13 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
       await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
       return;
     }
+  }
+
+  const repoTopic = getThreadRepoTopic(ctx, chatId);
+  if (repoTopic) {
+    const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
+    await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
+    return;
   }
 
   if (caption) {
@@ -1489,6 +1678,12 @@ async function tryAutoRouteVoice(
     );
     if (!result) return false;
 
+    const routingText = [caption, result.transcript].filter(Boolean).join("\n\n");
+    if (shouldConfirmGeneralRoute(routingText, result, repos, activeWorkspaces)) {
+      await requestRouteConfirmation(ctx, chatId, result, [voicePath]);
+      return true;
+    }
+
     return await executeRouteResult(ctx, chatId, result, [voicePath]);
   } catch (err) {
     console.error("[ai-router] voice routing failed:", err);
@@ -1518,6 +1713,11 @@ async function tryAutoRouteText(
       result.prompt = buildSkillPrompt(skillMention.skill, skillMention.remaining);
     }
 
+    if (shouldConfirmGeneralRoute(text, result, repos, activeWorkspaces)) {
+      await requestRouteConfirmation(ctx, chatId, result, attachments);
+      return true;
+    }
+
     return await executeRouteResult(ctx, chatId, result, attachments);
   } catch (err) {
     console.error("[ai-router] text routing failed:", err);
@@ -1529,7 +1729,8 @@ async function executeRouteResult(
   ctx: Context,
   chatId: string,
   result: RouteResult,
-  attachments: string[] = []
+  attachments: string[] = [],
+  source: RouteSource = "general_ai"
 ): Promise<boolean> {
   const promptPreview = JSON.stringify(result.prompt.slice(0, 120));
   console.log(
@@ -1544,11 +1745,29 @@ async function executeRouteResult(
   }
 
   if (plan.kind === "existing") {
+    recordRouteAttempt({
+      chatId,
+      source,
+      action: "existing",
+      repoPath: plan.workspace.repoPath,
+      repoName: path.basename(plan.workspace.repoPath),
+      workspaceId: plan.workspace.id,
+      status: "routed",
+    });
     await sendMessageToWorkspace(ctx, plan.workspace, result.prompt, attachments);
     return true;
   }
 
   if (plan.kind === "new") {
+    recordRouteAttempt({
+      chatId,
+      source,
+      action: "new",
+      repoPath: repoPathForName(plan.repoName),
+      repoName: plan.repoName,
+      status: "routed",
+      failureReason: plan.existingRejection,
+    });
     await startWorkspaceFromMessage(ctx, plan.repoName, result.prompt, attachments);
     return true;
   }
@@ -1557,7 +1776,99 @@ async function executeRouteResult(
     console.log(`[ai-router] unresolvable repo: ${plan.repoName}`);
   }
 
+  recordRouteAttempt({
+    chatId,
+    source,
+    action: result.action,
+    repoName: result.repoName ?? null,
+    workspaceId: result.workspaceId ?? null,
+    status: "failed",
+    failureReason:
+      plan.reason === "unresolvable_repo" && plan.repoName
+        ? `unresolvable_repo:${plan.repoName}`
+        : plan.reason,
+  });
+
   return false;
+}
+
+function shouldConfirmGeneralRoute(
+  text: string,
+  result: RouteResult,
+  repos: string[],
+  activeWorkspaces: Workspace[]
+): boolean {
+  if (detectExplicitTarget(text, repos)) return false;
+  if (detectExplicitWorkspaceTarget(text, activeWorkspaces)) return false;
+  // A General-topic route with no explicit repo/workspace is an inference. Ask
+  // before creating a branch, workspace, topic, and agent run.
+  return result.action === "new" || result.action === "existing";
+}
+
+function detectExplicitWorkspaceTarget(text: string, activeWorkspaces: Workspace[]): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  for (const workspace of activeWorkspaces) {
+    const candidates = [
+      workspace.id,
+      workspace.conductorWorkspaceName,
+      workspace.name,
+    ].filter((value): value is string => Boolean(value));
+    for (const candidate of candidates) {
+      const escaped = candidate.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`(^|\\W)${escaped}(\\W|$)`, "i").test(lower)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function requestRouteConfirmation(
+  ctx: Context,
+  chatId: string,
+  result: RouteResult,
+  attachments: string[]
+): Promise<void> {
+  pruneExpiredRouteConfirmations();
+  const id = randomUUID().replace(/-/g, "").slice(0, 12);
+  pendingRouteConfirmations.set(id, {
+    chatId,
+    result: { ...result },
+    attachments: [...attachments],
+    createdAt: Date.now(),
+  });
+  recordRouteAttempt({
+    chatId,
+    source: "general_ai",
+    action: result.action,
+    repoName: result.repoName ?? null,
+    workspaceId: result.workspaceId ?? null,
+    status: "needs_confirmation",
+    failureReason: "general_topic_inferred_target",
+  });
+
+  const target =
+    result.action === "new"
+      ? `repo <b>${escHtml(result.repoName ?? "unknown")}</b>`
+      : "an existing workspace";
+  await ctx.reply(
+    `I can route this to ${target}, but the General topic did not name a repo or workspace clearly.\n\n<i>${escHtml(truncate(result.prompt, 240))}</i>`,
+    {
+      parse_mode: "HTML",
+      ...styledKeyboard([
+        [btn(`Start in ${result.repoName ?? "target"}`, `routeconfirm:${id}:yes`)],
+        [btn("Cancel", `routeconfirm:${id}:cancel`)],
+      ]),
+    }
+  );
+}
+
+function pruneExpiredRouteConfirmations(): void {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [id, pending] of pendingRouteConfirmations) {
+    if (pending.createdAt < cutoff) pendingRouteConfirmations.delete(id);
+  }
 }
 
 function getAutoRoutableWorkspaces(chatId: string): Workspace[] {
@@ -1628,6 +1939,21 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     }
   }
 
+  const repoTopic = getThreadRepoTopic(ctx, chatId);
+  if (repoTopic) {
+    const transcript = await transcribeVoiceMessage(localPath);
+    if (transcript) {
+      const text = caption ? `${caption}\n\n${transcript}` : transcript;
+      await startWorkspaceFromRepoTopic(ctx, repoTopic, applySkillHashtag(text));
+    } else {
+      const message = caption
+        ? `${caption}\n\nThe user sent a voice message (${duration}s). Please review the attached recording.`
+        : `The user sent a voice message (${duration}s). Please review the attached recording.`;
+      await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
+    }
+    return;
+  }
+
   // Auto-route: use AI to transcribe and determine the target repo/workspace.
   // Caption (if any) is the user's explicit routing intent; the router sees
   // both signals.
@@ -1680,6 +2006,12 @@ async function handleTextMessage(ctx: Context): Promise<void> {
       await sendMessageToWorkspace(ctx, threadWorkspace, applySkillHashtag(text));
       return;
     }
+  }
+
+  const repoTopic = getThreadRepoTopic(ctx, chatId);
+  if (repoTopic) {
+    await startWorkspaceFromRepoTopic(ctx, repoTopic, applySkillHashtag(text));
+    return;
   }
 
   if (!selectionKey) {
@@ -2096,6 +2428,7 @@ Commands:
 /ship, /qa, /investigate, /retro, /health, /checkpoint — Shortcut skills
 /workspaces — List all tracked workspaces
 /prs, /ship_status — Show PR and branch ship status
+/decisions — Show pending agent questions
 /status — Show active workspace summary
 /stop &lt;name&gt; — Stop a workspace
 /repos — List repos (tap to select)
@@ -2108,7 +2441,7 @@ Commands:
 • Slash shortcuts (like <code>/ship</code>) accept an optional workspace name and instructions.
 • Use <code>/skills</code> any time to see the full list.
 
-Tap a repo from /repos, then type your prompt.
+Tap a repo from /repos, then type your prompt. In group/forum mode, tap Topic beside a repo to create a durable repo topic for new tasks.
 Reply with a photo, screenshot, or voice note to send it to the agent.`,
     { parse_mode: "HTML" }
   );
@@ -2154,6 +2487,52 @@ async function handleSetupApplyCallback(ctx: Context): Promise<void> {
   }
 
   await ctx.reply(response.message, { parse_mode: "HTML" });
+}
+
+async function handleRouteConfirmCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const id = match?.[1];
+  const choice = match?.[2] as "yes" | "cancel" | undefined;
+  const chatId = ctx.chat?.id?.toString();
+  if (!id || !choice || !chatId) return;
+
+  const pending = pendingRouteConfirmations.get(id);
+  if (!pending || pending.chatId !== chatId) {
+    await ctx.answerCbQuery("This route confirmation expired");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    return;
+  }
+
+  pendingRouteConfirmations.delete(id);
+  if (choice === "cancel") {
+    recordRouteAttempt({
+      chatId,
+      source: "general_ai",
+      action: pending.result.action,
+      repoName: pending.result.repoName ?? null,
+      workspaceId: pending.result.workspaceId ?? null,
+      status: "cancelled",
+      failureReason: "user_cancelled_confirmation",
+    });
+    await ctx.answerCbQuery("Cancelled");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    return;
+  }
+
+  await ctx.answerCbQuery("Starting...");
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+  const routed = await executeRouteResult(
+    ctx,
+    chatId,
+    pending.result,
+    pending.attachments,
+    "general_ai"
+  );
+  if (!routed) {
+    await ctx.reply(
+      "That route is no longer available. Use /run <repo> to start a workspace, or send a new message with the repo/workspace named explicitly."
+    );
+  }
 }
 
 async function handleStopCallback(ctx: Context): Promise<void> {

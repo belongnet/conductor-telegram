@@ -71,18 +71,20 @@ src/
 | `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
 | `/workspaces` | `/workspaces` | List all tracked workspaces |
 | `/prs`, `/ship_status` | `/prs` | Show PR, check, merge, and stale-branch status for tracked workspaces |
+| `/decisions` | `/decisions` | Show unanswered agent questions for this chat |
 | `/status` | `/status` | Show active workspace summary |
 | `/stop` | `/stop <name>` | Stop a running workspace |
 | `/repos` | `/repos` | List available repositories (tap to select) |
 | `/help` | `/help` | Show help message |
 
-Three ways to target a workspace with skill or follow-up commands:
+Ways to target work from Telegram:
 
 1. **Reply** to any forwarded workspace message with `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut.
 2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically.
-3. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
+3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message.
+4. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
 
-Photos, screenshots, and voice notes sent as replies are staged to the workspace for the agent.
+Photos, screenshots, and voice notes sent as replies are staged to the workspace for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
 ## Manual Telegram setup
 
@@ -115,7 +117,7 @@ Add the bot to your target group, make it admin, then run setup in that group.
 8. If the bot shows a `Use This Chat` button, tap it. The bot will save this supergroup and your Telegram user automatically.
 9. Restart the bot only if you are running it with hardcoded env vars outside the CLI.
 
-New workspaces will create one forum topic per workspace automatically. If topic creation fails because the chat is not a forum or the bot lacks permissions, the bot falls back to normal chat messages.
+New workspaces will create one forum topic per workspace automatically. Repo topics can also be created from `/repos` and reused as stable launch pads for that repository. If topic creation fails because the chat is not a forum or the bot lacks permissions, the bot falls back to normal chat messages.
 
 If the bot is already configured for your private chat, you can also add it to a new group and send `/setup` there from the same Telegram account. The bot will show what is missing and can switch itself into group/forum mode from that chat without first resetting `OWNER_CHAT_ID`.
 
@@ -185,6 +187,8 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `decisions` | Questions posed to the operator with answers |
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
 | `pr_records` | GitHub PR/check/merge state verified by repo + branch |
+| `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
+| `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
 
 ## Development
 

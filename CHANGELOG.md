@@ -4,6 +4,18 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-05-27
+
+### Added
+- `/decisions` lists pending agent questions for the current Telegram chat.
+- Forum groups can create durable repo topics from `/repos`; messages, files, screenshots, and voice notes in a repo topic start new workspaces for that repo without AI route guessing.
+- General-topic AI routing now asks for confirmation before starting or continuing work when the message does not explicitly name a repo or workspace.
+- Route attempts are recorded in a redacted SQLite audit table for routed, failed, pending-confirmation, and cancelled routes.
+
+### Fixed
+- Deleted repo topics can be recreated from `/repos` instead of being stuck on a stale Telegram thread id.
+- Confirmed routes now tell the user when the inferred target expired or became unroutable before the confirmation button was tapped.
+
 ## [0.3.9] - 2026-05-22
 
 ### Changed

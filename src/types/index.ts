@@ -22,6 +22,29 @@ export interface Workspace {
   archivedAt: string | null;
 }
 
+export interface RepoTopic {
+  chatId: string;
+  repoPath: string;
+  repoName: string;
+  telegramThreadId: number;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+}
+
+export type RouteSource =
+  | "reply"
+  | "workspace_topic"
+  | "repo_topic"
+  | "general_ai"
+  | "command";
+
+export type RouteAttemptStatus =
+  | "routed"
+  | "needs_confirmation"
+  | "failed"
+  | "cancelled";
+
 export type PrState = "none" | "open" | "closed" | "merged" | "unknown";
 export type PrChecksStatus = "passing" | "pending" | "failing" | "unknown";
 
