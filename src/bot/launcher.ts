@@ -170,6 +170,22 @@ function normalizeAgentType(value: string | null | undefined): AgentType | null 
   return null;
 }
 
+export function inferAgentTypeFromModel(
+  model: string | null | undefined
+): AgentType | null {
+  const normalized = normalizeModelForCli(model?.trim() ?? "").toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (/^(gpt|o\d|codex)([-_.]|$)/.test(normalized)) {
+    return "codex";
+  }
+  if (/(^|[-_.])(claude|opus|sonnet|haiku)([-_.]|$)/.test(normalized)) {
+    return "claude";
+  }
+  return null;
+}
+
 function getSettingValue(key: string): string | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
@@ -214,7 +230,12 @@ function hasAgentSessions(agentType: AgentType): boolean {
 }
 
 function getDefaultAgentType(): AgentType {
-  return normalizeAgentType(process.env.TELEGRAM_DEFAULT_AGENT_TYPE) ?? "claude";
+  return (
+    normalizeAgentType(process.env.TELEGRAM_DEFAULT_AGENT_TYPE) ??
+    inferAgentTypeFromModel(process.env.TELEGRAM_DEFAULT_MODEL) ??
+    inferAgentTypeFromModel(getSettingValue("default_model")) ??
+    "claude"
+  );
 }
 
 function getReviewAgentType(): AgentType {
@@ -236,6 +257,26 @@ function normalizeModelForCli(model: string): string {
   return model.replace(/-\d+[mk]$/i, "");
 }
 
+function isModelCompatibleWithAgent(model: string, agentType: AgentType): boolean {
+  const inferredAgentType = inferAgentTypeFromModel(model);
+  return inferredAgentType === null || inferredAgentType === agentType;
+}
+
+function firstCompatibleModel(
+  agentType: AgentType,
+  candidates: Array<string | null | undefined>
+): string | null {
+  for (const candidate of candidates) {
+    const normalized = candidate?.trim()
+      ? normalizeModelForCli(candidate.trim())
+      : null;
+    if (normalized && isModelCompatibleWithAgent(normalized, agentType)) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
 function resolveAgentModel(
   agentType: AgentType,
   launchMode: LaunchMode,
@@ -254,14 +295,22 @@ function resolveAgentModel(
   }
 
   if (agentType === "claude") {
-    return normalizeModelForCli(
-      getSettingValue("default_model") ??
-      getRecentModelForAgent("claude") ??
-      DEFAULT_CLAUDE_MODEL
+    return (
+      firstCompatibleModel("claude", [
+        getSettingValue("default_model"),
+        getRecentModelForAgent("claude"),
+        DEFAULT_CLAUDE_MODEL,
+      ]) ?? DEFAULT_CLAUDE_MODEL
     );
   }
 
-  return getRecentModelForAgent("codex") ?? DEFAULT_CODEX_MODEL;
+  return (
+    firstCompatibleModel("codex", [
+      getSettingValue("default_model"),
+      getRecentModelForAgent("codex"),
+      DEFAULT_CODEX_MODEL,
+    ]) ?? DEFAULT_CODEX_MODEL
+  );
 }
 
 function resolveCodexThinkingLevel(launchMode: LaunchMode): string | null {
@@ -299,7 +348,7 @@ function truncateTitle(value: string, maxLen: number): string {
   return value.length > maxLen ? `${value.slice(0, maxLen - 3)}...` : value;
 }
 
-function resolveLaunchConfig(
+export function resolveLaunchConfig(
   options: SessionLaunchOptions
 ): ResolvedLaunchConfig {
   const launchMode = options.launchMode ?? "prompt";
