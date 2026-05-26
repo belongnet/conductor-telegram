@@ -1259,7 +1259,7 @@ async function sendRepoTopicReadyMessage(
   repoName: string,
   threadId: number
 ): Promise<void> {
-  await ctx.telegram.sendMessage(
+  const message = await ctx.telegram.sendMessage(
     ctx.chat!.id,
     `<b>${escHtml(repoName)}</b> repo topic is ready.\n\nSend a message or voice note here to start a new workspace in this repo. Workspace follow-ups still go in the workspace's own topic.`,
     {
@@ -1267,6 +1267,13 @@ async function sendRepoTopicReadyMessage(
       message_thread_id: threadId,
     }
   );
+  await ctx.telegram
+    .pinChatMessage(ctx.chat!.id, message.message_id, {
+      disable_notification: true,
+    })
+    .catch((err) =>
+      console.error(`[forum] could not pin repo topic message ${threadId}:`, err)
+    );
 }
 
 async function handleRunRepoCallback(ctx: Context): Promise<void> {
