@@ -1233,10 +1233,20 @@ export async function launchWorkspace(
     model: string;
   } | { error: string }
 > {
-  const repoName = path.basename(repoPath);
-  const workspacesDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName);
-
   console.log(`[launcher] launchWorkspace called: repoPath=${repoPath}`);
+
+  // Look up the repo in Conductor's DB before choosing the workspace path.
+  // Conductor's repo name can differ from the root folder basename when users
+  // add the same repo more than once, e.g. conductor-telegram-v1.
+  const repoInfo = getRepoFromConductorDb(repoPath);
+  if (!repoInfo) {
+    return { error: `Repo "${repoPath}" not found in Conductor DB. Add it via the Conductor UI first.` };
+  }
+  const workspacesDir = path.join(
+    CONDUCTOR_WORKSPACES_DIR,
+    getWorkspaceRepoDirName(repoInfo, repoPath)
+  );
+  console.log(`[launcher] Found repo: ${repoInfo.repoId} (${repoInfo.name})`);
 
   // Reserve city names already used by workspace directories or workspace branches.
   let reservedNames: Set<string>;
@@ -1253,18 +1263,11 @@ export async function launchWorkspace(
   // Pick a city name for the workspace
   const cityName = pickCityName(reservedNames);
   const branchName = `belongcond/${cityName}`;
-  const workspaceDir = path.join(workspacesDir, cityName);
+  const workspaceDir = getWorkspacePathFromRepo(repoInfo, repoPath, cityName);
 
   console.log(`[launcher] Creating workspace: ${cityName} (branch: ${branchName})`);
 
-  // 1. Look up the repo in Conductor's DB
-  const repoInfo = getRepoFromConductorDb(repoPath);
-  if (!repoInfo) {
-    return { error: `Repo "${repoPath}" not found in Conductor DB. Add it via the Conductor UI first.` };
-  }
-  console.log(`[launcher] Found repo: ${repoInfo.repoId} (${repoInfo.name})`);
-
-  // 2. Create git worktree
+  // 1. Create git worktree
   try {
     const defaultBranch = repoInfo.defaultBranch ?? "main";
     await execAsync(`cd "${repoPath}" && git worktree add -b "${branchName}" "${workspaceDir}" "${defaultBranch}"`);
@@ -1285,7 +1288,7 @@ export async function launchWorkspace(
     buildDisplayPrompt(fullPrompt, options.launchMode ?? "prompt")
   );
 
-  // 3. Insert workspace + session into Conductor's DB
+  // 2. Insert workspace + session into Conductor's DB
   const workspaceId = randomUUID();
   let sessionCreateResult: SessionCreateResult;
 
@@ -1293,10 +1296,15 @@ export async function launchWorkspace(
     const db = new Database(CONDUCTOR_DB_PATH);
     const defaultBranchName = repoInfo.defaultBranch ?? "main";
     const sessionId = randomUUID();
-    db.prepare(
-      `INSERT INTO workspaces (id, repository_id, directory_name, branch, active_session_id, state, derived_status, initialization_parent_branch, intended_target_branch, placeholder_branch_name, initialization_files_copied)
-       VALUES (?, ?, ?, ?, ?, 'ready', 'in-progress', ?, ?, ?, 0)`
-    ).run(workspaceId, repoInfo.repoId, cityName, branchName, sessionId, defaultBranchName, defaultBranchName, branchName);
+    insertConductorWorkspace(db, {
+      workspaceId,
+      repoId: repoInfo.repoId,
+      cityName,
+      branchName,
+      sessionId,
+      defaultBranchName,
+      workspaceDir,
+    });
     sessionCreateResult = insertSessionForWorkspace(
       db,
       workspaceId,
@@ -1316,7 +1324,7 @@ export async function launchWorkspace(
 
   revealWorkspaceInConductor(workspaceDir);
 
-  // 4. Spawn the configured agent
+  // 3. Spawn the configured agent
   const { done } = spawnAgent(
     sessionCreateResult.sessionId,
     repoPath,
@@ -1366,12 +1374,11 @@ export async function sendToSession(
     };
   }
 
-  const repoName = wsInfo.repoName ?? workspaceName;
   const repoPath = wsInfo.repoPath ?? options.repoPath;
   if (!repoPath) {
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
-  const workspaceDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
+  const workspaceDir = getWorkspacePathFromInfo(wsInfo, workspaceName);
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
     attachmentSourcePaths
@@ -1428,12 +1435,11 @@ export async function launchWorkspaceSession(
     };
   }
 
-  const repoName = wsInfo.repoName ?? workspaceName;
   const repoPath = wsInfo.repoPath ?? options.repoPath;
   if (!repoPath) {
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
-  const workspaceDir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
+  const workspaceDir = getWorkspacePathFromInfo(wsInfo, workspaceName);
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
     options.attachmentSourcePaths ?? []
@@ -1561,6 +1567,106 @@ interface ConductorRepoInfo {
   defaultBranch: string | null;
 }
 
+function isPathSegment(value: string): boolean {
+  return value.length > 0 && !value.includes("/") && !value.includes("\\");
+}
+
+function getWorkspaceRepoDirName(
+  repoInfo: Pick<ConductorRepoInfo, "name">,
+  repoPath: string
+): string {
+  const dbName = repoInfo.name?.trim();
+  if (dbName && isPathSegment(dbName)) {
+    return dbName;
+  }
+  return path.basename(repoPath);
+}
+
+function getWorkspacePathFromRepo(
+  repoInfo: Pick<ConductorRepoInfo, "name">,
+  repoPath: string,
+  workspaceName: string
+): string {
+  return path.join(
+    CONDUCTOR_WORKSPACES_DIR,
+    getWorkspaceRepoDirName(repoInfo, repoPath),
+    workspaceName
+  );
+}
+
+function getWorkspacePathFromInfo(
+  workspace: Pick<ConductorWorkspaceInfo, "repoName" | "workspacePath">,
+  workspaceName: string
+): string {
+  if (workspace.workspacePath?.trim()) {
+    return workspace.workspacePath;
+  }
+  const repoName = workspace.repoName ?? workspaceName;
+  return path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
+}
+
+function getTableColumns(db: Database.Database, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+function insertConductorWorkspace(
+  db: Database.Database,
+  opts: {
+    workspaceId: string;
+    repoId: string;
+    cityName: string;
+    branchName: string;
+    sessionId: string;
+    defaultBranchName: string;
+    workspaceDir: string;
+  }
+): void {
+  const columns = [
+    "id",
+    "repository_id",
+    "directory_name",
+    "branch",
+    "active_session_id",
+    "state",
+    "derived_status",
+    "initialization_parent_branch",
+    "intended_target_branch",
+    "placeholder_branch_name",
+    "initialization_files_copied",
+  ];
+  const values: unknown[] = [
+    opts.workspaceId,
+    opts.repoId,
+    opts.cityName,
+    opts.branchName,
+    opts.sessionId,
+    "ready",
+    "in-progress",
+    opts.defaultBranchName,
+    opts.defaultBranchName,
+    opts.branchName,
+    0,
+  ];
+
+  const workspaceColumns = getTableColumns(db, "workspaces");
+  if (workspaceColumns.has("workspace_path")) {
+    columns.push("workspace_path");
+    values.push(opts.workspaceDir);
+  }
+  if (workspaceColumns.has("permission_level")) {
+    columns.push("permission_level");
+    values.push("write");
+  }
+
+  db.prepare(
+    `INSERT INTO workspaces (${columns.join(", ")})
+     VALUES (${columns.map(() => "?").join(", ")})`
+  ).run(...values);
+}
+
 function getRepoFromConductorDb(repoPath: string): ConductorRepoInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
@@ -1583,6 +1689,7 @@ export interface ConductorWorkspaceInfo {
   model: string | null;
   repoName: string | null;
   repoPath: string | null;
+  workspacePath: string | null;
   status: string | null;
   state: string | null;
   derivedStatus: string | null;
@@ -1625,6 +1732,10 @@ function getWorkspaceFromConductorDb(
 ): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const workspaceColumns = getTableColumns(db, "workspaces");
+    const workspacePathSelect = workspaceColumns.has("workspace_path")
+      ? "w.workspace_path"
+      : "NULL as workspace_path";
     const where = ["w.directory_name = ?"];
     const params: any[] = [directoryName];
     if (repoPath) {
@@ -1642,6 +1753,7 @@ function getWorkspaceFromConductorDb(
           s.is_hidden as session_hidden,
           r.name as repo_name,
           r.root_path as repo_path,
+          ${workspacePathSelect},
           w.state,
           w.derived_status,
           w.pinned_at,
@@ -1674,6 +1786,7 @@ function getWorkspaceFromConductorDb(
       model: row.model,
       repoName: row.repo_name ?? null,
       repoPath: row.repo_path ?? null,
+      workspacePath: row.workspace_path ?? null,
       status: row.status ?? null,
       state: row.state ?? null,
       derivedStatus: row.derived_status ?? null,
@@ -1830,12 +1943,15 @@ export function getSessionMessagesAfter(
 
 /**
  * Get the filesystem path for a workspace by its directory name.
- * Looks up the repo name from Conductor's DB to build the full path.
+ * Uses Conductor's stored workspace path when present, falling back to repo name.
  */
-export function getWorkspaceDir(workspaceName: string): string | null {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName);
-  if (!wsInfo?.repoName) return null;
-  return path.join(CONDUCTOR_WORKSPACES_DIR, wsInfo.repoName, workspaceName);
+export function getWorkspaceDir(
+  workspaceName: string,
+  repoPath: string | null = null
+): string | null {
+  const wsInfo = getWorkspaceFromConductorDb(workspaceName, repoPath);
+  if (!wsInfo?.repoName && !wsInfo?.workspacePath) return null;
+  return getWorkspacePathFromInfo(wsInfo, workspaceName);
 }
 
 // ── Shell helpers ────────────────────────────────────────────

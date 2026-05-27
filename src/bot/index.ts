@@ -21,10 +21,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
-  CONDUCTOR_WORKSPACES_DIR,
   getMaxSessionMessageRowId,
   getSessionMessagesAfter,
   getSessionResult,
+  getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
   type SessionMessage,
@@ -734,8 +734,8 @@ function formatForwardedMessage(
 
 function workspaceDirFor(ws: Workspace): string | null {
   if (!ws.conductorWorkspaceName) return null;
-  const repoName = path.basename(ws.repoPath);
-  const dir = path.join(CONDUCTOR_WORKSPACES_DIR, repoName, ws.conductorWorkspaceName);
+  const dir = getWorkspaceDir(ws.conductorWorkspaceName, ws.repoPath);
+  if (!dir) return null;
   return existsSync(dir) ? dir : null;
 }
 

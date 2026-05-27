@@ -3,6 +3,7 @@ import {
   answerPendingStdinDecision,
   archiveConductorWorkspace,
   formatAttachmentReference,
+  getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
   launchWorkspace,
@@ -180,10 +181,6 @@ function fetchBuffer(url: string): Promise<Buffer> {
 const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ??
   `${process.env.HOME}/conductor/repos`;
-
-const CONDUCTOR_WORKSPACES_DIR =
-  process.env.CONDUCTOR_WORKSPACES_DIR ??
-  `${process.env.HOME}/conductor/workspaces`;
 
 function getRepoList(): string[] {
   try {
@@ -391,10 +388,7 @@ function getThreadRepoTopic(ctx: Context, chatId: string): RepoTopic | null {
 }
 
 function getWorkspaceDirectory(target: WorkspaceTarget): string | null {
-  if (!target.repoName) {
-    return null;
-  }
-  return path.join(CONDUCTOR_WORKSPACES_DIR, target.repoName, target.conductorName);
+  return getWorkspaceDir(target.conductorName, target.repoPath);
 }
 
 function parseSkillRoutes(text: string): SkillRoute[] {
@@ -2957,12 +2951,13 @@ function stageDecisionAttachment(decision: Decision, sourcePath: string): string
     return sourcePath;
   }
 
-  const repoName = path.basename(workspace.repoPath);
-  const workspaceDir = path.join(
-    CONDUCTOR_WORKSPACES_DIR,
-    repoName,
-    workspace.conductorWorkspaceName
+  const workspaceDir = getWorkspaceDir(
+    workspace.conductorWorkspaceName,
+    workspace.repoPath
   );
+  if (!workspaceDir) {
+    return sourcePath;
+  }
 
   try {
     const [stagedPath] = stageAttachmentPaths(workspaceDir, [sourcePath]);

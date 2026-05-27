@@ -176,6 +176,50 @@ test("Conductor workspace lookup prefers the newest timestamp even across mixed 
   }
 });
 
+test("workspace directories use Conductor repo names when root folder names differ", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-path-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repos/conductor-telegram', 'conductor-telegram-v1', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'idle', datetime('now'), 'ws-1', 0, 'gpt-5.4', 'codex')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch, workspace_path)
+       VALUES
+        ('ws-1', 'repo-1', 'rabat', 'session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main', NULL)`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { getWorkspaceDir } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify({
+          dir: getWorkspaceDir("rabat", "/tmp/repos/conductor-telegram")
+        }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+      }
+    ) as { dir: string };
+
+    assert.equal(
+      result.dir,
+      path.join(workspaceRoot, "conductor-telegram-v1", "rabat")
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("sendToSession does not mark Conductor workspaces active when launch preconditions fail", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-send-"));
   try {
@@ -291,6 +335,7 @@ function createConductorDb(dbPath: string): Database {
       repository_id TEXT,
       directory_name TEXT,
       active_session_id TEXT,
+      workspace_path TEXT,
       updated_at TEXT,
       state TEXT,
       derived_status TEXT,
