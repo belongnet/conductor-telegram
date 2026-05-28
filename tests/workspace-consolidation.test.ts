@@ -7,7 +7,9 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { closeDb, getDb } from "../src/store/db.js";
 import {
+  buildCodexExecArgs,
   formatAttachmentReference,
+  getTerminalSessionStatus,
   inferAgentTypeFromModel,
   isConductorWorkspaceVisible,
 } from "../src/bot/launcher.js";
@@ -73,6 +75,57 @@ test("model family detection recognizes Codex and Claude model names", () => {
   assert.equal(inferAgentTypeFromModel("opus-1m"), "claude");
   assert.equal(inferAgentTypeFromModel("claude-sonnet-4-5"), "claude");
   assert.equal(inferAgentTypeFromModel("custom-router-model"), null);
+});
+
+test("Codex exec args delimit prompts after variadic image attachments", () => {
+  assert.deepEqual(
+    buildCodexExecArgs(
+      "gpt-5.5",
+      "Review this screenshot.",
+      null,
+      ["/tmp/screenshot.png", "/tmp/notes.txt"]
+    ),
+    [
+      "exec",
+      "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--model",
+      "gpt-5.5",
+      "--image",
+      "/tmp/screenshot.png",
+      "--",
+      "Review this screenshot.",
+    ]
+  );
+
+  assert.deepEqual(
+    buildCodexExecArgs(
+      "gpt-5.5",
+      "Follow up with this screenshot.",
+      "thread-123",
+      ["/tmp/screenshot.jpg"]
+    ),
+    [
+      "exec",
+      "resume",
+      "--json",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--model",
+      "gpt-5.5",
+      "--image",
+      "/tmp/screenshot.jpg",
+      "--",
+      "thread-123",
+      "Follow up with this screenshot.",
+    ]
+  );
+});
+
+test("agent process failures leave sessions in error status", () => {
+  assert.equal(getTerminalSessionStatus({ isError: false, exitCode: 0 }), "idle");
+  assert.equal(getTerminalSessionStatus({ isError: true, exitCode: 0 }), "error");
+  assert.equal(getTerminalSessionStatus({ isError: false, exitCode: 1 }), "error");
+  assert.equal(getTerminalSessionStatus({ isError: false, exitCode: -1 }), "error");
 });
 
 test("OpenAI Conductor default model selects Codex when no Telegram agent is configured", () => {

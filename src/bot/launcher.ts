@@ -76,6 +76,7 @@ export interface AgentResult {
 
 export type AgentType = "claude" | "codex";
 type LaunchMode = "prompt" | "review";
+type TerminalSessionStatus = "idle" | "error";
 
 interface SessionLaunchOptions {
   agentType?: AgentType;
@@ -99,6 +100,14 @@ interface SessionCreateResult {
   initialCursorRowid: number;
   agentType: AgentType;
   model: string;
+}
+
+export function getTerminalSessionStatus(
+  result: Pick<AgentResult, "isError" | "exitCode">
+): TerminalSessionStatus {
+  return result.isError || (result.exitCode !== null && result.exitCode !== 0)
+    ? "error"
+    : "idle";
 }
 
 /**
@@ -507,11 +516,11 @@ function spawnClaudeAgent(
     child.on("close", (code) => {
       console.log(`[agent] Process exited with code ${code}`);
       result.exitCode = code;
-      if (code !== 0 && !result.resultText) {
+      if (code !== 0) {
         result.isError = true;
       }
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
-      updateSessionStatus(conductorSessionId, "idle");
+      updateSessionStatus(conductorSessionId, getTerminalSessionStatus(result));
       resolve(result);
     });
 
@@ -520,7 +529,7 @@ function spawnClaudeAgent(
       result.isError = true;
       result.exitCode = -1;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
-      updateSessionStatus(conductorSessionId, "idle");
+      updateSessionStatus(conductorSessionId, getTerminalSessionStatus(result));
       resolve(result);
     });
   });
@@ -613,7 +622,7 @@ function spawnCodexAgent(
       result.durationMs = Date.now() - startedAt;
       result.numTurns = turnCount;
       result.resultText = lastAssistantText || result.resultText;
-      if (code !== 0 && !result.resultText) {
+      if (code !== 0) {
         result.isError = true;
       }
 
@@ -629,7 +638,7 @@ function spawnCodexAgent(
       }
 
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
-      updateSessionStatus(conductorSessionId, "idle");
+      updateSessionStatus(conductorSessionId, getTerminalSessionStatus(result));
       resolve(result);
     });
 
@@ -639,7 +648,7 @@ function spawnCodexAgent(
       result.exitCode = -1;
       result.durationMs = Date.now() - startedAt;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
-      updateSessionStatus(conductorSessionId, "idle");
+      updateSessionStatus(conductorSessionId, getTerminalSessionStatus(result));
       resolve(result);
     });
   });
@@ -647,7 +656,7 @@ function spawnCodexAgent(
   return { child, done };
 }
 
-function buildCodexExecArgs(
+export function buildCodexExecArgs(
   model: string,
   prompt: string,
   agentSessionId: string | null,
@@ -656,16 +665,20 @@ function buildCodexExecArgs(
   const imageArgs = attachmentPaths
     .filter(isImageAttachment)
     .flatMap((filePath) => ["--image", filePath]);
+  const commonArgs = [
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--model",
+    model,
+    ...imageArgs,
+  ];
 
   if (agentSessionId) {
     return [
       "exec",
       "resume",
-      "--json",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--model",
-      model,
-      ...imageArgs,
+      ...commonArgs,
+      "--",
       agentSessionId,
       prompt,
     ];
@@ -673,11 +686,8 @@ function buildCodexExecArgs(
 
   return [
     "exec",
-    "--json",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--model",
-    model,
-    ...imageArgs,
+    ...commonArgs,
+    "--",
     prompt,
   ];
 }
