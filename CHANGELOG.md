@@ -4,8 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-06-03
+
 ### Fixed
 - Launching with no `TELEGRAM_DEFAULT_AGENT_TYPE` now picks the agent that matches Conductor's configured `default_model` (and `TELEGRAM_DEFAULT_MODEL`), so an OpenAI model like `gpt-5.5` no longer launches the Claude CLI. Incompatible historical models are skipped when resolving the per-agent default.
+- Messages, files, screenshots, and voice notes sent in durable repo topics now start work from the repo path stored for that topic, so custom repo roots no longer launch in the wrong repository.
 
 ## [0.3.10] - 2026-05-27
 

@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveRouteExecutionPlan } from "../src/bot/commands.js";
+import {
+  resolveRepoTopicLaunchTarget,
+  resolveRouteExecutionPlan,
+} from "../src/bot/commands.js";
 import type { RouteResult } from "../src/bot/ai-router.js";
 import type { Workspace } from "../src/types/index.js";
 
@@ -33,6 +36,18 @@ function workspace(overrides: Partial<Workspace> = {}): Workspace {
     ...overrides,
   };
 }
+
+test("repo topic launch targets preserve the stored repo path", () => {
+  const target = resolveRepoTopicLaunchTarget({
+    repoName: "ai-deploy-clo",
+    repoPath: "/custom/repos/ai-deploy-clo",
+  });
+
+  assert.deepEqual(target, {
+    repoName: "ai-deploy-clo",
+    repoPath: "/custom/repos/ai-deploy-clo",
+  });
+});
 
 test("route execution sends valid existing routes to the workspace", () => {
   const plan = resolveRouteExecutionPlan(
