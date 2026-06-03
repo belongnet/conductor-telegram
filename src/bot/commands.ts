@@ -77,6 +77,11 @@ type RouteExecutionPlannerDeps = {
   resolveRepo: (input: string) => string | null;
 };
 
+interface RepoLaunchTarget {
+  repoName: string;
+  repoPath: string;
+}
+
 export type RouteExecutionPlan =
   | { kind: "existing"; workspace: Workspace }
   | { kind: "new"; repoName: string; existingRejection?: string }
@@ -122,6 +127,16 @@ export function resolveRouteExecutionPlan(
   }
 
   return { kind: "unroutable", reason: "missing_target", existingRejection };
+}
+
+/** @internal exported for route executor unit tests; not part of the public bot API. */
+export function resolveRepoTopicLaunchTarget(
+  topic: Pick<RepoTopic, "repoName" | "repoPath">
+): RepoLaunchTarget {
+  return {
+    repoName: topic.repoName,
+    repoPath: topic.repoPath,
+  };
 }
 
 // Map Telegram message IDs to decision IDs (for reply-based answering)
@@ -835,7 +850,21 @@ async function startWorkspaceFromMessage(
   prompt: string,
   attachmentSourcePaths: string[] = []
 ): Promise<void> {
-  const repoPath = path.join(CONDUCTOR_REPOS_DIR, repoName);
+  await startWorkspaceForRepo(
+    ctx,
+    { repoName, repoPath: path.join(CONDUCTOR_REPOS_DIR, repoName) },
+    prompt,
+    attachmentSourcePaths
+  );
+}
+
+async function startWorkspaceForRepo(
+  ctx: Context,
+  target: RepoLaunchTarget,
+  prompt: string,
+  attachmentSourcePaths: string[] = []
+): Promise<void> {
+  const { repoName, repoPath } = target;
   const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
@@ -949,7 +978,12 @@ async function startWorkspaceFromRepoTopic(
     repoName: topic.repoName,
     status: "routed",
   });
-  await startWorkspaceFromMessage(ctx, topic.repoName, prompt, attachmentSourcePaths);
+  await startWorkspaceForRepo(
+    ctx,
+    resolveRepoTopicLaunchTarget(topic),
+    prompt,
+    attachmentSourcePaths
+  );
 }
 
 // ── /workspaces ─────────────────────────────────────────────
