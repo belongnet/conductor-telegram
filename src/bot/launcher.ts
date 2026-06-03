@@ -1,5 +1,5 @@
 import { exec, spawn, type ChildProcess } from "node:child_process";
-import { copyFileSync, mkdirSync } from "node:fs";
+import { copyFileSync, mkdirSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -1235,12 +1235,12 @@ export async function launchWorkspace(
 > {
   console.log(`[launcher] launchWorkspace called: repoPath=${repoPath}`);
 
-  // Look up the repo in Conductor's DB before choosing the workspace path.
-  // Conductor's repo name can differ from the root folder basename when users
-  // add the same repo more than once, e.g. conductor-telegram-v1.
-  const repoInfo = getRepoFromConductorDb(repoPath);
+  // Ensure the repo exists in Conductor's DB before choosing the workspace
+  // path. Telegram lists repos from disk, and Conductor's repo name can differ
+  // from the root folder basename when users add the same repo more than once.
+  const repoInfo = await ensureRepoInConductorDb(repoPath);
   if (!repoInfo) {
-    return { error: `Repo "${repoPath}" not found in Conductor DB. Add it via the Conductor UI first.` };
+    return { error: `Repo "${repoPath}" does not exist or is not a git repository.` };
   }
   const workspacesDir = path.join(
     CONDUCTOR_WORKSPACES_DIR,
@@ -1681,6 +1681,95 @@ function getRepoFromConductorDb(repoPath: string): ConductorRepoInfo | null {
   }
 }
 
+async function ensureRepoInConductorDb(repoPath: string): Promise<ConductorRepoInfo | null> {
+  const existing = getRepoFromConductorDb(repoPath);
+  if (existing) {
+    return existing;
+  }
+
+  if (!(await isGitRepo(repoPath))) {
+    return null;
+  }
+
+  const repoId = randomUUID();
+  const name = path.basename(repoPath);
+  const defaultBranch = await resolveRepoDefaultBranch(repoPath);
+  const remoteUrl = await resolveRepoRemoteUrl(repoPath);
+
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    const row = db.prepare(
+      `SELECT id, name, default_branch FROM repos WHERE root_path = ?`
+    ).get(repoPath) as any;
+    if (row) {
+      db.close();
+      return { repoId: row.id, name: row.name, defaultBranch: row.default_branch };
+    }
+
+    db.prepare(
+      `INSERT INTO repos (id, remote_url, name, default_branch, root_path)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(repoId, remoteUrl, name, defaultBranch, repoPath);
+    db.close();
+    console.log(
+      `[launcher] Registered repo in Conductor DB: ${repoId} (${name}) ${repoPath}`
+    );
+    return { repoId, name, defaultBranch };
+  } catch (err) {
+    console.error(`[launcher] Failed to register repo in Conductor DB:`, err);
+    return null;
+  }
+}
+
+async function isGitRepo(repoPath: string): Promise<boolean> {
+  try {
+    if (!statSync(repoPath).isDirectory()) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  try {
+    await execAsync(`git -C ${shellQuote(repoPath)} rev-parse --git-dir`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveRepoDefaultBranch(repoPath: string): Promise<string> {
+  const candidates = [
+    `git -C ${shellQuote(repoPath)} symbolic-ref --short refs/remotes/origin/HEAD`,
+    `git -C ${shellQuote(repoPath)} rev-parse --abbrev-ref HEAD`,
+  ];
+
+  for (const cmd of candidates) {
+    try {
+      const output = (await execAsync(cmd)).trim();
+      const branch = output.replace(/^origin\//, "");
+      if (branch && branch !== "HEAD") {
+        return branch;
+      }
+    } catch {
+      // Try the next source.
+    }
+  }
+
+  return "main";
+}
+
+async function resolveRepoRemoteUrl(repoPath: string): Promise<string | null> {
+  try {
+    const output = (await execAsync(
+      `git -C ${shellQuote(repoPath)} config --get remote.origin.url`
+    )).trim();
+    return output || null;
+  } catch {
+    return null;
+  }
+}
+
 export interface ConductorWorkspaceInfo {
   workspaceId: string;
   sessionId: string;
@@ -1963,6 +2052,10 @@ function execAsync(cmd: string): Promise<string> {
       else resolve(stdout);
     });
   });
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function sleep(ms: number): Promise<void> {
