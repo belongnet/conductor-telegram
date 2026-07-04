@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { closeDb, getDb } from "../src/store/db.js";
 import {
   answerDecision,
@@ -73,6 +74,41 @@ test("repo topics are persisted by chat and repo path", () => {
     assert.ok(afterTouch?.lastUsedAt);
     assert.ok(afterTouch.lastUsedAt >= beforeTouch.lastUsedAt);
   });
+});
+
+test("store migration adds telegram link session column before creating its index", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-routing-migration-"));
+  try {
+    const dbPath = path.join(dir, "bot.db");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE telegram_message_links (
+        chat_id TEXT NOT NULL,
+        telegram_message_id TEXT NOT NULL,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (chat_id, telegram_message_id)
+      );
+      CREATE INDEX idx_telegram_message_links_workspace
+        ON telegram_message_links(workspace_id, created_at);
+    `);
+    legacy.close();
+
+    closeDb();
+    const db = getDb(dbPath);
+    const columns = db.prepare("PRAGMA table_info(telegram_message_links)").all() as Array<{
+      name: string;
+    }>;
+    const indexes = db.prepare("PRAGMA index_list(telegram_message_links)").all() as Array<{
+      name: string;
+    }>;
+
+    assert.ok(columns.some((row) => row.name === "session_id"));
+    assert.ok(indexes.some((row) => row.name === "idx_telegram_message_links_session"));
+  } finally {
+    closeDb();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("route attempts record redacted routing decisions", () => {

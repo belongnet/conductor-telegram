@@ -48,9 +48,6 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_telegram_message_links_workspace
     ON telegram_message_links(workspace_id, created_at);
 
-  CREATE INDEX IF NOT EXISTS idx_telegram_message_links_session
-    ON telegram_message_links(session_id, created_at);
-
   CREATE TABLE IF NOT EXISTS thread_cursors (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     session_id TEXT NOT NULL,
@@ -168,6 +165,10 @@ export function getDb(dbPath?: string): Database.Database {
   ensureColumn(_db, "workspaces", "telegram_thread_id", "INTEGER");
   ensureColumn(_db, "workspaces", "archived_at", "TEXT");
   ensureColumn(_db, "telegram_message_links", "session_id", "TEXT");
+  _db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_telegram_message_links_session
+      ON telegram_message_links(session_id, created_at);
+  `);
   return _db;
 }
 

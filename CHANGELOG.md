@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-04
+
+### Fixed
+- Existing bot databases now add `telegram_message_links.session_id` before creating the session index, so upgrading from 0.3.x no longer crashes startup with `no such column: session_id`.
+
 ## [0.4.0] - 2026-07-04
 
 ### Added
