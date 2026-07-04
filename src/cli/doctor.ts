@@ -6,8 +6,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import Database from "better-sqlite3";
 import { CONFIG_PATH, tryLoadConfig, type CLIFlags } from "./config.js";
 import { EXIT_GENERAL } from "./errors.js";
+import { describeConductorSettingsSource } from "../store/conductor-settings.js";
 
 const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
@@ -164,6 +166,75 @@ function checkConductor(conductorDbPath: string | undefined): CheckResult {
   return { name: "Conductor", ok: true, detail: p };
 }
 
+function checkConductorSettings(): CheckResult {
+  const source = describeConductorSettingsSource();
+  if (!source.tomlReadable) {
+    return {
+      name: "Conductor settings",
+      ok: true,
+      detail: `${source.tomlPath} not found; falling back to legacy DB settings`,
+    };
+  }
+  return {
+    name: "Conductor settings",
+    ok: true,
+    detail: `${source.tomlPath} (${source.tomlKeys} keys)`,
+  };
+}
+
+function tableColumns(db: Database.Database, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+function checkConductor072Schema(conductorDbPath: string | undefined): CheckResult {
+  const p =
+    conductorDbPath ??
+    path.join(
+      os.homedir(),
+      "Library/Application Support/com.conductor.app/conductor.db"
+    );
+  if (!fs.existsSync(p)) {
+    return {
+      name: "Conductor 0.72 schema",
+      ok: false,
+      detail: "Conductor DB not found",
+    };
+  }
+
+  try {
+    const db = new Database(p, { readonly: true });
+    const workspaceColumns = tableColumns(db, "workspaces");
+    const sessionColumns = tableColumns(db, "sessions");
+    const messageColumns = tableColumns(db, "session_messages");
+    db.close();
+
+    const features = [
+      workspaceColumns.has("workspace_name") && "workspace names",
+      workspaceColumns.has("hosting_server_url") && "cloud hosting",
+      workspaceColumns.has("sandbox_provider") && "cloud provider",
+      sessionColumns.has("title") && "thread titles",
+      messageColumns.has("queue_order") && "queued messages",
+    ].filter(Boolean);
+
+    return {
+      name: "Conductor 0.72 schema",
+      ok: true,
+      detail: features.length > 0
+        ? features.join(", ")
+        : "legacy schema; threads/cloud steering will be limited",
+    };
+  } catch (err) {
+    return {
+      name: "Conductor 0.72 schema",
+      ok: false,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 function checkPlugin(): CheckResult {
   const pluginDir = path.join(
     os.homedir(),
@@ -235,6 +306,8 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     await checkBotToken(config?.botToken),
     checkDatabase(config?.dbPath),
     checkConductor(config?.conductorDbPath),
+    checkConductorSettings(),
+    checkConductor072Schema(config?.conductorDbPath),
     await checkGithub(),
     checkPlugin(),
     checkRepos(config?.conductorReposDir),

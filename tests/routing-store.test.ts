@@ -9,12 +9,16 @@ import {
   createDecision,
   deleteRepoTopic,
   createWorkspace,
+  getThreadCursor,
   getPendingDecisionsForChat,
   getRepoTopic,
   getRepoTopicByThreadId,
   getRepoTopicsForChat,
+  getWorkspaceMessageTarget,
+  linkTelegramMessage,
   recordRouteAttempt,
   touchRepoTopic,
+  updateThreadCursor,
   upsertRepoTopic,
 } from "../src/store/queries.js";
 
@@ -130,5 +134,31 @@ test("pending decisions are scoped to unanswered decisions in the chat", () => {
     assert.deepEqual(rows.map((row) => row.id), [pending]);
     assert.equal(rows[0]?.question, "pending?");
     assert.equal(rows[0]?.options, JSON.stringify(["yes", "no"]));
+  });
+});
+
+test("thread cursors and Telegram links preserve Conductor session targets", () => {
+  withTempDb(() => {
+    const workspace = createWorkspace({
+      name: "threaded",
+      prompt: "watch both threads",
+      repoPath: "/repos/a",
+      telegramChatId: "chat-1",
+    });
+
+    updateThreadCursor(workspace.id, "session-a", 41, "Build");
+    updateThreadCursor(workspace.id, "session-b", 7, "Review");
+
+    assert.equal(
+      getThreadCursor(workspace.id, "session-a")?.lastForwardedRowid,
+      41
+    );
+    assert.equal(getThreadCursor(workspace.id, "session-b")?.title, "Review");
+
+    linkTelegramMessage("chat-1", "100", workspace.id, "session-b");
+
+    const target = getWorkspaceMessageTarget("chat-1", "100");
+    assert.equal(target?.workspace.id, workspace.id);
+    assert.equal(target?.sessionId, "session-b");
   });
 });

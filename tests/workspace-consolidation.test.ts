@@ -176,6 +176,96 @@ test("Conductor workspace lookup prefers the newest timestamp even across mixed 
   }
 });
 
+test("Conductor workspace lookup matches workspace_name and detects cloud workspaces", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-cloud-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'idle', datetime('now'), 'ws-1', 0, 'gpt-5.5', 'codex')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, workspace_name, active_session_id,
+         updated_at, state, derived_status, pinned_at, initialization_parent_branch,
+         intended_target_branch, hosting_server_url, sandbox_provider, remote_file_sync_enabled)
+       VALUES
+        ('ws-1', 'repo-1', 'cloud-dir', 'Cloud Friendly', 'session-1',
+         '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main',
+         'main', 'https://sandbox.example', 'vercel', 1)`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { getWorkspaceSessionInfo, isRemoteConductorWorkspace } from "./src/bot/launcher.ts";
+        const info = getWorkspaceSessionInfo("Cloud Friendly", "/tmp/repo");
+        console.log(JSON.stringify({
+          displayName: info?.displayName,
+          directoryName: info?.directoryName,
+          remote: info ? isRemoteConductorWorkspace(info) : false,
+          remoteFileSyncEnabled: info?.remoteFileSyncEnabled
+        }));
+      `,
+      { CONDUCTOR_DB_PATH: dbPath }
+    ) as {
+      displayName: string;
+      directoryName: string;
+      remote: boolean;
+      remoteFileSyncEnabled: boolean;
+    };
+
+    assert.equal(result.displayName, "Cloud Friendly");
+    assert.equal(result.directoryName, "cloud-dir");
+    assert.equal(result.remote, true);
+    assert.equal(result.remoteFileSyncEnabled, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor sessions are observe-only from Telegram steering", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-cursor-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'idle', datetime('now'), 'ws-1', 0, 'cursor-model', 'cursor')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state,
+         derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'cursor-ws', 'session-1', '2026-05-19 00:00:00',
+         'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(await sendToSession("cursor-ws", "hello", [], { repoPath: "/tmp/repo" })));
+      `,
+      { CONDUCTOR_DB_PATH: dbPath }
+    ) as { reason: string };
+
+    assert.equal(result.reason, "unsupported_agent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("workspace directories use Conductor repo names when root folder names differ", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-path-"));
   try {
@@ -324,7 +414,8 @@ function createConductorDb(dbPath: string): Database {
       workspace_id TEXT,
       is_hidden INTEGER DEFAULT 0,
       model TEXT,
-      agent_type TEXT
+      agent_type TEXT,
+      title TEXT
     );
     CREATE TABLE settings (
       key TEXT PRIMARY KEY,
@@ -334,8 +425,12 @@ function createConductorDb(dbPath: string): Database {
       id TEXT PRIMARY KEY,
       repository_id TEXT,
       directory_name TEXT,
+      workspace_name TEXT,
       active_session_id TEXT,
       workspace_path TEXT,
+      hosting_server_url TEXT,
+      sandbox_provider TEXT,
+      remote_file_sync_enabled INTEGER DEFAULT 0,
       updated_at TEXT,
       state TEXT,
       derived_status TEXT,
