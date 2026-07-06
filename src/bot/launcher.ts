@@ -681,7 +681,7 @@ function spawnCodexAgent(
   return { child, done };
 }
 
-function buildCodexExecArgs(
+export function buildCodexExecArgs(
   model: string,
   prompt: string,
   agentSessionId: string | null,
@@ -699,9 +699,9 @@ function buildCodexExecArgs(
       "--dangerously-bypass-approvals-and-sandbox",
       "--model",
       model,
-      ...imageArgs,
       agentSessionId,
       prompt,
+      ...imageArgs,
     ];
   }
 
@@ -711,8 +711,8 @@ function buildCodexExecArgs(
     "--dangerously-bypass-approvals-and-sandbox",
     "--model",
     model,
-    ...imageArgs,
     prompt,
+    ...imageArgs,
   ];
 }
 

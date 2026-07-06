@@ -7,6 +7,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { closeDb, getDb } from "../src/store/db.js";
 import {
+  buildCodexExecArgs,
   formatAttachmentReference,
   inferAgentTypeFromModel,
   isConductorWorkspaceVisible,
@@ -25,6 +26,22 @@ test("attachment references use markdown syntax that inline media extractor unde
   assert.equal(
     formatAttachmentReference("/tmp/photo.heic"),
     "![photo.heic](/tmp/photo.heic)"
+  );
+});
+
+test("Codex image args come after positional prompt args", () => {
+  assert.deepEqual(
+    buildCodexExecArgs("gpt-5.5", "inspect this image", null, [
+      "/tmp/screenshot.jpg",
+    ]).slice(-3),
+    ["inspect this image", "--image", "/tmp/screenshot.jpg"]
+  );
+
+  assert.deepEqual(
+    buildCodexExecArgs("gpt-5.5", "follow up", "thread-123", [
+      "/tmp/screenshot.jpg",
+    ]).slice(-4),
+    ["thread-123", "follow up", "--image", "/tmp/screenshot.jpg"]
   );
 });
 
