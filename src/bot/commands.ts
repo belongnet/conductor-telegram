@@ -15,6 +15,7 @@ import {
   stageAttachmentPaths,
   setConductorActiveSession,
   stopAgent,
+  type AgentResult,
   type ConductorSessionInfo,
 } from "./launcher.js";
 import {
@@ -994,6 +995,8 @@ async function startWorkspaceForRepo(
       ]),
     }
   );
+
+  observeAgentCompletion(ctx, workspace, result.workspaceName, result.done);
 }
 
 async function startWorkspaceFromRepoTopic(
@@ -1466,6 +1469,9 @@ async function tryAnswerDecisionReplyWithFormatter(
 
 // ── Photo handler ────────────────────────────────────────────
 
+const IMAGE_REVIEW_FALLBACK_PROMPT =
+  "The user sent a screenshot/image; it is attached below as a file reference. Open the attached image with the Read tool, then respond to what it shows.";
+
 async function handlePhotoMessage(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
   if (!chatId) return;
@@ -1499,7 +1505,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (repliedTarget) {
     const message = caption
       ? applySkillHashtag(caption)
-      : "The user sent a screenshot/image. Please review it.";
+      : IMAGE_REVIEW_FALLBACK_PROMPT;
     await sendMessageToWorkspace(ctx, repliedTarget.workspace, message, [localPath], {
       sessionId: repliedTarget.sessionId,
     });
@@ -1513,7 +1519,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     if (threadWorkspace) {
       const message = caption
         ? applySkillHashtag(caption)
-        : "The user sent a screenshot/image. Please review it.";
+        : IMAGE_REVIEW_FALLBACK_PROMPT;
       await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
       return;
     }
@@ -1523,7 +1529,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (repoTopic) {
     const message = caption
       ? applySkillHashtag(caption)
-      : "The user sent a screenshot/image. Please review it.";
+      : IMAGE_REVIEW_FALLBACK_PROMPT;
     await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
     return;
   }
@@ -2437,6 +2443,8 @@ async function startThreadForTarget(
     `🟢 New thread running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
     { parse_mode: "HTML", ...threadOpts }
   );
+
+  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
 }
 
 // ── /review <workspace> [instructions] ──────────────────────
@@ -2523,6 +2531,8 @@ async function handleReview(ctx: Context): Promise<void> {
     `🟢 Review running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
     { parse_mode: "HTML" }
   );
+
+  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
 }
 
 // ── /skills <workspace> ─────────────────────────────────────
@@ -3239,6 +3249,8 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     { parse_mode: "HTML" }
   );
 
+  observeAgentCompletion(ctx, trackedWorkspace, conductorName, result.done);
+
   if (action === "pr") {
     await sendPrStatusCard(ctx, { ...workspace, status: "running" });
   }
@@ -3337,6 +3349,53 @@ async function sendMessageToWorkspace(
     `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(messagePreview, 200))}</i>`,
     { parse_mode: "HTML" }
   );
+
+  if (result.warning) {
+    await ctx.reply(result.warning);
+  }
+
+  observeAgentCompletion(ctx, workspace, conductorName, result.done);
+}
+
+/**
+ * Watch a spawned agent run and surface hard failures in Telegram. Without
+ * this, a run that dies before producing output looks like a clean
+ * "finished" with nothing to show.
+ */
+function observeAgentCompletion(
+  ctx: Context,
+  workspace: Workspace,
+  conductorName: string,
+  done: Promise<AgentResult>
+): void {
+  done
+    .then(async (agentResult) => {
+      if (!agentResult.isError) return;
+
+      updateWorkspaceStatus(workspace.id, "failed");
+      if (workspace.telegramThreadId) {
+        syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "failed" }).catch((err) =>
+          console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+        );
+      }
+
+      const exitNote =
+        typeof agentResult.exitCode === "number" ? ` (exit ${agentResult.exitCode})` : "";
+      let text = `🔴 <b>${escHtml(conductorName)}</b> agent run failed${exitNote}.`;
+      const detail = agentResult.stderrTail?.trim();
+      if (detail) {
+        text += `\n<pre>${escHtml(truncate(detail, 600))}</pre>`;
+      }
+      if (workspace.telegramThreadId) {
+        await ctx.telegram.sendMessage(workspace.telegramChatId, text, {
+          parse_mode: "HTML",
+          message_thread_id: workspace.telegramThreadId,
+        });
+      } else {
+        await ctx.reply(text, { parse_mode: "HTML" });
+      }
+    })
+    .catch((err) => console.error("[send] agent completion watch error:", err));
 }
 
 // ── Helpers ─────────────────────────────────────────────────

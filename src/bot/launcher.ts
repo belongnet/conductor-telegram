@@ -75,7 +75,11 @@ export interface AgentResult {
   numTurns?: number;
   isError: boolean;
   exitCode: number | null;
+  /** Last portion of the agent process stderr, set only on failed runs. */
+  stderrTail?: string;
 }
+
+const STDERR_TAIL_LIMIT = 2000;
 
 export type AgentType = "claude" | "codex";
 type LaunchMode = "prompt" | "review";
@@ -441,16 +445,23 @@ function spawnClaudeAgent(
   model: string,
   workspaceName: string,
   options: {
+    agentSessionId?: string | null;
     isFollowUp?: boolean;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
   const isFollowUp = options.isFollowUp ?? false;
   const sessionFlag = isFollowUp ? "--resume" : "--session-id";
+  // App-created threads have a Claude session id that differs from the
+  // Conductor session id; resuming the Conductor id makes the CLI exit
+  // immediately with "No conversation found".
+  const sessionArg = isFollowUp
+    ? options.agentSessionId ?? conductorSessionId
+    : conductorSessionId;
   const args = [
     "-p", prompt,
     "--output-format", "stream-json",
     "--verbose",
-    sessionFlag, conductorSessionId,
+    sessionFlag, sessionArg,
     "--max-turns", "1000",
     "--model", model,
     "--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE,
@@ -479,6 +490,7 @@ function spawnClaudeAgent(
     let result: AgentResult = { isError: false, exitCode: null };
     let buffer = "";
     let stdoutBytes = 0;
+    let stderrTail = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
       stdoutBytes += chunk.length;
@@ -508,15 +520,21 @@ function spawnClaudeAgent(
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) console.log(`[agent:stderr] ${text.slice(0, 200)}`);
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+      const trimmed = text.trim();
+      if (trimmed) console.log(`[agent:stderr] ${trimmed.slice(0, 200)}`);
     });
 
     child.on("close", (code) => {
       console.log(`[agent] Process exited with code ${code}`);
       result.exitCode = code;
-      if (code !== 0 && !result.resultText) {
+      // code === null means killed by signal (e.g. user pressed Stop) — not an error.
+      if (code !== null && code !== 0 && !result.resultText) {
         result.isError = true;
+      }
+      if (result.isError && stderrTail.trim()) {
+        result.stderrTail = stderrTail.trim();
       }
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
@@ -527,6 +545,7 @@ function spawnClaudeAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
+      result.stderrTail = String(err?.message ?? err);
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
@@ -580,6 +599,7 @@ function spawnCodexAgent(
     let turnCount = 0;
     let latestAgentSessionId = agentSessionId;
     let lastAssistantText = "";
+    let stderrTail = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
@@ -611,8 +631,10 @@ function spawnCodexAgent(
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) console.log(`[agent:stderr] ${text.slice(0, 200)}`);
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+      const trimmed = text.trim();
+      if (trimmed) console.log(`[agent:stderr] ${trimmed.slice(0, 200)}`);
     });
 
     child.on("close", (code) => {
@@ -621,8 +643,11 @@ function spawnCodexAgent(
       result.durationMs = Date.now() - startedAt;
       result.numTurns = turnCount;
       result.resultText = lastAssistantText || result.resultText;
-      if (code !== 0 && !result.resultText) {
+      if (code !== null && code !== 0 && !result.resultText) {
         result.isError = true;
+      }
+      if (result.isError && stderrTail.trim()) {
+        result.stderrTail = stderrTail.trim();
       }
 
       if (lastAssistantText) {
@@ -645,6 +670,7 @@ function spawnCodexAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
+      result.stderrTail = String(err?.message ?? err);
       result.durationMs = Date.now() - startedAt;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
@@ -914,6 +940,17 @@ function processStreamMessage(
     msg.type !== "system"
   ) {
     return;
+  }
+
+  // Keep claude_session_id pointing at the live Claude session so follow-up
+  // --resume calls target the right conversation (resume can mint a new id).
+  if (
+    msg.type === "system" &&
+    msg.subtype === "init" &&
+    typeof msg.session_id === "string" &&
+    msg.session_id
+  ) {
+    updateAgentSessionId(sessionId, msg.session_id);
   }
 
   const role = msg.type === "user" ? "user" : "assistant";
@@ -1470,12 +1507,19 @@ interface SessionSendTarget {
  * the workspace's active one — used when the user replies to a forwarded
  * thread message in Telegram.
  */
+export interface SendSuccess {
+  ok: true;
+  done: Promise<AgentResult>;
+  /** User-facing caveat about the send (e.g. attachments dropped for cloud). */
+  warning?: string;
+}
+
 export async function sendToSession(
   workspaceName: string,
   prompt: string,
   attachmentSourcePaths: string[] = [],
   options: { repoPath?: string | null; sessionId?: string | null } = {}
-): Promise<{ ok: true; done: Promise<AgentResult> } | SendError> {
+): Promise<SendSuccess | SendError> {
   const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
   if (!wsInfo) {
     return {
@@ -2248,7 +2292,7 @@ async function steerRemoteSession(
   target: SessionSendTarget,
   prompt: string,
   attachmentSourcePaths: string[]
-): Promise<{ ok: true; done: Promise<AgentResult> } | SendError> {
+): Promise<SendSuccess | SendError> {
   if (REMOTE_STEERING_MODE !== "queue") {
     return remoteObserveOnlyError(wsInfo);
   }
@@ -2257,10 +2301,15 @@ async function steerRemoteSession(
     return remoteObserveOnlyError(wsInfo);
   }
 
+  const droppedCount = attachmentSourcePaths.length;
   let text = prompt.trim() || "(empty message)";
-  if (attachmentSourcePaths.length > 0) {
-    text += `\n\n[Note: ${attachmentSourcePaths.length} Telegram attachment(s) could not be delivered to this cloud workspace.]`;
+  if (droppedCount > 0) {
+    text += `\n\n[Note: ${droppedCount} Telegram attachment(s) could not be delivered to this cloud workspace.]`;
   }
+  const warning =
+    droppedCount > 0
+      ? `⚠️ ${droppedCount === 1 ? "The attachment" : `${droppedCount} attachments`} couldn't be delivered — ☁️ cloud workspaces can't receive Telegram files yet. Only the text was sent.`
+      : undefined;
 
   const queued = queueUserMessageInConductorDb(
     target.sessionId,
@@ -2280,7 +2329,7 @@ async function steerRemoteSession(
     console.log(
       `[steer] message queued behind busy agent for ${wsInfo.displayName} (${target.sessionId})`
     );
-    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }) };
+    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
   }
 
   const dispatched = await waitForQueuedDispatch(queued.messageId);
@@ -2289,7 +2338,7 @@ async function steerRemoteSession(
     console.log(
       `[steer] queued message dispatched for ${wsInfo.displayName} (${target.sessionId})`
     );
-    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }) };
+    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
   }
 
   removeQueuedMessageIfUndispatched(queued.messageId);
