@@ -3,14 +3,20 @@ import {
   answerPendingStdinDecision,
   archiveConductorWorkspace,
   formatAttachmentReference,
+  getConductorWorkspaceSessions,
+  getMaxSessionMessageRowId,
   getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
+  isRemoteConductorWorkspace,
   launchWorkspace,
   launchWorkspaceSession,
   sendToSession,
   stageAttachmentPaths,
+  setConductorActiveSession,
   stopAgent,
+  type AgentResult,
+  type ConductorSessionInfo,
 } from "./launcher.js";
 import {
   archiveWorkspace,
@@ -29,8 +35,10 @@ import {
   answerDecision,
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
-  getWorkspaceByTelegramMessage,
+  getWorkspaceMessageTarget,
   getHeartbeat,
+  getThreadCursor,
+  updateThreadCursor,
   getPrRecordsForWorkspaces,
   deleteRepoTopic,
   getRepoTopic,
@@ -144,6 +152,22 @@ const messageToDecision = new Map<number, number>();
 
 // Track repo-selection confirmation messages so replies create a workspace directly
 const messageToRepoSelection = new Map<string, string>(); // chatId:messageId → repoName
+const messageToThreadStart = new Map<
+  string,
+  { conductorName: string; repoPath: string | null }
+>(); // chatId:messageId → target workspace
+
+interface PendingThreadAction {
+  chatId: string;
+  action: "select" | "new";
+  conductorName: string;
+  repoPath: string | null;
+  workspaceId: string;
+  sessionId?: string;
+  createdAt: number;
+}
+
+const pendingThreadActions = new Map<string, PendingThreadAction>();
 
 /**
  * Register a Telegram message ID as associated with a decision,
@@ -227,6 +251,7 @@ interface WorkspaceTarget {
   repoPath: string | null;
   repoName: string | null;
   targetBranch: string | null;
+  sessionId: string | null;
 }
 
 interface SkillRoute {
@@ -265,6 +290,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "run", description: "Start a new workspace run" },
   { command: "review", description: "Start a review session for a workspace" },
   { command: "send", description: "Send a follow-up to a workspace" },
+  { command: "threads", description: "List or switch Conductor threads" },
   { command: "skills", description: "List available skills" },
   { command: "skill", description: "Invoke a workspace skill by name" },
   { command: "gstack", description: "Ask the agent to use GStack skills" },
@@ -325,7 +351,7 @@ function findTrackedWorkspace(
 
 function resolveWorkspaceTarget(
   identifier: string,
-  opts: { chatId?: string; repoPath?: string | null } = {}
+  opts: { chatId?: string; repoPath?: string | null; sessionId?: string | null } = {}
 ): WorkspaceTarget | null | "ambiguous" {
   const tracked = findTrackedWorkspace(identifier, opts.chatId);
   if (tracked === "ambiguous") return "ambiguous";
@@ -346,6 +372,7 @@ function resolveWorkspaceTarget(
     repoPath: sessionInfo.repoPath,
     repoName: sessionInfo.repoName,
     targetBranch: sessionInfo.targetBranch,
+    sessionId: opts.sessionId ?? null,
   };
 }
 
@@ -366,13 +393,16 @@ function getReplyWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
   if (!chatId) {
     return null;
   }
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (!repliedWorkspace?.conductorWorkspaceName) {
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  const conductorName = repliedTarget?.workspace.conductorWorkspaceName;
+  if (!conductorName) {
     return null;
   }
-  const target = resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName, {
+  const repliedWorkspace = repliedTarget.workspace;
+  const target = resolveWorkspaceTarget(conductorName, {
     chatId,
     repoPath: repliedWorkspace.repoPath,
+    sessionId: repliedTarget.sessionId,
   });
   return target === "ambiguous" ? null : target;
 }
@@ -531,7 +561,9 @@ async function sendPromptToTarget(
   prompt: string
 ): Promise<void> {
   if (target.trackedWorkspace) {
-    await sendMessageToWorkspace(ctx, target.trackedWorkspace, prompt);
+    await sendMessageToWorkspace(ctx, target.trackedWorkspace, prompt, [], {
+      sessionId: target.sessionId,
+    });
     return;
   }
 
@@ -541,6 +573,7 @@ async function sendPromptToTarget(
 
   const result = await sendToSession(target.conductorName, prompt, [], {
     repoPath: target.repoPath,
+    sessionId: target.sessionId,
   });
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
@@ -565,6 +598,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.command("stop", handleStop);
   bot.command("repos", handleRepos);
   bot.command("send", handleSend);
+  bot.command("threads", handleThreads);
   bot.command("review", handleReview);
   bot.command("skills", handleSkills);
   bot.command("skill", handleSkill);
@@ -583,6 +617,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^repotopic:(\d+)$/, handleRepoTopicCallback);
   bot.action(/^routeconfirm:([a-f0-9]+):(yes|cancel)$/, handleRouteConfirmCallback);
   bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
+  bot.action(/^thread:(set|new):([a-f0-9]+)$/, handleThreadCallback);
   bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
   bot.action(/^pr:(refresh|fix|merge):(.+)$/, handlePrCallback);
   bot.action(/^archive:(.+)$/, handleArchiveCallback);
@@ -960,6 +995,8 @@ async function startWorkspaceForRepo(
       ]),
     }
   );
+
+  observeAgentCompletion(ctx, workspace, result.workspaceName, result.done);
 }
 
 async function startWorkspaceFromRepoTopic(
@@ -1001,8 +1038,12 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
   const lines = workspaces.map((ws) => {
     const icon = statusIcon(ws.status);
     const name = ws.conductorWorkspaceName ?? ws.name;
+    const sessionInfo = ws.conductorWorkspaceName
+      ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath)
+      : null;
+    const cloud = sessionInfo && isRemoteConductorWorkspace(sessionInfo) ? " ☁️" : "";
     const pr = compactPrBadge(prRecords.get(ws.id));
-    return `${icon} <b>${escHtml(name)}</b> — ${ws.status} · <code>${escHtml(pr)}</code>\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
+    return `${icon} <b>${escHtml(name)}${cloud}</b> — ${ws.status} · <code>${escHtml(pr)}</code>\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
   });
 
   const stopRows = workspaces
@@ -1086,7 +1127,11 @@ async function handleStatus(ctx: Context): Promise<void> {
   const summary = active
     .map((ws) => {
       const name = ws.conductorWorkspaceName ?? ws.name;
-      return `${statusIcon(ws.status)} <b>${escHtml(name)}</b>: ${ws.status}`;
+      const sessionInfo = ws.conductorWorkspaceName
+        ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath)
+        : null;
+      const cloud = sessionInfo && isRemoteConductorWorkspace(sessionInfo) ? " ☁️" : "";
+      return `${statusIcon(ws.status)} <b>${escHtml(name)}${cloud}</b>: ${ws.status}`;
     })
     .join("\n");
 
@@ -1424,6 +1469,9 @@ async function tryAnswerDecisionReplyWithFormatter(
 
 // ── Photo handler ────────────────────────────────────────────
 
+const IMAGE_REVIEW_FALLBACK_PROMPT =
+  "The user sent a screenshot/image; it is attached below as a file reference. Open the attached image with the Read tool, then respond to what it shows.";
+
 async function handlePhotoMessage(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
   if (!chatId) return;
@@ -1453,12 +1501,14 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
     const message = caption
       ? applySkillHashtag(caption)
-      : "The user sent a screenshot/image. Please review it.";
-    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+      : IMAGE_REVIEW_FALLBACK_PROMPT;
+    await sendMessageToWorkspace(ctx, repliedTarget.workspace, message, [localPath], {
+      sessionId: repliedTarget.sessionId,
+    });
     return;
   }
 
@@ -1469,7 +1519,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     if (threadWorkspace) {
       const message = caption
         ? applySkillHashtag(caption)
-        : "The user sent a screenshot/image. Please review it.";
+        : IMAGE_REVIEW_FALLBACK_PROMPT;
       await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
       return;
     }
@@ -1479,7 +1529,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (repoTopic) {
     const message = caption
       ? applySkillHashtag(caption)
-      : "The user sent a screenshot/image. Please review it.";
+      : IMAGE_REVIEW_FALLBACK_PROMPT;
     await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
     return;
   }
@@ -1504,6 +1554,7 @@ type AttachmentKind = "document" | "audio" | "video" | "animation";
 interface TelegramFileSpec {
   fileId: string;
   ext: string;
+  mimeType?: string;
   label: string;
   fallbackPrompt: string;
 }
@@ -1534,6 +1585,7 @@ function describeAttachment(ctx: Context, kind: AttachmentKind): TelegramFileSpe
   return {
     fileId: meta.file_id,
     ext,
+    mimeType,
     label: `${prettyKind}${dur}${niceName}`,
     fallbackPrompt: `The user sent a ${kind}${dur}${niceName}. Please review the attached file.`,
   };
@@ -1541,6 +1593,32 @@ function describeAttachment(ctx: Context, kind: AttachmentKind): TelegramFileSpe
 
 function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+const TRANSCRIBABLE_AUDIO_EXTS = new Set([
+  ".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".flac", ".aac",
+]);
+
+function isTranscribableAudio(kind: AttachmentKind, spec: TelegramFileSpec): boolean {
+  return kind === "audio" ||
+    TRANSCRIBABLE_AUDIO_EXTS.has(spec.ext.toLowerCase()) ||
+    spec.mimeType?.startsWith("audio/") === true;
+}
+
+async function buildAudioMessageOrAttachment(
+  localPath: string,
+  caption: string,
+  fallbackPrompt: string
+): Promise<{ message: string; attachments: string[] }> {
+  const transcript = await transcribeVoiceMessage(localPath);
+  if (transcript) {
+    const text = caption ? `${caption}\n\n${transcript}` : transcript;
+    return { message: applySkillHashtag(text), attachments: [] };
+  }
+  return {
+    message: caption ? applySkillHashtag(caption) : fallbackPrompt,
+    attachments: [localPath],
+  };
 }
 
 async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Promise<void> {
@@ -1561,6 +1639,7 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
   }
 
   const localPath = await downloadTelegramFile(ctx, spec.fileId, spec.ext);
+  const audioLike = isTranscribableAudio(kind, spec);
 
   // Decision-reply path: stage and forward as a markdown image/link ref so
   // Conductor renders the file inline and agents can echo the same syntax back.
@@ -1574,10 +1653,17 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
     return;
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
-    const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
-    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
+    const routed = audioLike
+      ? await buildAudioMessageOrAttachment(localPath, caption, spec.fallbackPrompt)
+      : {
+          message: caption ? applySkillHashtag(caption) : spec.fallbackPrompt,
+          attachments: [localPath],
+        };
+    await sendMessageToWorkspace(ctx, repliedTarget.workspace, routed.message, routed.attachments, {
+      sessionId: repliedTarget.sessionId,
+    });
     return;
   }
 
@@ -1585,17 +1671,32 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
     if (threadWorkspace) {
-      const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
-      await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      const routed = audioLike
+        ? await buildAudioMessageOrAttachment(localPath, caption, spec.fallbackPrompt)
+        : {
+            message: caption ? applySkillHashtag(caption) : spec.fallbackPrompt,
+            attachments: [localPath],
+          };
+      await sendMessageToWorkspace(ctx, threadWorkspace, routed.message, routed.attachments);
       return;
     }
   }
 
   const repoTopic = getThreadRepoTopic(ctx, chatId);
   if (repoTopic) {
-    const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
-    await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
+    const routed = audioLike
+      ? await buildAudioMessageOrAttachment(localPath, caption, spec.fallbackPrompt)
+      : {
+          message: caption ? applySkillHashtag(caption) : spec.fallbackPrompt,
+          attachments: [localPath],
+        };
+    await startWorkspaceFromRepoTopic(ctx, repoTopic, routed.message, routed.attachments);
     return;
+  }
+
+  if (audioLike) {
+    const routed = await tryAutoRouteVoice(ctx, chatId, localPath, caption);
+    if (routed) return;
   }
 
   if (caption) {
@@ -1931,17 +2032,21 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
     const transcript = await transcribeVoiceMessage(localPath);
     if (transcript) {
       const text = caption ? `${caption}\n\n${transcript}` : transcript;
-      await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(text));
+      await sendMessageToWorkspace(ctx, repliedTarget.workspace, applySkillHashtag(text), [], {
+        sessionId: repliedTarget.sessionId,
+      });
     } else {
       const message = caption
         ? `${caption}\n\nThe user sent a voice message (${duration}s). Please review the attached recording.`
         : `The user sent a voice message (${duration}s). Please review the attached recording.`;
-      await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+      await sendMessageToWorkspace(ctx, repliedTarget.workspace, message, [localPath], {
+        sessionId: repliedTarget.sessionId,
+      });
     }
     return;
   }
@@ -2006,8 +2111,29 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;
 
-  // Check if this is a reply to a repo-selection confirmation message
+  // Check if this is a reply to a "new thread" prompt
   const replyToMsgId = (ctx.message as any)?.reply_to_message?.message_id;
+  if (replyToMsgId) {
+    const replyMessageKey = getRepoSelectionMessageKey(chatId, replyToMsgId);
+    const threadStart = messageToThreadStart.get(replyMessageKey);
+    if (threadStart) {
+      messageToThreadStart.delete(replyMessageKey);
+      const target = resolveWorkspaceTarget(threadStart.conductorName, {
+        chatId,
+        repoPath: threadStart.repoPath,
+      });
+      if (!target || target === "ambiguous") {
+        await ctx.reply(`Workspace "${escHtml(threadStart.conductorName)}" is no longer available.`, {
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      await startThreadForTarget(ctx, target, text);
+      return;
+    }
+  }
+
+  // Check if this is a reply to a repo-selection confirmation message
   if (replyToMsgId) {
     const replyMessageKey = getRepoSelectionMessageKey(chatId, replyToMsgId);
     const repoName = messageToRepoSelection.get(replyMessageKey);
@@ -2020,9 +2146,11 @@ async function handleTextMessage(ctx: Context): Promise<void> {
     }
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
-    await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(text));
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
+    await sendMessageToWorkspace(ctx, repliedTarget.workspace, applySkillHashtag(text), [], {
+      sessionId: repliedTarget.sessionId,
+    });
     return;
   }
 
@@ -2124,6 +2252,201 @@ async function handleSend(ctx: Context): Promise<void> {
   await sendMessageToWorkspace(ctx, workspace, message);
 }
 
+// ── /threads [workspace] [new <prompt>] ─────────────────────
+
+async function handleThreads(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/threads\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
+  const contextualTarget = getContextualTarget(ctx);
+
+  let target: WorkspaceTarget | null = null;
+  let tail = "";
+
+  if (!args) {
+    target = contextualTarget;
+  } else {
+    const [head, rest] = splitHead(args);
+    if (head.toLowerCase() === "new" && contextualTarget) {
+      target = contextualTarget;
+      tail = args;
+    } else {
+      const explicitTarget = resolveWorkspaceTarget(head, { chatId });
+      if (explicitTarget === "ambiguous") {
+        await ctx.reply(`Workspace "${escHtml(head)}" is ambiguous in this chat. Use the workspace id instead.`, {
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      if (explicitTarget) {
+        target = explicitTarget;
+        tail = rest;
+      } else if (contextualTarget) {
+        target = contextualTarget;
+        tail = args;
+      }
+    }
+  }
+
+  if (!target) {
+    await ctx.reply(
+      "Usage: /threads <workspace-name>\n\nInside a workspace topic or reply, use /threads. To start a thread: /threads <workspace-name> new <prompt>."
+    );
+    return;
+  }
+
+  const [maybeNew, newPrompt] = splitHead(tail);
+  if (maybeNew.toLowerCase() === "new") {
+    if (!newPrompt) {
+      await ctx.reply("Usage: /threads <workspace-name> new <prompt>");
+      return;
+    }
+    await startThreadForTarget(ctx, target, newPrompt);
+    return;
+  }
+
+  await showThreadList(ctx, target);
+}
+
+function formatSessionTitle(session: ConductorSessionInfo): string {
+  const title = session.title?.trim();
+  if (title) return title;
+  if (session.isActive) return "Active thread";
+  return `Thread ${session.sessionId.slice(0, 8)}`;
+}
+
+function rememberThreadAction(input: Omit<
+  PendingThreadAction,
+  "createdAt"
+>): string {
+  pruneThreadActions();
+  const token = randomUUID().replace(/-/g, "").slice(0, 12);
+  pendingThreadActions.set(token, { ...input, createdAt: Date.now() });
+  return token;
+}
+
+function pruneThreadActions(): void {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [token, action] of pendingThreadActions) {
+    if (action.createdAt < cutoff) pendingThreadActions.delete(token);
+  }
+}
+
+async function showThreadList(ctx: Context, target: WorkspaceTarget): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  const info = getWorkspaceSessionInfo(target.conductorName, target.repoPath);
+  if (!info) {
+    await ctx.reply(`Workspace "${escHtml(target.conductorName)}" was not found in Conductor.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const sessions = getConductorWorkspaceSessions(info.workspaceId);
+  const remoteBadge = isRemoteConductorWorkspace(info) ? " ☁️" : "";
+  const lines = sessions.length > 0
+    ? sessions.map((session, index) => {
+        const marker = session.isActive ? "▶" : " ";
+        const title = formatSessionTitle(session);
+        const agent = session.rawAgentType ?? session.agentType;
+        return `${marker} ${index + 1}. <b>${escHtml(title)}</b> · <code>${escHtml(session.status ?? "unknown")}</code> · <code>${escHtml(agent)}</code>${session.model ? ` · <code>${escHtml(session.model)}</code>` : ""}`;
+      })
+    : ["No visible threads found."];
+
+  const rows = sessions
+    .filter((session) => !session.isActive)
+    .slice(0, 8)
+    .map((session) => {
+      const token = rememberThreadAction({
+        chatId: chatId ?? "",
+        action: "select",
+        conductorName: target.conductorName,
+        repoPath: target.repoPath,
+        workspaceId: info.workspaceId,
+        sessionId: session.sessionId,
+      });
+      return [btn(`Use ${formatSessionTitle(session)}`, `thread:set:${token}`)];
+    });
+
+  if (!isRemoteConductorWorkspace(info)) {
+    const token = rememberThreadAction({
+      chatId: chatId ?? "",
+      action: "new",
+      conductorName: target.conductorName,
+      repoPath: target.repoPath,
+      workspaceId: info.workspaceId,
+    });
+    rows.push([btn("New Thread", `thread:new:${token}`)]);
+  }
+
+  await ctx.reply(
+    `<b>${escHtml(info.displayName)}${remoteBadge} threads</b>\n\n${lines.join("\n")}`,
+    {
+      parse_mode: "HTML",
+      ...(rows.length > 0 ? styledKeyboard(rows) : {}),
+    }
+  );
+}
+
+async function startThreadForTarget(
+  ctx: Context,
+  target: WorkspaceTarget,
+  prompt: string
+): Promise<void> {
+  const trackedWorkspace = ensureTrackedWorkspace(ctx, target, prompt);
+  if (!trackedWorkspace) {
+    await ctx.reply(`Could not resolve repo details for <b>${escHtml(target.conductorName)}</b>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const threadOpts = trackedWorkspace.telegramThreadId
+    ? { message_thread_id: trackedWorkspace.telegramThreadId }
+    : {};
+  const progress = await ctx.reply(
+    `Starting a new thread for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(prompt, 200))}</i>`,
+    { parse_mode: "HTML", ...threadOpts }
+  );
+  updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
+
+  const result = await launchWorkspaceSession(target.conductorName, prompt, {
+    repoPath: target.repoPath,
+    launchMode: "prompt",
+  });
+
+  if ("error" in result) {
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `Failed to start a new thread for <b>${escHtml(target.conductorName)}</b>:\n${escHtml(result.error)}`,
+      { parse_mode: "HTML", ...threadOpts }
+    );
+    return;
+  }
+
+  updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
+  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
+  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  updateThreadCursor(
+    trackedWorkspace.id,
+    result.sessionId,
+    result.initialCursorRowid,
+    null
+  );
+  updateWorkspaceStatus(trackedWorkspace.id, "running");
+  await ctx.telegram.editMessageText(
+    ctx.chat!.id,
+    progress.message_id,
+    undefined,
+    `🟢 New thread running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
+    { parse_mode: "HTML", ...threadOpts }
+  );
+
+  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
+}
+
 // ── /review <workspace> [instructions] ──────────────────────
 
 async function handleReview(ctx: Context): Promise<void> {
@@ -2208,6 +2531,8 @@ async function handleReview(ctx: Context): Promise<void> {
     `🟢 Review running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
     { parse_mode: "HTML" }
   );
+
+  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
 }
 
 // ── /skills <workspace> ─────────────────────────────────────
@@ -2449,6 +2774,7 @@ Commands:
 /run &lt;repo&gt; &lt;prompt&gt; — Start a new workspace
 /run &lt;number&gt; &lt;prompt&gt; — Start using repo number
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
+/threads [workspace] — List, switch, or start Conductor threads
 /review &lt;workspace&gt; [instructions] — Start a review session
 /skills [workspace] — List built-in and workspace skills
 /skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
@@ -2466,6 +2792,7 @@ Commands:
 <b>Invoking skills</b>
 • Tag <code>#skill</code> anywhere in a message: <code>#ship</code>, <code>#qa find auth bugs</code>, <code>#gstack</code>.
 • Inside a workspace topic or reply, the hashtag targets that workspace automatically.
+• Replying to a forwarded thread message targets that exact Conductor thread.
 • Slash shortcuts (like <code>/ship</code>) accept an optional workspace name and instructions.
 • Use <code>/skills</code> any time to see the full list.
 
@@ -2561,6 +2888,65 @@ async function handleRouteConfirmCallback(ctx: Context): Promise<void> {
       "That route is no longer available. Use /run <repo> to start a workspace, or send a new message with the repo/workspace named explicitly."
     );
   }
+}
+
+async function handleThreadCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const action = match?.[1] as "set" | "new" | undefined;
+  const token = match?.[2];
+  const chatId = ctx.chat?.id?.toString();
+  if (!action || !token || !chatId) return;
+
+  const pending = pendingThreadActions.get(token);
+  if (!pending || pending.chatId !== chatId || pending.action !== (action === "set" ? "select" : "new")) {
+    await ctx.answerCbQuery("This thread action expired");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    return;
+  }
+
+  pendingThreadActions.delete(token);
+
+  if (action === "set") {
+    if (!pending.sessionId) return;
+    const ok = setConductorActiveSession(pending.workspaceId, pending.sessionId);
+    if (!ok) {
+      await ctx.answerCbQuery("Thread no longer exists");
+      return;
+    }
+
+    const tracked = getWorkspaceByName(pending.conductorName, {
+      chatId,
+      repoPath: pending.repoPath ?? undefined,
+    });
+    if (tracked) {
+      updateWorkspaceConductorSession(tracked.id, pending.sessionId);
+      const cursor = getThreadCursor(tracked.id, pending.sessionId);
+      const rowid = cursor?.lastForwardedRowid ?? getMaxSessionMessageRowId(pending.sessionId);
+      if (!cursor) {
+        updateThreadCursor(tracked.id, pending.sessionId, rowid, null);
+      }
+      updateWorkspaceForwardCursor(tracked.id, rowid);
+    }
+
+    await ctx.answerCbQuery("Default thread updated");
+    await ctx.reply(`Default thread updated for <b>${escHtml(pending.conductorName)}</b>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const prompt = await ctx.reply(
+    `Reply to this message with the first prompt for a new thread in <b>${escHtml(pending.conductorName)}</b>.`,
+    { parse_mode: "HTML" }
+  );
+  messageToThreadStart.set(
+    getRepoSelectionMessageKey(chatId, prompt.message_id),
+    {
+      conductorName: pending.conductorName,
+      repoPath: pending.repoPath,
+    }
+  );
+  await ctx.answerCbQuery("Reply with the first prompt");
 }
 
 async function handleStopCallback(ctx: Context): Promise<void> {
@@ -2812,6 +3198,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     repoPath: workspace.repoPath,
     repoName: workspace.repoPath ? path.basename(workspace.repoPath) : null,
     targetBranch: null,
+    sessionId: null,
   }, prompt);
 
   if (!trackedWorkspace) {
@@ -2862,6 +3249,8 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     { parse_mode: "HTML" }
   );
 
+  observeAgentCompletion(ctx, trackedWorkspace, conductorName, result.done);
+
   if (action === "pr") {
     await sendPrStatusCard(ctx, { ...workspace, status: "running" });
   }
@@ -2870,15 +3259,15 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
 function getReplyTargetWorkspace(
   ctx: Context,
   chatId: string
-): Workspace | undefined {
+): { workspace: Workspace; sessionId: string | null } | undefined {
   const reply = (ctx.message as any)?.reply_to_message;
   const replyToMessageId = reply?.message_id;
   if (!replyToMessageId) return undefined;
 
-  const linked = getWorkspaceByTelegramMessage(chatId, String(replyToMessageId));
+  const linked = getWorkspaceMessageTarget(chatId, String(replyToMessageId));
   if (linked) {
     console.log(
-      `[reply-route] linked message ${replyToMessageId} -> ${linked.conductorWorkspaceName ?? linked.name}`
+      `[reply-route] linked message ${replyToMessageId} -> ${linked.workspace.conductorWorkspaceName ?? linked.workspace.name}${linked.sessionId ? ` (${linked.sessionId})` : ""}`
     );
     return linked;
   }
@@ -2891,7 +3280,7 @@ function getReplyTargetWorkspace(
   } else {
     console.log(`[reply-route] no match for replied message ${replyToMessageId}`);
   }
-  return inferred;
+  return inferred ? { workspace: inferred, sessionId: null } : undefined;
 }
 
 function inferWorkspaceFromReply(reply: any, chatId: string): Workspace | undefined {
@@ -2916,7 +3305,8 @@ async function sendMessageToWorkspace(
   ctx: Context,
   workspace: Workspace,
   message: string,
-  attachmentSourcePaths: string[] = []
+  attachmentSourcePaths: string[] = [],
+  options: { sessionId?: string | null } = {}
 ): Promise<void> {
   const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
   const messagePreview = previewOutgoingText(message, attachmentSourcePaths);
@@ -2939,6 +3329,7 @@ async function sendMessageToWorkspace(
 
   const result = await sendToSession(conductorName, message, attachmentSourcePaths, {
     repoPath: workspace.repoPath,
+    sessionId: options.sessionId ?? null,
   });
 
   if ("error" in result) {
@@ -2958,6 +3349,53 @@ async function sendMessageToWorkspace(
     `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(messagePreview, 200))}</i>`,
     { parse_mode: "HTML" }
   );
+
+  if (result.warning) {
+    await ctx.reply(result.warning);
+  }
+
+  observeAgentCompletion(ctx, workspace, conductorName, result.done);
+}
+
+/**
+ * Watch a spawned agent run and surface hard failures in Telegram. Without
+ * this, a run that dies before producing output looks like a clean
+ * "finished" with nothing to show.
+ */
+function observeAgentCompletion(
+  ctx: Context,
+  workspace: Workspace,
+  conductorName: string,
+  done: Promise<AgentResult>
+): void {
+  done
+    .then(async (agentResult) => {
+      if (!agentResult.isError) return;
+
+      updateWorkspaceStatus(workspace.id, "failed");
+      if (workspace.telegramThreadId) {
+        syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "failed" }).catch((err) =>
+          console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+        );
+      }
+
+      const exitNote =
+        typeof agentResult.exitCode === "number" ? ` (exit ${agentResult.exitCode})` : "";
+      let text = `🔴 <b>${escHtml(conductorName)}</b> agent run failed${exitNote}.`;
+      const detail = agentResult.stderrTail?.trim();
+      if (detail) {
+        text += `\n<pre>${escHtml(truncate(detail, 600))}</pre>`;
+      }
+      if (workspace.telegramThreadId) {
+        await ctx.telegram.sendMessage(workspace.telegramChatId, text, {
+          parse_mode: "HTML",
+          message_thread_id: workspace.telegramThreadId,
+        });
+      } else {
+        await ctx.reply(text, { parse_mode: "HTML" });
+      }
+    })
+    .catch((err) => console.error("[send] agent completion watch error:", err));
 }
 
 // ── Helpers ─────────────────────────────────────────────────

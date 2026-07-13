@@ -22,6 +22,15 @@ export interface Workspace {
   archivedAt: string | null;
 }
 
+export interface ThreadCursor {
+  workspaceId: string;
+  sessionId: string;
+  lastForwardedRowid: number;
+  title: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface RepoTopic {
   chatId: string;
   repoPath: string;

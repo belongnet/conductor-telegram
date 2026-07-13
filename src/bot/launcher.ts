@@ -1,5 +1,5 @@
 import { exec, spawn, type ChildProcess } from "node:child_process";
-import { copyFileSync, mkdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -7,8 +7,11 @@ import Database from "better-sqlite3";
 import {
   createDecision,
   addEvent,
+  getMetaValue,
+  setMetaValue,
   getWorkspaceByName as getTrackedWorkspaceByName,
 } from "../store/queries.js";
+import { getConductorSetting } from "../store/conductor-settings.js";
 
 export const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
@@ -72,7 +75,11 @@ export interface AgentResult {
   numTurns?: number;
   isError: boolean;
   exitCode: number | null;
+  /** Last portion of the agent process stderr, set only on failed runs. */
+  stderrTail?: string;
 }
+
+const STDERR_TAIL_LIMIT = 2000;
 
 export type AgentType = "claude" | "codex";
 type LaunchMode = "prompt" | "review";
@@ -180,23 +187,18 @@ export function inferAgentTypeFromModel(
   if (/^(gpt|o\d|codex)([-_.]|$)/.test(normalized)) {
     return "codex";
   }
-  if (/(^|[-_.])(claude|opus|sonnet|haiku)([-_.]|$)/.test(normalized)) {
+  if (/(^|[-_.])(claude|opus|sonnet|haiku|fable)([-_.]|$)/.test(normalized)) {
     return "claude";
   }
   return null;
 }
 
+/**
+ * Conductor 0.72 moved settings to ~/.conductor/settings.toml; the DB rows
+ * this bot historically read are deprecated (but kept as fallback).
+ */
 function getSettingValue(key: string): string | null {
-  try {
-    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const row = db.prepare(
-      "SELECT value FROM settings WHERE key = ?"
-    ).get(key) as { value?: string } | undefined;
-    db.close();
-    return typeof row?.value === "string" ? row.value : null;
-  } catch {
-    return null;
-  }
+  return getConductorSetting(key);
 }
 
 function getRecentModelForAgent(agentType: AgentType): string | null {
@@ -242,6 +244,12 @@ function getReviewAgentType(): AgentType {
   const configured = normalizeAgentType(process.env.TELEGRAM_REVIEW_AGENT_TYPE);
   if (configured) {
     return configured;
+  }
+  const reviewModelAgent =
+    inferAgentTypeFromModel(process.env.TELEGRAM_REVIEW_MODEL) ??
+    inferAgentTypeFromModel(getSettingValue("review_model"));
+  if (reviewModelAgent) {
+    return reviewModelAgent;
   }
   if (hasAgentSessions("codex")) {
     return "codex";
@@ -297,7 +305,9 @@ function resolveAgentModel(
   if (agentType === "claude") {
     return (
       firstCompatibleModel("claude", [
-        getSettingValue("default_model"),
+        launchMode === "review"
+          ? getSettingValue("review_model")
+          : getSettingValue("default_model"),
         getRecentModelForAgent("claude"),
         DEFAULT_CLAUDE_MODEL,
       ]) ?? DEFAULT_CLAUDE_MODEL
@@ -306,7 +316,9 @@ function resolveAgentModel(
 
   return (
     firstCompatibleModel("codex", [
-      getSettingValue("default_model"),
+      launchMode === "review"
+        ? getSettingValue("review_model")
+        : getSettingValue("default_model"),
       getRecentModelForAgent("codex"),
       DEFAULT_CODEX_MODEL,
     ]) ?? DEFAULT_CODEX_MODEL
@@ -433,16 +445,23 @@ function spawnClaudeAgent(
   model: string,
   workspaceName: string,
   options: {
+    agentSessionId?: string | null;
     isFollowUp?: boolean;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
   const isFollowUp = options.isFollowUp ?? false;
   const sessionFlag = isFollowUp ? "--resume" : "--session-id";
+  // App-created threads have a Claude session id that differs from the
+  // Conductor session id; resuming the Conductor id makes the CLI exit
+  // immediately with "No conversation found".
+  const sessionArg = isFollowUp
+    ? options.agentSessionId ?? conductorSessionId
+    : conductorSessionId;
   const args = [
     "-p", prompt,
     "--output-format", "stream-json",
     "--verbose",
-    sessionFlag, conductorSessionId,
+    sessionFlag, sessionArg,
     "--max-turns", "1000",
     "--model", model,
     "--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE,
@@ -471,6 +490,7 @@ function spawnClaudeAgent(
     let result: AgentResult = { isError: false, exitCode: null };
     let buffer = "";
     let stdoutBytes = 0;
+    let stderrTail = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
       stdoutBytes += chunk.length;
@@ -500,15 +520,21 @@ function spawnClaudeAgent(
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) console.log(`[agent:stderr] ${text.slice(0, 200)}`);
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+      const trimmed = text.trim();
+      if (trimmed) console.log(`[agent:stderr] ${trimmed.slice(0, 200)}`);
     });
 
     child.on("close", (code) => {
       console.log(`[agent] Process exited with code ${code}`);
       result.exitCode = code;
-      if (code !== 0 && !result.resultText) {
+      // code === null means killed by signal (e.g. user pressed Stop) — not an error.
+      if (code !== null && code !== 0 && !result.resultText) {
         result.isError = true;
+      }
+      if (result.isError && stderrTail.trim()) {
+        result.stderrTail = stderrTail.trim();
       }
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
@@ -519,6 +545,7 @@ function spawnClaudeAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
+      result.stderrTail = String(err?.message ?? err);
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       resolve(result);
@@ -572,6 +599,7 @@ function spawnCodexAgent(
     let turnCount = 0;
     let latestAgentSessionId = agentSessionId;
     let lastAssistantText = "";
+    let stderrTail = "";
 
     child.stdout?.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
@@ -603,8 +631,10 @@ function spawnCodexAgent(
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (text) console.log(`[agent:stderr] ${text.slice(0, 200)}`);
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+      const trimmed = text.trim();
+      if (trimmed) console.log(`[agent:stderr] ${trimmed.slice(0, 200)}`);
     });
 
     child.on("close", (code) => {
@@ -613,8 +643,11 @@ function spawnCodexAgent(
       result.durationMs = Date.now() - startedAt;
       result.numTurns = turnCount;
       result.resultText = lastAssistantText || result.resultText;
-      if (code !== 0 && !result.resultText) {
+      if (code !== null && code !== 0 && !result.resultText) {
         result.isError = true;
+      }
+      if (result.isError && stderrTail.trim()) {
+        result.stderrTail = stderrTail.trim();
       }
 
       if (lastAssistantText) {
@@ -637,6 +670,7 @@ function spawnCodexAgent(
       console.error(`[agent] Spawn error:`, err);
       result.isError = true;
       result.exitCode = -1;
+      result.stderrTail = String(err?.message ?? err);
       result.durationMs = Date.now() - startedAt;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
@@ -839,7 +873,7 @@ export function sendInputToAgent(agentKey: string, input: string): boolean {
  * Telegram surface keeps working across SDK versions. Multi-question calls collapse to the first question for now,
  * with the rest mentioned in the body so the operator at least sees them.
  */
-function extractAskUserQuestion(input: any): { question: string; options: string[] | undefined } {
+export function extractAskUserQuestion(input: any): { question: string; options: string[] | undefined } {
   const fallback = "Agent is asking a question";
 
   const questions = Array.isArray(input?.questions) ? input.questions : null;
@@ -906,6 +940,17 @@ function processStreamMessage(
     msg.type !== "system"
   ) {
     return;
+  }
+
+  // Keep claude_session_id pointing at the live Claude session so follow-up
+  // --resume calls target the right conversation (resume can mint a new id).
+  if (
+    msg.type === "system" &&
+    msg.subtype === "init" &&
+    typeof msg.session_id === "string" &&
+    msg.session_id
+  ) {
+    updateAgentSessionId(sessionId, msg.session_id);
   }
 
   const role = msg.type === "user" ? "user" : "assistant";
@@ -1195,22 +1240,106 @@ function pickCityName(existingDirs: Set<string>): string {
   return available[Math.floor(Math.random() * available.length)];
 }
 
-async function getExistingWorkspaceBranchNames(repoPath: string): Promise<Set<string>> {
-  try {
-    const output = await execAsync(
-      `cd "${repoPath}" && git branch --format='%(refname:short)' --list 'belongcond/*'`
-    );
-    return new Set(
-      output
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith("belongcond/"))
-        .map((line) => line.slice("belongcond/".length))
-        .filter((line) => line.length > 0)
-    );
-  } catch {
-    return new Set();
+const LEGACY_BRANCH_PREFIX = "belongcond";
+
+let cachedBranchPrefix: string | null = null;
+
+/**
+ * Resolve the branch prefix for bot-created workspace branches.
+ *
+ * Conductor 0.72 defaults to prefixing branches with the GitHub username
+ * (settings.toml `[git] branch_prefix_type = "github_username"`), e.g.
+ * `nomadcalendar/tokyo`. Follow the app's convention so bot branches sit next
+ * to app branches: recent app-created branches are the best source (no
+ * network), then `gh api user`, then the legacy `belongcond` prefix.
+ */
+export async function getBranchPrefix(): Promise<string> {
+  if (cachedBranchPrefix) return cachedBranchPrefix;
+
+  const fromEnv = process.env.TELEGRAM_BRANCH_PREFIX?.trim().replace(/\/+$/, "");
+  if (fromEnv) {
+    cachedBranchPrefix = fromEnv;
+    return cachedBranchPrefix;
   }
+
+  const configuredPrefix = getSettingValue("branch_prefix")?.trim().replace(/\/+$/, "");
+  if (configuredPrefix) {
+    cachedBranchPrefix = configuredPrefix;
+    return cachedBranchPrefix;
+  }
+
+  if (getSettingValue("branch_prefix_type") === "github_username") {
+    const sniffed = sniffRecentBranchPrefix();
+    if (sniffed) {
+      cachedBranchPrefix = sniffed;
+      return cachedBranchPrefix;
+    }
+    const ghUser = await getGithubUsername();
+    if (ghUser) {
+      cachedBranchPrefix = ghUser;
+      return cachedBranchPrefix;
+    }
+  }
+
+  cachedBranchPrefix = LEGACY_BRANCH_PREFIX;
+  return cachedBranchPrefix;
+}
+
+/** Most recent Conductor workspace branch prefix that isn't the bot's own. */
+function sniffRecentBranchPrefix(): string | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const rows = db.prepare(
+      `SELECT branch FROM workspaces
+       WHERE branch LIKE '%/%'
+       ORDER BY created_at DESC
+       LIMIT 25`
+    ).all() as Array<{ branch?: string }>;
+    db.close();
+    for (const row of rows) {
+      const prefix = row.branch?.split("/")[0]?.trim();
+      if (prefix && prefix !== LEGACY_BRANCH_PREFIX) {
+        return prefix;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function getGithubUsername(): Promise<string | null> {
+  try {
+    const output = await execAsync("gh api user -q .login");
+    const login = output.trim();
+    return /^[A-Za-z0-9-]+$/.test(login) ? login : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getExistingWorkspaceBranchNames(
+  repoPath: string,
+  prefixes: string[]
+): Promise<Set<string>> {
+  const names = new Set<string>();
+  for (const prefix of new Set(prefixes)) {
+    try {
+      const output = await execAsync(
+        `cd ${shellQuote(repoPath)} && git branch --format='%(refname:short)' --list ${shellQuote(`${prefix}/*`)}`
+      );
+      for (const line of output.split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith(`${prefix}/`)) {
+          const name = trimmed.slice(prefix.length + 1);
+          if (name) names.add(name);
+        }
+      }
+    } catch {
+      // Repo without git or prefix without branches: nothing to reserve.
+    }
+  }
+  return names;
 }
 
 /**
@@ -1256,13 +1385,17 @@ export async function launchWorkspace(
   } catch {
     reservedNames = new Set();
   }
-  for (const branchName of await getExistingWorkspaceBranchNames(repoPath)) {
-    reservedNames.add(branchName);
+  const branchPrefix = await getBranchPrefix();
+  for (const usedName of await getExistingWorkspaceBranchNames(repoPath, [
+    branchPrefix,
+    LEGACY_BRANCH_PREFIX,
+  ])) {
+    reservedNames.add(usedName);
   }
 
   // Pick a city name for the workspace
   const cityName = pickCityName(reservedNames);
-  const branchName = `belongcond/${cityName}`;
+  const branchName = `${branchPrefix}/${cityName}`;
   const workspaceDir = getWorkspacePathFromRepo(repoInfo, repoPath, cityName);
 
   console.log(`[launcher] Creating workspace: ${cityName} (branch: ${branchName})`);
@@ -1270,7 +1403,9 @@ export async function launchWorkspace(
   // 1. Create git worktree
   try {
     const defaultBranch = repoInfo.defaultBranch ?? "main";
-    await execAsync(`cd "${repoPath}" && git worktree add -b "${branchName}" "${workspaceDir}" "${defaultBranch}"`);
+    await execAsync(
+      `cd ${shellQuote(repoPath)} && git worktree add -b ${shellQuote(branchName)} ${shellQuote(workspaceDir)} ${shellQuote(defaultBranch)}`
+    );
     console.log(`[launcher] Git worktree created at ${workspaceDir}`);
   } catch (err) {
     console.error(`[launcher] Git worktree failed:`, err);
@@ -1351,15 +1486,40 @@ export async function launchWorkspace(
   };
 }
 
+export interface SendError {
+  error: string;
+  reason?: "unsupported_agent" | "remote_observe_only" | "remote_steer_unverified";
+}
+
+interface SessionSendTarget {
+  sessionId: string;
+  agentType: AgentType;
+  rawAgentType: string | null;
+  agentSessionId: string | null;
+  model: string | null;
+  status: string | null;
+}
+
 /**
  * Send a follow-up prompt to an existing workspace session.
+ *
+ * `options.sessionId` targets a specific thread (Conductor session) instead of
+ * the workspace's active one — used when the user replies to a forwarded
+ * thread message in Telegram.
  */
+export interface SendSuccess {
+  ok: true;
+  done: Promise<AgentResult>;
+  /** User-facing caveat about the send (e.g. attachments dropped for cloud). */
+  warning?: string;
+}
+
 export async function sendToSession(
   workspaceName: string,
   prompt: string,
   attachmentSourcePaths: string[] = [],
-  options: { repoPath?: string | null } = {}
-): Promise<{ ok: true; done: Promise<AgentResult> } | { error: string }> {
+  options: { repoPath?: string | null; sessionId?: string | null } = {}
+): Promise<SendSuccess | SendError> {
   const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
   if (!wsInfo) {
     return {
@@ -1374,11 +1534,51 @@ export async function sendToSession(
     };
   }
 
+  let target: SessionSendTarget = {
+    sessionId: wsInfo.sessionId,
+    agentType: wsInfo.agentType,
+    rawAgentType: wsInfo.rawAgentType,
+    agentSessionId: wsInfo.agentSessionId,
+    model: wsInfo.model,
+    status: wsInfo.status,
+  };
+  if (options.sessionId && options.sessionId !== wsInfo.sessionId) {
+    const session = getConductorSessionById(options.sessionId);
+    if (!session || session.workspaceId !== wsInfo.workspaceId) {
+      return {
+        error: `That thread no longer exists in "${wsInfo.displayName}". Sending in the topic targets the active thread instead.`,
+      };
+    }
+    target = {
+      sessionId: session.sessionId,
+      agentType: session.agentType,
+      rawAgentType: session.rawAgentType,
+      agentSessionId: session.claudeSessionId,
+      model: session.model,
+      status: session.status,
+    };
+  }
+
   const repoPath = wsInfo.repoPath ?? options.repoPath;
   if (!repoPath) {
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
-  const workspaceDir = getWorkspacePathFromInfo(wsInfo, workspaceName);
+
+  if (isRemoteConductorWorkspace(wsInfo)) {
+    return steerRemoteSession(wsInfo, target, prompt, attachmentSourcePaths);
+  }
+
+  if (!isSpawnableAgentType(target.rawAgentType)) {
+    return {
+      error: `This thread runs "${target.rawAgentType}", which the bot can't steer from Telegram. Open it in Conductor, or start a new thread with /threads.`,
+      reason: "unsupported_agent",
+    };
+  }
+
+  const workspaceDir = getWorkspacePathFromInfo(wsInfo, wsInfo.directoryName || workspaceName);
+  if (!workspaceDir) {
+    return { error: `Workspace "${wsInfo.displayName}" has no local directory on this Mac.` };
+  }
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
     attachmentSourcePaths
@@ -1387,15 +1587,15 @@ export async function sendToSession(
   markConductorWorkspaceActive(wsInfo.workspaceId);
 
   const { done } = spawnAgent(
-    wsInfo.sessionId,
+    target.sessionId,
     repoPath,
     workspaceDir,
     fullPrompt,
-    normalizeModelForCli(wsInfo.model ?? resolveAgentModel(wsInfo.agentType, "prompt")),
-    wsInfo.agentType,
-    workspaceName,
+    normalizeModelForCli(target.model ?? resolveAgentModel(target.agentType, "prompt")),
+    target.agentType,
+    wsInfo.directoryName || workspaceName,
     {
-      agentSessionId: wsInfo.agentSessionId,
+      agentSessionId: target.agentSessionId,
       isFollowUp: true,
       attachmentPaths: stagedAttachmentPaths,
       launchMode: "prompt",
@@ -1419,7 +1619,7 @@ export async function launchWorkspaceSession(
     initialCursorRowid: number;
     agentType: AgentType;
     model: string;
-  } | { error: string }
+  } | SendError
 > {
   const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
   if (!wsInfo) {
@@ -1439,7 +1639,20 @@ export async function launchWorkspaceSession(
   if (!repoPath) {
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
-  const workspaceDir = getWorkspacePathFromInfo(wsInfo, workspaceName);
+  if (isRemoteConductorWorkspace(wsInfo)) {
+    const remoteError: SendError = {
+      error: `☁️ "${wsInfo.displayName}" runs in Conductor Cloud — the bot can message its existing threads, but can't start new threads there yet. Open it in Conductor on your Mac.`,
+      reason: "remote_observe_only",
+    };
+    return remoteError;
+  }
+  const workspaceDir = getWorkspacePathFromInfo(
+    wsInfo,
+    wsInfo.directoryName || workspaceName
+  );
+  if (!workspaceDir) {
+    return { error: `Workspace "${wsInfo.displayName}" has no local directory on this Mac.` };
+  }
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
     options.attachmentSourcePaths ?? []
@@ -1528,8 +1741,15 @@ export function archiveConductorWorkspace(
 ): boolean {
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
-    const where = ["directory_name = ?"];
-    const params: any[] = [workspaceName];
+    const columns = getTableColumns(db, "workspaces");
+    const where = [
+      columns.has("workspace_name")
+        ? "(directory_name = ? OR workspace_name = ?)"
+        : "directory_name = ?",
+    ];
+    const params: any[] = columns.has("workspace_name")
+      ? [workspaceName, workspaceName]
+      : [workspaceName];
     if (repoPath) {
       where.push(
         `repository_id IN (
@@ -1595,14 +1815,36 @@ function getWorkspacePathFromRepo(
 }
 
 function getWorkspacePathFromInfo(
-  workspace: Pick<ConductorWorkspaceInfo, "repoName" | "workspacePath">,
+  workspace: Pick<
+    ConductorWorkspaceInfo,
+    "repoName" | "workspacePath" | "hostingServerUrl" | "sandboxProvider"
+  >,
   workspaceName: string
-): string {
+): string | null {
   if (workspace.workspacePath?.trim()) {
+    // For cloud workspaces workspace_path is the local sync mirror — only
+    // trust it when it actually exists on this machine.
+    if (
+      isRemoteConductorWorkspace(workspace) &&
+      !existsSync(workspace.workspacePath)
+    ) {
+      return null;
+    }
     return workspace.workspacePath;
+  }
+  if (isRemoteConductorWorkspace(workspace)) {
+    return null;
   }
   const repoName = workspace.repoName ?? workspaceName;
   return path.join(CONDUCTOR_WORKSPACES_DIR, repoName, workspaceName);
+}
+
+/** Agent types the bot can spawn locally. Cursor (0.63+) and future agents are
+ * observe-only: resuming their sessions with the Claude CLI would corrupt them. */
+function isSpawnableAgentType(rawAgentType: string | null): boolean {
+  return (
+    rawAgentType === null || rawAgentType === "claude" || rawAgentType === "codex"
+  );
 }
 
 function getTableColumns(db: Database.Database, table: string): Set<string> {
@@ -1655,6 +1897,10 @@ function insertConductorWorkspace(
   if (workspaceColumns.has("workspace_path")) {
     columns.push("workspace_path");
     values.push(opts.workspaceDir);
+  }
+  if (workspaceColumns.has("workspace_name")) {
+    columns.push("workspace_name");
+    values.push(opts.cityName);
   }
   if (workspaceColumns.has("permission_level")) {
     columns.push("permission_level");
@@ -1775,16 +2021,33 @@ export interface ConductorWorkspaceInfo {
   sessionId: string;
   agentSessionId: string | null;
   agentType: AgentType;
+  /** Raw sessions.agent_type — may be an agent the bot can't spawn (cursor). */
+  rawAgentType: string | null;
   model: string | null;
   repoName: string | null;
   repoPath: string | null;
   workspacePath: string | null;
+  /** User-visible name: workspace_name when set (0.72+), else directory_name. */
+  displayName: string;
+  directoryName: string;
   status: string | null;
   state: string | null;
   derivedStatus: string | null;
   pinnedAt: string | null;
   sessionHidden: boolean;
   targetBranch: string | null;
+  hostingServerUrl: string | null;
+  sandboxProvider: string | null;
+  remoteFileSyncEnabled: boolean;
+}
+
+/** A Conductor Cloud workspace: hosted in a remote sandbox, not on this Mac. */
+export function isRemoteConductorWorkspace(
+  workspace: Pick<ConductorWorkspaceInfo, "hostingServerUrl" | "sandboxProvider">
+): boolean {
+  return Boolean(
+    workspace.hostingServerUrl?.trim() || workspace.sandboxProvider?.trim()
+  );
 }
 
 export function isConductorWorkspaceVisible(
@@ -1815,18 +2078,52 @@ function markConductorWorkspaceActive(workspaceId: string): void {
   }
 }
 
+/** Feature-detected SELECT fragments for columns added in newer Conductor versions. */
+function workspaceOptionalSelects(db: Database.Database): {
+  workspacePath: string;
+  workspaceName: string;
+  hostingServerUrl: string;
+  sandboxProvider: string;
+  remoteFileSync: string;
+  hasWorkspaceName: boolean;
+} {
+  const columns = getTableColumns(db, "workspaces");
+  return {
+    workspacePath: columns.has("workspace_path")
+      ? "w.workspace_path"
+      : "NULL as workspace_path",
+    workspaceName: columns.has("workspace_name")
+      ? "w.workspace_name"
+      : "NULL as workspace_name",
+    hostingServerUrl: columns.has("hosting_server_url")
+      ? "w.hosting_server_url"
+      : "NULL as hosting_server_url",
+    sandboxProvider: columns.has("sandbox_provider")
+      ? "w.sandbox_provider"
+      : "NULL as sandbox_provider",
+    remoteFileSync: columns.has("remote_file_sync_enabled")
+      ? "w.remote_file_sync_enabled"
+      : "0 as remote_file_sync_enabled",
+    hasWorkspaceName: columns.has("workspace_name"),
+  };
+}
+
 function getWorkspaceFromConductorDb(
-  directoryName: string,
+  workspaceName: string,
   repoPath: string | null = null
 ): ConductorWorkspaceInfo | null {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const workspaceColumns = getTableColumns(db, "workspaces");
-    const workspacePathSelect = workspaceColumns.has("workspace_path")
-      ? "w.workspace_path"
-      : "NULL as workspace_path";
-    const where = ["w.directory_name = ?"];
-    const params: any[] = [directoryName];
+    const optional = workspaceOptionalSelects(db);
+    // 0.72+ lets users rename workspaces (workspace_name); match either the
+    // directory name (the bot's stored identity) or the user-set name.
+    const nameMatch = optional.hasWorkspaceName
+      ? "(w.directory_name = ? OR w.workspace_name = ?)"
+      : "w.directory_name = ?";
+    const where = [nameMatch];
+    const params: any[] = optional.hasWorkspaceName
+      ? [workspaceName, workspaceName]
+      : [workspaceName];
     if (repoPath) {
       where.push("r.root_path = ?");
       params.push(repoPath);
@@ -1835,6 +2132,7 @@ function getWorkspaceFromConductorDb(
       `SELECT
           w.id as workspace_id,
           w.active_session_id as session_id,
+          w.directory_name,
           s.model,
           s.status,
           s.agent_type,
@@ -1842,7 +2140,11 @@ function getWorkspaceFromConductorDb(
           s.is_hidden as session_hidden,
           r.name as repo_name,
           r.root_path as repo_path,
-          ${workspacePathSelect},
+          ${optional.workspacePath},
+          ${optional.workspaceName},
+          ${optional.hostingServerUrl},
+          ${optional.sandboxProvider},
+          ${optional.remoteFileSync},
           w.state,
           w.derived_status,
           w.pinned_at,
@@ -1861,31 +2163,46 @@ function getWorkspaceFromConductorDb(
 
     if (!repoPath && rows.length > 1) {
       console.warn(
-        `[launcher] ambiguous Conductor workspace "${directoryName}" matched ${rows.length} repos; caller must pass repoPath`
+        `[launcher] ambiguous Conductor workspace "${workspaceName}" matched ${rows.length} repos; caller must pass repoPath`
       );
       return null;
     }
     const row = rows[0];
     if (!row?.workspace_id || !row?.session_id) return null;
-    return {
-      workspaceId: row.workspace_id,
-      sessionId: row.session_id,
-      agentSessionId: row.agent_session_id ?? null,
-      agentType: normalizeAgentType(row.agent_type) ?? "claude",
-      model: row.model,
-      repoName: row.repo_name ?? null,
-      repoPath: row.repo_path ?? null,
-      workspacePath: row.workspace_path ?? null,
-      status: row.status ?? null,
-      state: row.state ?? null,
-      derivedStatus: row.derived_status ?? null,
-      pinnedAt: row.pinned_at ?? null,
-      sessionHidden: row.session_hidden === 1,
-      targetBranch: row.target_branch ?? null,
-    };
+    return mapConductorWorkspaceRow(row);
   } catch {
     return null;
   }
+}
+
+function mapConductorWorkspaceRow(row: any): ConductorWorkspaceInfo {
+  const directoryName = row.directory_name ?? "";
+  const userSetName =
+    typeof row.workspace_name === "string" && row.workspace_name.trim()
+      ? row.workspace_name.trim()
+      : null;
+  return {
+    workspaceId: row.workspace_id,
+    sessionId: row.session_id,
+    agentSessionId: row.agent_session_id ?? null,
+    agentType: normalizeAgentType(row.agent_type) ?? "claude",
+    rawAgentType: row.agent_type ?? null,
+    model: row.model,
+    repoName: row.repo_name ?? null,
+    repoPath: row.repo_path ?? null,
+    workspacePath: row.workspace_path ?? null,
+    displayName: userSetName ?? directoryName,
+    directoryName,
+    status: row.status ?? null,
+    state: row.state ?? null,
+    derivedStatus: row.derived_status ?? null,
+    pinnedAt: row.pinned_at ?? null,
+    sessionHidden: row.session_hidden === 1,
+    targetBranch: row.target_branch ?? null,
+    hostingServerUrl: row.hosting_server_url ?? null,
+    sandboxProvider: row.sandbox_provider ?? null,
+    remoteFileSyncEnabled: row.remote_file_sync_enabled === 1,
+  };
 }
 
 export function getWorkspaceSessionInfo(
@@ -1893,6 +2210,323 @@ export function getWorkspaceSessionInfo(
   repoPath: string | null = null
 ): ConductorWorkspaceInfo | null {
   return getWorkspaceFromConductorDb(workspaceName, repoPath);
+}
+
+// ── Threads (multiple sessions per workspace, Conductor 0.44+) ──
+
+export interface ConductorSessionInfo {
+  sessionId: string;
+  workspaceId: string;
+  title: string | null;
+  status: string | null;
+  agentType: AgentType;
+  rawAgentType: string | null;
+  model: string | null;
+  claudeSessionId: string | null;
+  isActive: boolean;
+  createdAt: string | null;
+}
+
+const SESSION_SELECT = `
+  SELECT s.id as session_id, s.workspace_id, s.title, s.status, s.agent_type,
+         s.model, s.claude_session_id, s.created_at,
+         CASE WHEN w.active_session_id = s.id THEN 1 ELSE 0 END as is_active
+  FROM sessions s
+  JOIN workspaces w ON w.id = s.workspace_id`;
+
+function mapConductorSessionRow(row: any): ConductorSessionInfo {
+  return {
+    sessionId: row.session_id,
+    workspaceId: row.workspace_id,
+    title: row.title ?? null,
+    status: row.status ?? null,
+    agentType: normalizeAgentType(row.agent_type) ?? "claude",
+    rawAgentType: row.agent_type ?? null,
+    model: row.model ?? null,
+    claudeSessionId: row.claude_session_id ?? null,
+    isActive: row.is_active === 1,
+    createdAt: row.created_at ?? null,
+  };
+}
+
+/** All visible (non-hidden) sessions of a Conductor workspace — its threads. */
+export function getConductorWorkspaceSessions(
+  workspaceId: string
+): ConductorSessionInfo[] {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const rows = db.prepare(
+      `${SESSION_SELECT}
+       WHERE s.workspace_id = ? AND COALESCE(s.is_hidden, 0) = 0
+       ORDER BY s.created_at ASC, s.id ASC`
+    ).all(workspaceId) as any[];
+    db.close();
+    return rows.map(mapConductorSessionRow);
+  } catch {
+    return [];
+  }
+}
+
+export function getConductorSessionById(
+  sessionId: string
+): ConductorSessionInfo | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = db.prepare(
+      `${SESSION_SELECT} WHERE s.id = ?`
+    ).get(sessionId) as any;
+    db.close();
+    return row ? mapConductorSessionRow(row) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Make a thread the workspace's active session (mirrors switching tabs in the app). */
+export function setConductorActiveSession(
+  workspaceId: string,
+  sessionId: string
+): boolean {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    const result = db.prepare(
+      `UPDATE workspaces
+       SET active_session_id = ?, updated_at = datetime('now')
+       WHERE id = ?
+         AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = ? AND s.workspace_id = ?)`
+    ).run(sessionId, workspaceId, sessionId, workspaceId);
+    db.close();
+    return result.changes > 0;
+  } catch (err) {
+    console.error(`[launcher] Failed to set active session:`, err);
+    return false;
+  }
+}
+
+export interface ConductorWorkspaceListing {
+  workspaceId: string;
+  directoryName: string;
+  displayName: string;
+  repoName: string | null;
+  repoPath: string | null;
+  isRemote: boolean;
+  updatedAt: string | null;
+}
+
+/** Recent non-archived Conductor workspaces (for /watch discovery). */
+export function listRecentConductorWorkspaces(limit = 15): ConductorWorkspaceListing[] {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const optional = workspaceOptionalSelects(db);
+    const rows = db.prepare(
+      `SELECT w.id as workspace_id, w.directory_name, w.updated_at,
+              r.name as repo_name, r.root_path as repo_path,
+              ${optional.workspaceName},
+              ${optional.hostingServerUrl},
+              ${optional.sandboxProvider}
+       FROM workspaces w
+       LEFT JOIN repos r ON r.id = w.repository_id
+       WHERE COALESCE(w.state, 'ready') != 'archived'
+       ORDER BY datetime(w.updated_at) DESC
+       LIMIT ?`
+    ).all(limit) as any[];
+    db.close();
+    return rows.map((row) => {
+      const userSetName =
+        typeof row.workspace_name === "string" && row.workspace_name.trim()
+          ? row.workspace_name.trim()
+          : null;
+      return {
+        workspaceId: row.workspace_id,
+        directoryName: row.directory_name ?? "",
+        displayName: userSetName ?? row.directory_name ?? "",
+        repoName: row.repo_name ?? null,
+        repoPath: row.repo_path ?? null,
+        isRemote: Boolean(row.hosting_server_url || row.sandbox_provider),
+        updatedAt: row.updated_at ?? null,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+// ── Conductor Cloud steering (experimental) ──────────────────
+//
+// Cloud workspaces run their agents in remote sandboxes; the bot can't spawn a
+// CLI against them. The Mac app queues user messages as `session_messages`
+// rows (queue_order set, sent_at NULL until dispatch) and dispatches them to
+// the agent. We mimic that write and watch whether the running app picks it
+// up. Capability is probed once per workspace and cached in bot meta.
+
+const REMOTE_STEERING_MODE = (
+  process.env.TELEGRAM_REMOTE_STEERING ?? "queue"
+).trim().toLowerCase();
+const STEER_DISPATCH_TIMEOUT_MS = 45_000;
+const STEER_POLL_INTERVAL_MS = 1_500;
+
+function steerCapabilityKey(workspaceId: string): string {
+  return `remote_steer:${workspaceId}`;
+}
+
+function remoteObserveOnlyError(wsInfo: ConductorWorkspaceInfo): SendError {
+  return {
+    error: `☁️ "${wsInfo.displayName}" is a Conductor Cloud workspace in observe-only mode — its activity mirrors here, but steering from Telegram isn't available. Open it in Conductor on your Mac to reply.`,
+    reason: "remote_observe_only",
+  };
+}
+
+async function steerRemoteSession(
+  wsInfo: ConductorWorkspaceInfo,
+  target: SessionSendTarget,
+  prompt: string,
+  attachmentSourcePaths: string[]
+): Promise<SendSuccess | SendError> {
+  if (REMOTE_STEERING_MODE !== "queue") {
+    return remoteObserveOnlyError(wsInfo);
+  }
+  const capability = getMetaValue(steerCapabilityKey(wsInfo.workspaceId));
+  if (capability === "observe") {
+    return remoteObserveOnlyError(wsInfo);
+  }
+
+  const droppedCount = attachmentSourcePaths.length;
+  let text = prompt.trim() || "(empty message)";
+  if (droppedCount > 0) {
+    text += `\n\n[Note: ${droppedCount} Telegram attachment(s) could not be delivered to this cloud workspace.]`;
+  }
+  const warning =
+    droppedCount > 0
+      ? `⚠️ ${droppedCount === 1 ? "The attachment" : `${droppedCount} attachments`} couldn't be delivered — ☁️ cloud workspaces can't receive Telegram files yet. Only the text was sent.`
+      : undefined;
+
+  const queued = queueUserMessageInConductorDb(
+    target.sessionId,
+    text,
+    target.model
+  );
+  if (!queued) {
+    return {
+      error: `Could not queue a message for "${wsInfo.displayName}" — this Conductor version may not support message queueing.`,
+    };
+  }
+
+  const sessionBusy = target.status === "working";
+  if (sessionBusy && capability === "queue") {
+    // Verified workspace with a busy agent: the app dispatches queued
+    // messages when the agent frees up, same as sending from the app UI.
+    console.log(
+      `[steer] message queued behind busy agent for ${wsInfo.displayName} (${target.sessionId})`
+    );
+    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
+  }
+
+  const dispatched = await waitForQueuedDispatch(queued.messageId);
+  if (dispatched) {
+    setMetaValue(steerCapabilityKey(wsInfo.workspaceId), "queue");
+    console.log(
+      `[steer] queued message dispatched for ${wsInfo.displayName} (${target.sessionId})`
+    );
+    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
+  }
+
+  removeQueuedMessageIfUndispatched(queued.messageId);
+  if (sessionBusy) {
+    // Can't distinguish "app never dispatches bot rows" from "agent is just
+    // busy" — don't poison the capability cache; ask the user to retry.
+    return {
+      error: `The agent in ☁️ "${wsInfo.displayName}" is busy and steering isn't verified yet for this workspace. Try again once it's idle.`,
+      reason: "remote_steer_unverified",
+    };
+  }
+  setMetaValue(steerCapabilityKey(wsInfo.workspaceId), "observe");
+  console.warn(
+    `[steer] queued message was not dispatched for ${wsInfo.displayName}; marking workspace observe-only`
+  );
+  return remoteObserveOnlyError(wsInfo);
+}
+
+function queueUserMessageInConductorDb(
+  sessionId: string,
+  text: string,
+  model: string | null
+): { messageId: string } | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    const columns = getTableColumns(db, "session_messages");
+    if (!columns.has("queue_order")) {
+      db.close();
+      return null;
+    }
+
+    const messageId = randomUUID();
+    const now = new Date().toISOString();
+    // Mirror the app's own queued-row shape (sampled from a live 0.72 DB):
+    // turn_id = id, model = raw session model, sender_id = the app's client
+    // user id, sent_at NULL until the app dispatches.
+    const nextOrder = db.prepare(
+      `SELECT COALESCE(MAX(queue_order), 0) + 1 as next_order
+       FROM session_messages
+       WHERE session_id = ? AND sent_at IS NULL AND queue_order IS NOT NULL`
+    ).get(sessionId) as { next_order?: number } | undefined;
+    const senderId = db.prepare(
+      "SELECT value FROM settings WHERE key = 'roundhouse_client_user_id'"
+    ).get() as { value?: string } | undefined;
+
+    const insertColumns = [
+      "id", "session_id", "role", "content", "created_at", "sent_at",
+      "model", "turn_id", "queue_order",
+    ];
+    const values: unknown[] = [
+      messageId, sessionId, "user", text, now, null,
+      model, messageId, nextOrder?.next_order ?? 1,
+    ];
+    if (columns.has("sender_id")) {
+      insertColumns.push("sender_id");
+      values.push(senderId?.value ?? null);
+    }
+
+    db.prepare(
+      `INSERT INTO session_messages (${insertColumns.join(", ")})
+       VALUES (${insertColumns.map(() => "?").join(", ")})`
+    ).run(...values);
+    db.close();
+    return { messageId };
+  } catch (err) {
+    console.error(`[steer] Failed to queue message:`, err);
+    return null;
+  }
+}
+
+async function waitForQueuedDispatch(messageId: string): Promise<boolean> {
+  const deadline = Date.now() + STEER_DISPATCH_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(STEER_POLL_INTERVAL_MS);
+    try {
+      const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+      const row = db.prepare(
+        "SELECT sent_at FROM session_messages WHERE id = ?"
+      ).get(messageId) as { sent_at?: string | null } | undefined;
+      db.close();
+      if (row && row.sent_at) return true;
+      if (!row) return false; // The app removed the row — treat as rejected.
+    } catch {
+      // Transient read error (WAL churn): keep polling until the deadline.
+    }
+  }
+  return false;
+}
+
+function removeQueuedMessageIfUndispatched(messageId: string): void {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    db.prepare(
+      "DELETE FROM session_messages WHERE id = ? AND sent_at IS NULL"
+    ).run(messageId);
+    db.close();
+  } catch (err) {
+    console.error(`[steer] Failed to clean up queued message:`, err);
+  }
 }
 
 /**
@@ -1965,6 +2599,41 @@ export function getSessionResult(
        WHERE ${where.join(" AND ")}
        ORDER BY sm.created_at DESC LIMIT 5`
     ).all(...params) as any[];
+    db.close();
+
+    for (const row of rows) {
+      try {
+        const content = JSON.parse(row.content);
+        if (content.type === "result") {
+          return {
+            resultText: content.result ?? "",
+            costUsd: content.total_cost_usd ?? 0,
+            durationMs: content.duration_ms ?? 0,
+            numTurns: content.num_turns ?? 0,
+            isError: content.is_error ?? false,
+          };
+        }
+      } catch {
+        // Not JSON or wrong shape
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Per-session variant of getSessionResult, for thread-level completion notices. */
+export function getSessionResultBySessionId(
+  sessionId: string
+): SessionResult | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const rows = db.prepare(
+      `SELECT content FROM session_messages
+       WHERE session_id = ? AND role = 'assistant'
+       ORDER BY created_at DESC LIMIT 5`
+    ).all(sessionId) as any[];
     db.close();
 
     for (const row of rows) {
