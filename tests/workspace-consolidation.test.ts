@@ -10,6 +10,7 @@ import {
   formatAttachmentReference,
   inferAgentTypeFromModel,
   isConductorWorkspaceVisible,
+  simplifyModel,
 } from "../src/bot/launcher.js";
 import { runStartupMaintenance } from "../src/store/maintenance.js";
 
@@ -69,10 +70,21 @@ test("Conductor visibility hides archived or hidden workspaces", () => {
 
 test("model family detection recognizes Codex and Claude model names", () => {
   assert.equal(inferAgentTypeFromModel("gpt-5.5"), "codex");
+  assert.equal(inferAgentTypeFromModel("gpt-5.6-sol"), "codex");
   assert.equal(inferAgentTypeFromModel("o4-mini"), "codex");
   assert.equal(inferAgentTypeFromModel("opus-1m"), "claude");
   assert.equal(inferAgentTypeFromModel("claude-sonnet-4-5"), "claude");
+  assert.equal(inferAgentTypeFromModel("fable-5"), "claude");
+  assert.equal(inferAgentTypeFromModel("claude-fable-5"), "claude");
   assert.equal(inferAgentTypeFromModel("custom-router-model"), null);
+});
+
+test("simplifyModel collapses model ids to their display family", () => {
+  assert.equal(simplifyModel("claude-fable-5"), "fable");
+  assert.equal(simplifyModel("fable-5"), "fable");
+  assert.equal(simplifyModel("claude-opus-4-8"), "opus");
+  assert.equal(simplifyModel("custom-router-model"), "custom-router-model");
+  assert.equal(simplifyModel(null), null);
 });
 
 test("OpenAI Conductor default model selects Codex when no Telegram agent is configured", () => {
@@ -131,7 +143,7 @@ test("Claude launch skips incompatible OpenAI model history", () => {
     ) as { agentType: string; model: string };
 
     assert.equal(result.agentType, "claude");
-    assert.equal(result.model, "opus");
+    assert.equal(result.model, "claude-fable-5");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

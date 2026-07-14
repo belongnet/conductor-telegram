@@ -28,8 +28,8 @@ const CODEX_BIN =
 const TELEGRAM_AGENT_PERMISSION_MODE =
   process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? "bypassPermissions";
 
-const DEFAULT_CLAUDE_MODEL = "opus";
-const DEFAULT_CODEX_MODEL = "gpt-5.4";
+const DEFAULT_CLAUDE_MODEL = "claude-fable-5";
+const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 
 // City names for workspace directory naming (matches Conductor's convention)
 const CITY_NAMES = [
@@ -180,7 +180,7 @@ export function inferAgentTypeFromModel(
   if (/^(gpt|o\d|codex)([-_.]|$)/.test(normalized)) {
     return "codex";
   }
-  if (/(^|[-_.])(claude|opus|sonnet|haiku)([-_.]|$)/.test(normalized)) {
+  if (/(^|[-_.])(claude|opus|sonnet|haiku|fable)([-_.]|$)/.test(normalized)) {
     return "claude";
   }
   return null;
@@ -1072,11 +1072,12 @@ function extractTextValue(value: any): string | null {
   return JSON.stringify(value);
 }
 
-function simplifyModel(model: string | null | undefined): string | null {
+export function simplifyModel(model: string | null | undefined): string | null {
   if (!model) return null;
   if (model.includes("opus")) return "opus";
   if (model.includes("sonnet")) return "sonnet";
   if (model.includes("haiku")) return "haiku";
+  if (model.includes("fable")) return "fable";
   return model;
 }
 
