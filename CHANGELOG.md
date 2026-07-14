@@ -4,6 +4,26 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-04
+
+### Fixed
+- Existing bot databases now add `telegram_message_links.session_id` before creating the session index, so upgrading from 0.3.x no longer crashes startup with `no such column: session_id`.
+
+## [0.4.0] - 2026-07-04
+
+### Added
+- Conductor 0.72 thread support. The poller now follows every visible Conductor session in a tracked workspace, labels forwarded messages with the thread title when there is more than one thread, and stores a per-session forwarding cursor.
+- `/threads` lists Conductor threads for a workspace, switches the default active thread, and can start a new thread from Telegram.
+- Reply routing now preserves the Conductor session behind a forwarded Telegram message, so replies land in the exact thread that produced the message.
+- Conductor Cloud workspaces are detected from the local Conductor DB and marked with ☁️ in Telegram lists. Remote workspaces use queued-message steering when Conductor dispatches bot-inserted rows, and fall back to clear observe-only notices when steering is unavailable.
+- `conductor-telegram doctor` now reports `~/.conductor/settings.toml` and Conductor 0.72 schema capabilities, including cloud, thread titles, and queued messages.
+
+### Changed
+- Conductor settings are read from `~/.conductor/settings.toml` first, with the legacy `settings` DB table as fallback. This covers default/review models, Codex thinking levels, Claude effort levels, and git branch prefix settings.
+- Bot-created workspaces follow Conductor's current branch prefix convention, including explicit `git.branch_prefix` and GitHub-username prefixes.
+- Voice/audio polish: audio files sent as Telegram audio or documents are transcribed like voice notes when possible, and `TELEGRAM_WHISPER_MODEL=base` resolves to the bundled whisper.cpp base model path.
+- Cursor-agent sessions are treated as observe-only instead of being resumed with the wrong local CLI.
+
 ## [0.3.11] - 2026-06-03
 
 ### Fixed

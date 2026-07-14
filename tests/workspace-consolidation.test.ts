@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -188,6 +188,96 @@ test("Conductor workspace lookup prefers the newest timestamp even across mixed 
   }
 });
 
+test("Conductor workspace lookup matches workspace_name and detects cloud workspaces", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-cloud-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'idle', datetime('now'), 'ws-1', 0, 'gpt-5.5', 'codex')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, workspace_name, active_session_id,
+         updated_at, state, derived_status, pinned_at, initialization_parent_branch,
+         intended_target_branch, hosting_server_url, sandbox_provider, remote_file_sync_enabled)
+       VALUES
+        ('ws-1', 'repo-1', 'cloud-dir', 'Cloud Friendly', 'session-1',
+         '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main',
+         'main', 'https://sandbox.example', 'vercel', 1)`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { getWorkspaceSessionInfo, isRemoteConductorWorkspace } from "./src/bot/launcher.ts";
+        const info = getWorkspaceSessionInfo("Cloud Friendly", "/tmp/repo");
+        console.log(JSON.stringify({
+          displayName: info?.displayName,
+          directoryName: info?.directoryName,
+          remote: info ? isRemoteConductorWorkspace(info) : false,
+          remoteFileSyncEnabled: info?.remoteFileSyncEnabled
+        }));
+      `,
+      { CONDUCTOR_DB_PATH: dbPath }
+    ) as {
+      displayName: string;
+      directoryName: string;
+      remote: boolean;
+      remoteFileSyncEnabled: boolean;
+    };
+
+    assert.equal(result.displayName, "Cloud Friendly");
+    assert.equal(result.directoryName, "cloud-dir");
+    assert.equal(result.remote, true);
+    assert.equal(result.remoteFileSyncEnabled, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cursor sessions are observe-only from Telegram steering", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-cursor-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'idle', datetime('now'), 'ws-1', 0, 'cursor-model', 'cursor')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state,
+         derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'cursor-ws', 'session-1', '2026-05-19 00:00:00',
+         'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(await sendToSession("cursor-ws", "hello", [], { repoPath: "/tmp/repo" })));
+      `,
+      { CONDUCTOR_DB_PATH: dbPath }
+    ) as { reason: string };
+
+    assert.equal(result.reason, "unsupported_agent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("workspace directories use Conductor repo names when root folder names differ", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-conductor-path-"));
   try {
@@ -318,6 +408,197 @@ test("startup maintenance prunes old events and archived message links", () => {
   }
 });
 
+test("claude follow-ups resume the stored claude_session_id, not the Conductor session id", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-resume-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    // App-created thread: the real Claude session id differs from the row id.
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const argsOut = path.join(dir, "claude-args.txt");
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(fakeClaude, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsOut}"\nexit 0\n`);
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import { readFileSync } from "node:fs";
+        import { sendToSession } from "./src/bot/launcher.ts";
+        const sendResult = await sendToSession("local-ws", "hello again", [], { repoPath: "/tmp/repo" });
+        if (!("ok" in sendResult)) {
+          console.log(JSON.stringify(sendResult));
+          process.exit(0);
+        }
+        const agentResult = await sendResult.done;
+        const args = readFileSync("${argsOut}", "utf8").trim().split("\\n");
+        console.log(JSON.stringify({ ok: true, exitCode: agentResult.exitCode, args }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as { ok?: boolean; error?: string; exitCode: number; args: string[] };
+
+    assert.equal(result.ok, true, `send failed: ${result.error}`);
+    assert.equal(result.exitCode, 0);
+    const resumeIndex = result.args.indexOf("--resume");
+    assert.notEqual(resumeIndex, -1, `expected --resume in ${result.args.join(" ")}`);
+    assert.equal(result.args[resumeIndex + 1], "claude-real-1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("failed claude runs surface an error result with stderr detail", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-fail-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh\necho "No conversation found with session ID: claude-real-1" >&2\nexit 1\n`
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        const sendResult = await sendToSession("local-ws", "hello", [], { repoPath: "/tmp/repo" });
+        if (!("ok" in sendResult)) {
+          console.log(JSON.stringify(sendResult));
+          process.exit(0);
+        }
+        const agentResult = await sendResult.done;
+        console.log(JSON.stringify(agentResult));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as { isError: boolean; exitCode: number | null; stderrTail?: string };
+
+    assert.equal(result.isError, true);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderrTail ?? "", /No conversation found/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cloud steering reports dropped attachments in the send warning", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-cloud-attach-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.exec(`
+      CREATE TABLE session_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        role TEXT,
+        content TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        sent_at TEXT,
+        model TEXT,
+        turn_id TEXT,
+        queue_order INTEGER
+      );
+    `);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    // Busy cloud session: verified queue capability returns without polling.
+    db.prepare(
+      `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('session-1', 'working', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, workspace_name, active_session_id,
+         updated_at, state, derived_status, pinned_at, initialization_parent_branch,
+         intended_target_branch, hosting_server_url, sandbox_provider, remote_file_sync_enabled)
+       VALUES
+        ('ws-1', 'repo-1', 'cloud-dir', 'honolulu', 'session-1',
+         '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main',
+         'main', 'https://sandbox.example', 'vercel', 1)`
+    ).run();
+    db.close();
+
+    const attachment = path.join(dir, "screenshot.jpg");
+    writeFileSync(attachment, "fake-image-bytes");
+
+    const result = runLauncherEval(
+      `
+        import { setMetaValue } from "./src/store/queries.ts";
+        import { sendToSession } from "./src/bot/launcher.ts";
+        setMetaValue("remote_steer:ws-1", "queue");
+        const sendResult = await sendToSession("honolulu", "", ["${attachment}"], { repoPath: "/tmp/repo" });
+        console.log(JSON.stringify(sendResult));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as { ok?: boolean; error?: string; warning?: string };
+
+    assert.equal(result.ok, true, `steer failed: ${result.error}`);
+    assert.match(result.warning ?? "", /couldn't be delivered/);
+
+    const verifyDb = new Database(dbPath);
+    const queued = verifyDb
+      .prepare("SELECT content FROM session_messages WHERE queue_order IS NOT NULL")
+      .get() as { content: string } | undefined;
+    verifyDb.close();
+    assert.match(queued?.content ?? "", /could not be delivered/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function createConductorDb(dbPath: string): Database {
   const db = new Database(dbPath);
   db.exec(`
@@ -336,7 +617,8 @@ function createConductorDb(dbPath: string): Database {
       workspace_id TEXT,
       is_hidden INTEGER DEFAULT 0,
       model TEXT,
-      agent_type TEXT
+      agent_type TEXT,
+      title TEXT
     );
     CREATE TABLE settings (
       key TEXT PRIMARY KEY,
@@ -346,8 +628,12 @@ function createConductorDb(dbPath: string): Database {
       id TEXT PRIMARY KEY,
       repository_id TEXT,
       directory_name TEXT,
+      workspace_name TEXT,
       active_session_id TEXT,
       workspace_path TEXT,
+      hosting_server_url TEXT,
+      sandbox_provider TEXT,
+      remote_file_sync_enabled INTEGER DEFAULT 0,
       updated_at TEXT,
       state TEXT,
       derived_status TEXT,
