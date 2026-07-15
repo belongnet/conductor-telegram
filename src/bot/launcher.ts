@@ -201,23 +201,6 @@ function getSettingValue(key: string): string | null {
   return getConductorSetting(key);
 }
 
-function getRecentModelForAgent(agentType: AgentType): string | null {
-  try {
-    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const row = db.prepare(
-      `SELECT model
-       FROM sessions
-       WHERE agent_type = ? AND model IS NOT NULL AND trim(model) != ''
-       ORDER BY created_at DESC
-       LIMIT 1`
-    ).get(agentType) as { model?: string } | undefined;
-    db.close();
-    return typeof row?.model === "string" ? row.model : null;
-  } catch {
-    return null;
-  }
-}
-
 function hasAgentSessions(agentType: AgentType): boolean {
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
@@ -302,27 +285,17 @@ function resolveAgentModel(
     return normalizeModelForCli(envModel.trim());
   }
 
-  if (agentType === "claude") {
-    return (
-      firstCompatibleModel("claude", [
-        launchMode === "review"
-          ? getSettingValue("review_model")
-          : getSettingValue("default_model"),
-        getRecentModelForAgent("claude"),
-        DEFAULT_CLAUDE_MODEL,
-      ]) ?? DEFAULT_CLAUDE_MODEL
-    );
-  }
-
-  return (
-    firstCompatibleModel("codex", [
-      launchMode === "review"
-        ? getSettingValue("review_model")
-        : getSettingValue("default_model"),
-      getRecentModelForAgent("codex"),
-      DEFAULT_CODEX_MODEL,
-    ]) ?? DEFAULT_CODEX_MODEL
-  );
+  // Session history is deliberately not consulted here: the bot writes each
+  // launch's model back into the sessions table, so a historical model would
+  // re-elect itself on every launch and shipped default upgrades would never
+  // take effect.
+  const configuredModel =
+    launchMode === "review"
+      ? getSettingValue("review_model")
+      : getSettingValue("default_model");
+  const fallback =
+    agentType === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
+  return firstCompatibleModel(agentType, [configuredModel]) ?? fallback;
 }
 
 function resolveCodexThinkingLevel(launchMode: LaunchMode): string | null {

@@ -104,6 +104,8 @@ test("OpenAI Conductor default model selects Codex when no Telegram agent is con
       `,
       {
         CONDUCTOR_DB_PATH: dbPath,
+        // Pre-0.72 Conductor: no settings.toml, DB rows are live.
+        CONDUCTOR_SETTINGS_PATH: path.join(dir, "no-settings.toml"),
         TELEGRAM_DEFAULT_AGENT_TYPE: "",
         TELEGRAM_DEFAULT_MODEL: "",
       }
@@ -116,17 +118,13 @@ test("OpenAI Conductor default model selects Codex when no Telegram agent is con
   }
 });
 
-test("Claude launch skips incompatible OpenAI model history", () => {
+test("forced Claude launch skips an incompatible live Conductor model setting", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-model-skip-"));
   try {
     const dbPath = path.join(dir, "conductor.db");
     const db = createConductorDb(dbPath);
     db.prepare(
       "INSERT INTO settings (key, value) VALUES ('default_model', 'gpt-5.5')"
-    ).run();
-    db.prepare(
-      `INSERT INTO sessions (id, status, updated_at, workspace_id, model, agent_type)
-       VALUES ('bad-claude-session', 'idle', datetime('now'), 'ws-1', 'gpt-5.5', 'claude')`
     ).run();
     db.close();
 
@@ -137,6 +135,8 @@ test("Claude launch skips incompatible OpenAI model history", () => {
       `,
       {
         CONDUCTOR_DB_PATH: dbPath,
+        // Pre-0.72 Conductor: no settings.toml, DB rows are live.
+        CONDUCTOR_SETTINGS_PATH: path.join(dir, "no-settings.toml"),
         TELEGRAM_DEFAULT_AGENT_TYPE: "claude",
         TELEGRAM_DEFAULT_MODEL: "",
       }
@@ -144,6 +144,98 @@ test("Claude launch skips incompatible OpenAI model history", () => {
 
     assert.equal(result.agentType, "claude");
     assert.equal(result.model, "claude-fable-5");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("deprecated Conductor settings and session history don't override shipped defaults", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-stale-model-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    // Conductor 0.72 migration freezes settings rows with a deprecated_at stamp.
+    db.exec("ALTER TABLE settings ADD COLUMN deprecated_at TEXT");
+    db.prepare(
+      "INSERT INTO settings (key, value, deprecated_at) VALUES ('default_model', 'gpt-5.5', '2026-06-06 11:03:39')"
+    ).run();
+    db.prepare(
+      "INSERT INTO settings (key, value, deprecated_at) VALUES ('review_model', 'opus-4-8-1m', '2026-06-06 11:03:39')"
+    ).run();
+    // Stale history left behind by the bot's own earlier launches.
+    db.prepare(
+      `INSERT INTO sessions (id, status, created_at, updated_at, workspace_id, model, agent_type)
+       VALUES ('old-claude', 'idle', '2026-07-01 10:00:00', '2026-07-01 10:00:00', 'ws-1', 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, created_at, updated_at, workspace_id, model, agent_type)
+       VALUES ('old-codex', 'idle', '2026-07-02 10:00:00', '2026-07-02 10:00:00', 'ws-1', 'gpt-5.4', 'codex')`
+    ).run();
+    db.close();
+
+    // settings.toml as Conductor 0.72+ writes it: sections present, no model values.
+    const tomlPath = path.join(dir, "settings.toml");
+    writeFileSync(tomlPath, "[models]\n[models.claude_code]\n[models.codex]\n");
+
+    const result = runLauncherEval(
+      `
+        import { resolveLaunchConfig } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify({
+          prompt: resolveLaunchConfig({}),
+          review: resolveLaunchConfig({ launchMode: "review" }),
+        }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_SETTINGS_PATH: tomlPath,
+        TELEGRAM_DEFAULT_AGENT_TYPE: "",
+        TELEGRAM_DEFAULT_MODEL: "",
+        TELEGRAM_REVIEW_AGENT_TYPE: "",
+        TELEGRAM_REVIEW_MODEL: "",
+      }
+    ) as {
+      prompt: { agentType: string; model: string };
+      review: { agentType: string; model: string };
+    };
+
+    assert.equal(result.prompt.agentType, "claude");
+    assert.equal(result.prompt.model, "claude-fable-5");
+    assert.equal(result.review.agentType, "codex");
+    assert.equal(result.review.model, "gpt-5.6-sol");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unstamped Conductor 0.72 DB settings remain live fallbacks", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-live-model-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.exec("ALTER TABLE settings ADD COLUMN deprecated_at TEXT");
+    db.prepare(
+      "INSERT INTO settings (key, value, deprecated_at) VALUES ('default_model', 'gpt-5.5', NULL)"
+    ).run();
+    db.close();
+
+    const tomlPath = path.join(dir, "settings.toml");
+    writeFileSync(tomlPath, "[models]\n");
+
+    const result = runLauncherEval(
+      `
+        import { resolveLaunchConfig } from "./src/bot/launcher.ts";
+        console.log(JSON.stringify(resolveLaunchConfig({})));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_SETTINGS_PATH: tomlPath,
+        TELEGRAM_DEFAULT_AGENT_TYPE: "",
+        TELEGRAM_DEFAULT_MODEL: "",
+      }
+    ) as { agentType: string; model: string };
+
+    assert.equal(result.agentType, "codex");
+    assert.equal(result.model, "gpt-5.5");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
