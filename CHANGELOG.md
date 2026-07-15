@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-15
+
+### Changed
+- New Claude workspaces now launch on Fable 5 by default (full model id `claude-fable-5`), and the launcher recognizes the Fable family when inferring agent type and simplifying model names. The default Codex model moves to `gpt-5.6-sol`.
+
 ## [0.4.2] - 2026-07-14
 
 ### Fixed
