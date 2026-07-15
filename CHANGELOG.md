@@ -4,6 +4,12 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-14
+
+### Fixed
+- Telegram-launched workspaces now auto-register valid git repositories in Conductor's repo database when the repo is visible on disk but missing from Conductor metadata.
+- Repo-only `"existing"` route decisions now continue the single running workspace in that repo instead of always starting a new workspace, while ambiguous matches still fall back safely.
+
 ## [0.4.1] - 2026-07-04
 
 ### Fixed
