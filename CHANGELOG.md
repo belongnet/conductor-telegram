@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-15
+
+### Changed
+- Completed, stopped, and archived workspace forum topics now switch to the folder topic icon, and the Archive button closes the topic after syncing that visual state instead of deleting it from the Telegram sidebar.
+
 ## [0.4.3] - 2026-07-15
 
 ### Changed
