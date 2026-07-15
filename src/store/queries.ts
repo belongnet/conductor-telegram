@@ -5,6 +5,7 @@ import type {
   PrChecksStatus,
   PrRecord,
   PrState,
+  ThreadCursor,
   Workspace,
   WorkspaceEvent,
   WorkspaceStatus,
@@ -246,33 +247,158 @@ export function updateWorkspaceForwardCursor(
   ).run(rowid, id);
 }
 
+// ── Thread cursors ───────────────────────────────────────────
+
+export function upsertThreadCursor(input: {
+  workspaceId: string;
+  sessionId: string;
+  lastForwardedRowid: number;
+  title?: string | null;
+}): ThreadCursor {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO thread_cursors
+      (workspace_id, session_id, last_forwarded_rowid, title, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(workspace_id, session_id) DO UPDATE SET
+       last_forwarded_rowid = excluded.last_forwarded_rowid,
+       title = COALESCE(excluded.title, thread_cursors.title),
+       updated_at = excluded.updated_at`
+  ).run(
+    input.workspaceId,
+    input.sessionId,
+    input.lastForwardedRowid,
+    input.title ?? null,
+    now,
+    now
+  );
+
+  const cursor = getThreadCursor(input.workspaceId, input.sessionId);
+  if (!cursor) {
+    throw new Error(`Failed to upsert thread cursor ${input.workspaceId}/${input.sessionId}`);
+  }
+  return cursor;
+}
+
+export function getThreadCursor(
+  workspaceId: string,
+  sessionId: string
+): ThreadCursor | undefined {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT * FROM thread_cursors
+       WHERE workspace_id = ? AND session_id = ?`
+    )
+    .get(workspaceId, sessionId) as any;
+  return row ? mapThreadCursorRow(row) : undefined;
+}
+
+export function getThreadCursorsForWorkspace(workspaceId: string): ThreadCursor[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT * FROM thread_cursors
+       WHERE workspace_id = ?
+       ORDER BY updated_at DESC`
+    )
+    .all(workspaceId) as any[];
+  return rows.map(mapThreadCursorRow);
+}
+
+export function updateThreadCursor(
+  workspaceId: string,
+  sessionId: string,
+  rowid: number,
+  title?: string | null
+): void {
+  upsertThreadCursor({
+    workspaceId,
+    sessionId,
+    lastForwardedRowid: rowid,
+    title,
+  });
+}
+
+export function deleteThreadCursorsNotIn(
+  workspaceId: string,
+  sessionIds: string[]
+): void {
+  const db = getDb();
+  if (sessionIds.length === 0) {
+    db.prepare("DELETE FROM thread_cursors WHERE workspace_id = ?").run(workspaceId);
+    return;
+  }
+  const placeholders = sessionIds.map(() => "?").join(",");
+  db.prepare(
+    `DELETE FROM thread_cursors
+     WHERE workspace_id = ? AND session_id NOT IN (${placeholders})`
+  ).run(workspaceId, ...sessionIds);
+}
+
 export function linkTelegramMessage(
   chatId: string,
   telegramMessageId: string,
-  workspaceId: string
+  workspaceId: string,
+  sessionId?: string | null
 ): void {
   const db = getDb();
   db.prepare(
     `INSERT OR REPLACE INTO telegram_message_links
-      (chat_id, telegram_message_id, workspace_id)
-     VALUES (?, ?, ?)`
-  ).run(chatId, telegramMessageId, workspaceId);
+      (chat_id, telegram_message_id, workspace_id, session_id)
+     VALUES (?, ?, ?, ?)`
+  ).run(chatId, telegramMessageId, workspaceId, sessionId ?? null);
 }
 
 export function getWorkspaceByTelegramMessage(
   chatId: string,
   telegramMessageId: string
 ): Workspace | undefined {
+  return getWorkspaceMessageTarget(chatId, telegramMessageId)?.workspace;
+}
+
+export function getWorkspaceMessageTarget(
+  chatId: string,
+  telegramMessageId: string
+): { workspace: Workspace; sessionId: string | null } | undefined {
   const db = getDb();
   const row = db
     .prepare(
-      `SELECT w.*
+      `SELECT w.*, tml.session_id as linked_session_id
        FROM telegram_message_links tml
        JOIN workspaces w ON w.id = tml.workspace_id
        WHERE tml.chat_id = ? AND tml.telegram_message_id = ? AND w.archived_at IS NULL`
     )
     .get(chatId, telegramMessageId) as any;
-  return row ? mapWorkspaceRow(row) : undefined;
+  return row
+    ? {
+        workspace: mapWorkspaceRow(row),
+        sessionId: row.linked_session_id ?? null,
+      }
+    : undefined;
+}
+
+// ── Meta ────────────────────────────────────────────────────
+
+export function getMetaValue(key: string): string | null {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get(key) as { value?: string } | undefined;
+  return typeof row?.value === "string" ? row.value : null;
+}
+
+export function setMetaValue(key: string, value: string): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO meta (key, value, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  ).run(key, value, now);
 }
 
 // ── Repo Topics ────────────────────────────────────────────────
@@ -423,6 +549,17 @@ function mapWorkspaceRow(row: any): Workspace {
     lastForwardedMessageRowid: Number(row.last_forwarded_message_rowid ?? 0),
     telegramThreadId: row.telegram_thread_id ?? null,
     archivedAt: row.archived_at ?? null,
+  };
+}
+
+function mapThreadCursorRow(row: any): ThreadCursor {
+  return {
+    workspaceId: row.workspace_id,
+    sessionId: row.session_id,
+    lastForwardedRowid: Number(row.last_forwarded_rowid ?? 0),
+    title: row.title ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 

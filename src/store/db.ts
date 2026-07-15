@@ -40,12 +40,26 @@ const SCHEMA = `
     chat_id TEXT NOT NULL,
     telegram_message_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    session_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (chat_id, telegram_message_id)
   );
 
   CREATE INDEX IF NOT EXISTS idx_telegram_message_links_workspace
     ON telegram_message_links(workspace_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS thread_cursors (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    session_id TEXT NOT NULL,
+    last_forwarded_rowid INTEGER NOT NULL DEFAULT 0,
+    title TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (workspace_id, session_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_thread_cursors_workspace
+    ON thread_cursors(workspace_id, updated_at);
 
   CREATE TABLE IF NOT EXISTS bot_heartbeat (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -150,6 +164,11 @@ export function getDb(dbPath?: string): Database.Database {
   );
   ensureColumn(_db, "workspaces", "telegram_thread_id", "INTEGER");
   ensureColumn(_db, "workspaces", "archived_at", "TEXT");
+  ensureColumn(_db, "telegram_message_links", "session_id", "TEXT");
+  _db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_telegram_message_links_session
+      ON telegram_message_links(session_id, created_at);
+  `);
   return _db;
 }
 

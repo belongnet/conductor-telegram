@@ -22,22 +22,31 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   getMaxSessionMessageRowId,
+  getConductorWorkspaceSessions,
   getSessionMessagesAfter,
-  getSessionResult,
+  getSessionResultBySessionId,
   getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
+  isRemoteConductorWorkspace,
+  type ConductorSessionInfo,
   type SessionMessage,
 } from "./launcher.js";
 import {
   archiveWorkspace,
+  deleteThreadCursorsNotIn,
   getAllThreadedWorkspaces,
   getAllWorkspaces,
   getArtifactEvents,
   getMaxEventId,
+  getMetaValue,
   getNewEvents,
+  getThreadCursor,
   getWorkspace,
   linkTelegramMessage,
+  setMetaValue,
+  updateThreadCursor,
+  upsertThreadCursor,
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
@@ -47,6 +56,7 @@ import type {
   ArtifactPayload,
   HumanRequestPayload,
   StatusPayload,
+  ThreadCursor,
   Workspace,
 } from "../types/index.js";
 import {
@@ -266,12 +276,13 @@ async function recoverMissingWorkspaceTopic(ws: Workspace): Promise<number | nul
 async function sendForwardToWorkspaceTopic(
   ws: Workspace,
   htmlText: string,
-  media: InlineMediaItem[]
+  media: InlineMediaItem[],
+  sessionId?: string | null
 ): Promise<void> {
   if (media.length === 0) {
     await sendToWorkspaceTopic(ws, htmlText, { parse_mode: "HTML" })
       .then((sent) => {
-        linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id);
+        linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id, sessionId);
       });
     return;
   }
@@ -288,7 +299,7 @@ async function sendForwardToWorkspaceTopic(
       captionForFirst
     );
     if (sentMessageId !== null) {
-      linkTelegramMessage(ws.telegramChatId, String(sentMessageId), ws.id);
+      linkTelegramMessage(ws.telegramChatId, String(sentMessageId), ws.id, sessionId);
     }
   } else {
     // Split into chunks of 10 (Telegram's media-group cap). The caption rides the
@@ -300,14 +311,14 @@ async function sendForwardToWorkspaceTopic(
       isFirstChunk = false;
       const sentMessages = await sendMediaGroupToWorkspaceTopic(ws, chunk, caption);
       for (const sent of sentMessages) {
-        linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id);
+        linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id, sessionId);
       }
     }
   }
 
   if (trailingText) {
     await sendToWorkspaceTopic(ws, trailingText, { parse_mode: "HTML" }).then((sent) => {
-      linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id);
+      linkTelegramMessage(ws.telegramChatId, String(sent.message_id), ws.id, sessionId);
     });
   }
 }
@@ -433,35 +444,57 @@ function startSessionPoller(): void {
 
         if (ws.conductorSessionId !== sessionInfo.sessionId) {
           updateWorkspaceConductorSession(ws.id, sessionInfo.sessionId);
-          const baselineRowId = getMaxSessionMessageRowId(sessionInfo.sessionId);
-          updateWorkspaceForwardCursor(ws.id, baselineRowId);
-          continue;
         }
 
-        const newMessages = getSessionMessagesAfter(
-          sessionInfo.sessionId,
-          ws.lastForwardedMessageRowid
+        const sessions = getConductorWorkspaceSessions(sessionInfo.workspaceId);
+        const visibleSessions =
+          sessions.length > 0 ? sessions : [activeSessionFromWorkspaceInfo(sessionInfo)];
+        const hasMultipleThreads = visibleSessions.length > 1;
+        const wsDir = workspaceDirFor(ws);
+        deleteThreadCursorsNotIn(
+          ws.id,
+          visibleSessions.map((session) => session.sessionId)
         );
-        if (newMessages.length > 0) {
-          const wsDir = workspaceDirFor(ws);
+
+        for (const session of visibleSessions) {
+          const title = formatThreadTitle(session);
+          const cursor = ensureThreadCursor(ws, session, title);
+          const newMessages = getSessionMessagesAfter(
+            session.sessionId,
+            cursor.lastForwardedRowid
+          );
+          if (newMessages.length === 0) {
+            rememberThreadStatus(ws, session, hasMultipleThreads);
+            continue;
+          }
+
           for (const message of newMessages) {
             const forwarded = formatForwardedMessage(
               ws.conductorWorkspaceName,
               message,
-              wsDir
+              wsDir,
+              hasMultipleThreads ? title : null
             );
             if (!forwarded) continue;
-            sendForwardToWorkspaceTopic(ws, forwarded.text, forwarded.media)
+            sendForwardToWorkspaceTopic(
+              ws,
+              forwarded.text,
+              forwarded.media,
+              session.sessionId
+            )
               .catch((err) => pollerLog.error("forward error:", err));
           }
-          updateWorkspaceForwardCursor(
-            ws.id,
-            newMessages[newMessages.length - 1].rowid
-          );
+          const lastRowid = newMessages[newMessages.length - 1].rowid;
+          updateThreadCursor(ws.id, session.sessionId, lastRowid, title);
+          if (session.sessionId === sessionInfo.sessionId) {
+            updateWorkspaceForwardCursor(ws.id, lastRowid);
+          }
+          rememberThreadStatus(ws, session, hasMultipleThreads);
         }
 
-        const sessionStatus = sessionInfo.status;
-        if (sessionStatus === "working" && ws.status !== "running") {
+        const anyWorking = visibleSessions.some((session) => session.status === "working");
+        const anyError = visibleSessions.some((session) => session.status === "error");
+        if (anyWorking && ws.status !== "running") {
           updateWorkspaceStatus(ws.id, "running");
           if (ws.telegramThreadId) {
             syncWorkspaceTopic(bot.telegram, { ...ws, status: "running" }).catch((err) =>
@@ -470,38 +503,17 @@ function startSessionPoller(): void {
           }
         }
 
-        if (sessionStatus === "idle" && ws.status === "running") {
+        if (!anyWorking && !anyError && ws.status === "running") {
           updateWorkspaceStatus(ws.id, "done");
-          const name = ws.conductorWorkspaceName ?? ws.name;
-          const result = getSessionResult(ws.conductorWorkspaceName!, ws.repoPath);
-
-          let msg = `✅ <b>${esc(name)}</b> finished`;
-          if (result) {
-            const stats = formatStats(result);
-            if (stats) msg += `  <code>${stats}</code>`;
-            if (result.resultText) {
-              const resultHtml = maybeExpandableQuote(
-                markdownToTelegramHtml(trunc(result.resultText, 3200))
-              );
-              msg += `\n\n${resultHtml}`;
-              if (msg.length > TELEGRAM_MAX_TEXT) {
-                msg = truncateHtml(msg, TELEGRAM_MAX_TEXT);
-              }
-            }
-          }
-
-          const postDoneButtons = styledKeyboard([
-            [
-              btn("🔍 Review Changes", `postdone:review:${ws.id}`),
-              btn("🔀 Generate PR", `postdone:pr:${ws.id}`),
-            ],
-            [btn("Archive", `archive:${ws.id}`)],
-          ]);
-
-          sendToWorkspaceTopic(ws, msg, {
+          const active = visibleSessions.find((session) => session.sessionId === sessionInfo.sessionId);
+          const notifyDone = !hasMultipleThreads;
+          const doneNotify = notifyDone
+            ? sendToWorkspaceTopic(ws, buildFinishedMessage(ws, active ?? null, false), {
               parse_mode: "HTML",
-              ...postDoneButtons,
+              ...postDoneKeyboard(ws),
             })
+            : Promise.resolve();
+          doneNotify
             .then(() => {
               if (ws.telegramThreadId) {
                 syncWorkspaceTopic(bot.telegram, { ...ws, status: "done" }).catch((err) =>
@@ -510,7 +522,7 @@ function startSessionPoller(): void {
               }
             })
             .catch((err) => pollerLog.error("notify error:", err));
-        } else if (sessionStatus === "error" && ws.status !== "failed") {
+        } else if (anyError && ws.status !== "failed") {
           updateWorkspaceStatus(ws.id, "failed");
           const name = ws.conductorWorkspaceName ?? ws.name;
           sendToWorkspaceTopic(ws, `🔴 <b>${esc(name)}</b> encountered an error.`, {
@@ -528,6 +540,123 @@ function startSessionPoller(): void {
         }
       }
   }, POLL_INTERVAL_MS);
+}
+
+function activeSessionFromWorkspaceInfo(
+  info: NonNullable<ReturnType<typeof getWorkspaceSessionInfo>>
+): ConductorSessionInfo {
+  return {
+    sessionId: info.sessionId,
+    workspaceId: info.workspaceId,
+    title: null,
+    status: info.status,
+    agentType: info.agentType,
+    rawAgentType: info.rawAgentType,
+    model: info.model,
+    claudeSessionId: info.agentSessionId,
+    isActive: true,
+    createdAt: null,
+  };
+}
+
+function formatThreadTitle(session: ConductorSessionInfo): string {
+  const title = session.title?.trim();
+  if (title) return title;
+  if (session.isActive) return "Active thread";
+  return `Thread ${session.sessionId.slice(0, 8)}`;
+}
+
+function ensureThreadCursor(
+  ws: Workspace,
+  session: ConductorSessionInfo,
+  title: string
+): ThreadCursor {
+  const existing = getThreadCursor(ws.id, session.sessionId);
+  if (existing) return existing;
+
+  const baseline =
+    session.sessionId === ws.conductorSessionId
+      ? ws.lastForwardedMessageRowid
+      : getMaxSessionMessageRowId(session.sessionId);
+  return upsertThreadCursor({
+    workspaceId: ws.id,
+    sessionId: session.sessionId,
+    lastForwardedRowid: baseline,
+    title,
+  });
+}
+
+function threadStatusKey(workspaceId: string, sessionId: string): string {
+  return `thread_status:${workspaceId}:${sessionId}`;
+}
+
+function rememberThreadStatus(
+  ws: Workspace,
+  session: ConductorSessionInfo,
+  hasMultipleThreads: boolean
+): void {
+  const status = session.status ?? "unknown";
+  const key = threadStatusKey(ws.id, session.sessionId);
+  const previous = getMetaValue(key);
+  if (previous === status) return;
+  setMetaValue(key, status);
+
+  if (!hasMultipleThreads || previous !== "working") return;
+
+  if (status === "idle") {
+    sendToWorkspaceTopic(ws, buildFinishedMessage(ws, session, true), {
+      parse_mode: "HTML",
+      ...postDoneKeyboard(ws),
+    }).catch((err) => pollerLog.error("thread done notify error:", err));
+  } else if (status === "error") {
+    const name = ws.conductorWorkspaceName ?? ws.name;
+    sendToWorkspaceTopic(
+      ws,
+      `🔴 <b>${esc(name)}</b> · 🧵 <i>${esc(formatThreadTitle(session))}</i> encountered an error.`,
+      {
+        parse_mode: "HTML",
+        ...styledButtons([btn("Archive", `archive:${ws.id}`)]),
+      }
+    ).catch((err) => pollerLog.error("thread error notify error:", err));
+  }
+}
+
+function postDoneKeyboard(ws: Workspace): Record<string, unknown> {
+  return styledKeyboard([
+    [
+      btn("🔍 Review Changes", `postdone:review:${ws.id}`),
+      btn("🔀 Generate PR", `postdone:pr:${ws.id}`),
+    ],
+    [btn("Archive", `archive:${ws.id}`)],
+  ]);
+}
+
+function buildFinishedMessage(
+  ws: Workspace,
+  session: ConductorSessionInfo | null,
+  includeThread: boolean
+): string {
+  const name = ws.conductorWorkspaceName ?? ws.name;
+  const result = session ? getSessionResultBySessionId(session.sessionId) : null;
+  const thread = includeThread && session
+    ? ` · 🧵 <i>${esc(formatThreadTitle(session))}</i>`
+    : "";
+
+  let msg = `✅ <b>${esc(name)}</b>${thread} finished`;
+  if (result) {
+    const stats = formatStats(result);
+    if (stats) msg += `  <code>${stats}</code>`;
+    if (result.resultText) {
+      const resultHtml = maybeExpandableQuote(
+        markdownToTelegramHtml(trunc(result.resultText, 3200))
+      );
+      msg += `\n\n${resultHtml}`;
+      if (msg.length > TELEGRAM_MAX_TEXT) {
+        msg = truncateHtml(msg, TELEGRAM_MAX_TEXT);
+      }
+    }
+  }
+  return msg;
 }
 
 function syncHiddenConductorWorkspace(ws: Workspace): void {
@@ -701,7 +830,8 @@ function startEventPoller(): void {
 function formatForwardedMessage(
   workspaceName: string,
   message: SessionMessage,
-  workspaceDir: string | null
+  workspaceDir: string | null,
+  threadTitle: string | null = null
 ): { text: string; media: InlineMediaItem[] } | null {
   if (message.role !== "assistant") {
     return null;
@@ -716,7 +846,9 @@ function formatForwardedMessage(
     ? extractInlineMedia(text, workspaceDir)
     : { cleanedText: text, media: [] as InlineMediaItem[] };
 
-  const headerLine = `🤖 <b>${esc(workspaceName)}</b>`;
+  const headerLine = threadTitle
+    ? `🤖 <b>${esc(workspaceName)}</b> · 🧵 <i>${esc(threadTitle)}</i>`
+    : `🤖 <b>${esc(workspaceName)}</b>`;
   if (!cleanedText.trim()) {
     // Assistant turn was nothing but file refs. Send media with a bare header
     // (or nothing if there's also no media to ship).

@@ -13,9 +13,11 @@ const WHISPER_CPP_DIR =
 const WHISPER_BIN =
   process.env.TELEGRAM_WHISPER_BIN ??
   path.join(WHISPER_CPP_DIR, "build/bin/whisper-cli");
+const WHISPER_MODEL_SETTING = process.env.TELEGRAM_WHISPER_MODEL ?? "base";
 const WHISPER_MODEL =
-  process.env.TELEGRAM_WHISPER_MODEL ??
-  path.join(WHISPER_CPP_DIR, "models-local/ggml-base.bin");
+  WHISPER_MODEL_SETTING.includes("/") || WHISPER_MODEL_SETTING.endsWith(".bin")
+    ? WHISPER_MODEL_SETTING
+    : path.join(WHISPER_CPP_DIR, `models-local/ggml-${WHISPER_MODEL_SETTING}.bin`);
 const AFCONVERT_BIN =
   process.env.AFCONVERT_BIN ??
   "/usr/bin/afconvert";
