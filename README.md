@@ -65,6 +65,7 @@ src/
 | `/run` | `/run <repo> <prompt>` | Start a new workspace with an AI agent |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
+| `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
 | `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md |
 | `/skill` | `/skill <workspace> <name> [instructions]` | Invoke a specific workspace skill |
 | `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
@@ -79,12 +80,16 @@ src/
 
 Ways to target work from Telegram:
 
-1. **Reply** to any forwarded workspace message with `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut.
-2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically.
+1. **Reply** to any forwarded workspace message with text, media, `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut. If that message came from a specific Conductor thread, the reply goes back to that exact thread.
+2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically. Plain messages go to the workspace's active Conductor thread.
 3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message.
 4. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
 
-Photos, screenshots, and voice notes sent as replies are staged to the workspace for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
+Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
+
+Conductor Cloud workspaces are observe-first. The bot marks them with `☁️`, forwards activity that Conductor syncs into the local DB, and can attempt queued-message steering when `TELEGRAM_REMOTE_STEERING=queue` is enabled.
+
+Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
 ## Manual Telegram setup
 
@@ -157,6 +162,10 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | | `TELEGRAM_REVIEW_AGENT_TYPE` | Agent type for `/review` sessions |
 | | `TELEGRAM_REVIEW_MODEL` | Model for `/review` sessions |
 | | `TELEGRAM_AGENT_PERMISSION_MODE` | Permission mode (default: `bypassPermissions`) |
+| | `TELEGRAM_REMOTE_STEERING` | Cloud steering mode: `queue` (default) or `off` |
+| | `TELEGRAM_WHISPER_MODEL` | whisper.cpp model name or path (default: `base`) |
+
+Conductor app settings are read from `~/.conductor/settings.toml` first, with the legacy Conductor DB `settings` table as fallback. The bot uses Conductor's default/review model settings, Codex thinking levels, Claude effort levels, and git branch prefix settings when Telegram-specific env vars are not set.
 
 Existing `.env` files are auto-detected and can be imported during setup.
 
@@ -186,6 +195,7 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `events` | Status updates, artifacts, and human requests from MCP |
 | `decisions` | Questions posed to the operator with answers |
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
+| `thread_cursors` | Per-Conductor-session forwarding cursors for thread fan-out |
 | `pr_records` | GitHub PR/check/merge state verified by repo + branch |
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
 | `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
