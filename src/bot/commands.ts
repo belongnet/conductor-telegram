@@ -82,6 +82,7 @@ function describeWorkspaceRejection(
 
 type RouteExecutionPlannerDeps = {
   getWorkspace: (id: string) => Workspace | undefined;
+  getActiveWorkspaces: () => Workspace[];
   resolveRepo: (input: string) => string | null;
 };
 
@@ -104,7 +105,7 @@ export type RouteExecutionPlan =
 export function resolveRouteExecutionPlan(
   chatId: string,
   result: RouteResult,
-  deps: RouteExecutionPlannerDeps = { getWorkspace, resolveRepo }
+  deps: RouteExecutionPlannerDeps = { getWorkspace, getActiveWorkspaces, resolveRepo }
 ): RouteExecutionPlan {
   let existingRejection: string | undefined;
 
@@ -124,6 +125,25 @@ export function resolveRouteExecutionPlan(
   if (result.repoName) {
     const resolved = deps.resolveRepo(result.repoName);
     if (resolved) {
+      if (result.action === "existing" && !result.workspaceId) {
+        const candidates = deps
+          .getActiveWorkspaces()
+          .filter(
+            (workspace) =>
+              workspace.telegramChatId === chatId &&
+              workspace.status === "running" &&
+              workspace.conductorWorkspaceName &&
+              path.basename(workspace.repoPath) === resolved
+          );
+
+        if (candidates.length === 1) {
+          return { kind: "existing", workspace: candidates[0] };
+        }
+
+        if (candidates.length > 1) {
+          existingRejection = "ambiguous running workspaces in repo";
+        }
+      }
       return { kind: "new", repoName: resolved, existingRejection };
     }
     return {

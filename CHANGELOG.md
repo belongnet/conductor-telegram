@@ -4,13 +4,16 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-07-15
+## [0.4.3] - 2026-07-15
 
 ### Changed
 - New Claude workspaces now launch on Fable 5 by default (full model id `claude-fable-5`), and the launcher recognizes the Fable family when inferring agent type and simplifying model names. The default Codex model moves to `gpt-5.6-sol`.
 
+## [0.4.2] - 2026-07-14
+
 ### Fixed
-- Repos are auto-registered before a workspace launch, so launching into a repo topic no longer fails when the repo hasn't been registered yet.
+- Telegram-launched workspaces now auto-register valid git repositories in Conductor's repo database when the repo is visible on disk but missing from Conductor metadata.
+- Repo-only `"existing"` route decisions now continue the single running workspace in that repo instead of always starting a new workspace, while ambiguous matches still fall back safely.
 
 ## [0.4.1] - 2026-07-04
 
