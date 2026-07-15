@@ -52,7 +52,6 @@ import {
   createWorkspaceTopic,
   createRepoTopic,
   closeWorkspaceTopic,
-  deleteWorkspaceTopic,
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
@@ -3021,7 +3020,12 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
   }
 
   if (workspace.telegramThreadId) {
-    await deleteWorkspaceTopic(
+    try {
+      await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "archived" });
+    } catch (err) {
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err);
+    }
+    await closeWorkspaceTopic(
       ctx.telegram,
       workspace.telegramChatId,
       workspace.telegramThreadId

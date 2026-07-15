@@ -120,7 +120,11 @@ function parseArtifactTopicState(workspace: Workspace): TopicVisualState | null 
 }
 
 function getWorkspaceTopicState(workspace: Workspace): TopicVisualState {
-  if (workspace.status === "archived") {
+  if (
+    workspace.status === "done" ||
+    workspace.status === "stopped" ||
+    workspace.status === "archived"
+  ) {
     return "archived";
   }
   if (getPendingDecision(workspace.id)) return "needs_input";
