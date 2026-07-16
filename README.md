@@ -253,6 +253,16 @@ conductor-telegram doctor
 
 Config is preserved across upgrades. The `doctor` command validates everything still works.
 
+## Mac gateway deployment
+
+The production Mac gateway is redeployed by GitHub Actions whenever `main` is updated or a release is published. The workflow expects a self-hosted macOS runner labeled `conductor-telegram-gateway`.
+
+On each deploy it checks out the merged revision, runs typecheck/tests/build, installs that checkout globally, reinstalls the launchd service, and restarts it:
+
+```bash
+scripts/deploy-mac-gateway.sh
+```
+
 ## License
 
 MIT - Built by [Belong.net](https://belong.net)

@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-07-16
+
+### Added
+- GitHub Actions now redeploys the self-hosted macOS gateway on `main` pushes and published releases, installing the merged checkout globally and restarting the launchd service.
+
 ## [0.4.6] - 2026-07-15
 
 ### Fixed
