@@ -4,6 +4,12 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-07-15
+
+### Fixed
+- Existing installations now receive the shipped Fable 5 and gpt-5.6-sol defaults instead of reusing deprecated Conductor settings or models from earlier sessions. Explicit overrides, current settings.toml values, and legacy settings from pre-0.72 installs still take precedence.
+- `conductor-telegram doctor` now shows the resolved prompt and review agent/model pairs so stale or explicit configuration is visible before launch.
+
 ## [0.4.4] - 2026-07-15
 
 ### Changed

@@ -118,15 +118,29 @@ function readSettingsToml(): Map<string, TomlValue> | null {
 }
 
 function readSettingFromDb(key: string): string | null {
+  let db: Database.Database | null = null;
   try {
-    const db = new Database(conductorDbPath(), { readonly: true });
-    const row = db
-      .prepare("SELECT value FROM settings WHERE key = ?")
-      .get(key) as { value?: string } | undefined;
-    db.close();
-    return typeof row?.value === "string" ? row.value : null;
+    db = new Database(conductorDbPath(), { readonly: true });
+    let row: { value?: string; deprecated_at?: string | null } | undefined;
+    try {
+      row = db
+        .prepare("SELECT value, deprecated_at FROM settings WHERE key = ?")
+        .get(key) as typeof row;
+    } catch {
+      // Pre-0.72 Conductor DBs have no deprecated_at column.
+      row = db
+        .prepare("SELECT value FROM settings WHERE key = ?")
+        .get(key) as typeof row;
+    }
+    if (typeof row?.value !== "string") return null;
+    // Conductor 0.72 stamps rows deprecated_at when it migrates them to
+    // settings.toml and stops updating them; a stamped row is stale, not
+    // current user intent, so treat it as unset.
+    return row.deprecated_at ? null : row.value;
   } catch {
     return null;
+  } finally {
+    db?.close();
   }
 }
 

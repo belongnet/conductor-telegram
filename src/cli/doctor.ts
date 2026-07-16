@@ -7,7 +7,12 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import Database from "better-sqlite3";
-import { CONFIG_PATH, tryLoadConfig, type CLIFlags } from "./config.js";
+import {
+  CONFIG_PATH,
+  tryLoadConfig,
+  type CLIFlags,
+  type Config,
+} from "./config.js";
 import { EXIT_GENERAL } from "./errors.js";
 import { describeConductorSettingsSource } from "../store/conductor-settings.js";
 
@@ -295,6 +300,40 @@ function checkRepos(reposDir: string | undefined): CheckResult {
   }
 }
 
+export async function checkLaunchModels(
+  config: Config | null
+): Promise<CheckResult> {
+  try {
+    // Mirror the env injection the start command performs so the resolved
+    // models match what the running bot would actually launch.
+    if (config?.conductorDbPath)
+      process.env.CONDUCTOR_DB_PATH = config.conductorDbPath;
+    if (config?.defaultAgentType)
+      process.env.TELEGRAM_DEFAULT_AGENT_TYPE = config.defaultAgentType;
+    if (config?.defaultModel)
+      process.env.TELEGRAM_DEFAULT_MODEL = config.defaultModel;
+    if (config?.reviewAgentType)
+      process.env.TELEGRAM_REVIEW_AGENT_TYPE = config.reviewAgentType;
+    if (config?.reviewModel)
+      process.env.TELEGRAM_REVIEW_MODEL = config.reviewModel;
+    const { resolveLaunchConfig } = await import("../bot/launcher.js");
+    const prompt = resolveLaunchConfig({});
+    const review = resolveLaunchConfig({ launchMode: "review" });
+    return {
+      name: "Launch models",
+      ok: true,
+      detail: `prompt → ${prompt.agentType}/${prompt.model} · review → ${review.agentType}/${review.model}`,
+    };
+  } catch (err) {
+    return {
+      name: "Launch models",
+      ok: false,
+      detail: `could not resolve: ${err instanceof Error ? err.message : String(err)}`,
+      fix: "Check conductorDbPath and model overrides in ~/.conductor-telegram/config.json",
+    };
+  }
+}
+
 export async function runDoctor(flags: CLIFlags): Promise<void> {
   const config = tryLoadConfig(flags);
 
@@ -308,6 +347,7 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     checkConductor(config?.conductorDbPath),
     checkConductorSettings(),
     checkConductor072Schema(config?.conductorDbPath),
+    await checkLaunchModels(config),
     await checkGithub(),
     checkPlugin(),
     checkRepos(config?.conductorReposDir),
