@@ -201,7 +201,7 @@ test("deprecated Conductor settings and session history don't override shipped d
     assert.equal(result.prompt.agentType, "claude");
     assert.equal(result.prompt.model, "claude-fable-5");
     assert.equal(result.review.agentType, "codex");
-    assert.equal(result.review.model, "gpt-5.6-sol");
+    assert.equal(result.review.model, "gpt-5.5");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -621,7 +621,7 @@ test("failed claude runs surface an error result with stderr detail", () => {
   }
 });
 
-test("cloud steering reports dropped attachments in the send warning", () => {
+test("cloud steering uses the official API and never writes Conductor message rows", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-cloud-attach-"));
   try {
     const dbPath = path.join(dir, "conductor.db");
@@ -643,7 +643,6 @@ test("cloud steering reports dropped attachments in the send warning", () => {
       `INSERT INTO repos (id, root_path, name, default_branch)
        VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
     ).run();
-    // Busy cloud session: verified queue capability returns without polling.
     db.prepare(
       `INSERT INTO sessions (id, status, updated_at, workspace_id, is_hidden, model, agent_type)
        VALUES ('session-1', 'working', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
@@ -665,33 +664,390 @@ test("cloud steering reports dropped attachments in the send warning", () => {
 
     const result = runLauncherEval(
       `
-        import { setMetaValue } from "./src/store/queries.ts";
-        import { sendToSession } from "./src/bot/launcher.ts";
-        setMetaValue("remote_steer:ws-1", "queue");
+        const calls = [];
+        globalThis.fetch = async (url, init = {}) => {
+          const target = String(url);
+          const pathname = new URL(target).pathname;
+          const method = String(init.method ?? "GET").toUpperCase();
+          calls.push({
+            url: target,
+            pathname,
+            method,
+            body: init.body ? JSON.parse(String(init.body)) : null,
+          });
+          if (pathname === "/v0/sessions/session-1/status") {
+            return new Response(
+              JSON.stringify({
+                workspaceId: "ws-1",
+                sessionId: "session-1",
+                status: "idle",
+                updatedAt: "2026-07-28T12:00:00.000Z",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            );
+          }
+          if (pathname === "/v0/sessions/session-1") {
+            return new Response(
+              JSON.stringify({
+                id: "session-1",
+                deepLink: "conductor://workspace/ws-1/session/session-1",
+                name: "Active thread",
+                model: "opus",
+                resolvedModel: "opus",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            );
+          }
+          if (
+            pathname === "/v0/sessions/session-1/messages" &&
+            method === "GET"
+          ) {
+            return new Response(
+              JSON.stringify({
+                data: [{
+                  id: "message-existing",
+                  sessionId: "session-1",
+                  sessionIndex: 10,
+                  type: "assistant",
+                  content: { role: "assistant", text: "Ready" },
+                  receivedAt: "2026-07-28T11:59:00.000Z",
+                }],
+                offset: 0,
+                hasMore: false,
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            );
+          }
+          if (pathname === "/v0/sessions/session-2/status") {
+            return new Response(
+              JSON.stringify({
+                workspaceId: "ws-1",
+                sessionId: "session-2",
+                status: "idle",
+                updatedAt: "2026-07-28T12:00:00.000Z",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            );
+          }
+          if (pathname === "/v0/sessions") {
+            return new Response(
+              JSON.stringify({
+                id: "session-2",
+                deepLink: "conductor://workspace/ws-1/session/session-2",
+                name: "Cloud thread",
+                model: "sonnet-4-6-1m",
+                resolvedModel: "sonnet-4-6-1m",
+              }),
+              { status: 201, headers: { "content-type": "application/json" } }
+            );
+          }
+          const body = init.body ? JSON.parse(String(init.body)) : null;
+          return new Response(
+            JSON.stringify({ messageId: body?.messageId, state: "queued" }),
+            { status: 201, headers: { "content-type": "application/json" } }
+          );
+        };
+        import { launchWorkspaceSession, sendToSession } from "./src/bot/launcher.ts";
         const sendResult = await sendToSession("honolulu", "", ["${attachment}"], { repoPath: "/tmp/repo" });
-        console.log(JSON.stringify(sendResult));
+        const launchResult = await launchWorkspaceSession("honolulu", "Start a cloud thread", {
+          repoPath: "/tmp/repo",
+          agentType: "claude",
+          model: "claude-sonnet-4-6-1m",
+          title: "Cloud thread",
+        });
+        const reviewResult = await launchWorkspaceSession("honolulu", "Review this", {
+          repoPath: "/tmp/repo",
+          launchMode: "review",
+        });
+        console.log(JSON.stringify({ sendResult, launchResult, reviewResult, calls }));
       `,
       {
         CONDUCTOR_DB_PATH: dbPath,
         DB_PATH: path.join(dir, "bot.db"),
+        CONDUCTOR_API_BASE_URL: "https://api.conductor.test",
+        CONDUCTOR_API_KEY: "test-key",
+        CONDUCTOR_CLOUD_BACKEND: "api",
       }
-    ) as { ok?: boolean; error?: string; warning?: string };
+    ) as {
+      sendResult: { ok?: boolean; error?: string; warning?: string };
+      launchResult: {
+        sessionId?: string;
+        backendKind?: string;
+        initialCursorMessageId?: string;
+        error?: string;
+      };
+      reviewResult: { error?: string; reason?: string };
+      calls: Array<{
+        url: string;
+        pathname: string;
+        method: string;
+        body: { message?: string; messageId?: string; model?: string };
+      }>;
+    };
 
-    assert.equal(result.ok, true, `steer failed: ${result.error}`);
-    assert.match(result.warning ?? "", /couldn't be delivered/);
+    assert.equal(
+      result.sendResult.ok,
+      true,
+      `steer failed: ${result.sendResult.error}`
+    );
+    assert.match(result.sendResult.warning ?? "", /couldn't be delivered/);
+    const steeringCall = result.calls.find(
+      (call) =>
+        call.pathname === "/v0/sessions/session-1/messages" &&
+        call.method === "POST"
+    );
+    assert.equal(
+      steeringCall?.url,
+      "https://api.conductor.test/v0/sessions/session-1/messages"
+    );
+    assert.match(
+      steeringCall?.body.message ?? "",
+      /could not be delivered/
+    );
+    assert.equal(result.launchResult.sessionId, "session-2");
+    assert.equal(result.launchResult.backendKind, "cloud-api");
+    const launchMessageCall = result.calls.find(
+      (call) =>
+        call.pathname === "/v0/sessions/session-2/messages" &&
+        call.method === "POST"
+    );
+    assert.equal(
+      result.launchResult.initialCursorMessageId,
+      launchMessageCall?.body.messageId
+    );
+    const createSessionCall = result.calls.find(
+      (call) =>
+        call.pathname === "/v0/sessions" &&
+        call.method === "POST"
+    );
+    assert.equal(
+      createSessionCall?.url,
+      "https://api.conductor.test/v0/sessions"
+    );
+    assert.equal(createSessionCall?.body.model, "sonnet-4-6-1m");
+    assert.equal(
+      launchMessageCall?.url,
+      "https://api.conductor.test/v0/sessions/session-2/messages"
+    );
+    assert.equal(result.reviewResult.reason, "cloud_policy_unsupported");
+    assert.match(result.reviewResult.error ?? "", /permission-policy enforcement/);
+    assert.equal(result.calls.length, 8);
 
     const verifyDb = new Database(dbPath);
-    const queued = verifyDb
-      .prepare("SELECT content FROM session_messages WHERE queue_order IS NOT NULL")
-      .get() as { content: string } | undefined;
+    const queuedRows = verifyDb
+      .prepare("SELECT COUNT(*) as count FROM session_messages")
+      .get() as { count: number };
     verifyDb.close();
-    assert.match(queued?.content ?? "", /could not be delivered/);
+    assert.equal(queuedRows.count, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-function createConductorDb(dbPath: string): Database {
+test("observe-only cloud mirroring never stores SQLite ids as API cursors", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-cloud-mirror-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const db = createConductorDb(dbPath);
+    db.exec(`
+      CREATE TABLE session_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        role TEXT,
+        content TEXT,
+        created_at TEXT,
+        sent_at TEXT
+      );
+    `);
+    db.prepare(
+      `INSERT INTO session_messages
+       (id, session_id, role, content, created_at, sent_at)
+       VALUES
+       ('sqlite-message-1', 'session-1', 'assistant', 'first', datetime('now'), datetime('now')),
+       ('sqlite-message-2', 'session-1', 'assistant', 'second', datetime('now'), datetime('now'))`
+    ).run();
+    db.close();
+
+    const result = runLauncherEval(
+      `
+        import {
+          getMaxSessionMessageCursor,
+          getSessionMessagesAfter,
+        } from "./src/bot/launcher.ts";
+        const baseline = await getMaxSessionMessageCursor(
+          "session-1",
+          "cloud-api"
+        );
+        const messages = await getSessionMessagesAfter(
+          "session-1",
+          1,
+          25,
+          { backendKind: "cloud-api", afterMessageId: null }
+        );
+        console.log(JSON.stringify({ baseline, messages }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_CLOUD_BACKEND: "off",
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as {
+      baseline: { rowid: number; messageId: string | null };
+      messages: Array<{ rowid: number; messageId: string | null; content: string }>;
+    };
+
+    assert.equal(result.baseline.rowid, 2);
+    assert.equal(result.baseline.messageId, null);
+    assert.deepEqual(
+      result.messages.map((message) => ({
+        rowid: message.rowid,
+        messageId: message.messageId,
+        content: message.content,
+      })),
+      [{ rowid: 2, messageId: null, content: "second" }]
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("persisted cloud bindings survive without the Conductor desktop database", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-cloud-restart-"));
+  try {
+    const result = runLauncherEval(
+      `
+        const calls = [];
+        globalThis.fetch = async (url, init = {}) => {
+          const pathname = new URL(String(url)).pathname;
+          calls.push(pathname);
+          const json = (value, status = 200) =>
+            new Response(JSON.stringify(value), {
+              status,
+              headers: { "content-type": "application/json" },
+            });
+          if (pathname === "/v0/workspaces/workspace-api/status") {
+            return json({
+              workspaceId: "workspace-api",
+              status: "ready",
+              updatedAt: "2026-07-28T12:00:00.000Z",
+            });
+          }
+          if (pathname === "/v0/workspaces/workspace-api") {
+            return json({
+              id: "workspace-api",
+              name: "Cloud after restart",
+              createdAt: "2026-07-28T11:00:00.000Z",
+              deepLink: "conductor://workspace/workspace-api",
+            });
+          }
+          if (pathname === "/v0/sessions/session-api/status") {
+            return json({
+              workspaceId: "workspace-api",
+              sessionId: "session-api",
+              status: "idle",
+              updatedAt: "2026-07-28T12:00:00.000Z",
+            });
+          }
+          if (pathname === "/v0/sessions/session-api") {
+            return json({
+              id: "session-api",
+              deepLink: "conductor://workspace/workspace-api/session/session-api",
+              name: "Recovered thread",
+              model: "gpt-5.5",
+              resolvedModel: "gpt-5.5",
+              archivedAt: null,
+            });
+          }
+          if (pathname === "/v0/sessions/session-api/messages") {
+            if (String(init.method ?? "GET").toUpperCase() === "GET") {
+              return json({
+                data: [{
+                  id: "message-existing",
+                  sessionId: "session-api",
+                  sessionIndex: 4,
+                  type: "assistant",
+                  content: { role: "assistant", text: "Ready" },
+                  receivedAt: "2026-07-28T11:59:00.000Z",
+                }],
+                offset: 0,
+                hasMore: false,
+              });
+            }
+            const body = init.body ? JSON.parse(String(init.body)) : {};
+            return json({ messageId: body.messageId, state: "queued" }, 201);
+          }
+          return json({ userMessage: "not found" }, 404);
+        };
+        import {
+          getCloudWorkspaceSessionInfo,
+          getWorkspaceSessionInfo,
+          sendToSession,
+        } from "./src/bot/launcher.ts";
+        const binding = {
+          conductorWorkspaceId: "workspace-api",
+          conductorSessionId: "session-api",
+          conductorBackendKind: "cloud-api",
+          repoPath: "/tmp/repo",
+          status: "running",
+        };
+        const fallback = getWorkspaceSessionInfo(
+          "cloud-restart",
+          "/tmp/repo",
+          binding
+        );
+        const live = await getCloudWorkspaceSessionInfo(
+          "cloud-restart",
+          "/tmp/repo",
+          binding
+        );
+        const sent = await sendToSession(
+          "cloud-restart",
+          "Continue after restart",
+          [],
+          { repoPath: "/tmp/repo", binding }
+        );
+        console.log(JSON.stringify({ fallback, live, sent, calls }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: path.join(dir, "missing-conductor.db"),
+        CONDUCTOR_SETTINGS_PATH: path.join(dir, "missing-settings.toml"),
+        DB_PATH: path.join(dir, "bot.db"),
+        CONDUCTOR_API_BASE_URL: "https://api.conductor.test",
+        CONDUCTOR_API_KEY: "test-key",
+        CONDUCTOR_CLOUD_BACKEND: "api",
+      }
+    ) as {
+      fallback: {
+        workspaceId: string;
+        sessionId: string;
+        sandboxProvider: string;
+      };
+      live: {
+        displayName: string;
+        status: string;
+        model: string;
+        agentType: string;
+      };
+      sent: { ok?: boolean; error?: string };
+      calls: string[];
+    };
+
+    assert.equal(result.fallback.workspaceId, "workspace-api");
+    assert.equal(result.fallback.sessionId, "session-api");
+    assert.equal(result.fallback.sandboxProvider, "conductor-api");
+    assert.equal(result.live.displayName, "Cloud after restart");
+    assert.equal(result.live.status, "idle");
+    assert.equal(result.live.model, "gpt-5.5");
+    assert.equal(result.live.agentType, "codex");
+    assert.equal(result.sent.ok, true, result.sent.error);
+    assert.ok(result.calls.includes("/v0/workspaces/workspace-api"));
+    assert.ok(result.calls.includes("/v0/sessions/session-api/messages"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function createConductorDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.exec(`
     CREATE TABLE repos (

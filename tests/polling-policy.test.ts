@@ -1,0 +1,252 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  advanceCloudSessionCycle,
+  canCompletePolledWorkspace,
+  cloudCycleIsInFlight,
+  cloudSessionCycleKey,
+  encodeCloudSessionCycle,
+  parseCloudSessionCycle,
+  shouldPollTrackedWorkspace,
+} from "../src/bot/polling-policy.js";
+
+test("cloud completion requires observed work and authoritative idle statuses", () => {
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: true,
+      sessions: [{ status: "idle" }],
+      cloudWorkObserved: false,
+      cloudWorkPending: true,
+    }),
+    false
+  );
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: true,
+      sessions: [{ status: null }],
+      cloudWorkObserved: true,
+      cloudWorkPending: false,
+    }),
+    false
+  );
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: true,
+      sessions: [{ status: "idle" }, { status: "idle" }],
+      cloudWorkObserved: true,
+      cloudWorkPending: false,
+    }),
+    true
+  );
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: true,
+      sessions: [{ status: "idle" }],
+      cloudWorkObserved: true,
+      cloudWorkPending: true,
+    }),
+    false
+  );
+});
+
+test("local completion preserves the existing non-working, non-error policy", () => {
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: false,
+      sessions: [{ status: "idle" }],
+      cloudWorkObserved: false,
+      cloudWorkPending: false,
+    }),
+    true
+  );
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: false,
+      sessions: [{ status: "working" }],
+      cloudWorkObserved: false,
+      cloudWorkPending: false,
+    }),
+    false
+  );
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: false,
+      sessions: [{ status: "error" }],
+      cloudWorkObserved: false,
+      cloudWorkPending: false,
+    }),
+    false
+  );
+});
+
+test("cloud cycle keys isolate each Conductor workspace and session", () => {
+  assert.equal(
+    cloudSessionCycleKey("workspace-1", "session-1"),
+    "cloud_session_cycle:workspace-1:session-1"
+  );
+  assert.notEqual(
+    cloudSessionCycleKey("workspace-1", "session-1"),
+    cloudSessionCycleKey("workspace-1", "session-2")
+  );
+});
+
+test("cloud cycles ignore assistant backlog until the exact outbound message appears", () => {
+  const pending = {
+    phase: "pending" as const,
+    outboundMessageId: "message-new",
+    baselineRowid: 10,
+  };
+  const oldAssistant = {
+    messageId: "message-old-assistant",
+    rowid: 11,
+    role: "assistant",
+  };
+
+  assert.deepEqual(
+    advanceCloudSessionCycle({
+      cycle: pending,
+      status: "idle",
+      messages: [oldAssistant],
+    }),
+    pending
+  );
+
+  const boundary = advanceCloudSessionCycle({
+    cycle: pending,
+    status: "idle",
+    messages: [
+      oldAssistant,
+      { messageId: "message-new", rowid: 12, role: "user" },
+    ],
+  });
+  assert.deepEqual(boundary, {
+    phase: "boundary",
+    outboundMessageId: "message-new",
+    baselineRowid: 10,
+    boundaryRowid: 12,
+  });
+  assert.equal(cloudCycleIsInFlight(boundary), true);
+});
+
+test("cloud cycles require work after their generation boundary", () => {
+  const boundary = {
+    phase: "boundary" as const,
+    outboundMessageId: "message-new",
+    boundaryRowid: 12,
+  };
+
+  const working = advanceCloudSessionCycle({
+    cycle: boundary,
+    status: "working",
+    messages: [],
+  });
+  assert.equal(working?.phase, "working");
+  assert.equal(cloudCycleIsInFlight(working), true);
+
+  const observed = advanceCloudSessionCycle({
+    cycle: working,
+    status: "idle",
+    messages: [],
+  });
+  assert.equal(observed?.phase, "observed");
+  assert.equal(cloudCycleIsInFlight(observed), false);
+  assert.equal(
+    canCompletePolledWorkspace({
+      remote: true,
+      sessions: [{ status: "idle" }],
+      cloudWorkObserved: observed?.phase === "observed",
+      cloudWorkPending: cloudCycleIsInFlight(observed),
+    }),
+    true
+  );
+
+  assert.equal(
+    advanceCloudSessionCycle({
+      cycle: boundary,
+      status: "idle",
+      messages: [
+        { messageId: "assistant-new", rowid: 13, role: "assistant" },
+      ],
+    })?.phase,
+    "observed"
+  );
+});
+
+test("a second cloud generation cannot reuse a prior generation's assistant reply", () => {
+  const secondGeneration = {
+    phase: "pending" as const,
+    outboundMessageId: "message-second",
+    baselineRowid: 20,
+  };
+  assert.deepEqual(
+    advanceCloudSessionCycle({
+      cycle: secondGeneration,
+      status: "idle",
+      messages: [
+        { messageId: "assistant-first", rowid: 21, role: "assistant" },
+      ],
+    }),
+    secondGeneration
+  );
+});
+
+test("new-session boundaries observe only subsequent assistant work", () => {
+  const observed = advanceCloudSessionCycle({
+    cycle: {
+      phase: "boundary",
+      outboundMessageId: "message-new-session",
+    },
+    status: "idle",
+    messages: [
+      { messageId: "assistant-new", rowid: 1, role: "assistant" },
+    ],
+  });
+  assert.equal(observed?.phase, "observed");
+});
+
+test("canceling cycles remain in flight until the API confirms termination", () => {
+  const canceling = { phase: "canceling" as const };
+  assert.equal(
+    advanceCloudSessionCycle({
+      cycle: canceling,
+      status: "working",
+      messages: [],
+    })?.phase,
+    "canceling"
+  );
+  assert.equal(cloudCycleIsInFlight(canceling), true);
+
+  const complete = advanceCloudSessionCycle({
+    cycle: canceling,
+    status: "idle",
+    messages: [],
+  });
+  assert.equal(complete?.phase, "complete");
+  assert.equal(cloudCycleIsInFlight(complete), false);
+});
+
+test("cloud cycle metadata round-trips and rejects invalid values", () => {
+  const cycle = {
+    phase: "pending" as const,
+    outboundMessageId: "message-1",
+    baselineRowid: 7,
+  };
+  assert.deepEqual(parseCloudSessionCycle(encodeCloudSessionCycle(cycle)), cycle);
+  assert.deepEqual(parseCloudSessionCycle("observed"), { phase: "observed" });
+  assert.equal(parseCloudSessionCycle('{"phase":"unknown"}'), null);
+  assert.equal(parseCloudSessionCycle("not-json"), null);
+});
+
+test("completed and failed cloud workspaces remain observable", () => {
+  for (const status of ["starting", "running", "done", "failed", "stopped"]) {
+    assert.equal(
+      shouldPollTrackedWorkspace({ status, cloudOnly: true }),
+      true,
+      status
+    );
+  }
+  assert.equal(
+    shouldPollTrackedWorkspace({ status: "archived", cloudOnly: true }),
+    false
+  );
+});

@@ -16,7 +16,9 @@ export interface Workspace {
   telegramChatId: string;
   telegramMessageId: string | null;
   conductorWorkspaceName: string | null;
+  conductorWorkspaceId: string | null;
   conductorSessionId: string | null;
+  conductorBackendKind: "local" | "cloud-api" | null;
   lastForwardedMessageRowid: number;
   telegramThreadId: number | null;
   archivedAt: string | null;
@@ -25,7 +27,9 @@ export interface Workspace {
 export interface ThreadCursor {
   workspaceId: string;
   sessionId: string;
+  backendKind: "local" | "cloud-api";
   lastForwardedRowid: number;
+  lastMessageId: string | null;
   title: string | null;
   createdAt: string;
   updatedAt: string;
@@ -67,6 +71,7 @@ export interface PrRecord {
   state: PrState;
   isDraft: boolean;
   headRef: string | null;
+  headSha: string | null;
   baseRef: string | null;
   reviewDecision: string | null;
   mergeStateStatus: string | null;
@@ -78,6 +83,17 @@ export interface PrRecord {
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface MergeIntent {
+  intentId: string;
+  workspaceId: string;
+  prNumber: number;
+  headSha: string;
+  requestedBy: string;
+  expiresAt: string;
+  consumedAt: string | null;
+  createdAt: string;
 }
 
 export type EventType =

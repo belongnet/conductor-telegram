@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { getDb } from "./db.js";
 import type {
   EventType,
+  MergeIntent,
   PrChecksStatus,
   PrRecord,
   PrState,
@@ -42,7 +43,9 @@ export function createWorkspace(opts: {
     telegramChatId: opts.telegramChatId,
     telegramMessageId: null,
     conductorWorkspaceName: null,
+    conductorWorkspaceId: null,
     conductorSessionId: null,
+    conductorBackendKind: null,
     lastForwardedMessageRowid: 0,
     telegramThreadId: null,
     archivedAt: null,
@@ -214,6 +217,29 @@ export function updateWorkspaceConductorSession(
   ).run(sessionId, id);
 }
 
+export function updateWorkspaceConductorBinding(
+  id: string,
+  input: {
+    workspaceId: string;
+    sessionId: string;
+    backendKind: "local" | "cloud-api";
+  }
+): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE workspaces
+     SET conductor_workspace_id = ?,
+         conductor_session_id = ?,
+         conductor_backend_kind = ?
+     WHERE id = ?`
+  ).run(
+    input.workspaceId,
+    input.sessionId,
+    input.backendKind,
+    id
+  );
+}
+
 export function updateWorkspaceThreadId(
   id: string,
   threadId: number
@@ -243,7 +269,12 @@ export function updateWorkspaceForwardCursor(
 ): void {
   const db = getDb();
   db.prepare(
-    "UPDATE workspaces SET last_forwarded_message_rowid = ? WHERE id = ?"
+    `UPDATE workspaces
+     SET last_forwarded_message_rowid = MAX(
+       COALESCE(last_forwarded_message_rowid, 0),
+       ?
+     )
+     WHERE id = ?`
   ).run(rowid, id);
 }
 
@@ -252,23 +283,56 @@ export function updateWorkspaceForwardCursor(
 export function upsertThreadCursor(input: {
   workspaceId: string;
   sessionId: string;
+  backendKind: "local" | "cloud-api";
   lastForwardedRowid: number;
+  lastMessageId?: string | null;
   title?: string | null;
 }): ThreadCursor {
   const db = getDb();
   const now = new Date().toISOString();
   db.prepare(
     `INSERT INTO thread_cursors
-      (workspace_id, session_id, last_forwarded_rowid, title, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+      (workspace_id, session_id, backend_kind, last_forwarded_rowid,
+       last_message_id, title, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(workspace_id, session_id) DO UPDATE SET
-       last_forwarded_rowid = excluded.last_forwarded_rowid,
+       last_forwarded_rowid = CASE
+         WHEN thread_cursors.backend_kind = 'cloud-api'
+           AND excluded.backend_kind = 'local'
+           THEN thread_cursors.last_forwarded_rowid
+         WHEN COALESCE(thread_cursors.backend_kind, 'local') <> excluded.backend_kind
+           THEN excluded.last_forwarded_rowid
+         ELSE MAX(
+           thread_cursors.last_forwarded_rowid,
+           excluded.last_forwarded_rowid
+         )
+       END,
+       last_message_id = CASE
+         WHEN thread_cursors.backend_kind = 'cloud-api'
+           AND excluded.backend_kind = 'local'
+           THEN thread_cursors.last_message_id
+         WHEN COALESCE(thread_cursors.backend_kind, 'local') <> excluded.backend_kind
+           THEN excluded.last_message_id
+         WHEN excluded.backend_kind = 'cloud-api'
+           AND excluded.last_message_id IS NOT NULL
+           AND excluded.last_forwarded_rowid >= thread_cursors.last_forwarded_rowid
+           THEN excluded.last_message_id
+         ELSE thread_cursors.last_message_id
+       END,
+       backend_kind = CASE
+         WHEN thread_cursors.backend_kind = 'cloud-api'
+           AND excluded.backend_kind = 'local'
+           THEN thread_cursors.backend_kind
+         ELSE excluded.backend_kind
+       END,
        title = COALESCE(excluded.title, thread_cursors.title),
        updated_at = excluded.updated_at`
   ).run(
     input.workspaceId,
     input.sessionId,
+    input.backendKind,
     input.lastForwardedRowid,
+    input.lastMessageId ?? null,
     input.title ?? null,
     now,
     now
@@ -311,12 +375,16 @@ export function updateThreadCursor(
   workspaceId: string,
   sessionId: string,
   rowid: number,
-  title?: string | null
+  title?: string | null,
+  lastMessageId?: string | null,
+  backendKind: "local" | "cloud-api" = "local"
 ): void {
   upsertThreadCursor({
     workspaceId,
     sessionId,
+    backendKind,
     lastForwardedRowid: rowid,
+    lastMessageId,
     title,
   });
 }
@@ -545,7 +613,13 @@ function mapWorkspaceRow(row: any): Workspace {
     telegramChatId: row.telegram_chat_id,
     telegramMessageId: row.telegram_message_id,
     conductorWorkspaceName: row.conductor_workspace_name,
+    conductorWorkspaceId: row.conductor_workspace_id ?? null,
     conductorSessionId: row.conductor_session_id ?? null,
+    conductorBackendKind:
+      row.conductor_backend_kind === "local" ||
+      row.conductor_backend_kind === "cloud-api"
+        ? row.conductor_backend_kind
+        : null,
     lastForwardedMessageRowid: Number(row.last_forwarded_message_rowid ?? 0),
     telegramThreadId: row.telegram_thread_id ?? null,
     archivedAt: row.archived_at ?? null,
@@ -556,7 +630,10 @@ function mapThreadCursorRow(row: any): ThreadCursor {
   return {
     workspaceId: row.workspace_id,
     sessionId: row.session_id,
+    backendKind:
+      row.backend_kind === "cloud-api" ? "cloud-api" : "local",
     lastForwardedRowid: Number(row.last_forwarded_rowid ?? 0),
+    lastMessageId: row.last_message_id ?? null,
     title: row.title ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -575,6 +652,7 @@ export function upsertPrRecord(input: {
   state?: PrState;
   isDraft?: boolean;
   headRef?: string | null;
+  headSha?: string | null;
   baseRef?: string | null;
   reviewDecision?: string | null;
   mergeStateStatus?: string | null;
@@ -590,10 +668,10 @@ export function upsertPrRecord(input: {
   db.prepare(
     `INSERT INTO pr_records
       (workspace_id, repo_path, branch, pr_number, pr_url, title, state, is_draft,
-       head_ref, base_ref, review_decision, merge_state_status, mergeable,
+       head_ref, head_sha, base_ref, review_decision, merge_state_status, mergeable,
        checks_status, checks_summary, branch_exists, last_checked_at, last_error,
        created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(workspace_id) DO UPDATE SET
        repo_path = excluded.repo_path,
        branch = excluded.branch,
@@ -603,6 +681,7 @@ export function upsertPrRecord(input: {
        state = excluded.state,
        is_draft = excluded.is_draft,
        head_ref = excluded.head_ref,
+       head_sha = excluded.head_sha,
        base_ref = excluded.base_ref,
        review_decision = excluded.review_decision,
        merge_state_status = excluded.merge_state_status,
@@ -623,6 +702,7 @@ export function upsertPrRecord(input: {
     input.state ?? "unknown",
     input.isDraft ? 1 : 0,
     input.headRef ?? null,
+    input.headSha ?? null,
     input.baseRef ?? null,
     input.reviewDecision ?? null,
     input.mergeStateStatus ?? null,
@@ -686,6 +766,7 @@ function mapPrRecordRow(row: any): PrRecord {
     state: (row.state ?? "unknown") as PrState,
     isDraft: Boolean(row.is_draft),
     headRef: row.head_ref ?? null,
+    headSha: row.head_sha ?? null,
     baseRef: row.base_ref ?? null,
     reviewDecision: row.review_decision ?? null,
     mergeStateStatus: row.merge_state_status ?? null,
@@ -699,6 +780,96 @@ function mapPrRecordRow(row: any): PrRecord {
     updatedAt: row.updated_at,
   };
 }
+
+// ── Merge confirmation intents ─────────────────────────────
+
+export function createMergeIntent(input: {
+  workspaceId: string;
+  prNumber: number;
+  headSha: string;
+  requestedBy: string;
+  ttlSeconds?: number;
+}): MergeIntent {
+  if (!Number.isInteger(input.prNumber) || input.prNumber <= 0) {
+    throw new Error("Merge intent requires a positive PR number");
+  }
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(input.headSha)) {
+    throw new Error("Merge intent requires a full Git object ID");
+  }
+  const db = getDb();
+  const now = new Date();
+  const intent: MergeIntent = {
+    intentId: randomUUID().replaceAll("-", ""),
+    workspaceId: input.workspaceId,
+    prNumber: input.prNumber,
+    headSha: input.headSha.toLowerCase(),
+    requestedBy: input.requestedBy,
+    expiresAt: new Date(now.getTime() + (input.ttlSeconds ?? 600) * 1000).toISOString(),
+    consumedAt: null,
+    createdAt: now.toISOString(),
+  };
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE merge_intents SET consumed_at = ?
+       WHERE workspace_id = ? AND consumed_at IS NULL`
+    ).run(intent.createdAt, input.workspaceId);
+    db.prepare(
+      `INSERT INTO merge_intents
+       (intent_id, workspace_id, pr_number, head_sha, requested_by, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      intent.intentId,
+      intent.workspaceId,
+      intent.prNumber,
+      intent.headSha,
+      intent.requestedBy,
+      intent.expiresAt,
+      intent.createdAt
+    );
+  })();
+  return intent;
+}
+
+export function getMergeIntent(intentId: string): MergeIntent | undefined {
+  const row = getDb()
+    .prepare("SELECT * FROM merge_intents WHERE intent_id = ?")
+    .get(intentId) as any;
+  return row ? mapMergeIntentRow(row) : undefined;
+}
+
+export function consumeMergeIntent(
+  intentId: string,
+  requestedBy: string,
+  now: Date = new Date()
+): MergeIntent | undefined {
+  const db = getDb();
+  const consumedAt = now.toISOString();
+  const consume = db.transaction(() => {
+    const result = db.prepare(
+      `UPDATE merge_intents SET consumed_at = ?
+       WHERE intent_id = ? AND requested_by = ? AND consumed_at IS NULL
+         AND expires_at > ?`
+    ).run(consumedAt, intentId, requestedBy, consumedAt);
+    if (result.changes !== 1) return undefined;
+    const row = db.prepare("SELECT * FROM merge_intents WHERE intent_id = ?").get(intentId) as any;
+    return row ? mapMergeIntentRow(row) : undefined;
+  });
+  return consume();
+}
+
+function mapMergeIntentRow(row: any): MergeIntent {
+  return {
+    intentId: row.intent_id,
+    workspaceId: row.workspace_id,
+    prNumber: Number(row.pr_number),
+    headSha: row.head_sha,
+    requestedBy: row.requested_by,
+    expiresAt: row.expires_at,
+    consumedAt: row.consumed_at ?? null,
+    createdAt: row.created_at,
+  };
+}
+
 
 // ── Events ──────────────────────────────────────────────────
 

@@ -7,6 +7,7 @@
 import { getVersionString, printBanner } from "./banner.js";
 import { exitWithConfigError } from "./errors.js";
 import type { CLIFlags } from "./config.js";
+import { fileURLToPath } from "node:url";
 
 function parseFlags(args: string[]): {
   command: string;
@@ -27,6 +28,10 @@ function parseFlags(args: string[]): {
       flags.chatId = args[++i];
     } else if (arg === "--db-path" && i + 1 < args.length) {
       flags.dbPath = args[++i];
+    } else if (arg === "--doppler-project" && i + 1 < args.length) {
+      flags.dopplerProject = args[++i];
+    } else if (arg === "--doppler-config" && i + 1 < args.length) {
+      flags.dopplerConfig = args[++i];
     } else if (arg === "--version" || arg === "-v") {
       console.log(getVersionString());
       process.exit(0);
@@ -65,6 +70,10 @@ function printHelp(): void {
     --token TOKEN    Telegram bot token (overrides config)
     --chat-id ID     Owner chat ID (overrides config)
     --db-path PATH   Database path (overrides config)
+    --doppler-project NAME
+                     Doppler project used by foreground and launchd runtime
+    --doppler-config NAME
+                     Doppler config used by foreground and launchd runtime
     --quiet          Suppress startup banner
     --no-color       Disable colored output (also respects NO_COLOR env)
     --version, -v    Show version
@@ -79,6 +88,24 @@ function printHelp(): void {
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const { command, flags, rest } = parseFlags(args);
+
+  if (command === "start" || command === "doctor" || command === "status") {
+    const { tryLoadConfig } = await import("./config.js");
+    const { isDopplerRuntimeActive, resolveDopplerRuntime, runWithDoppler } =
+      await import("./doppler.js");
+    const runtimeConfig = tryLoadConfig(flags);
+    if (runtimeConfig) {
+      const doppler = resolveDopplerRuntime(runtimeConfig);
+      if (doppler && !isDopplerRuntimeActive(doppler)) {
+        const status = runWithDoppler(doppler, [
+          process.execPath,
+          fileURLToPath(import.meta.url),
+          ...args,
+        ]);
+        process.exit(status);
+      }
+    }
+  }
 
   switch (command) {
     case "help":
@@ -112,7 +139,7 @@ async function main(): Promise<void> {
 
     case "service": {
       const { runService } = await import("./service.js");
-      await runService(rest);
+      await runService(rest, flags);
       break;
     }
 
@@ -141,6 +168,13 @@ async function main(): Promise<void> {
           "Run 'conductor-telegram setup' to reconfigure, or 'conductor-telegram doctor' to diagnose"
         );
       }
+      if (!config.botToken || !config.ownerChatId) {
+        exitWithConfigError(
+          "Invalid runtime configuration",
+          "BOT_TOKEN and OWNER_CHAT_ID must come from config.json, flags, or the configured Doppler runtime",
+          "Add the missing values or run 'conductor-telegram doctor'"
+        );
+      }
 
       // Inject config into process.env for the existing bot code
       process.env.BOT_TOKEN = config.botToken;
@@ -167,6 +201,12 @@ async function main(): Promise<void> {
         process.env.TELEGRAM_REVIEW_AGENT_TYPE = config.reviewAgentType;
       if (config.reviewModel)
         process.env.TELEGRAM_REVIEW_MODEL = config.reviewModel;
+      if (config.conductorApiBaseUrl)
+        process.env.CONDUCTOR_API_BASE_URL = config.conductorApiBaseUrl;
+      if (config.conductorApiKey)
+        process.env.CONDUCTOR_API_KEY = config.conductorApiKey;
+      if (config.conductorCloudBackend)
+        process.env.CONDUCTOR_CLOUD_BACKEND = config.conductorCloudBackend;
 
       // Print banner
       printBanner("Starting...");

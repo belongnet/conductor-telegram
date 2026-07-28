@@ -2,9 +2,10 @@ import type { Context, Telegraf } from "telegraf";
 import {
   answerPendingStdinDecision,
   archiveConductorWorkspace,
+  canUseConductorCloudApi,
   formatAttachmentReference,
   getConductorWorkspaceSessions,
-  getMaxSessionMessageRowId,
+  getMaxSessionMessageCursor,
   getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
@@ -14,7 +15,7 @@ import {
   sendToSession,
   stageAttachmentPaths,
   setConductorActiveSession,
-  stopAgent,
+  stopConductorAgent,
   type AgentResult,
   type ConductorSessionInfo,
 } from "./launcher.js";
@@ -31,6 +32,7 @@ import {
   updateWorkspaceStatus,
   updateWorkspaceTelegramMessage,
   updateWorkspaceConductorName,
+  updateWorkspaceConductorBinding,
   updateWorkspaceThreadId,
   answerDecision,
   updateWorkspaceConductorSession,
@@ -40,6 +42,9 @@ import {
   getThreadCursor,
   updateThreadCursor,
   getPrRecordsForWorkspaces,
+  consumeMergeIntent,
+  createMergeIntent,
+  getMergeIntent,
   deleteRepoTopic,
   getRepoTopic,
   getRepoTopicByThreadId,
@@ -183,6 +188,7 @@ interface PendingThreadAction {
   repoPath: string | null;
   workspaceId: string;
   sessionId?: string;
+  backendKind?: "local" | "cloud-api";
   createdAt: number;
 }
 
@@ -377,7 +383,11 @@ function resolveWorkspaceTarget(
   const trackedWorkspace = tracked ?? null;
   const conductorName = trackedWorkspace?.conductorWorkspaceName ?? identifier;
   const repoPath = opts.repoPath ?? trackedWorkspace?.repoPath ?? null;
-  const sessionInfo = getWorkspaceSessionInfo(conductorName, repoPath);
+  const sessionInfo = getWorkspaceSessionInfo(
+    conductorName,
+    repoPath,
+    trackedWorkspace
+  );
   if (!sessionInfo) {
     return null;
   }
@@ -574,6 +584,32 @@ function ensureTrackedWorkspace(
   return workspace;
 }
 
+function persistConductorLaunchBinding(
+  workspaceId: string,
+  launch: {
+    workspaceId: string;
+    sessionId: string;
+    backendKind: "local" | "cloud-api";
+    initialCursorRowid: number;
+    initialCursorMessageId: string | null;
+  }
+): void {
+  updateWorkspaceConductorBinding(workspaceId, {
+    workspaceId: launch.workspaceId,
+    sessionId: launch.sessionId,
+    backendKind: launch.backendKind,
+  });
+  updateWorkspaceForwardCursor(workspaceId, launch.initialCursorRowid);
+  updateThreadCursor(
+    workspaceId,
+    launch.sessionId,
+    launch.initialCursorRowid,
+    null,
+    launch.initialCursorMessageId,
+    launch.backendKind
+  );
+}
+
 async function sendPromptToTarget(
   ctx: Context,
   target: WorkspaceTarget,
@@ -639,6 +675,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^thread:(set|new):([a-f0-9]+)$/, handleThreadCallback);
   bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
   bot.action(/^pr:(refresh|fix|merge):(.+)$/, handlePrCallback);
+  bot.action(/^pr:mergeconfirm:([a-f0-9]+)$/, handlePrMergeConfirmCallback);
   bot.action(/^archive:(.+)$/, handleArchiveCallback);
 
   // Media and text handlers
@@ -988,8 +1025,7 @@ async function startWorkspaceForRepo(
 
   // Workspace created and agent running
   updateWorkspaceConductorName(workspace.id, result.workspaceName);
-  updateWorkspaceConductorSession(workspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(workspace.id, result.initialCursorRowid);
+  persistConductorLaunchBinding(workspace.id, result);
   updateWorkspaceStatus(workspace.id, "running");
   workspace.conductorWorkspaceName = result.workspaceName;
   workspace.status = "running";
@@ -1058,7 +1094,7 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
     const icon = statusIcon(ws.status);
     const name = ws.conductorWorkspaceName ?? ws.name;
     const sessionInfo = ws.conductorWorkspaceName
-      ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath)
+      ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath, ws)
       : null;
     const cloud = sessionInfo && isRemoteConductorWorkspace(sessionInfo) ? " ☁️" : "";
     const pr = compactPrBadge(prRecords.get(ws.id));
@@ -1147,7 +1183,7 @@ async function handleStatus(ctx: Context): Promise<void> {
     .map((ws) => {
       const name = ws.conductorWorkspaceName ?? ws.name;
       const sessionInfo = ws.conductorWorkspaceName
-        ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath)
+        ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath, ws)
         : null;
       const cloud = sessionInfo && isRemoteConductorWorkspace(sessionInfo) ? " ☁️" : "";
       return `${statusIcon(ws.status)} <b>${escHtml(name)}${cloud}</b>: ${ws.status}`;
@@ -1215,11 +1251,33 @@ async function handleStop(ctx: Context): Promise<void> {
     await ctx.reply(`Workspace "${idOrName}" not found.`);
     return;
   }
-
   const wsName = workspace.conductorWorkspaceName ?? workspace.name;
+  const conductorInfo = workspace.conductorWorkspaceName
+    ? getWorkspaceSessionInfo(
+        workspace.conductorWorkspaceName,
+        workspace.repoPath,
+        workspace
+      )
+    : null;
   const killed = workspace.conductorWorkspaceName
-    ? stopAgent(workspace.conductorWorkspaceName, workspace.repoPath)
+    ? await stopConductorAgent(
+        workspace.conductorWorkspaceName,
+        workspace.repoPath,
+        workspace.conductorSessionId,
+        workspace
+      )
     : false;
+  if (
+    conductorInfo &&
+    isRemoteConductorWorkspace(conductorInfo) &&
+    !killed
+  ) {
+    await ctx.reply(
+      `Could not stop ☁️ <b>${escHtml(wsName)}</b> through the Conductor API.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
   updateWorkspaceStatus(workspace.id, "stopped");
   if (workspace.telegramThreadId) {
@@ -2353,7 +2411,11 @@ function pruneThreadActions(): void {
 
 async function showThreadList(ctx: Context, target: WorkspaceTarget): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
-  const info = getWorkspaceSessionInfo(target.conductorName, target.repoPath);
+  const info = getWorkspaceSessionInfo(
+    target.conductorName,
+    target.repoPath,
+    target.trackedWorkspace
+  );
   if (!info) {
     await ctx.reply(`Workspace "${escHtml(target.conductorName)}" was not found in Conductor.`, {
       parse_mode: "HTML",
@@ -2361,7 +2423,12 @@ async function showThreadList(ctx: Context, target: WorkspaceTarget): Promise<vo
     return;
   }
 
-  const sessions = getConductorWorkspaceSessions(info.workspaceId);
+  const sessions = await getConductorWorkspaceSessions(
+    info.workspaceId,
+    target.trackedWorkspace?.conductorSessionId ?? info.sessionId,
+    target.trackedWorkspace?.conductorBackendKind ??
+      (isRemoteConductorWorkspace(info) ? "cloud-api" : "local")
+  );
   const remoteBadge = isRemoteConductorWorkspace(info) ? " ☁️" : "";
   const lines = sessions.length > 0
     ? sessions.map((session, index) => {
@@ -2383,17 +2450,19 @@ async function showThreadList(ctx: Context, target: WorkspaceTarget): Promise<vo
         repoPath: target.repoPath,
         workspaceId: info.workspaceId,
         sessionId: session.sessionId,
+        backendKind: session.backendKind,
       });
       return [btn(`Use ${formatSessionTitle(session)}`, `thread:set:${token}`)];
     });
 
-  if (!isRemoteConductorWorkspace(info)) {
+  if (!isRemoteConductorWorkspace(info) || canUseConductorCloudApi()) {
     const token = rememberThreadAction({
       chatId: chatId ?? "",
       action: "new",
       conductorName: target.conductorName,
       repoPath: target.repoPath,
       workspaceId: info.workspaceId,
+      backendKind: isRemoteConductorWorkspace(info) ? "cloud-api" : "local",
     });
     rows.push([btn("New Thread", `thread:new:${token}`)]);
   }
@@ -2419,7 +2488,6 @@ async function startThreadForTarget(
     });
     return;
   }
-
   const threadOpts = trackedWorkspace.telegramThreadId
     ? { message_thread_id: trackedWorkspace.telegramThreadId }
     : {};
@@ -2432,6 +2500,7 @@ async function startThreadForTarget(
   const result = await launchWorkspaceSession(target.conductorName, prompt, {
     repoPath: target.repoPath,
     launchMode: "prompt",
+    binding: trackedWorkspace,
   });
 
   if ("error" in result) {
@@ -2446,14 +2515,7 @@ async function startThreadForTarget(
   }
 
   updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
-  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
-  updateThreadCursor(
-    trackedWorkspace.id,
-    result.sessionId,
-    result.initialCursorRowid,
-    null
-  );
+  persistConductorLaunchBinding(trackedWorkspace.id, result);
   updateWorkspaceStatus(trackedWorkspace.id, "running");
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
@@ -2512,7 +2574,6 @@ async function handleReview(ctx: Context): Promise<void> {
     });
     return;
   }
-
   const progress = await ctx.reply(
     `Starting review for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(reviewPrompt, 200))}</i>`,
     { parse_mode: "HTML" }
@@ -2524,6 +2585,7 @@ async function handleReview(ctx: Context): Promise<void> {
     title: "Review Changes",
     reviewBaseBranch: target.targetBranch,
     repoPath: target.repoPath,
+    binding: trackedWorkspace,
   });
 
   if ("error" in result) {
@@ -2539,8 +2601,7 @@ async function handleReview(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
-  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  persistConductorLaunchBinding(trackedWorkspace.id, result);
   updateWorkspaceStatus(trackedWorkspace.id, "running");
 
   await ctx.telegram.editMessageText(
@@ -2927,7 +2988,11 @@ async function handleThreadCallback(ctx: Context): Promise<void> {
 
   if (action === "set") {
     if (!pending.sessionId) return;
-    const ok = setConductorActiveSession(pending.workspaceId, pending.sessionId);
+    const ok = await setConductorActiveSession(
+      pending.workspaceId,
+      pending.sessionId,
+      pending.backendKind
+    );
     if (!ok) {
       await ctx.answerCbQuery("Thread no longer exists");
       return;
@@ -2938,12 +3003,28 @@ async function handleThreadCallback(ctx: Context): Promise<void> {
       repoPath: pending.repoPath ?? undefined,
     });
     if (tracked) {
-      updateWorkspaceConductorSession(tracked.id, pending.sessionId);
       const cursor = getThreadCursor(tracked.id, pending.sessionId);
-      const rowid = cursor?.lastForwardedRowid ?? getMaxSessionMessageRowId(pending.sessionId);
+      const latest =
+        cursor ??
+        (await getMaxSessionMessageCursor(
+          pending.sessionId,
+          pending.backendKind
+        ));
+      const rowid =
+        "lastForwardedRowid" in latest
+          ? latest.lastForwardedRowid
+          : latest.rowid;
       if (!cursor) {
-        updateThreadCursor(tracked.id, pending.sessionId, rowid, null);
+        updateThreadCursor(
+          tracked.id,
+          pending.sessionId,
+          rowid,
+          null,
+          "messageId" in latest ? latest.messageId : null,
+          pending.backendKind
+        );
       }
+      updateWorkspaceConductorSession(tracked.id, pending.sessionId);
       updateWorkspaceForwardCursor(tracked.id, rowid);
     }
 
@@ -2975,7 +3056,21 @@ async function handleStopCallback(ctx: Context): Promise<void> {
 
   const workspace = getWorkspace(workspaceId);
   if (workspace?.conductorWorkspaceName) {
-    stopAgent(workspace.conductorWorkspaceName, workspace.repoPath);
+    const info = getWorkspaceSessionInfo(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace
+    );
+    const stopped = await stopConductorAgent(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace.conductorSessionId,
+      workspace
+    );
+    if (info && isRemoteConductorWorkspace(info) && !stopped) {
+      await ctx.answerCbQuery("Conductor API could not stop this cloud session");
+      return;
+    }
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
@@ -3013,11 +3108,23 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
-
-  archiveWorkspace(workspaceId);
   if (workspace.conductorWorkspaceName) {
-    archiveConductorWorkspace(workspace.conductorWorkspaceName, workspace.repoPath);
+    const info = getWorkspaceSessionInfo(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace
+    );
+    const archived = await archiveConductorWorkspace(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace
+    );
+    if (info && isRemoteConductorWorkspace(info) && !archived) {
+      await ctx.answerCbQuery("Conductor API could not archive this cloud workspace");
+      return;
+    }
   }
+  archiveWorkspace(workspaceId);
 
   if (workspace.telegramThreadId) {
     try {
@@ -3089,7 +3196,6 @@ async function handlePrCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
-
   if (action === "refresh") {
     await ctx.answerCbQuery("Refreshing PR status...");
     const { record } = await refreshWorkspacePr(workspace);
@@ -3109,7 +3215,7 @@ async function handlePrCallback(ctx: Context): Promise<void> {
       workspace.conductorWorkspaceName,
       prompt,
       [],
-      { repoPath: workspace.repoPath }
+      { repoPath: workspace.repoPath, binding: workspace }
     );
     if ("error" in result) {
       await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
@@ -3127,8 +3233,74 @@ async function handlePrCallback(ctx: Context): Promise<void> {
     await ctx.reply("PR is not eligible to merge yet. Refresh after checks pass.");
     return;
   }
+  if (!record.prNumber || !record.headSha) {
+    await ctx.reply("PR identity is incomplete. Refresh and try again.");
+    return;
+  }
+  const intent = createMergeIntent({
+    workspaceId: workspace.id,
+    prNumber: record.prNumber,
+    headSha: record.headSha,
+    requestedBy: ctx.from!.id.toString(),
+  });
+  await ctx.reply(
+    [
+      "<b>Confirm merge</b>",
+      `PR: <code>#${record.prNumber}</code>`,
+      `Exact reviewed head: <code>${escHtml(record.headSha.slice(0, 12))}</code>`,
+      "This confirmation expires in 10 minutes and becomes invalid if the PR head changes.",
+    ].join("\n"),
+    {
+      parse_mode: "HTML",
+      ...styledKeyboard([
+        [btn("Confirm exact SHA merge", `pr:mergeconfirm:${intent.intentId}`)],
+      ]),
+    }
+  );
+}
 
-  const merged = await mergeWorkspacePr(workspace, record);
+async function handlePrMergeConfirmCallback(ctx: Context): Promise<void> {
+  const intentId = (ctx as any).match?.[1] as string | undefined;
+  if (!intentId || !ctx.from) return;
+
+  const intent = getMergeIntent(intentId);
+  if (!intent || intent.requestedBy !== ctx.from.id.toString()) {
+    await ctx.answerCbQuery("Merge confirmation is invalid");
+    return;
+  }
+  if (intent.consumedAt || Date.parse(intent.expiresAt) <= Date.now()) {
+    await ctx.answerCbQuery("Merge confirmation expired");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    return;
+  }
+
+  const workspace = getWorkspace(intent.workspaceId);
+  if (!workspace) {
+    await ctx.answerCbQuery("Workspace not found");
+    return;
+  }
+  await ctx.answerCbQuery("Re-checking exact PR head...");
+  const { record } = await refreshWorkspacePr(workspace);
+  if (
+    !canMergePr(record) ||
+    record.prNumber !== intent.prNumber ||
+    record.headSha?.toLowerCase() !== intent.headSha.toLowerCase()
+  ) {
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    await ctx.reply(
+      "Merge stopped: the PR, review, checks, mergeability, or exact head SHA changed. Request a fresh merge confirmation."
+    );
+    await editOrSendPrCard(ctx, workspace, record);
+    return;
+  }
+  const consumed = consumeMergeIntent(intentId, ctx.from.id.toString());
+  if (!consumed) {
+    await ctx.reply("Merge confirmation was already used or expired.");
+    return;
+  }
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+
+  const merged = await mergeWorkspacePr(workspace, record, intent.headSha);
   if (!merged.ok) {
     await ctx.reply(`Merge failed: ${escHtml(merged.message)}`, { parse_mode: "HTML" });
     const refreshed = await refreshWorkspacePr(workspace);
@@ -3136,9 +3308,13 @@ async function handlePrCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  await ctx.reply(`Merged PR: ${escHtml(merged.message)}`, { parse_mode: "HTML" });
   const refreshed = await refreshWorkspacePr(workspace);
-  await editOrSendPrCard(ctx, workspace, refreshed.record);
+  await ctx.reply(`Merged PR: ${escHtml(merged.message)}`, { parse_mode: "HTML" }).catch((error) =>
+    console.error(`[pr:${record.prNumber}] merge notice failed:`, error)
+  );
+  await editOrSendPrCard(ctx, workspace, refreshed.record).catch((error) =>
+    console.error(`[pr:${record.prNumber}] merged PR card failed:`, error)
+  );
 }
 
 async function editOrSendPrCard(
@@ -3193,7 +3369,6 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
-
   const conductorName = workspace.conductorWorkspaceName;
   const actionLabel = action === "review" ? "Review" : "PR generation";
 
@@ -3246,6 +3421,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     launchMode: action === "review" ? "review" : "prompt",
     title: action === "review" ? "Review Changes" : "Generate PR",
     repoPath: workspace.repoPath,
+    binding: trackedWorkspace,
   });
 
   if ("error" in result) {
@@ -3261,8 +3437,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceConductorName(trackedWorkspace.id, conductorName);
-  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  persistConductorLaunchBinding(trackedWorkspace.id, result);
   updateWorkspaceStatus(trackedWorkspace.id, "running");
 
   await ctx.telegram.editMessageText(
@@ -3354,6 +3529,7 @@ async function sendMessageToWorkspace(
   const result = await sendToSession(conductorName, message, attachmentSourcePaths, {
     repoPath: workspace.repoPath,
     sessionId: options.sessionId ?? null,
+    binding: workspace,
   });
 
   if ("error" in result) {

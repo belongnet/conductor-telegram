@@ -10,7 +10,7 @@
  * etc. when there's exactly one item).
  */
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 export type MediaKind = "photo" | "video" | "audio" | "document" | "animation";
@@ -46,7 +46,8 @@ export function classifyByExtension(filePath: string): MediaKind {
 
 /**
  * Find markdown-style file references in `text` that resolve to local files
- * inside `baseDir` (or to absolute paths that exist on disk).
+ * inside `baseDir`. Absolute paths are accepted only when their canonical
+ * target remains inside that directory.
  *
  * Returns the cleaned text (matched references stripped) and the list of
  * inline media items the caller should attach.
@@ -65,7 +66,7 @@ export function extractInlineMedia(
 
   // Markdown image: ![alt](url)
   cleaned = cleaned.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (match, _alt, url) => {
-    const item = resolveLocalFile(url, baseDir);
+    const item = resolveWorkspaceMediaFile(url, baseDir);
     if (!item) return match;
     if (seen.has(item.filePath)) return "";
     seen.add(item.filePath);
@@ -77,7 +78,7 @@ export function extractInlineMedia(
   // engines; we just make sure the leading '!' wasn't there by checking match[0] prefix later).
   cleaned = cleaned.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (match, _name, url, offset) => {
     if (offset > 0 && cleaned[offset - 1] === "!") return match;
-    const item = resolveLocalFile(url, baseDir);
+    const item = resolveWorkspaceMediaFile(url, baseDir);
     if (!item) return match;
     if (seen.has(item.filePath)) return "";
     seen.add(item.filePath);
@@ -91,7 +92,10 @@ export function extractInlineMedia(
   return { cleanedText: cleaned, media };
 }
 
-function resolveLocalFile(url: string, baseDir: string): InlineMediaItem | null {
+export function resolveWorkspaceMediaFile(
+  url: string,
+  baseDir: string
+): InlineMediaItem | null {
   if (/^https?:\/\//i.test(url)) return null;
 
   let p = url;
@@ -102,9 +106,26 @@ function resolveLocalFile(url: string, baseDir: string): InlineMediaItem | null 
   }
 
   if (!existsSync(p)) return null;
+  let canonicalBase: string;
+  let canonicalPath: string;
+  try {
+    canonicalBase = realpathSync(baseDir);
+    canonicalPath = realpathSync(p);
+  } catch {
+    return null;
+  }
+  const relative = path.relative(canonicalBase, canonicalPath);
+  if (
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    return null;
+  }
+
   let stat;
   try {
-    stat = statSync(p);
+    stat = statSync(canonicalPath);
   } catch {
     return null;
   }
@@ -112,8 +133,8 @@ function resolveLocalFile(url: string, baseDir: string): InlineMediaItem | null 
   if (stat.size > TELEGRAM_MAX_UPLOAD_BYTES) return null;
 
   return {
-    kind: classifyByExtension(p),
-    filePath: p,
-    filename: path.basename(p),
+    kind: classifyByExtension(canonicalPath),
+    filePath: canonicalPath,
+    filename: path.basename(canonicalPath),
   };
 }

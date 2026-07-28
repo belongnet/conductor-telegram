@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,11 +16,13 @@ import {
   getRepoTopic,
   getRepoTopicByThreadId,
   getRepoTopicsForChat,
+  getWorkspace,
   getWorkspaceMessageTarget,
   linkTelegramMessage,
   recordRouteAttempt,
   touchRepoTopic,
   updateThreadCursor,
+  updateWorkspaceConductorBinding,
   upsertRepoTopic,
 } from "../src/store/queries.js";
 
@@ -111,6 +114,72 @@ test("store migration adds telegram link session column before creating its inde
   }
 });
 
+test("concurrent processes serialize legacy schema migrations", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-routing-concurrent-"));
+  try {
+    const dbPath = path.join(dir, "bot.db");
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'starting',
+        repo_path TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        telegram_chat_id TEXT NOT NULL,
+        telegram_message_id TEXT,
+        conductor_workspace_name TEXT,
+        conductor_session_id TEXT,
+        last_forwarded_message_rowid INTEGER NOT NULL DEFAULT 0,
+        telegram_thread_id INTEGER,
+        archived_at TEXT
+      );
+    `);
+    legacy.close();
+
+    const script = [
+      'import { getDb, closeDb } from "./src/store/db.ts";',
+      "getDb();",
+      "closeDb();",
+    ].join("\n");
+    const runMigration = () =>
+      new Promise<void>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ["--import", "tsx", "--input-type=module", "-e", script],
+          {
+            cwd: process.cwd(),
+            env: { ...process.env, DB_PATH: dbPath },
+            stdio: ["ignore", "ignore", "pipe"],
+          }
+        );
+        let stderr = "";
+        child.stderr.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        child.on("error", reject);
+        child.on("exit", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(stderr || `migration exited ${code}`));
+        });
+      });
+
+    await Promise.all(Array.from({ length: 6 }, runMigration));
+
+    const migrated = new Database(dbPath, { readonly: true });
+    const columns = migrated
+      .prepare("PRAGMA table_info(workspaces)")
+      .all() as Array<{ name: string }>;
+    migrated.close();
+    assert.ok(columns.some((row) => row.name === "conductor_workspace_id"));
+    assert.ok(columns.some((row) => row.name === "conductor_backend_kind"));
+  } finally {
+    closeDb();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("route attempts record redacted routing decisions", () => {
   withTempDb(() => {
     const id = recordRouteAttempt({
@@ -182,19 +251,74 @@ test("thread cursors and Telegram links preserve Conductor session targets", () 
       telegramChatId: "chat-1",
     });
 
-    updateThreadCursor(workspace.id, "session-a", 41, "Build");
+    updateThreadCursor(
+      workspace.id,
+      "session-a",
+      41,
+      "Build",
+      "api-message-41",
+      "cloud-api"
+    );
     updateThreadCursor(workspace.id, "session-b", 7, "Review");
 
     assert.equal(
       getThreadCursor(workspace.id, "session-a")?.lastForwardedRowid,
       41
     );
+    assert.equal(
+      getThreadCursor(workspace.id, "session-a")?.lastMessageId,
+      "api-message-41"
+    );
     assert.equal(getThreadCursor(workspace.id, "session-b")?.title, "Review");
+
+    updateWorkspaceConductorBinding(workspace.id, {
+      workspaceId: "cloud-workspace-1",
+      sessionId: "session-a",
+      backendKind: "cloud-api",
+    });
+    const rebound = getWorkspace(workspace.id);
+    assert.equal(rebound?.conductorWorkspaceId, "cloud-workspace-1");
+    assert.equal(rebound?.conductorSessionId, "session-a");
+    assert.equal(rebound?.conductorBackendKind, "cloud-api");
 
     linkTelegramMessage("chat-1", "100", workspace.id, "session-b");
 
     const target = getWorkspaceMessageTarget("chat-1", "100");
     assert.equal(target?.workspace.id, workspace.id);
     assert.equal(target?.sessionId, "session-b");
+  });
+});
+
+test("stale cursor updates cannot regress a forwarded transcript", () => {
+  withTempDb(() => {
+    const workspace = createWorkspace({
+      name: "cursor-race",
+      prompt: "watch",
+      repoPath: "/repos/a",
+      telegramChatId: "chat-1",
+    });
+
+    updateThreadCursor(workspace.id, "session-a", 900, "Local baseline");
+    updateThreadCursor(
+      workspace.id,
+      "session-a",
+      42,
+      "Build",
+      "api-message-42",
+      "cloud-api"
+    );
+    updateThreadCursor(
+      workspace.id,
+      "session-a",
+      12,
+      "Stale title",
+      "api-message-12",
+      "cloud-api"
+    );
+    updateThreadCursor(workspace.id, "session-a", 1_000, "Stale local mirror");
+
+    const cursor = getThreadCursor(workspace.id, "session-a");
+    assert.equal(cursor?.lastForwardedRowid, 42);
+    assert.equal(cursor?.lastMessageId, "api-message-42");
   });
 });

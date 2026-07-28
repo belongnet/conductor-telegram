@@ -31,6 +31,10 @@ export function formatPrCard(workspace: Workspace, record: PrRecord): string {
     lines.push("PR: <i>not found</i>");
   }
 
+  if (record.headSha) {
+    lines.push(`Current head: <code>${escHtml(record.headSha.slice(0, 12))}</code>`);
+  }
+
   lines.push(`Checks: <code>${escHtml(record.checksStatus)}</code>${record.checksSummary ? ` (${escHtml(record.checksSummary)})` : ""}`);
 
   if (record.reviewDecision) {

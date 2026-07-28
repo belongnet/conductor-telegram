@@ -59,6 +59,8 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
       botToken: flags.token,
       ownerChatId: flags.chatId,
       dbPath: flags.dbPath,
+      dopplerProject: flags.dopplerProject,
+      dopplerConfig: flags.dopplerConfig,
     };
     saveConfig(config);
     console.log("  Config saved to ~/.conductor-telegram/config.json");
@@ -118,15 +120,16 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
   }
 
   // Bot token
-  const tokenInput = await p.text({
-    message: "Telegram bot token",
-    placeholder: existingConfig.botToken
-      ? "(press Enter to keep current)"
-      : "Paste token from @BotFather",
-    defaultValue: existingConfig.botToken,
+  const tokenInput = await p.password({
+    message: existingConfig.botToken
+      ? "Telegram bot token (leave blank to keep current)"
+      : "Telegram bot token from @BotFather",
     validate: (val) => {
-      if (!val) return "Bot token is required";
-      if (!val.includes(":")) return "Token should contain a colon (e.g. 123456:ABC...)";
+      const candidate = val || existingConfig.botToken;
+      if (!candidate) return "Bot token is required";
+      if (!candidate.includes(":")) {
+        return "Token should contain a colon (e.g. 123456:ABC...)";
+      }
     },
   });
 
@@ -135,7 +138,8 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
     process.exit(0);
   }
 
-  const botToken = (tokenInput as string) || existingConfig.botToken || "";
+  const botToken =
+    (tokenInput as string).trim() || existingConfig.botToken || "";
 
   // Validate token
   const spinner = p.spinner();
@@ -224,6 +228,64 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
     process.exit(0);
   }
 
+  const conductorApiKeyInput = await p.password({
+    message:
+      "Conductor API key (optional; enables supported cloud workspace control)",
+    validate: () => undefined,
+  });
+
+  if (p.isCancel(conductorApiKeyInput)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+
+  const conductorApiKey =
+    (conductorApiKeyInput as string).trim() ||
+    existingConfig.conductorApiKey ||
+    undefined;
+
+  const dopplerProjectInput = await p.text({
+    message: "Doppler project for foreground/launchd secrets (optional)",
+    placeholder: existingConfig.dopplerProject
+      ? "(press Enter to keep current)"
+      : "Leave blank to use config.json only",
+    defaultValue: existingConfig.dopplerProject,
+    validate: (value) => {
+      if (!value) return;
+      if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
+        return "Use a Doppler project slug, not a URL";
+      }
+    },
+  });
+  if (p.isCancel(dopplerProjectInput)) {
+    p.cancel("Setup cancelled.");
+    process.exit(0);
+  }
+  const dopplerProject =
+    (dopplerProjectInput as string).trim() ||
+    existingConfig.dopplerProject ||
+    undefined;
+
+  let dopplerConfig: string | undefined;
+  if (dopplerProject) {
+    const dopplerConfigInput = await p.text({
+      message: "Doppler config",
+      placeholder: existingConfig.dopplerConfig ?? "production",
+      defaultValue: existingConfig.dopplerConfig ?? "production",
+      validate: (value) => {
+        if (!value) return "Doppler config is required when a project is set";
+        if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
+          return "Use a Doppler config slug, not a URL";
+        }
+      },
+    });
+    if (p.isCancel(dopplerConfigInput)) {
+      p.cancel("Setup cancelled.");
+      process.exit(0);
+    }
+    dopplerConfig = (dopplerConfigInput as string).trim();
+  }
+
   // MCP plugin install
   const shouldInstallPlugin = await p.confirm({
     message:
@@ -254,6 +316,13 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
     defaultModel: existingConfig.defaultModel,
     reviewAgentType: existingConfig.reviewAgentType,
     reviewModel: existingConfig.reviewModel,
+    conductorApiBaseUrl:
+      existingConfig.conductorApiBaseUrl ?? "https://api.conductor.build",
+    conductorApiKey,
+    conductorCloudBackend:
+      existingConfig.conductorCloudBackend ?? "auto",
+    dopplerProject,
+    dopplerConfig,
   };
 
   // Summary
@@ -265,6 +334,12 @@ export async function runSetup(flags: CLIFlags): Promise<void> {
       `  User ID:    ${ownerUserId ?? "(not set)"}`,
       `  Workspaces: ${config.conductorWorkspacesDir}`,
       `  Repos:      ${config.conductorReposDir}`,
+      `  Cloud API:  ${config.conductorApiKey ? "configured" : "observe-only"}`,
+      `  Secrets:    ${
+        config.dopplerProject && config.dopplerConfig
+          ? `Doppler ${config.dopplerProject}/${config.dopplerConfig}`
+          : "config.json"
+      }`,
       `  Config:     ~/.conductor-telegram/config.json`,
     ].join("\n")
   );

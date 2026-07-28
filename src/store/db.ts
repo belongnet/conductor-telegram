@@ -12,7 +12,9 @@ const SCHEMA = `
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     telegram_chat_id TEXT NOT NULL,
     telegram_message_id TEXT,
-    conductor_workspace_name TEXT
+    conductor_workspace_name TEXT,
+    conductor_workspace_id TEXT,
+    conductor_backend_kind TEXT
   );
 
   CREATE TABLE IF NOT EXISTS events (
@@ -51,7 +53,9 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS thread_cursors (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     session_id TEXT NOT NULL,
+    backend_kind TEXT NOT NULL DEFAULT 'local',
     last_forwarded_rowid INTEGER NOT NULL DEFAULT 0,
+    last_message_id TEXT,
     title TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -88,6 +92,7 @@ const SCHEMA = `
     state TEXT NOT NULL DEFAULT 'unknown',
     is_draft INTEGER NOT NULL DEFAULT 0,
     head_ref TEXT,
+    head_sha TEXT,
     base_ref TEXT,
     review_decision TEXT,
     merge_state_status TEXT,
@@ -103,6 +108,20 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_pr_records_repo_branch
     ON pr_records(repo_path, branch);
+
+  CREATE TABLE IF NOT EXISTS merge_intents (
+    intent_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    pr_number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_merge_intents_workspace_created
+    ON merge_intents(workspace_id, created_at DESC);
 
   CREATE TABLE IF NOT EXISTS repo_topics (
     chat_id TEXT NOT NULL,
@@ -151,24 +170,54 @@ export function getDb(dbPath?: string): Database.Database {
   _db = new Database(resolvedPath);
 
   // WAL mode for concurrent writes from multiple MCP server instances
-  _db.pragma("journal_mode = WAL");
   _db.pragma("busy_timeout = 5000");
+  _db.pragma("journal_mode = WAL");
 
-  _db.exec(SCHEMA);
-  ensureColumn(_db, "workspaces", "conductor_session_id", "TEXT");
-  ensureColumn(
-    _db,
-    "workspaces",
-    "last_forwarded_message_rowid",
-    "INTEGER NOT NULL DEFAULT 0"
-  );
-  ensureColumn(_db, "workspaces", "telegram_thread_id", "INTEGER");
-  ensureColumn(_db, "workspaces", "archived_at", "TEXT");
-  ensureColumn(_db, "telegram_message_links", "session_id", "TEXT");
-  _db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_telegram_message_links_session
-      ON telegram_message_links(session_id, created_at);
-  `);
+  try {
+    _db.exec("BEGIN IMMEDIATE");
+    _db.exec(SCHEMA);
+    ensureColumn(_db, "workspaces", "conductor_session_id", "TEXT");
+    ensureColumn(
+      _db,
+      "workspaces",
+      "last_forwarded_message_rowid",
+      "INTEGER NOT NULL DEFAULT 0"
+    );
+    ensureColumn(_db, "workspaces", "telegram_thread_id", "INTEGER");
+    ensureColumn(_db, "workspaces", "archived_at", "TEXT");
+    ensureColumn(_db, "workspaces", "conductor_workspace_id", "TEXT");
+    ensureColumn(_db, "workspaces", "conductor_backend_kind", "TEXT");
+    ensureColumn(_db, "telegram_message_links", "session_id", "TEXT");
+    ensureColumn(_db, "thread_cursors", "last_message_id", "TEXT");
+    ensureColumn(
+      _db,
+      "thread_cursors",
+      "backend_kind",
+      "TEXT NOT NULL DEFAULT 'local'"
+    );
+    _db.exec(`
+      UPDATE thread_cursors
+      SET backend_kind = 'cloud-api'
+      WHERE workspace_id IN (
+        SELECT id
+        FROM workspaces
+        WHERE conductor_backend_kind = 'cloud-api'
+      );
+    `);
+    ensureColumn(_db, "pr_records", "head_sha", "TEXT");
+    _db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_telegram_message_links_session
+        ON telegram_message_links(session_id, created_at);
+    `);
+    _db.exec("COMMIT");
+  } catch (error) {
+    if (_db.inTransaction) {
+      _db.exec("ROLLBACK");
+    }
+    _db.close();
+    _db = null;
+    throw error;
+  }
   return _db;
 }
 
