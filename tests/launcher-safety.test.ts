@@ -17,31 +17,40 @@ import {
   resolveRemoteBaseCommit,
 } from "../src/bot/launcher.js";
 
-test("agent environment excludes bot and provider API-key variables", () => {
-  const env = buildAgentEnvironment(
-    {
-      HOME: "/Users/operator",
-      PATH: "/usr/bin:/bin",
-      DB_PATH: "/tmp/conductor-telegram.db",
-      BOT_TOKEN: "telegram-secret",
-      CONDUCTOR_API_KEY: "conductor-secret",
-      OPENAI_API_KEY: "provider-secret",
-      ANTHROPIC_API_KEY: "provider-secret",
-      GITHUB_TOKEN: "github-secret",
-    },
-    {
-      agentType: "codex",
-      workspaceName: "oslo",
-      workspaceDir: "/workspaces/oslo",
-      repoPath: "/repos/app",
-    }
-  );
+const OPERATOR_ENV = {
+  HOME: "/Users/operator",
+  PATH: "/usr/bin:/bin",
+  DB_PATH: "/tmp/conductor-telegram.db",
+  BOT_TOKEN: "telegram-secret",
+  CONDUCTOR_API_KEY: "conductor-secret",
+  OPENAI_API_KEY: "provider-secret",
+  ANTHROPIC_API_KEY: "provider-secret",
+  GITHUB_TOKEN: "github-secret",
+};
+
+/** buildAgentEnvironment creates a real runtime home; don't leak it. */
+function buildIsolatedEnv(
+  t: { after: (fn: () => void) => void },
+  context: Parameters<typeof buildAgentEnvironment>[1],
+  source: NodeJS.ProcessEnv = OPERATOR_ENV
+): NodeJS.ProcessEnv {
+  const env = buildAgentEnvironment(source, context);
+  t.after(() => rmSync(env.HOME ?? "", { recursive: true, force: true }));
+  return env;
+}
+
+test("agent environment excludes bot and provider API-key variables", (t) => {
+  const env = buildIsolatedEnv(t, {
+    agentType: "codex",
+    workspaceName: "oslo",
+    workspaceDir: "/workspaces/oslo",
+    repoPath: "/repos/app",
+  });
 
   assert.notEqual(env.HOME, "/Users/operator");
   assert.match(env.HOME ?? "", /conductor-telegram-agents/);
   assert.equal(env.CODEX_HOME, "/Users/operator/.codex");
   assert.equal(env.CLAUDE_CONFIG_DIR, undefined);
-  assert.equal(env.DB_PATH, undefined);
   assert.equal(env.CONDUCTOR_WORKSPACE_NAME, "oslo");
   assert.equal(env.CONDUCTOR_WORKSPACE_PATH, "/workspaces/oslo");
   assert.equal(env.CONDUCTOR_ROOT_PATH, "/repos/app");
@@ -50,6 +59,62 @@ test("agent environment excludes bot and provider API-key variables", () => {
   assert.equal(env.OPENAI_API_KEY, undefined);
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
   assert.equal(env.GITHUB_TOKEN, undefined);
+});
+
+test("agent environment keeps the oversight database reachable", (t) => {
+  const forwarded = buildIsolatedEnv(t, {
+    agentType: "claude",
+    workspaceName: "oslo",
+    workspaceDir: "/workspaces/oslo",
+    repoPath: "/repos/app",
+  });
+  // The MCP server resolves DB_PATH from its own env. Without it, it would
+  // create an empty database under the isolated HOME and drop every report.
+  assert.equal(forwarded.DB_PATH, "/tmp/conductor-telegram.db");
+  assert.notEqual(forwarded.DB_PATH, path.join(forwarded.HOME ?? "", ".conductor-telegram"));
+
+  const defaulted = buildIsolatedEnv(
+    t,
+    {
+      agentType: "claude",
+      workspaceName: "oslo",
+      workspaceDir: "/workspaces/oslo",
+      repoPath: "/repos/app",
+    },
+    { HOME: "/Users/operator", PATH: "/usr/bin:/bin" }
+  );
+  // Falls back to the operator's home, never the throwaway runtime home.
+  assert.equal(
+    defaulted.DB_PATH,
+    "/Users/operator/.conductor-telegram/conductor-telegram.db"
+  );
+  assert.match(defaulted.CONDUCTOR_DB_PATH ?? "", /^\/Users\/operator\/Library/);
+});
+
+test("only full-access launches receive git and gh credentials", (t) => {
+  const legacy = buildIsolatedEnv(t, {
+    agentType: "claude",
+    accessMode: "legacy",
+    workspaceName: "oslo",
+    workspaceDir: "/workspaces/oslo",
+    repoPath: "/repos/app",
+  });
+  assert.equal(legacy.GIT_CONFIG_GLOBAL, "/Users/operator/.gitconfig");
+  assert.equal(legacy.GH_CONFIG_DIR, "/Users/operator/.config/gh");
+
+  for (const accessMode of ["read-only", "workspace-write"] as const) {
+    const restricted = buildIsolatedEnv(t, {
+      agentType: "claude",
+      accessMode,
+      workspaceName: "oslo",
+      workspaceDir: "/workspaces/oslo",
+      repoPath: "/repos/app",
+    });
+    assert.equal(restricted.GIT_CONFIG_GLOBAL, undefined);
+    assert.equal(restricted.GH_CONFIG_DIR, undefined);
+    assert.equal(restricted.GIT_SSH_COMMAND, undefined);
+    assert.equal(restricted.SSH_AUTH_SOCK, undefined);
+  }
 });
 
 test("Codex launches are sandboxed and never use the bypass flag", () => {
@@ -97,6 +162,32 @@ test("Codex launches are sandboxed and never use the bypass flag", () => {
   ]);
 });
 
+test("a flag-shaped prompt cannot reach Codex as a flag", () => {
+  const hostile = "--dangerously-bypass-approvals-and-sandbox";
+  const fresh = buildCodexExecArgs("gpt-5.5", hostile, null, [], "read-only");
+  const resumed = buildCodexExecArgs(
+    "gpt-5.5",
+    hostile,
+    "00000000-0000-0000-0000-000000000000",
+    [],
+    "workspace-write"
+  );
+
+  for (const args of [fresh, resumed]) {
+    const separator = args.indexOf("--");
+    assert.notEqual(separator, -1, "argv must carry a positional separator");
+    // Everything Codex parses as options comes before the separator.
+    assert.equal(args.slice(0, separator).includes(hostile), false);
+    assert.equal(args[args.length - 1], hostile);
+  }
+  assert.deepEqual(fresh.slice(fresh.indexOf("--")), ["--", hostile]);
+  assert.deepEqual(resumed.slice(resumed.indexOf("--")), [
+    "--",
+    "00000000-0000-0000-0000-000000000000",
+    hostile,
+  ]);
+});
+
 test("generated restricted arguments parse in Conductor's bundled Codex CLI", (t) => {
   const codexBin = path.join(
     os.homedir(),
@@ -107,15 +198,22 @@ test("generated restricted arguments parse in Conductor's bundled Codex CLI", (t
     return;
   }
 
+  // Cut at the `--` separator so --help is still parsed as a flag.
+  const withoutPositionals = (args: string[]): string[] =>
+    args.slice(0, args.indexOf("--"));
   const cases = [
-    buildCodexExecArgs("gpt-5.5", "inspect", null, [], "read-only").slice(0, -1),
-    buildCodexExecArgs(
-      "gpt-5.5",
-      "implement",
-      "00000000-0000-0000-0000-000000000000",
-      [],
-      "workspace-write"
-    ).slice(0, -1),
+    withoutPositionals(
+      buildCodexExecArgs("gpt-5.5", "inspect", null, [], "read-only")
+    ),
+    withoutPositionals(
+      buildCodexExecArgs(
+        "gpt-5.5",
+        "implement",
+        "00000000-0000-0000-0000-000000000000",
+        [],
+        "workspace-write"
+      )
+    ),
   ];
   for (const args of cases) {
     assert.doesNotThrow(() =>

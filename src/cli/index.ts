@@ -95,14 +95,24 @@ async function main(): Promise<void> {
       await import("./doppler.js");
     const runtimeConfig = tryLoadConfig(flags);
     if (runtimeConfig) {
-      const doppler = resolveDopplerRuntime(runtimeConfig);
-      if (doppler && !isDopplerRuntimeActive(doppler)) {
-        const status = runWithDoppler(doppler, [
-          process.execPath,
-          fileURLToPath(import.meta.url),
-          ...args,
-        ]);
-        process.exit(status);
+      try {
+        const doppler = resolveDopplerRuntime(runtimeConfig);
+        if (doppler && !isDopplerRuntimeActive(doppler)) {
+          const status = runWithDoppler(doppler, [
+            process.execPath,
+            fileURLToPath(import.meta.url),
+            ...args,
+          ]);
+          process.exit(status);
+        }
+      } catch (error) {
+        // `start` must fail closed: running without the managed secrets would
+        // silently drop cloud control. `doctor` and `status` exist to explain
+        // exactly this kind of breakage, so they carry on and report it.
+        if (command === "start") throw error;
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`Warning: Doppler runtime unavailable (${detail}).`);
+        console.error("Continuing with locally configured values.\n");
       }
     }
   }

@@ -195,14 +195,23 @@ export function getDb(dbPath?: string): Database.Database {
       "backend_kind",
       "TEXT NOT NULL DEFAULT 'local'"
     );
+    // Relabelling a cursor also changes which namespace its position lives in:
+    // a local cursor holds a session_messages rowid, a cloud one holds an API
+    // message id. Carrying the old rowid across would leave a cloud cursor
+    // permanently ahead of every API id it is later compared against, so reset
+    // to the unbaselined state and let ensureThreadCursor re-anchor it. The
+    // backend_kind predicate also keeps this one-shot per row.
     _db.exec(`
       UPDATE thread_cursors
-      SET backend_kind = 'cloud-api'
-      WHERE workspace_id IN (
-        SELECT id
-        FROM workspaces
-        WHERE conductor_backend_kind = 'cloud-api'
-      );
+      SET backend_kind = 'cloud-api',
+          last_forwarded_rowid = 0,
+          last_message_id = NULL
+      WHERE backend_kind <> 'cloud-api'
+        AND workspace_id IN (
+          SELECT id
+          FROM workspaces
+          WHERE conductor_backend_kind = 'cloud-api'
+        );
     `);
     ensureColumn(_db, "pr_records", "head_sha", "TEXT");
     _db.exec(`

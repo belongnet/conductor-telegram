@@ -8,7 +8,9 @@ import {
   buildServiceDopplerEnvironment,
   buildDopplerRunArgs,
   DopplerRuntimeError,
+  isDopplerRuntimeActive,
   stripDopplerManagedConfig,
+  DOPPLER_RUNTIME_SENTINEL_ENV,
 } from "../src/cli/doppler.js";
 import {
   buildBotPlist,
@@ -41,6 +43,46 @@ test("Doppler runtime injects only the explicit conductor-telegram allowlist", (
   );
   assert.deepEqual(args.slice(args.indexOf("--") + 1), command);
   assert.equal(args.some((value) => value.includes("secret-value")), false);
+});
+
+test("a re-exec into the Doppler runtime is detected exactly once", () => {
+  const runtime = { project: "Belong-Agents", config: "PRD" };
+
+  // Doppler resolves references case-insensitively but injects its own
+  // canonical lowercase slug. A byte-for-byte comparison would look inactive
+  // forever, and each miss re-execs the CLI under `doppler run` again.
+  assert.equal(
+    isDopplerRuntimeActive(runtime, {
+      DOPPLER_PROJECT: "belong-agents",
+      DOPPLER_CONFIG: "prd",
+    }),
+    true
+  );
+
+  // The sentinel is authoritative even when Doppler reports something else
+  // entirely, e.g. a service token scoped to a different config.
+  assert.equal(
+    isDopplerRuntimeActive(runtime, {
+      [DOPPLER_RUNTIME_SENTINEL_ENV]: "1",
+      DOPPLER_PROJECT: "other",
+      DOPPLER_CONFIG: "other",
+    }),
+    true
+  );
+
+  // A genuinely absent runtime must still re-exec.
+  assert.equal(isDopplerRuntimeActive(runtime, {}), false);
+  assert.equal(
+    isDopplerRuntimeActive(runtime, { DOPPLER_PROJECT: "belong-agents" }),
+    false
+  );
+
+  // The sentinel must not leak into the environment used to validate installs.
+  const sanitized = buildServiceDopplerEnvironment({
+    [DOPPLER_RUNTIME_SENTINEL_ENV]: "1",
+    PATH: "/usr/bin",
+  });
+  assert.equal(sanitized[DOPPLER_RUNTIME_SENTINEL_ENV], undefined);
 });
 
 test("Doppler runtime rejects an empty or widened secret allowlist", () => {

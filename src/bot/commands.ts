@@ -216,15 +216,34 @@ async function downloadTelegramFile(ctx: Context, fileId: string, ext: string = 
   const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
 
   // Determine extension from Telegram's file_path if not provided
-  const fileExt = ext || path.extname(file.file_path ?? "") || ".bin";
-  const localName = `${Date.now()}-${fileId.slice(-8)}${fileExt}`;
+  const fileExt = safeExtension(ext || path.extname(file.file_path ?? ""));
+  const safeId = fileId.slice(-8).replace(/[^A-Za-z0-9_-]/g, "");
+  const localName = `${Date.now()}-${safeId}${fileExt}`;
 
   mkdirSync(TELEGRAM_DOWNLOADS_DIR, { recursive: true });
   const localPath = path.join(TELEGRAM_DOWNLOADS_DIR, localName);
+  if (
+    path.dirname(path.resolve(localPath)) !==
+    path.resolve(TELEGRAM_DOWNLOADS_DIR)
+  ) {
+    throw new Error("Refusing to stage a download outside the downloads directory");
+  }
 
   const data = await fetchBuffer(url);
   writeFileSync(localPath, data);
   return localPath;
+}
+
+/**
+ * Constrain a Telegram-supplied extension to something that cannot steer the
+ * download path. `mime_type` is attacker-controlled and reaches here verbatim,
+ * so a value like `application/../../../.claude/settings.json` would otherwise
+ * be normalised by path.join into an arbitrary file write.
+ */
+export function safeExtension(ext: string): string {
+  return /^\.[A-Za-z0-9][A-Za-z0-9+._-]{0,15}$/.test(ext.trim())
+    ? ext.trim()
+    : ".bin";
 }
 
 function fetchBuffer(url: string): Promise<Buffer> {

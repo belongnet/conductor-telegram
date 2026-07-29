@@ -15,7 +15,21 @@ export interface CloudSessionCycle {
   outboundMessageId?: string;
   baselineRowid?: number;
   boundaryRowid?: number;
+  /** Epoch ms the cycle was reserved; used to expire a stuck `pending`. */
+  startedAt?: number;
 }
+
+/**
+ * How long a cycle may sit in `pending` before it is abandoned.
+ *
+ * `pending` only waits for the bot to observe the message it just sent, which
+ * resolves within a poll tick or two. A restart between reserving the cycle
+ * and recording its outbound id — or a cursor baselined past that message —
+ * would otherwise strand the thread forever: every later send is rejected as
+ * in-flight and the workspace can never complete. Later phases track real
+ * agent work and are deliberately not bounded.
+ */
+export const CLOUD_CYCLE_PENDING_TTL_MS = 10 * 60 * 1000;
 
 export interface CloudCycleMessage {
   messageId: string | null;
@@ -68,6 +82,9 @@ export function parseCloudSessionCycle(
       Number(parsed.boundaryRowid) >= 0
         ? { boundaryRowid: Math.trunc(Number(parsed.boundaryRowid)) }
         : {}),
+      ...(Number.isFinite(parsed.startedAt) && Number(parsed.startedAt) >= 0
+        ? { startedAt: Math.trunc(Number(parsed.startedAt)) }
+        : {}),
     };
   } catch {
     return null;
@@ -89,8 +106,10 @@ export function advanceCloudSessionCycle(input: {
   cycle: CloudSessionCycle | null;
   status: string | null;
   messages: CloudCycleMessage[];
+  now?: number;
 }): CloudSessionCycle | null {
   const { status, messages } = input;
+  const now = input.now ?? Date.now();
   let cycle = input.cycle;
 
   if (cycle?.phase === "canceling") {
@@ -100,7 +119,13 @@ export function advanceCloudSessionCycle(input: {
   }
 
   if (cycle?.phase === "pending") {
-    if (!cycle.outboundMessageId) return cycle;
+    // Abandoning a stuck reservation is safe: the worst case is that a reply
+    // to an already-delivered message is attributed to the next cycle, which
+    // is strictly better than blocking the thread permanently.
+    const expired =
+      cycle.startedAt !== undefined &&
+      now - cycle.startedAt > CLOUD_CYCLE_PENDING_TTL_MS;
+    if (!cycle.outboundMessageId) return expired ? { phase: "complete" } : cycle;
     const outboundMessageId = cycle.outboundMessageId;
     const baselineRowid = cycle.baselineRowid ?? -1;
     const boundary = messages.find(
@@ -108,12 +133,13 @@ export function advanceCloudSessionCycle(input: {
         message.messageId === outboundMessageId &&
         message.rowid > baselineRowid
     );
-    if (!boundary) return cycle;
+    if (!boundary) return expired ? { phase: "complete" } : cycle;
     cycle = {
       phase: "boundary",
       outboundMessageId: cycle.outboundMessageId,
       baselineRowid: cycle.baselineRowid,
       boundaryRowid: boundary.rowid,
+      ...(cycle.startedAt !== undefined ? { startedAt: cycle.startedAt } : {}),
     };
   }
 
@@ -156,6 +182,34 @@ export function shouldPollTrackedWorkspace(input: {
   cloudOnly: boolean;
 }): boolean {
   return input.status !== "archived";
+}
+
+/**
+ * Caps the per-tick request fan-out at the beta Conductor API.
+ *
+ * A workspace can hold hundreds of sessions, and every tracked workspace polls
+ * on the same timer. Firing one request per session at once earns 429s, which
+ * are retryable and so turn into a retry storm that never converges.
+ */
+export const MAX_CONCURRENT_SESSION_REQUESTS = 6;
+
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await fn(items[index], index);
+      }
+    })
+  );
+  return results;
 }
 
 export function canCompletePolledWorkspace(input: {

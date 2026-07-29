@@ -322,3 +322,95 @@ test("stale cursor updates cannot regress a forwarded transcript", () => {
     assert.equal(cursor?.lastMessageId, "api-message-42");
   });
 });
+
+test("a cloud cursor holding a SQLite rowid adopts the first API id it sees", () => {
+  withTempDb(() => {
+    const workspace = createWorkspace({
+      name: "cursor-namespace",
+      prompt: "watch",
+      repoPath: "/repos/a",
+      telegramChatId: "chat-1",
+    });
+
+    // A cloud cursor can be created before the API is reachable, baselined
+    // from the local mirror. Its position is a session_messages rowid, which
+    // is orders of magnitude larger than a per-session API index.
+    updateThreadCursor(workspace.id, "session-a", 4210, "Recovered", null, "cloud-api");
+    let cursor = getThreadCursor(workspace.id, "session-a");
+    assert.equal(cursor?.lastMessageId, null);
+
+    // Once the API answers, the real id must be adopted. Comparing 12 against
+    // the stale 4210 would reject it forever and strand the transcript.
+    updateThreadCursor(
+      workspace.id,
+      "session-a",
+      12,
+      "Build",
+      "api-message-12",
+      "cloud-api"
+    );
+    cursor = getThreadCursor(workspace.id, "session-a");
+    assert.equal(cursor?.lastMessageId, "api-message-12");
+    assert.equal(cursor?.lastForwardedRowid, 12);
+
+    // And the namespace must stay switched, so ordinary advances still apply.
+    updateThreadCursor(
+      workspace.id,
+      "session-a",
+      13,
+      "Build",
+      "api-message-13",
+      "cloud-api"
+    );
+    cursor = getThreadCursor(workspace.id, "session-a");
+    assert.equal(cursor?.lastMessageId, "api-message-13");
+    assert.equal(cursor?.lastForwardedRowid, 13);
+  });
+});
+
+test("relabelling a cursor to cloud-api drops its local-namespace position", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-cursor-migration-"));
+  const dbPath = path.join(dir, "bot.db");
+  try {
+    closeDb();
+    getDb(dbPath);
+    const workspace = createWorkspace({
+      name: "cursor-migration",
+      prompt: "watch",
+      repoPath: "/repos/a",
+      telegramChatId: "chat-1",
+    });
+    updateThreadCursor(workspace.id, "session-a", 4210, "Local baseline");
+    updateWorkspaceConductorBinding(workspace.id, {
+      workspaceId: "cw-1",
+      sessionId: "session-a",
+      backendKind: "cloud-api",
+    });
+    closeDb();
+
+    // Reopening runs the migration that relabels the cursor.
+    getDb(dbPath);
+    const cursor = getThreadCursor(workspace.id, "session-a");
+    assert.equal(cursor?.backendKind, "cloud-api");
+    assert.equal(cursor?.lastForwardedRowid, 0);
+    assert.equal(cursor?.lastMessageId, null);
+
+    // Re-running must not disturb a cursor that has since been anchored.
+    updateThreadCursor(
+      workspace.id,
+      "session-a",
+      7,
+      "Build",
+      "api-message-7",
+      "cloud-api"
+    );
+    closeDb();
+    getDb(dbPath);
+    const anchored = getThreadCursor(workspace.id, "session-a");
+    assert.equal(anchored?.lastForwardedRowid, 7);
+    assert.equal(anchored?.lastMessageId, "api-message-7");
+  } finally {
+    closeDb();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

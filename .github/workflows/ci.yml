@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck and test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is what the Mac gateway deploys on; 24 is what publish.yml builds.
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  deploy-script:
+    name: Deploy script parses under macOS bash
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      # macOS ships bash 3.2, where `set -u` rejects "${arr[@]}" on an empty
+      # array. The gateway deploy runs on this shell, so guard the syntax and
+      # the no-Doppler argument path here rather than discovering it mid-deploy.
+      - name: Syntax-check under bash 3.2
+        run: /bin/bash -n scripts/deploy-mac-gateway.sh
+      - name: Service install arguments expand with and without Doppler
+        run: |
+          /bin/bash -euo pipefail -c '
+            SERVICE_INSTALL_ARGS=()
+            show() { echo "argc=$#"; }
+            show ${SERVICE_INSTALL_ARGS[@]+"${SERVICE_INSTALL_ARGS[@]}"}
+            SERVICE_INSTALL_ARGS=(--doppler-project p --doppler-config c)
+            show ${SERVICE_INSTALL_ARGS[@]+"${SERVICE_INSTALL_ARGS[@]}"}
+          '

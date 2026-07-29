@@ -32,7 +32,9 @@ if [ -n "${CONDUCTOR_TELEGRAM_DOPPLER_PROJECT:-}" ] || [ -n "${CONDUCTOR_TELEGRA
     --doppler-config "$CONDUCTOR_TELEGRAM_DOPPLER_CONFIG"
   )
 fi
-conductor-telegram service install "${SERVICE_INSTALL_ARGS[@]}"
+# macOS ships bash 3.2, where `set -u` treats "${arr[@]}" on an empty array as
+# an unbound variable. The `+` expansion keeps the no-Doppler case working.
+conductor-telegram service install ${SERVICE_INSTALL_ARGS[@]+"${SERVICE_INSTALL_ARGS[@]}"}
 
 echo "Restarting launchd service..."
 conductor-telegram service restart

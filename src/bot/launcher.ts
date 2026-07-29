@@ -25,7 +25,9 @@ import {
   cloudCycleIsInFlight,
   cloudSessionCycleKey,
   encodeCloudSessionCycle,
+  mapWithConcurrency,
   parseCloudSessionCycle,
+  MAX_CONCURRENT_SESSION_REQUESTS,
   type CloudSessionCycle,
 } from "./polling-policy.js";
 import {
@@ -487,6 +489,7 @@ export function buildAgentEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   context: {
     agentType: AgentType;
+    accessMode?: AgentAccessMode;
     workspaceName: string;
     workspaceDir: string;
     repoPath: string;
@@ -510,7 +513,67 @@ export function buildAgentEnvironment(
   result.CONDUCTOR_WORKSPACE_NAME = context.workspaceName;
   result.CONDUCTOR_WORKSPACE_PATH = context.workspaceDir;
   result.CONDUCTOR_ROOT_PATH = context.repoPath;
+
+  // Oversight database coordinates. The MCP server runs as a child of the
+  // agent and resolves these from its own environment; relative to the
+  // isolated HOME it would otherwise create an empty database and silently
+  // drop every report_status/report_artifact/request_human call.
+  result.DB_PATH =
+    source.DB_PATH?.trim() ||
+    path.join(operatorHome, ".conductor-telegram", "conductor-telegram.db");
+  result.CONDUCTOR_DB_PATH =
+    source.CONDUCTOR_DB_PATH?.trim() ||
+    path.join(
+      operatorHome,
+      "Library",
+      "Application Support",
+      "com.conductor.app",
+      "conductor.db"
+    );
+
+  // Full-access launches are expected to commit, push, and open PRs, but the
+  // isolated HOME hides the operator's git/gh/ssh stores. Re-point them at the
+  // real ones the way CODEX_HOME/CLAUDE_CONFIG_DIR already are. Restricted
+  // launches are review-only and stay without VCS credentials.
+  if ((context.accessMode ?? "legacy") === "legacy") {
+    result.GIT_CONFIG_GLOBAL =
+      source.GIT_CONFIG_GLOBAL?.trim() || path.join(operatorHome, ".gitconfig");
+    result.GH_CONFIG_DIR =
+      source.GH_CONFIG_DIR?.trim() || path.join(operatorHome, ".config", "gh");
+    if (source.SSH_AUTH_SOCK?.trim()) {
+      result.SSH_AUTH_SOCK = source.SSH_AUTH_SOCK.trim();
+    }
+    const sshCommand =
+      source.GIT_SSH_COMMAND?.trim() || operatorGitSshCommand(operatorHome);
+    if (sshCommand) result.GIT_SSH_COMMAND = sshCommand;
+  }
   return result;
+}
+
+/** Standard key names ssh would have found under the operator's real HOME. */
+const SSH_IDENTITY_FILENAMES = ["id_ed25519", "id_ecdsa", "id_rsa"] as const;
+
+/**
+ * Point ssh back at the operator's ~/.ssh, since HOME no longer resolves there.
+ * Returns null when the operator has no ssh directory at all.
+ */
+function operatorGitSshCommand(operatorHome: string): string | null {
+  const sshDir = path.join(operatorHome, ".ssh");
+  if (!existsSync(sshDir)) return null;
+  const parts = ["ssh"];
+  const configPath = path.join(sshDir, "config");
+  if (existsSync(configPath)) parts.push("-F", shellQuote(configPath));
+  const knownHosts = path.join(sshDir, "known_hosts");
+  if (existsSync(knownHosts)) {
+    parts.push("-o", shellQuote(`UserKnownHostsFile=${knownHosts}`));
+  }
+  for (const name of SSH_IDENTITY_FILENAMES) {
+    const keyPath = path.join(sshDir, name);
+    if (existsSync(keyPath)) {
+      parts.push("-o", shellQuote(`IdentityFile=${keyPath}`));
+    }
+  }
+  return parts.length > 1 ? parts.join(" ") : null;
 }
 
 function createAgentRuntimeHome(workspaceDir: string): string {
@@ -701,6 +764,7 @@ function spawnClaudeAgent(
 
   const agentEnv = buildAgentEnvironment(process.env, {
     agentType: "claude",
+    accessMode: options.accessMode ?? "legacy",
     workspaceName,
     workspaceDir,
     repoPath,
@@ -826,6 +890,7 @@ function spawnCodexAgent(
 
   const agentEnv = buildAgentEnvironment(process.env, {
     agentType: "codex",
+    accessMode,
     workspaceName,
     workspaceDir,
     repoPath,
@@ -943,6 +1008,10 @@ export function buildCodexExecArgs(
     .filter(isImageAttachment)
     .flatMap((filePath) => ["--image", filePath]);
 
+  // The prompt is attacker-controlled, and Codex accepts sandbox-defeating
+  // flags on the exec subcommand. `--` forces everything after it to be read
+  // as a positional, so a message starting with "--dangerously-bypass-..."
+  // stays a prompt.
   if (agentSessionId) {
     return [
       ...codexAccessArgs(accessMode),
@@ -953,6 +1022,7 @@ export function buildCodexExecArgs(
       "--model",
       model,
       ...imageArgs,
+      "--",
       agentSessionId,
       prompt,
     ];
@@ -966,6 +1036,7 @@ export function buildCodexExecArgs(
     "--model",
     model,
     ...imageArgs,
+    "--",
     prompt,
   ];
 }
@@ -3163,8 +3234,10 @@ export async function getConductorWorkspaceSessions(
     const sessions = (await client.listWorkspaceSessions(workspaceId)).filter(
       (session) => !session.archivedAt
     );
-    const statuses = await Promise.all(
-      sessions.map((session) =>
+    const statuses = await mapWithConcurrency(
+      sessions,
+      MAX_CONCURRENT_SESSION_REQUESTS,
+      (session) =>
         client
           .getSessionStatus(session.id)
           .then((status) => {
@@ -3182,7 +3255,6 @@ export async function getConductorWorkspaceSessions(
             );
             return null;
           })
-      )
     );
     const activeSessionId =
       preferredActiveSessionId ?? transport?.activeSessionId;
@@ -3381,6 +3453,7 @@ interface CloudSessionCycleWrite {
   key: string;
   previous: CloudSessionCycle | null;
   currentValue: string;
+  startedAt: number;
 }
 
 function getCloudSessionCycle(
@@ -3398,9 +3471,12 @@ function reserveCloudSessionCycle(
 ): CloudSessionCycleWrite {
   const key = cloudSessionCycleKey(conductorWorkspaceId, sessionId);
   const previous = parseCloudSessionCycle(getMetaValue(key));
-  const currentValue = encodeCloudSessionCycle({ phase: "pending" });
+  // Stamped before any network I/O so a crash mid-send still leaves an
+  // expirable reservation rather than a permanently in-flight thread.
+  const startedAt = Date.now();
+  const currentValue = encodeCloudSessionCycle({ phase: "pending", startedAt });
   setMetaValue(key, currentValue);
-  return { key, previous, currentValue };
+  return { key, previous, currentValue, startedAt };
 }
 
 function writeCloudSessionCycle(
@@ -3408,7 +3484,12 @@ function writeCloudSessionCycle(
   cycle: CloudSessionCycle
 ): boolean {
   if (getMetaValue(write.key) !== write.currentValue) return false;
-  write.currentValue = encodeCloudSessionCycle(cycle);
+  // Carry the reservation timestamp forward so the TTL measures the whole
+  // cycle, not just the time since the last phase transition.
+  write.currentValue = encodeCloudSessionCycle({
+    startedAt: write.startedAt,
+    ...cycle,
+  });
   setMetaValue(write.key, write.currentValue);
   return true;
 }

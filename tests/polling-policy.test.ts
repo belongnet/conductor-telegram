@@ -6,8 +6,10 @@ import {
   cloudCycleIsInFlight,
   cloudSessionCycleKey,
   encodeCloudSessionCycle,
+  mapWithConcurrency,
   parseCloudSessionCycle,
   shouldPollTrackedWorkspace,
+  CLOUD_CYCLE_PENDING_TTL_MS,
 } from "../src/bot/polling-policy.js";
 
 test("cloud completion requires observed work and authoritative idle statuses", () => {
@@ -235,6 +237,101 @@ test("cloud cycle metadata round-trips and rejects invalid values", () => {
   assert.deepEqual(parseCloudSessionCycle("observed"), { phase: "observed" });
   assert.equal(parseCloudSessionCycle('{"phase":"unknown"}'), null);
   assert.equal(parseCloudSessionCycle("not-json"), null);
+});
+
+test("a pending cycle expires instead of blocking its thread forever", () => {
+  const startedAt = 1_000_000;
+  const fresh = { phase: "pending" as const, startedAt };
+  const justInsideTtl = startedAt + CLOUD_CYCLE_PENDING_TTL_MS;
+  const pastTtl = startedAt + CLOUD_CYCLE_PENDING_TTL_MS + 1;
+
+  // A crash between reserving the cycle and recording the outbound id leaves
+  // a cycle that can never advance on its own.
+  assert.deepEqual(
+    advanceCloudSessionCycle({
+      cycle: fresh,
+      status: "idle",
+      messages: [],
+      now: justInsideTtl,
+    }),
+    fresh,
+    "must not expire early"
+  );
+  assert.deepEqual(
+    advanceCloudSessionCycle({
+      cycle: fresh,
+      status: "idle",
+      messages: [],
+      now: pastTtl,
+    }),
+    { phase: "complete" }
+  );
+
+  // Same when the outbound message never shows up in the transcript.
+  const stranded = {
+    phase: "pending" as const,
+    outboundMessageId: "message-1",
+    startedAt,
+  };
+  assert.deepEqual(
+    advanceCloudSessionCycle({
+      cycle: stranded,
+      status: "idle",
+      messages: [{ messageId: "other", rowid: 5, role: "assistant" }],
+      now: pastTtl,
+    }),
+    { phase: "complete" }
+  );
+
+  // Real agent work is not on a clock: once past the boundary, a long-running
+  // session must stay in flight.
+  const working = {
+    phase: "working" as const,
+    outboundMessageId: "message-1",
+    boundaryRowid: 3,
+    startedAt,
+  };
+  assert.equal(
+    cloudCycleIsInFlight(
+      advanceCloudSessionCycle({
+        cycle: working,
+        status: "working",
+        messages: [],
+        now: pastTtl,
+      })
+    ),
+    true
+  );
+
+  // Legacy rows have no timestamp and must keep their existing behaviour.
+  const legacy = { phase: "pending" as const };
+  assert.deepEqual(
+    advanceCloudSessionCycle({
+      cycle: legacy,
+      status: "idle",
+      messages: [],
+      now: pastTtl,
+    }),
+    legacy
+  );
+});
+
+test("session request fan-out is capped", async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const items = Array.from({ length: 50 }, (_, index) => index);
+  const results = await mapWithConcurrency(items, 6, async (item) => {
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    inFlight--;
+    return item * 2;
+  });
+
+  assert.equal(peak <= 6, true, `peak concurrency was ${peak}`);
+  // Order must follow the input, not completion.
+  assert.deepEqual(results, items.map((item) => item * 2));
+  assert.deepEqual(await mapWithConcurrency([], 6, async () => 1), []);
 });
 
 test("completed and failed cloud workspaces remain observable", () => {

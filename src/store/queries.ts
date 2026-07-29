@@ -302,6 +302,13 @@ export function upsertThreadCursor(input: {
            THEN thread_cursors.last_forwarded_rowid
          WHEN COALESCE(thread_cursors.backend_kind, 'local') <> excluded.backend_kind
            THEN excluded.last_forwarded_rowid
+         -- First API id for this cursor: the stored position is a SQLite
+         -- rowid, so it must be left behind rather than MAX'd against an
+         -- API index that is numbered from zero per session.
+         WHEN excluded.backend_kind = 'cloud-api'
+           AND excluded.last_message_id IS NOT NULL
+           AND thread_cursors.last_message_id IS NULL
+           THEN excluded.last_forwarded_rowid
          ELSE MAX(
            thread_cursors.last_forwarded_rowid,
            excluded.last_forwarded_rowid
@@ -312,6 +319,10 @@ export function upsertThreadCursor(input: {
            AND excluded.backend_kind = 'local'
            THEN thread_cursors.last_message_id
          WHEN COALESCE(thread_cursors.backend_kind, 'local') <> excluded.backend_kind
+           THEN excluded.last_message_id
+         WHEN excluded.backend_kind = 'cloud-api'
+           AND excluded.last_message_id IS NOT NULL
+           AND thread_cursors.last_message_id IS NULL
            THEN excluded.last_message_id
          WHEN excluded.backend_kind = 'cloud-api'
            AND excluded.last_message_id IS NOT NULL

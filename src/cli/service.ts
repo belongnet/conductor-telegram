@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import {
   configExists,
   loadConfig,
+  loadPersistableConfig,
   saveConfig,
   tryLoadConfig,
   type CLIFlags,
@@ -286,6 +287,7 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
   }
 
   let doppler: DopplerRuntime | null = null;
+  let dopplerSecretNames: ReadonlySet<string> | null = null;
   try {
     doppler = resolveDopplerRuntime(config);
     if (doppler) {
@@ -325,6 +327,7 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
           `(${availableCloudKeys.length}/${optionalCloudKeys.length} optional cloud keys present)`
       );
       config = stripDopplerManagedConfig(config, names);
+      dopplerSecretNames = names;
     }
   } catch (error) {
     console.error(
@@ -350,6 +353,18 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
   console.log(`  wrote ${PLIST_PATH}`);
   console.log(`  wrote ${WATCHDOG_PLIST_PATH}`);
 
+  // Persist before bootstrapping. A bootstrap failure exits, and leaving
+  // Doppler-managed secrets in config.json while the service is already live
+  // under Doppler is the outcome this whole flow exists to avoid.
+  if (shouldSaveConfig) {
+    let persisted = loadPersistableConfig(flags);
+    if (dopplerSecretNames) {
+      persisted = stripDopplerManagedConfig(persisted, dopplerSecretNames);
+    }
+    saveConfig(persisted);
+    console.log(`  saved runtime configuration to ${STATE_DIR}/config.json`);
+  }
+
   const bot = bootstrap(LABEL, PLIST_PATH);
   if (!bot.ok) {
     console.error(`  bot: FAIL — ${bot.detail}`);
@@ -363,11 +378,6 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
     process.exit(1);
   }
   console.log(`  watchdog: ${watchdog.detail}`);
-
-  if (shouldSaveConfig) {
-    saveConfig(config);
-    console.log(`  saved runtime configuration to ${STATE_DIR}/config.json`);
-  }
 
   console.log();
   console.log("Bot will restart automatically on crash, logout, and reboot.");

@@ -51,3 +51,62 @@ test("saving secret-bearing config repairs existing file and directory permissio
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("persisted config never captures secrets from the ambient environment", () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "ct-config-persist-"));
+  const configDir = path.join(home, ".conductor-telegram");
+  try {
+    mkdirSync(configDir, { mode: 0o700 });
+    writeFileSync(
+      path.join(configDir, "config.json"),
+      JSON.stringify({ version: 1, botToken: "from-file", ownerChatId: "1" }),
+      { mode: 0o600 }
+    );
+
+    const script = [
+      'import { loadConfig, loadPersistableConfig } from "./src/cli/config.ts";',
+      "console.log(JSON.stringify({",
+      "  runtime: loadConfig({}),",
+      "  persisted: loadPersistableConfig({}),",
+      "}));",
+    ].join("\n");
+    const child = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", script],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          HOME: home,
+          // A key exported for this one command, as the deploy runner does.
+          CONDUCTOR_API_KEY: "ambient-secret",
+          BOT_TOKEN: "ambient-token",
+          CONDUCTOR_TELEGRAM_DOPPLER_PROJECT: "belong-agents",
+          CONDUCTOR_TELEGRAM_DOPPLER_CONFIG: "prd",
+        },
+        encoding: "utf8",
+      }
+    );
+    assert.equal(child.status, 0, child.stderr);
+    const { runtime, persisted } = JSON.parse(child.stdout);
+
+    // The running process still sees the environment.
+    assert.equal(runtime.conductorApiKey, "ambient-secret");
+    assert.equal(runtime.botToken, "ambient-token");
+
+    // Nothing secret from the environment reaches disk.
+    assert.equal(persisted.conductorApiKey, undefined);
+    assert.equal(persisted.botToken, "from-file");
+    assert.equal(
+      JSON.stringify(persisted).includes("ambient-secret"),
+      false,
+      "no ambient secret may appear anywhere in the persisted config"
+    );
+
+    // Non-secret Doppler references are pointers and must still persist.
+    assert.equal(persisted.dopplerProject, "belong-agents");
+    assert.equal(persisted.dopplerConfig, "prd");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

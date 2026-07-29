@@ -60,3 +60,32 @@ test("inline extraction leaves blocked local references in the message", () => {
     rmSync(outside, { recursive: true, force: true });
   }
 });
+
+test("attacker-supplied extensions cannot steer the download path", async () => {
+  const { safeExtension } = await import("../src/bot/commands.js");
+  const downloads = "/Users/operator/.conductor-telegram/downloads";
+
+  const hostile = [
+    ".../../../../../../.claude/settings.json",
+    "./../../Library/LaunchAgents/com.conductor-telegram.bot.plist",
+    "..",
+    "./..",
+    ".a/b",
+    "",
+    "   ",
+  ];
+  for (const ext of hostile) {
+    const resolved = safeExtension(ext);
+    assert.equal(resolved, ".bin", `${JSON.stringify(ext)} must be rejected`);
+    // The staged path must stay a direct child of the downloads directory.
+    assert.equal(
+      path.dirname(path.join(downloads, `123-abcd${resolved}`)),
+      downloads
+    );
+  }
+
+  // Ordinary extensions still survive untouched.
+  for (const ext of [".png", ".mp4", ".tar.gz", ".JPEG", ".webp"]) {
+    assert.equal(safeExtension(ext), ext);
+  }
+});

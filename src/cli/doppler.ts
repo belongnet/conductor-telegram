@@ -48,6 +48,7 @@ export function buildServiceDopplerEnvironment(
   delete sanitized.DOPPLER_TOKEN;
   delete sanitized.DOPPLER_PROJECT;
   delete sanitized.DOPPLER_CONFIG;
+  delete sanitized[DOPPLER_RUNTIME_SENTINEL_ENV];
   return sanitized;
 }
 
@@ -126,13 +127,25 @@ export function resolveDopplerRuntime(
   return { executable, ...reference };
 }
 
+/**
+ * Marks a process that is already running inside `doppler run`.
+ *
+ * This is the authoritative re-entry guard. Comparing the injected
+ * DOPPLER_PROJECT/DOPPLER_CONFIG alone is not sufficient: Doppler resolves
+ * references case-insensitively but always injects its own canonical slug, so
+ * a configured reference that is not already byte-identical would never look
+ * active and the CLI would re-exec itself without bound.
+ */
+export const DOPPLER_RUNTIME_SENTINEL_ENV = "CONDUCTOR_TELEGRAM_DOPPLER_ACTIVE";
+
 export function isDopplerRuntimeActive(
   runtime: Pick<DopplerRuntime, "project" | "config">,
   env: NodeJS.ProcessEnv = process.env
 ): boolean {
+  if (env[DOPPLER_RUNTIME_SENTINEL_ENV] === "1") return true;
   return (
-    env.DOPPLER_PROJECT === runtime.project &&
-    env.DOPPLER_CONFIG === runtime.config
+    env.DOPPLER_PROJECT?.toLowerCase() === runtime.project.toLowerCase() &&
+    env.DOPPLER_CONFIG?.toLowerCase() === runtime.config.toLowerCase()
   );
 }
 
@@ -274,7 +287,7 @@ export function runWithDoppler(
     buildDopplerRunArgs(scopedRuntime, command),
     {
       stdio: "inherit",
-      env: process.env,
+      env: { ...process.env, [DOPPLER_RUNTIME_SENTINEL_ENV]: "1" },
     }
   );
   if (result.error) {

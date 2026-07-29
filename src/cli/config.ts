@@ -192,6 +192,39 @@ export function loadConfig(flags: CLIFlags = {}): Config {
   return ConfigSchema.parse(merged);
 }
 
+/**
+ * Doppler references are non-secret pointers, so they may persist from the
+ * environment. `scripts/deploy-mac-gateway.sh` sets them exactly this way.
+ */
+const PERSISTABLE_ENV_KEYS = ["dopplerProject", "dopplerConfig"] as const;
+
+/**
+ * Config that is safe to write back to disk.
+ *
+ * `loadConfig` merges the ambient environment, which is right for a running
+ * process but wrong for persistence: a secret exported for a single command
+ * would be captured into config.json and silently outlive the shell that set
+ * it. Only the existing file, explicit flags, and the non-secret Doppler
+ * references survive here.
+ */
+export function loadPersistableConfig(flags: CLIFlags = {}): Config {
+  const fileConfig = stripUndefined(readConfigFile() as Record<string, unknown>);
+  const envConfig = stripUndefined(readEnvVars() as Record<string, unknown>);
+  const flagConfig = stripUndefined(applyFlags(flags) as Record<string, unknown>);
+
+  const persistableEnv: Record<string, unknown> = {};
+  for (const key of PERSISTABLE_ENV_KEYS) {
+    if (envConfig[key] !== undefined) persistableEnv[key] = envConfig[key];
+  }
+
+  return ConfigSchema.parse({
+    ...DEFAULTS,
+    ...fileConfig,
+    ...persistableEnv,
+    ...flagConfig,
+  });
+}
+
 /** Try to load config, returning null instead of throwing on validation errors. */
 export function tryLoadConfig(flags: CLIFlags = {}): Config | null {
   try {
