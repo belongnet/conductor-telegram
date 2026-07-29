@@ -1,17 +1,42 @@
-import { exec, spawn, type ChildProcess } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { exec, execFile, spawn, type ChildProcess } from "node:child_process";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { readdir } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 import {
   createDecision,
   addEvent,
   getMetaValue,
-  setMetaValue,
   getWorkspaceByName as getTrackedWorkspaceByName,
+  setMetaValue,
 } from "../store/queries.js";
 import { getConductorSetting } from "../store/conductor-settings.js";
+import {
+  cloudCycleIsInFlight,
+  cloudSessionCycleKey,
+  encodeCloudSessionCycle,
+  mapWithConcurrency,
+  parseCloudSessionCycle,
+  MAX_CONCURRENT_SESSION_REQUESTS,
+  type CloudSessionCycle,
+} from "./polling-policy.js";
+import {
+  ConductorApiError,
+  createConductorApiClientFromEnv,
+  isConductorCloudApiConfigured,
+  type ConductorApiMessage,
+  type ConductorApiSession,
+} from "../integrations/conductor-api.js";
 
 export const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
@@ -29,10 +54,10 @@ const CODEX_BIN =
   `${process.env.HOME}/Library/Application Support/com.conductor.app/bin/codex`;
 
 const TELEGRAM_AGENT_PERMISSION_MODE =
-  process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? "bypassPermissions";
+  process.env.TELEGRAM_AGENT_PERMISSION_MODE ?? "acceptEdits";
 
 const DEFAULT_CLAUDE_MODEL = "claude-fable-5";
-const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
 
 // City names for workspace directory naming (matches Conductor's convention)
 const CITY_NAMES = [
@@ -83,6 +108,7 @@ const STDERR_TAIL_LIMIT = 2000;
 
 export type AgentType = "claude" | "codex";
 type LaunchMode = "prompt" | "review";
+export type AgentAccessMode = "legacy" | "read-only" | "workspace-write";
 
 interface SessionLaunchOptions {
   agentType?: AgentType;
@@ -90,7 +116,10 @@ interface SessionLaunchOptions {
   title?: string | null;
   launchMode?: LaunchMode;
   reviewBaseBranch?: string | null;
+  accessMode?: AgentAccessMode;
 }
+
+export interface WorkspaceLaunchOptions extends SessionLaunchOptions {}
 
 interface ResolvedLaunchConfig {
   agentType: AgentType;
@@ -99,6 +128,7 @@ interface ResolvedLaunchConfig {
   launchMode: LaunchMode;
   reviewBaseBranch: string | null;
   codexThinkingLevel: string | null;
+  accessMode: AgentAccessMode;
 }
 
 interface SessionCreateResult {
@@ -248,6 +278,10 @@ function normalizeModelForCli(model: string): string {
   return model.replace(/-\d+[mk]$/i, "");
 }
 
+function normalizeModelForConductorApi(model: string): string {
+  return model.replace(/^claude-/i, "");
+}
+
 function isModelCompatibleWithAgent(model: string, agentType: AgentType): boolean {
   const inferredAgentType = inferAgentTypeFromModel(model);
   return inferredAgentType === null || inferredAgentType === agentType;
@@ -260,6 +294,21 @@ function firstCompatibleModel(
   for (const candidate of candidates) {
     const normalized = candidate?.trim()
       ? normalizeModelForCli(candidate.trim())
+      : null;
+    if (normalized && isModelCompatibleWithAgent(normalized, agentType)) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function firstCompatibleApiModel(
+  agentType: AgentType,
+  candidates: Array<string | null | undefined>
+): string | null {
+  for (const candidate of candidates) {
+    const normalized = candidate?.trim()
+      ? normalizeModelForConductorApi(candidate.trim())
       : null;
     if (normalized && isModelCompatibleWithAgent(normalized, agentType)) {
       return normalized;
@@ -296,6 +345,30 @@ function resolveAgentModel(
   const fallback =
     agentType === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
   return firstCompatibleModel(agentType, [configuredModel]) ?? fallback;
+}
+
+function resolveAgentModelForConductorApi(
+  agentType: AgentType,
+  launchMode: LaunchMode,
+  requestedModel?: string | null
+): string {
+  const envModel =
+    launchMode === "review"
+      ? process.env.TELEGRAM_REVIEW_MODEL
+      : process.env.TELEGRAM_DEFAULT_MODEL;
+  const configuredModel =
+    launchMode === "review"
+      ? getSettingValue("review_model")
+      : getSettingValue("default_model");
+  const fallback =
+    agentType === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
+  return (
+    firstCompatibleApiModel(agentType, [
+      requestedModel,
+      envModel,
+      configuredModel,
+    ]) ?? normalizeModelForConductorApi(fallback)
+  );
 }
 
 function resolveCodexThinkingLevel(launchMode: LaunchMode): string | null {
@@ -351,9 +424,29 @@ export function resolveLaunchConfig(
     title,
     launchMode,
     reviewBaseBranch: options.reviewBaseBranch ?? null,
+    accessMode:
+      options.accessMode ?? (launchMode === "review" ? "read-only" : "legacy"),
     codexThinkingLevel:
       agentType === "codex" ? resolveCodexThinkingLevel(launchMode) : null,
   };
+}
+
+function restrictedCodexLaunchError(
+  config: Pick<
+    ResolvedLaunchConfig,
+    "agentType" | "launchMode" | "accessMode"
+  >
+): string | null {
+  if (
+    config.agentType === "codex" &&
+    (config.launchMode === "review" || config.accessMode === "read-only")
+  ) {
+    return (
+      "Restricted Codex launches are disabled because its read-only sandbox " +
+      "does not isolate the CLI authentication store. Configure Claude as the review agent."
+    );
+  }
+  return null;
 }
 
 function isImageAttachment(filePath: string): boolean {
@@ -368,6 +461,228 @@ const TELEGRAM_INLINE_MEDIA_SYSTEM_PROMPT = [
   "- When you want the user to see a file you produced, reference it with the same syntax: `![name.png](/abs/path/to/name.png)` for images, `[name.ext](/abs/path/to/name.ext)` for everything else. The bridge will upload it to Telegram as a real attachment.",
   "- Use absolute paths inside the workspace.",
 ].join("\n");
+
+const AGENT_ENV_ALLOWLIST = [
+  "USER",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "COLORTERM",
+  "NO_COLOR",
+] as const;
+
+/**
+ * Build the environment visible to an autonomous agent.
+ *
+ * The bot process may hold Telegram and cloud-provider credentials. Child
+ * agents get only the small runtime allowlist below plus
+ * non-secret workspace coordinates. Authentication should come from the
+ * locally logged-in CLI/keychain, not inherited API-key environment variables.
+ */
+export function buildAgentEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+  context: {
+    agentType: AgentType;
+    accessMode?: AgentAccessMode;
+    workspaceName: string;
+    workspaceDir: string;
+    repoPath: string;
+  }
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  for (const key of AGENT_ENV_ALLOWLIST) {
+    const value = source[key];
+    if (value !== undefined) result[key] = value;
+  }
+  const operatorHome = source.HOME?.trim() || os.homedir();
+  const runtimeHome = createAgentRuntimeHome(context.workspaceDir);
+  result.HOME = runtimeHome;
+  if (context.agentType === "codex") {
+    result.CODEX_HOME =
+      source.CODEX_HOME?.trim() || path.join(operatorHome, ".codex");
+  } else {
+    result.CLAUDE_CONFIG_DIR =
+      source.CLAUDE_CONFIG_DIR?.trim() || path.join(operatorHome, ".claude");
+  }
+  result.CONDUCTOR_WORKSPACE_NAME = context.workspaceName;
+  result.CONDUCTOR_WORKSPACE_PATH = context.workspaceDir;
+  result.CONDUCTOR_ROOT_PATH = context.repoPath;
+
+  // Oversight database coordinates. The MCP server runs as a child of the
+  // agent and resolves these from its own environment; relative to the
+  // isolated HOME it would otherwise create an empty database and silently
+  // drop every report_status/report_artifact/request_human call.
+  result.DB_PATH =
+    source.DB_PATH?.trim() ||
+    path.join(operatorHome, ".conductor-telegram", "conductor-telegram.db");
+  result.CONDUCTOR_DB_PATH =
+    source.CONDUCTOR_DB_PATH?.trim() ||
+    path.join(
+      operatorHome,
+      "Library",
+      "Application Support",
+      "com.conductor.app",
+      "conductor.db"
+    );
+
+  // Full-access launches are expected to commit, push, and open PRs, but the
+  // isolated HOME hides the operator's git/gh/ssh stores. Re-point them at the
+  // real ones the way CODEX_HOME/CLAUDE_CONFIG_DIR already are. Restricted
+  // launches are review-only and stay without VCS credentials.
+  if ((context.accessMode ?? "legacy") === "legacy") {
+    result.GIT_CONFIG_GLOBAL =
+      source.GIT_CONFIG_GLOBAL?.trim() || path.join(operatorHome, ".gitconfig");
+    result.GH_CONFIG_DIR =
+      source.GH_CONFIG_DIR?.trim() || path.join(operatorHome, ".config", "gh");
+    if (source.SSH_AUTH_SOCK?.trim()) {
+      result.SSH_AUTH_SOCK = source.SSH_AUTH_SOCK.trim();
+    }
+    const sshCommand =
+      source.GIT_SSH_COMMAND?.trim() || operatorGitSshCommand(operatorHome);
+    if (sshCommand) result.GIT_SSH_COMMAND = sshCommand;
+  }
+  return result;
+}
+
+/** Standard key names ssh would have found under the operator's real HOME. */
+const SSH_IDENTITY_FILENAMES = ["id_ed25519", "id_ecdsa", "id_rsa"] as const;
+
+/**
+ * Point ssh back at the operator's ~/.ssh, since HOME no longer resolves there.
+ * Returns null when the operator has no ssh directory at all.
+ */
+function operatorGitSshCommand(operatorHome: string): string | null {
+  const sshDir = path.join(operatorHome, ".ssh");
+  if (!existsSync(sshDir)) return null;
+  const parts = ["ssh"];
+  const configPath = path.join(sshDir, "config");
+  if (existsSync(configPath)) parts.push("-F", shellQuote(configPath));
+  const knownHosts = path.join(sshDir, "known_hosts");
+  if (existsSync(knownHosts)) {
+    parts.push("-o", shellQuote(`UserKnownHostsFile=${knownHosts}`));
+  }
+  for (const name of SSH_IDENTITY_FILENAMES) {
+    const keyPath = path.join(sshDir, name);
+    if (existsSync(keyPath)) {
+      parts.push("-o", shellQuote(`IdentityFile=${keyPath}`));
+    }
+  }
+  return parts.length > 1 ? parts.join(" ") : null;
+}
+
+function createAgentRuntimeHome(workspaceDir: string): string {
+  const root = path.join(os.tmpdir(), "conductor-telegram-agents");
+  if (existsSync(root)) {
+    const stat = lstatSync(root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("Agent runtime temp root must be a real private directory");
+    }
+  } else {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+  }
+  chmodSync(root, 0o700);
+  const workspaceKey = createHash("sha256")
+    .update(path.resolve(workspaceDir))
+    .digest("hex")
+    .slice(0, 24);
+  const runtimeHome = path.join(root, `${workspaceKey}-${randomUUID()}`);
+  mkdirSync(runtimeHome, { mode: 0o700 });
+  chmodSync(runtimeHome, 0o700);
+  return runtimeHome;
+}
+
+function cleanupAgentRuntimeHome(env: NodeJS.ProcessEnv): void {
+  const runtimeHome = env.HOME;
+  const root = path.resolve(os.tmpdir(), "conductor-telegram-agents");
+  if (
+    !runtimeHome ||
+    !path.resolve(runtimeHome).startsWith(`${root}${path.sep}`)
+  ) {
+    return;
+  }
+  try {
+    rmSync(runtimeHome, { recursive: true, force: true });
+  } catch (error) {
+    console.warn("[agent] Could not clean isolated runtime home:", error);
+  }
+}
+
+const EMPTY_MCP_CONFIG = '{"mcpServers":{}}';
+const CODEX_EXEC_ISOLATION_ARGS = ["--ignore-user-config", "--ignore-rules"];
+
+export function claudeAccessArgs(accessMode: AgentAccessMode): string[] {
+  if (accessMode === "read-only") {
+    return [
+      "--permission-mode",
+      "plan",
+      "--tools",
+      "Read,Glob,Grep",
+      "--allowedTools",
+      "Read(./**),Glob,Grep",
+      "--setting-sources",
+      "",
+      "--safe-mode",
+      "--no-chrome",
+      "--strict-mcp-config",
+      "--mcp-config",
+      EMPTY_MCP_CONFIG,
+      "--disable-slash-commands",
+    ];
+  }
+  if (accessMode === "workspace-write") {
+    return [
+      "--permission-mode",
+      "dontAsk",
+      "--tools",
+      "Read,Edit,Write,Glob,Grep",
+      "--allowedTools",
+      "Read(./**),Edit(./**),Write(./**),Glob,Grep",
+      "--setting-sources",
+      "",
+      "--safe-mode",
+      "--no-chrome",
+      "--strict-mcp-config",
+      "--mcp-config",
+      EMPTY_MCP_CONFIG,
+      "--disable-slash-commands",
+    ];
+  }
+  return ["--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE];
+}
+
+function codexAccessArgs(accessMode: AgentAccessMode): string[] {
+  const sandbox = accessMode === "read-only" ? "read-only" : "workspace-write";
+  return [
+    "--sandbox",
+    sandbox,
+    "--ask-for-approval",
+    "never",
+    "--config",
+    "mcp_servers={}",
+    "--disable",
+    "apps",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "browser_use_external",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "hooks",
+    "--disable",
+    "in_app_browser",
+    "--disable",
+    "multi_agent",
+    "--disable",
+    "plugins",
+  ];
+}
 
 // ── Core: spawn Claude CLI + mirror to DB ───────────────────
 
@@ -384,7 +699,7 @@ function spawnAgent(
     isFollowUp?: boolean;
     attachmentPaths?: string[];
     launchMode?: LaunchMode;
-    reviewBaseBranch?: string | null;
+    accessMode?: AgentAccessMode;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
   if (agentType === "codex") {
@@ -420,6 +735,7 @@ function spawnClaudeAgent(
   options: {
     agentSessionId?: string | null;
     isFollowUp?: boolean;
+    accessMode?: AgentAccessMode;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
   const isFollowUp = options.isFollowUp ?? false;
@@ -437,7 +753,7 @@ function spawnClaudeAgent(
     sessionFlag, sessionArg,
     "--max-turns", "1000",
     "--model", model,
-    "--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE,
+    ...claudeAccessArgs(options.accessMode ?? "legacy"),
     "--append-system-prompt", TELEGRAM_INLINE_MEDIA_SYSTEM_PROMPT,
   ];
 
@@ -446,10 +762,17 @@ function spawnClaudeAgent(
 
   console.log(`[agent] CLAUDE_BIN: ${CLAUDE_BIN}`);
 
+  const agentEnv = buildAgentEnvironment(process.env, {
+    agentType: "claude",
+    accessMode: options.accessMode ?? "legacy",
+    workspaceName,
+    workspaceDir,
+    repoPath,
+  });
   const child = spawn(CLAUDE_BIN, args, {
     cwd: workspaceDir,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, HOME: process.env.HOME },
+    env: agentEnv,
   });
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
@@ -511,6 +834,7 @@ function spawnClaudeAgent(
       }
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
+      cleanupAgentRuntimeHome(agentEnv);
       resolve(result);
     });
 
@@ -521,6 +845,7 @@ function spawnClaudeAgent(
       result.stderrTail = String(err?.message ?? err);
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
+      cleanupAgentRuntimeHome(agentEnv);
       resolve(result);
     });
   });
@@ -540,24 +865,40 @@ function spawnCodexAgent(
     isFollowUp?: boolean;
     attachmentPaths?: string[];
     launchMode?: LaunchMode;
-    reviewBaseBranch?: string | null;
+    accessMode?: AgentAccessMode;
   } = {}
 ): { child: ChildProcess; done: Promise<AgentResult> } {
   const launchMode = options.launchMode ?? "prompt";
+  const accessMode = options.accessMode ?? "legacy";
+  if (launchMode === "review" || accessMode === "read-only") {
+    throw new Error(
+      "Restricted Codex launches are disabled; configure Claude for review work"
+    );
+  }
   const agentSessionId = options.agentSessionId ?? null;
-  const args =
-    launchMode === "review"
-      ? buildCodexReviewArgs(model, prompt, options.reviewBaseBranch)
-      : buildCodexExecArgs(model, prompt, agentSessionId, options.attachmentPaths ?? []);
+  const args = buildCodexExecArgs(
+    model,
+    prompt,
+    agentSessionId,
+    options.attachmentPaths ?? [],
+    accessMode
+  );
 
   console.log(`[agent] Spawning: codex ${args.join(" ").slice(0, 120)}...`);
   console.log(`[agent] CWD: ${workspaceDir}`);
   console.log(`[agent] CODEX_BIN: ${CODEX_BIN}`);
 
+  const agentEnv = buildAgentEnvironment(process.env, {
+    agentType: "codex",
+    accessMode,
+    workspaceName,
+    workspaceDir,
+    repoPath,
+  });
   const child = spawn(CODEX_BIN, args, {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, HOME: process.env.HOME },
+    env: agentEnv,
   });
 
   console.log(`[agent] Spawned PID: ${child.pid}`);
@@ -636,6 +977,7 @@ function spawnCodexAgent(
 
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
+      cleanupAgentRuntimeHome(agentEnv);
       resolve(result);
     });
 
@@ -647,6 +989,7 @@ function spawnCodexAgent(
       result.durationMs = Date.now() - startedAt;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
+      cleanupAgentRuntimeHome(agentEnv);
       resolve(result);
     });
   });
@@ -654,62 +997,48 @@ function spawnCodexAgent(
   return { child, done };
 }
 
-function buildCodexExecArgs(
+export function buildCodexExecArgs(
   model: string,
   prompt: string,
   agentSessionId: string | null,
-  attachmentPaths: string[]
+  attachmentPaths: string[],
+  accessMode: AgentAccessMode = "legacy"
 ): string[] {
   const imageArgs = attachmentPaths
     .filter(isImageAttachment)
     .flatMap((filePath) => ["--image", filePath]);
 
+  // The prompt is attacker-controlled, and Codex accepts sandbox-defeating
+  // flags on the exec subcommand. `--` forces everything after it to be read
+  // as a positional, so a message starting with "--dangerously-bypass-..."
+  // stays a prompt.
   if (agentSessionId) {
     return [
+      ...codexAccessArgs(accessMode),
       "exec",
       "resume",
       "--json",
-      "--dangerously-bypass-approvals-and-sandbox",
+      ...CODEX_EXEC_ISOLATION_ARGS,
       "--model",
       model,
       ...imageArgs,
+      "--",
       agentSessionId,
       prompt,
     ];
   }
 
   return [
+    ...codexAccessArgs(accessMode),
     "exec",
     "--json",
-    "--dangerously-bypass-approvals-and-sandbox",
+    ...CODEX_EXEC_ISOLATION_ARGS,
     "--model",
     model,
     ...imageArgs,
+    "--",
     prompt,
   ];
-}
-
-function buildCodexReviewArgs(
-  model: string,
-  prompt: string,
-  reviewBaseBranch: string | null | undefined
-): string[] {
-  const args = [
-    "exec",
-    "review",
-    "--json",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--model",
-    model,
-  ];
-
-  if (reviewBaseBranch?.trim()) {
-    args.push("--base", reviewBaseBranch.trim());
-    // Codex CLI does not allow --base and a positional prompt together
-  } else if (prompt.trim()) {
-    args.push(prompt);
-  }
-  return args;
 }
 
 function processCodexStreamMessage(
@@ -1179,7 +1508,9 @@ function insertSessionForWorkspace(
   ).run(
     sessionId,
     config.model,
-    TELEGRAM_AGENT_PERMISSION_MODE,
+    config.accessMode === "legacy"
+      ? TELEGRAM_AGENT_PERMISSION_MODE
+      : config.accessMode,
     workspaceId,
     config.agentType,
     agentSessionId,
@@ -1316,6 +1647,69 @@ async function getExistingWorkspaceBranchNames(
   return names;
 }
 
+const COMMIT_SHA_RE = /^[0-9a-f]{40,64}$/i;
+
+export async function resolveRemoteBaseCommit(
+  repoPath: string,
+  defaultBranch: string
+): Promise<string> {
+  await execFileAsync("git", ["fetch", "--prune", "origin", defaultBranch], repoPath);
+  const commit = (
+    await execFileAsync(
+      "git",
+      ["rev-parse", "--verify", `origin/${defaultBranch}^{commit}`],
+      repoPath
+    )
+  ).trim();
+  if (!COMMIT_SHA_RE.test(commit)) {
+    throw new Error(`origin/${defaultBranch} did not resolve to an immutable commit`);
+  }
+  return commit;
+}
+
+function deleteConductorWorkspaceRecords(
+  workspaceId: string | null,
+  sessionId: string | null
+): void {
+  if (!workspaceId && !sessionId) return;
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH);
+    const remove = db.transaction(() => {
+      if (sessionId) {
+        db.prepare("DELETE FROM session_messages WHERE session_id = ?").run(sessionId);
+        db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+      }
+      if (workspaceId) {
+        db.prepare("DELETE FROM workspaces WHERE id = ?").run(workspaceId);
+      }
+    });
+    remove();
+    db.close();
+  } catch (err) {
+    console.error(`[launcher] Failed to roll back Conductor DB records:`, err);
+  }
+}
+
+async function rollBackWorkspaceCreation(
+  repoPath: string,
+  workspaceDir: string,
+  branchName: string,
+  workspaceId: string | null,
+  sessionId: string | null
+): Promise<void> {
+  deleteConductorWorkspaceRecords(workspaceId, sessionId);
+  try {
+    await execFileAsync("git", ["worktree", "remove", "--force", workspaceDir], repoPath);
+  } catch (err) {
+    console.error(`[launcher] Failed to remove rolled-back worktree:`, err);
+  }
+  try {
+    await execFileAsync("git", ["branch", "-D", branchName], repoPath);
+  } catch (err) {
+    console.error(`[launcher] Failed to remove rolled-back branch:`, err);
+  }
+}
+
 /**
  * Create a workspace programmatically: git worktree + Conductor DB records.
  * No deeplinks needed — works even when Conductor UI is busy or unresponsive.
@@ -1325,15 +1719,18 @@ export async function launchWorkspace(
   prompt: string,
   onOutput?: (data: string) => void,
   attachmentSourcePaths: string[] = [],
-  options: SessionLaunchOptions = {}
+  options: WorkspaceLaunchOptions = {}
 ): Promise<
   {
     workspaceName: string;
     sessionId: string;
     done: Promise<AgentResult>;
     initialCursorRowid: number;
+    initialCursorMessageId: string | null;
     agentType: AgentType;
     model: string;
+    workspaceId: string;
+    backendKind: "local";
   } | { error: string }
 > {
   console.log(`[launcher] launchWorkspace called: repoPath=${repoPath}`);
@@ -1371,14 +1768,40 @@ export async function launchWorkspace(
   const cityName = pickCityName(reservedNames);
   const branchName = `${branchPrefix}/${cityName}`;
   const workspaceDir = getWorkspacePathFromRepo(repoInfo, repoPath, cityName);
+  const defaultBranch = repoInfo.defaultBranch ?? "main";
+  let baseCommit: string;
 
-  console.log(`[launcher] Creating workspace: ${cityName} (branch: ${branchName})`);
+  try {
+    baseCommit = await resolveRemoteBaseCommit(repoPath, defaultBranch);
+  } catch (err) {
+    try {
+      baseCommit = (
+        await execFileAsync(
+          "git",
+          ["rev-parse", "--verify", `${defaultBranch}^{commit}`],
+          repoPath
+        )
+      ).trim();
+      if (!COMMIT_SHA_RE.test(baseCommit)) {
+        throw new Error(
+          `${defaultBranch} did not resolve to an immutable commit`
+        );
+      }
+    } catch {
+      return { error: `Failed to resolve workspace base commit: ${err}` };
+    }
+  }
+
+  console.log(
+    `[launcher] Creating workspace: ${cityName} (branch: ${branchName}, base: ${baseCommit})`
+  );
 
   // 1. Create git worktree
   try {
-    const defaultBranch = repoInfo.defaultBranch ?? "main";
-    await execAsync(
-      `cd ${shellQuote(repoPath)} && git worktree add -b ${shellQuote(branchName)} ${shellQuote(workspaceDir)} ${shellQuote(defaultBranch)}`
+    await execFileAsync(
+      "git",
+      ["worktree", "add", "-b", branchName, workspaceDir, baseCommit],
+      repoPath
     );
     console.log(`[launcher] Git worktree created at ${workspaceDir}`);
   } catch (err) {
@@ -1387,67 +1810,115 @@ export async function launchWorkspace(
   }
   onOutput?.(`Workspace created: ${cityName}`);
 
-  const stagedAttachmentPaths = stageAttachmentPaths(
-    workspaceDir,
-    attachmentSourcePaths
-  );
+  let stagedAttachmentPaths: string[];
+  try {
+    stagedAttachmentPaths = stageAttachmentPaths(
+      workspaceDir,
+      attachmentSourcePaths
+    );
+  } catch (err) {
+    await rollBackWorkspaceCreation(
+      repoPath,
+      workspaceDir,
+      branchName,
+      null,
+      null
+    );
+    return { error: `Failed to stage workspace attachments: ${err}` };
+  }
   const fullPrompt = buildPromptWithAttachments(prompt, stagedAttachmentPaths);
   const launchConfig = finalizeLaunchConfig(
     resolveLaunchConfig(options),
     buildDisplayPrompt(fullPrompt, options.launchMode ?? "prompt")
   );
+  const restrictedLaunchError = restrictedCodexLaunchError(launchConfig);
+  if (restrictedLaunchError) {
+    await rollBackWorkspaceCreation(
+      repoPath,
+      workspaceDir,
+      branchName,
+      null,
+      null
+    );
+    return { error: restrictedLaunchError };
+  }
 
   // 2. Insert workspace + session into Conductor's DB
   const workspaceId = randomUUID();
   let sessionCreateResult: SessionCreateResult;
+  let conductorSessionId: string | null = null;
 
+  let conductorDb: Database.Database | null = null;
   try {
-    const db = new Database(CONDUCTOR_DB_PATH);
-    const defaultBranchName = repoInfo.defaultBranch ?? "main";
+    conductorDb = new Database(CONDUCTOR_DB_PATH);
     const sessionId = randomUUID();
-    insertConductorWorkspace(db, {
-      workspaceId,
-      repoId: repoInfo.repoId,
-      cityName,
-      branchName,
-      sessionId,
-      defaultBranchName,
-      workspaceDir,
+    conductorSessionId = sessionId;
+    const createRecords = conductorDb.transaction(() => {
+      insertConductorWorkspace(conductorDb!, {
+        workspaceId,
+        repoId: repoInfo.repoId,
+        cityName,
+        branchName,
+        sessionId,
+        defaultBranchName: defaultBranch,
+        workspaceDir,
+      });
+      return insertSessionForWorkspace(
+        conductorDb!,
+        workspaceId,
+        sessionId,
+        buildDisplayPrompt(fullPrompt, launchConfig.launchMode),
+        launchConfig
+      );
     });
-    sessionCreateResult = insertSessionForWorkspace(
-      db,
-      workspaceId,
-      sessionId,
-      buildDisplayPrompt(fullPrompt, launchConfig.launchMode),
-      launchConfig
-    );
+    sessionCreateResult = createRecords();
 
-    db.close();
     console.log(
       `[launcher] DB records created: workspace=${workspaceId}, session=${sessionCreateResult.sessionId}`
     );
   } catch (err) {
     console.error(`[launcher] DB insert failed:`, err);
+    await rollBackWorkspaceCreation(
+      repoPath,
+      workspaceDir,
+      branchName,
+      workspaceId,
+      conductorSessionId
+    );
     return { error: `Failed to create DB records: ${err}` };
+  } finally {
+    conductorDb?.close();
   }
 
   revealWorkspaceInConductor(workspaceDir);
 
   // 3. Spawn the configured agent
-  const { done } = spawnAgent(
-    sessionCreateResult.sessionId,
-    repoPath,
-    workspaceDir,
-    fullPrompt,
-    launchConfig.model,
-    launchConfig.agentType,
-    cityName,
-    {
-      attachmentPaths: stagedAttachmentPaths,
-      launchMode: launchConfig.launchMode,
-      reviewBaseBranch: launchConfig.reviewBaseBranch,
-    }
-  );
+  let done: Promise<AgentResult>;
+  try {
+    ({ done } = spawnAgent(
+      sessionCreateResult.sessionId,
+      repoPath,
+      workspaceDir,
+      fullPrompt,
+      launchConfig.model,
+      launchConfig.agentType,
+      cityName,
+      {
+        attachmentPaths: stagedAttachmentPaths,
+        launchMode: launchConfig.launchMode,
+        accessMode: launchConfig.accessMode,
+      }
+    ));
+  } catch (err) {
+    await rollBackWorkspaceCreation(
+      repoPath,
+      workspaceDir,
+      branchName,
+      workspaceId,
+      sessionCreateResult.sessionId
+    );
+    return { error: `Failed to start agent process: ${err}` };
+  }
   onOutput?.("Agent is running.");
 
   return {
@@ -1455,14 +1926,22 @@ export async function launchWorkspace(
     sessionId: sessionCreateResult.sessionId,
     done,
     initialCursorRowid: sessionCreateResult.initialCursorRowid,
+    initialCursorMessageId: null,
     agentType: launchConfig.agentType,
     model: launchConfig.model,
+    workspaceId,
+    backendKind: "local",
   };
 }
 
 export interface SendError {
   error: string;
-  reason?: "unsupported_agent" | "remote_observe_only" | "remote_steer_unverified";
+  reason?:
+    | "unsupported_agent"
+    | "remote_observe_only"
+    | "conductor_api_unavailable"
+    | "cloud_policy_unsupported"
+    | "cloud_session_busy";
 }
 
 interface SessionSendTarget {
@@ -1492,9 +1971,18 @@ export async function sendToSession(
   workspaceName: string,
   prompt: string,
   attachmentSourcePaths: string[] = [],
-  options: { repoPath?: string | null; sessionId?: string | null } = {}
+  options: {
+    repoPath?: string | null;
+    sessionId?: string | null;
+    accessMode?: AgentAccessMode;
+    binding?: TrackedConductorBinding | null;
+  } = {}
 ): Promise<SendSuccess | SendError> {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
+  const wsInfo = resolveConductorWorkspaceInfo(
+    workspaceName,
+    options.repoPath ?? null,
+    options.binding
+  );
   if (!wsInfo) {
     return {
       error: options.repoPath
@@ -1508,6 +1996,30 @@ export async function sendToSession(
     };
   }
 
+  const remote = isRemoteConductorWorkspace(wsInfo);
+  if (
+    remote &&
+    options.accessMode !== undefined &&
+    options.accessMode !== "legacy"
+  ) {
+    return {
+      error:
+        `☁️ "${wsInfo.displayName}" cannot use the requested ${options.accessMode} policy through the Conductor API. ` +
+        "Use a local workspace until the API exposes equivalent permission controls.",
+      reason: "cloud_policy_unsupported",
+    };
+  }
+
+  const trackedDefaultSessionId =
+    remote && !options.sessionId
+      ? options.binding?.conductorSessionId ??
+        getTrackedWorkspaceByName(workspaceName, {
+          repoPath: options.repoPath ?? wsInfo.repoPath ?? undefined,
+        })?.conductorSessionId
+      : null;
+  const requestedSessionId =
+    options.sessionId ?? trackedDefaultSessionId ?? wsInfo.sessionId;
+
   let target: SessionSendTarget = {
     sessionId: wsInfo.sessionId,
     agentType: wsInfo.agentType,
@@ -1516,8 +2028,17 @@ export async function sendToSession(
     model: wsInfo.model,
     status: wsInfo.status,
   };
-  if (options.sessionId && options.sessionId !== wsInfo.sessionId) {
-    const session = getConductorSessionById(options.sessionId);
+  if (remote) {
+    const remoteTarget = await getRemoteSessionSendTarget(
+      wsInfo,
+      requestedSessionId
+    );
+    if ("error" in remoteTarget) {
+      return remoteTarget;
+    }
+    target = remoteTarget;
+  } else if (requestedSessionId !== wsInfo.sessionId) {
+    const session = getConductorSessionById(requestedSessionId);
     if (!session || session.workspaceId !== wsInfo.workspaceId) {
       return {
         error: `That thread no longer exists in "${wsInfo.displayName}". Sending in the topic targets the active thread instead.`,
@@ -1538,7 +2059,7 @@ export async function sendToSession(
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
 
-  if (isRemoteConductorWorkspace(wsInfo)) {
+  if (remote) {
     return steerRemoteSession(wsInfo, target, prompt, attachmentSourcePaths);
   }
 
@@ -1559,6 +2080,14 @@ export async function sendToSession(
   );
   const fullPrompt = buildPromptWithAttachments(prompt, stagedAttachmentPaths);
   markConductorWorkspaceActive(wsInfo.workspaceId);
+  const accessMode = options.accessMode ?? "legacy";
+  if (target.agentType === "codex" && accessMode === "read-only") {
+    return {
+      error:
+        "Restricted Codex launches are disabled. Configure Claude for read-only review work.",
+      reason: "unsupported_agent",
+    };
+  }
 
   const { done } = spawnAgent(
     target.sessionId,
@@ -1573,6 +2102,7 @@ export async function sendToSession(
       isFollowUp: true,
       attachmentPaths: stagedAttachmentPaths,
       launchMode: "prompt",
+      accessMode,
     }
   );
 
@@ -1585,17 +2115,25 @@ export async function launchWorkspaceSession(
   options: SessionLaunchOptions & {
     attachmentSourcePaths?: string[];
     repoPath?: string | null;
+    binding?: TrackedConductorBinding | null;
   } = {}
 ): Promise<
   {
     sessionId: string;
     done: Promise<AgentResult>;
     initialCursorRowid: number;
+    initialCursorMessageId: string | null;
     agentType: AgentType;
     model: string;
+    workspaceId: string;
+    backendKind: "local" | "cloud-api";
   } | SendError
 > {
-  const wsInfo = getWorkspaceFromConductorDb(workspaceName, options.repoPath ?? null);
+  const wsInfo = resolveConductorWorkspaceInfo(
+    workspaceName,
+    options.repoPath ?? null,
+    options.binding
+  );
   if (!wsInfo) {
     return {
       error: options.repoPath
@@ -1614,11 +2152,107 @@ export async function launchWorkspaceSession(
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
   if (isRemoteConductorWorkspace(wsInfo)) {
-    const remoteError: SendError = {
-      error: `☁️ "${wsInfo.displayName}" runs in Conductor Cloud — the bot can message its existing threads, but can't start new threads there yet. Open it in Conductor on your Mac.`,
-      reason: "remote_observe_only",
-    };
-    return remoteError;
+    const accessMode =
+      options.accessMode ??
+      (options.launchMode === "review" ? "read-only" : "legacy");
+    if (accessMode !== "legacy") {
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" cannot start a ${accessMode} thread through the Conductor API because the API does not expose permission-policy enforcement yet.`,
+        reason: "cloud_policy_unsupported",
+      };
+    }
+    if ((options.attachmentSourcePaths?.length ?? 0) > 0) {
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" cannot receive Telegram attachments when starting a cloud thread through the Conductor API yet.`,
+        reason: "conductor_api_unavailable",
+      };
+    }
+
+    let client;
+    try {
+      client = createConductorApiClientFromEnv();
+    } catch (error) {
+      return conductorApiSendError(wsInfo, error);
+    }
+    if (!client) {
+      return remoteObserveOnlyError(wsInfo);
+    }
+
+    const launchConfig = finalizeLaunchConfig(
+      resolveLaunchConfig(options),
+      buildDisplayPrompt(prompt, options.launchMode ?? "prompt")
+    );
+    const apiModel = resolveAgentModelForConductorApi(
+      launchConfig.agentType,
+      launchConfig.launchMode,
+      options.model
+    );
+    let session: ConductorApiSession | null = null;
+    let pendingCycle: CloudSessionCycleWrite | null = null;
+    try {
+      const createdSession = await client.createSession({
+        workspaceId: wsInfo.workspaceId,
+        name: launchConfig.title,
+        agent: launchConfig.agentType,
+        model: apiModel,
+        effort:
+          launchConfig.agentType === "codex"
+            ? launchConfig.codexThinkingLevel ?? undefined
+            : undefined,
+      });
+      const createdStatus = await client.getSessionStatus(createdSession.id);
+      if (createdStatus.workspaceId !== wsInfo.workspaceId) {
+        throw new ConductorApiError(
+          "Conductor API created the thread in a different workspace"
+        );
+      }
+      session = createdSession;
+      const messageId = randomUUID();
+      pendingCycle = reserveCloudSessionCycle(
+        wsInfo.workspaceId,
+        session.id
+      );
+      writeCloudSessionCycle(pendingCycle, {
+        phase: "pending",
+        outboundMessageId: messageId,
+      });
+      const sent = await client.sendMessage({
+        sessionId: session.id,
+        message: prompt.trim() || "(empty message)",
+        messageId,
+      });
+      // A new session has no older transcript backlog, and callers persist
+      // this receipt as the initial API cursor.
+      writeCloudSessionCycle(pendingCycle, {
+        phase: "boundary",
+        outboundMessageId: sent.messageId,
+      });
+      return {
+        sessionId: session.id,
+        done: Promise.resolve({ isError: false, exitCode: 0 }),
+        initialCursorRowid: 0,
+        initialCursorMessageId: sent.messageId,
+        agentType: launchConfig.agentType,
+        model: session.resolvedModel ?? session.model ?? apiModel,
+        workspaceId: wsInfo.workspaceId,
+        backendKind: "cloud-api",
+      };
+    } catch (error) {
+      if (pendingCycle) {
+        restoreCloudSessionCycleAfterSendFailure(pendingCycle);
+      }
+      if (session) {
+        await client.archiveSession(session.id).catch((cleanupError) => {
+          console.error(
+            `[conductor-api] Failed to archive incomplete session ${session?.id}:`,
+            cleanupError
+          );
+        });
+      }
+      return conductorApiSendError(wsInfo, error);
+    }
   }
   const workspaceDir = getWorkspacePathFromInfo(
     wsInfo,
@@ -1643,6 +2277,10 @@ export async function launchWorkspaceSession(
     }),
     buildDisplayPrompt(fullPrompt, options.launchMode ?? "prompt", reviewBaseBranch)
   );
+  const restrictedLaunchError = restrictedCodexLaunchError(launchConfig);
+  if (restrictedLaunchError) {
+    return { error: restrictedLaunchError, reason: "unsupported_agent" };
+  }
   let sessionCreateResult: SessionCreateResult;
 
   try {
@@ -1678,7 +2316,7 @@ export async function launchWorkspaceSession(
     {
       attachmentPaths: stagedAttachmentPaths,
       launchMode: launchConfig.launchMode,
-      reviewBaseBranch,
+      accessMode: launchConfig.accessMode,
     }
   );
 
@@ -1686,8 +2324,11 @@ export async function launchWorkspaceSession(
     sessionId: sessionCreateResult.sessionId,
     done,
     initialCursorRowid: sessionCreateResult.initialCursorRowid,
+    initialCursorMessageId: null,
     agentType: launchConfig.agentType,
     model: launchConfig.model,
+    workspaceId: wsInfo.workspaceId,
+    backendKind: "local",
   };
 }
 
@@ -1709,10 +2350,31 @@ export function stopAgent(workspaceName: string, repoPath: string): boolean {
   return true;
 }
 
-export function archiveConductorWorkspace(
+export async function archiveConductorWorkspace(
   workspaceName: string,
-  repoPath: string | null = null
-): boolean {
+  repoPath: string | null = null,
+  binding: TrackedConductorBinding | null = null
+): Promise<boolean> {
+  const workspace = resolveConductorWorkspaceInfo(
+    workspaceName,
+    repoPath,
+    binding
+  );
+  if (workspace && isRemoteConductorWorkspace(workspace)) {
+    try {
+      const client = createConductorApiClientFromEnv();
+      if (!client) return false;
+      await client.archiveWorkspace(workspace.workspaceId);
+      return true;
+    } catch (error) {
+      console.error(
+        `[conductor-api] Failed to archive workspace ${workspace.displayName}:`,
+        error
+      );
+      return false;
+    }
+  }
+
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
     const columns = getTableColumns(db, "workspaces");
@@ -1751,6 +2413,52 @@ export function archiveConductorWorkspace(
  */
 export function isAgentRunning(workspaceName: string, repoPath: string): boolean {
   return runningAgents.has(workspaceAgentKey(repoPath, workspaceName));
+}
+
+export async function stopConductorAgent(
+  workspaceName: string,
+  repoPath: string,
+  sessionId: string | null = null,
+  binding: TrackedConductorBinding | null = null
+): Promise<boolean> {
+  const workspace = resolveConductorWorkspaceInfo(
+    workspaceName,
+    repoPath,
+    binding
+  );
+  if (workspace && isRemoteConductorWorkspace(workspace)) {
+    try {
+      const client = createConductorApiClientFromEnv();
+      if (!client) return false;
+      const trackedSessionId =
+        sessionId ??
+        getTrackedWorkspaceByName(workspaceName, { repoPath })
+          ?.conductorSessionId ??
+        workspace.sessionId;
+      const status = await client.getSessionStatus(trackedSessionId);
+      if (status.workspaceId !== workspace.workspaceId) {
+        console.error(
+          `[conductor-api] Refusing to cancel session ${trackedSessionId}: workspace identity mismatch`
+        );
+        return false;
+      }
+      const canceled = await client.cancelSession(trackedSessionId);
+      setMetaValue(
+        cloudSessionCycleKey(workspace.workspaceId, trackedSessionId),
+        encodeCloudSessionCycle({
+          phase: canceled.status === "idle" ? "complete" : "canceling",
+        })
+      );
+      return true;
+    } catch (error) {
+      console.error(
+        `[conductor-api] Failed to cancel session for ${workspace.displayName}:`,
+        error
+      );
+      return false;
+    }
+  }
+  return stopAgent(workspaceName, repoPath);
 }
 
 // ── Conductor DB helpers ────────────────────────────────────
@@ -1958,7 +2666,7 @@ async function isGitRepo(repoPath: string): Promise<boolean> {
   }
 }
 
-async function resolveRepoDefaultBranch(repoPath: string): Promise<string> {
+export async function resolveRepoDefaultBranch(repoPath: string): Promise<string> {
   const candidates = [
     `git -C ${shellQuote(repoPath)} symbolic-ref --short refs/remotes/origin/HEAD`,
     `git -C ${shellQuote(repoPath)} rev-parse --abbrev-ref HEAD`,
@@ -2010,9 +2718,22 @@ export interface ConductorWorkspaceInfo {
   pinnedAt: string | null;
   sessionHidden: boolean;
   targetBranch: string | null;
+  branchName: string | null;
   hostingServerUrl: string | null;
   sandboxProvider: string | null;
   remoteFileSyncEnabled: boolean;
+}
+
+/**
+ * Durable Conductor identity stored by conductor-telegram. The field names
+ * intentionally match Workspace so callers can pass a tracked row directly.
+ */
+export interface TrackedConductorBinding {
+  conductorWorkspaceId: string | null;
+  conductorSessionId: string | null;
+  conductorBackendKind: "local" | "cloud-api" | null;
+  repoPath?: string | null;
+  status?: string;
 }
 
 /** A Conductor Cloud workspace: hosted in a remote sandbox, not on this Mac. */
@@ -2059,6 +2780,7 @@ function workspaceOptionalSelects(db: Database.Database): {
   hostingServerUrl: string;
   sandboxProvider: string;
   remoteFileSync: string;
+  branchName: string;
   hasWorkspaceName: boolean;
 } {
   const columns = getTableColumns(db, "workspaces");
@@ -2078,6 +2800,7 @@ function workspaceOptionalSelects(db: Database.Database): {
     remoteFileSync: columns.has("remote_file_sync_enabled")
       ? "w.remote_file_sync_enabled"
       : "0 as remote_file_sync_enabled",
+    branchName: columns.has("branch") ? "w.branch as branch_name" : "NULL as branch_name",
     hasWorkspaceName: columns.has("workspace_name"),
   };
 }
@@ -2107,6 +2830,7 @@ function getWorkspaceFromConductorDb(
           w.id as workspace_id,
           w.active_session_id as session_id,
           w.directory_name,
+          ${optional.branchName},
           s.model,
           s.status,
           s.agent_type,
@@ -2173,17 +2897,172 @@ function mapConductorWorkspaceRow(row: any): ConductorWorkspaceInfo {
     pinnedAt: row.pinned_at ?? null,
     sessionHidden: row.session_hidden === 1,
     targetBranch: row.target_branch ?? null,
+    branchName: row.branch_name ?? null,
     hostingServerUrl: row.hosting_server_url ?? null,
     sandboxProvider: row.sandbox_provider ?? null,
     remoteFileSyncEnabled: row.remote_file_sync_enabled === 1,
   };
 }
 
+function trackedCloudWorkspaceInfo(
+  workspaceName: string,
+  repoPath: string | null,
+  binding: TrackedConductorBinding | null = null
+): ConductorWorkspaceInfo | null {
+  const tracked =
+    binding ??
+    getTrackedWorkspaceByName(workspaceName, {
+      repoPath: repoPath ?? undefined,
+    });
+  if (
+    tracked?.conductorBackendKind !== "cloud-api" ||
+    !tracked.conductorWorkspaceId ||
+    !tracked.conductorSessionId
+  ) {
+    return null;
+  }
+
+  const effectiveRepoPath = repoPath ?? tracked.repoPath ?? null;
+  const archived = tracked.status === "archived";
+  const inProgress =
+    tracked.status === "starting" || tracked.status === "running";
+  return {
+    workspaceId: tracked.conductorWorkspaceId,
+    sessionId: tracked.conductorSessionId,
+    agentSessionId: null,
+    agentType: getDefaultAgentType(),
+    rawAgentType: null,
+    model: null,
+    repoName: effectiveRepoPath ? path.basename(effectiveRepoPath) : null,
+    repoPath: effectiveRepoPath,
+    workspacePath: null,
+    displayName: workspaceName,
+    directoryName: workspaceName,
+    status: inProgress ? "working" : "idle",
+    state: archived ? "archived" : "ready",
+    derivedStatus: inProgress ? "in-progress" : tracked.status ?? null,
+    pinnedAt: null,
+    sessionHidden: archived,
+    targetBranch: null,
+    branchName: null,
+    hostingServerUrl: null,
+    sandboxProvider: "conductor-api",
+    remoteFileSyncEnabled: false,
+  };
+}
+
+function resolveConductorWorkspaceInfo(
+  workspaceName: string,
+  repoPath: string | null = null,
+  binding: TrackedConductorBinding | null = null
+): ConductorWorkspaceInfo | null {
+  const boundCloud = trackedCloudWorkspaceInfo(
+    workspaceName,
+    repoPath,
+    binding
+  );
+  if (binding?.conductorBackendKind === "cloud-api" && boundCloud) {
+    return boundCloud;
+  }
+  return (
+    getWorkspaceFromConductorDb(workspaceName, repoPath) ??
+    boundCloud
+  );
+}
+
 export function getWorkspaceSessionInfo(
   workspaceName: string,
-  repoPath: string | null = null
+  repoPath: string | null = null,
+  binding: TrackedConductorBinding | null = null
 ): ConductorWorkspaceInfo | null {
-  return getWorkspaceFromConductorDb(workspaceName, repoPath);
+  return resolveConductorWorkspaceInfo(workspaceName, repoPath, binding);
+}
+
+/**
+ * Refresh a durable cloud binding through the public API. If the API is
+ * temporarily unavailable, retain the last known identity so polling can
+ * recover without falsely declaring the workspace deleted.
+ */
+export async function getCloudWorkspaceSessionInfo(
+  workspaceName: string,
+  repoPath: string | null,
+  binding: TrackedConductorBinding,
+  options: { includeMetadata?: boolean } = {}
+): Promise<ConductorWorkspaceInfo | null> {
+  const fallback = trackedCloudWorkspaceInfo(
+    workspaceName,
+    repoPath,
+    binding
+  );
+  if (!fallback) return null;
+
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    console.error("[conductor-api] Invalid cloud backend configuration:", error);
+    return fallback;
+  }
+  if (!client) return fallback;
+
+  try {
+    const metadataPromise =
+      options.includeMetadata === false
+        ? Promise.resolve(null)
+        : Promise.all([
+            client.getWorkspace(fallback.workspaceId),
+            client.getSession(fallback.sessionId),
+          ]);
+    const [workspaceStatus, sessionStatus, metadata] = await Promise.all([
+      client.getWorkspaceStatus(fallback.workspaceId),
+      client.getSessionStatus(fallback.sessionId),
+      metadataPromise,
+    ]);
+    if (
+      workspaceStatus.workspaceId !== fallback.workspaceId ||
+      sessionStatus.workspaceId !== fallback.workspaceId ||
+      sessionStatus.sessionId !== fallback.sessionId
+    ) {
+      throw new ConductorApiError(
+        `Conductor API returned mismatched workspace/session identity for ${workspaceName}`
+      );
+    }
+
+    const [workspace, session] = metadata ?? [null, null];
+    const model = session?.resolvedModel ?? session?.model ?? fallback.model;
+    const agentType = inferAgentTypeFromModel(model) ?? fallback.agentType;
+    const archived =
+      workspaceStatus.status === "archived" ||
+      workspaceStatus.status === "deleted";
+    const working =
+      sessionStatus.status === "working" ||
+      workspaceStatus.status === "initializing" ||
+      workspaceStatus.status === "updating";
+    return {
+      ...fallback,
+      displayName: workspace?.name.trim() || fallback.displayName,
+      status: sessionStatus.status,
+      state: archived ? "archived" : workspaceStatus.status,
+      derivedStatus: working ? "in-progress" : "done",
+      sessionHidden: Boolean(session?.archivedAt) || archived,
+      agentType,
+      rawAgentType: agentType,
+      model,
+    };
+  } catch (error) {
+    console.warn(
+      `[conductor-api] Could not refresh persisted binding for ${workspaceName}:`,
+      error
+    );
+    return fallback;
+  }
+}
+
+export function getWorkspaceBranchName(
+  workspaceName: string,
+  repoPath: string | null = null
+): string | null {
+  return getWorkspaceFromConductorDb(workspaceName, repoPath)?.branchName ?? null;
 }
 
 // ── Threads (multiple sessions per workspace, Conductor 0.44+) ──
@@ -2199,6 +3078,7 @@ export interface ConductorSessionInfo {
   claudeSessionId: string | null;
   isActive: boolean;
   createdAt: string | null;
+  backendKind: "local" | "cloud-api";
 }
 
 const SESSION_SELECT = `
@@ -2220,11 +3100,85 @@ function mapConductorSessionRow(row: any): ConductorSessionInfo {
     claudeSessionId: row.claude_session_id ?? null,
     isActive: row.is_active === 1,
     createdAt: row.created_at ?? null,
+    backendKind: "local",
   };
 }
 
-/** All visible (non-hidden) sessions of a Conductor workspace — its threads. */
-export function getConductorWorkspaceSessions(
+function mapConductorApiSession(
+  workspaceId: string,
+  session: ConductorApiSession,
+  status: string | null,
+  isActive: boolean
+): ConductorSessionInfo {
+  const model = session.resolvedModel ?? session.model ?? null;
+  const agentType = inferAgentTypeFromModel(model) ?? "claude";
+  return {
+    sessionId: session.id,
+    workspaceId,
+    title: session.name ?? null,
+    status,
+    agentType,
+    rawAgentType: agentType,
+    model,
+    claudeSessionId: null,
+    isActive,
+    createdAt: null,
+    backendKind: "cloud-api",
+  };
+}
+
+function getWorkspaceTransportInfo(workspaceId: string): {
+  isRemote: boolean;
+  activeSessionId: string | null;
+} | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const optional = workspaceOptionalSelects(db);
+    const row = db.prepare(
+      `SELECT w.active_session_id,
+              ${optional.hostingServerUrl},
+              ${optional.sandboxProvider}
+       FROM workspaces w
+       WHERE w.id = ?`
+    ).get(workspaceId) as any;
+    db.close();
+    if (!row) return null;
+    return {
+      isRemote: Boolean(row.hosting_server_url || row.sandbox_provider),
+      activeSessionId: row.active_session_id ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getSessionTransportInfo(sessionId: string): {
+  workspaceId: string;
+  isRemote: boolean;
+} | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const optional = workspaceOptionalSelects(db);
+    const row = db.prepare(
+      `SELECT s.workspace_id,
+              ${optional.hostingServerUrl},
+              ${optional.sandboxProvider}
+       FROM sessions s
+       JOIN workspaces w ON w.id = s.workspace_id
+       WHERE s.id = ?`
+    ).get(sessionId) as any;
+    db.close();
+    if (!row?.workspace_id) return null;
+    return {
+      workspaceId: row.workspace_id,
+      isRemote: Boolean(row.hosting_server_url || row.sandbox_provider),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getConductorWorkspaceSessionsFromDb(
   workspaceId: string
 ): ConductorSessionInfo[] {
   try {
@@ -2238,6 +3192,86 @@ export function getConductorWorkspaceSessions(
     return rows.map(mapConductorSessionRow);
   } catch {
     return [];
+  }
+}
+
+/** All visible sessions of a workspace, using the API for cloud workspaces. */
+export async function getConductorWorkspaceSessions(
+  workspaceId: string,
+  preferredActiveSessionId: string | null = null,
+  backendKind?: "local" | "cloud-api"
+): Promise<ConductorSessionInfo[]> {
+  const localSessions = getConductorWorkspaceSessionsFromDb(workspaceId);
+  const transport = getWorkspaceTransportInfo(workspaceId);
+  const useCloudApi =
+    backendKind === "cloud-api" ||
+    (backendKind === undefined && transport?.isRemote === true);
+  if (!useCloudApi) {
+    return localSessions;
+  }
+
+  const fallback = localSessions.map((session) => ({
+    ...session,
+    // Desktop mirror status is not authoritative for a cloud session. Keeping
+    // this unknown prevents transient API failures from looking like completion.
+    status: null,
+    isActive:
+      session.sessionId ===
+      (preferredActiveSessionId ?? transport?.activeSessionId),
+    backendKind: "cloud-api" as const,
+  }));
+
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    console.error("[conductor-api] Invalid cloud backend configuration:", error);
+    return fallback;
+  }
+  if (!client) return fallback;
+
+  try {
+    const sessions = (await client.listWorkspaceSessions(workspaceId)).filter(
+      (session) => !session.archivedAt
+    );
+    const statuses = await mapWithConcurrency(
+      sessions,
+      MAX_CONCURRENT_SESSION_REQUESTS,
+      (session) =>
+        client
+          .getSessionStatus(session.id)
+          .then((status) => {
+            if (status.workspaceId !== workspaceId) {
+              throw new ConductorApiError(
+                `Conductor API returned session ${session.id} for a different workspace`
+              );
+            }
+            return status;
+          })
+          .catch((error) => {
+            console.warn(
+              `[conductor-api] Could not read status for session ${session.id}:`,
+              error
+            );
+            return null;
+          })
+    );
+    const activeSessionId =
+      preferredActiveSessionId ?? transport?.activeSessionId;
+    return sessions.map((session, index) =>
+      mapConductorApiSession(
+        workspaceId,
+        session,
+        statuses[index]?.status ?? null,
+        session.id === activeSessionId
+      )
+    );
+  } catch (error) {
+    console.warn(
+      `[conductor-api] Falling back to the desktop DB for workspace ${workspaceId}:`,
+      error
+    );
+    return fallback;
   }
 }
 
@@ -2256,11 +3290,41 @@ export function getConductorSessionById(
   }
 }
 
-/** Make a thread the workspace's active session (mirrors switching tabs in the app). */
-export function setConductorActiveSession(
+/**
+ * Make a local thread active in the desktop app. For cloud sessions the public
+ * API has no active-tab mutation, so validate membership and let Telegram's
+ * own persisted conductor_session_id become the default routing target.
+ */
+export async function setConductorActiveSession(
   workspaceId: string,
-  sessionId: string
-): boolean {
+  sessionId: string,
+  backendKind?: "local" | "cloud-api"
+): Promise<boolean> {
+  const transport = getWorkspaceTransportInfo(workspaceId);
+  const useCloudApi =
+    backendKind === "cloud-api" ||
+    (backendKind === undefined && transport?.isRemote === true);
+  if (useCloudApi) {
+    let client;
+    try {
+      client = createConductorApiClientFromEnv();
+    } catch (error) {
+      console.error("[conductor-api] Invalid cloud backend configuration:", error);
+      return false;
+    }
+    if (!client) return false;
+    try {
+      const status = await client.getSessionStatus(sessionId);
+      return status.workspaceId === workspaceId;
+    } catch (error) {
+      console.error(
+        `[conductor-api] Failed to validate session ${sessionId}:`,
+        error
+      );
+      return false;
+    }
+  }
+
   try {
     const db = new Database(CONDUCTOR_DB_PATH);
     const result = db.prepare(
@@ -2325,29 +3389,120 @@ export function listRecentConductorWorkspaces(limit = 15): ConductorWorkspaceLis
   }
 }
 
-// ── Conductor Cloud steering (experimental) ──────────────────
+// ── Conductor Cloud API transport ────────────────────────────
 //
-// Cloud workspaces run their agents in remote sandboxes; the bot can't spawn a
-// CLI against them. The Mac app queues user messages as `session_messages`
-// rows (queue_order set, sent_at NULL until dispatch) and dispatches them to
-// the agent. We mimic that write and watch whether the running app picks it
-// up. Capability is probed once per workspace and cached in bot meta.
+// Cloud writes must use Conductor's supported HTTP API. The local desktop DB
+// remains a temporary read-only discovery/fallback surface, but this process
+// never inserts, updates, or deletes cloud session_messages rows.
 
-const REMOTE_STEERING_MODE = (
-  process.env.TELEGRAM_REMOTE_STEERING ?? "queue"
-).trim().toLowerCase();
-const STEER_DISPATCH_TIMEOUT_MS = 45_000;
-const STEER_POLL_INTERVAL_MS = 1_500;
+async function getRemoteSessionSendTarget(
+  wsInfo: ConductorWorkspaceInfo,
+  sessionId: string
+): Promise<SessionSendTarget | SendError> {
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    return conductorApiSendError(wsInfo, error);
+  }
+  if (!client) {
+    return remoteObserveOnlyError(wsInfo);
+  }
 
-function steerCapabilityKey(workspaceId: string): string {
-  return `remote_steer:${workspaceId}`;
+  try {
+    const [session, status] = await Promise.all([
+      client.getSession(sessionId),
+      client.getSessionStatus(sessionId),
+    ]);
+    if (status.workspaceId !== wsInfo.workspaceId) {
+      return {
+        error: `That thread does not belong to "${wsInfo.displayName}".`,
+        reason: "conductor_api_unavailable",
+      };
+    }
+    const model = session.resolvedModel ?? session.model ?? wsInfo.model;
+    const agentType =
+      inferAgentTypeFromModel(model) ?? wsInfo.agentType;
+    return {
+      sessionId,
+      agentType,
+      rawAgentType: agentType,
+      agentSessionId: null,
+      model,
+      status: status.status,
+    };
+  } catch (error) {
+    return conductorApiSendError(wsInfo, error);
+  }
 }
 
 function remoteObserveOnlyError(wsInfo: ConductorWorkspaceInfo): SendError {
   return {
-    error: `☁️ "${wsInfo.displayName}" is a Conductor Cloud workspace in observe-only mode — its activity mirrors here, but steering from Telegram isn't available. Open it in Conductor on your Mac to reply.`,
-    reason: "remote_observe_only",
+    error:
+      `☁️ "${wsInfo.displayName}" is a Conductor Cloud workspace in observe-only mode. ` +
+      "Set CONDUCTOR_API_KEY and leave CONDUCTOR_CLOUD_BACKEND=auto (or set it to api) to steer it from Telegram.",
+    reason: "conductor_api_unavailable",
   };
+}
+
+export function canUseConductorCloudApi(): boolean {
+  return isConductorCloudApiConfigured();
+}
+
+interface CloudSessionCycleWrite {
+  key: string;
+  previous: CloudSessionCycle | null;
+  currentValue: string;
+  startedAt: number;
+}
+
+function getCloudSessionCycle(
+  conductorWorkspaceId: string,
+  sessionId: string
+): CloudSessionCycle | null {
+  return parseCloudSessionCycle(
+    getMetaValue(cloudSessionCycleKey(conductorWorkspaceId, sessionId))
+  );
+}
+
+function reserveCloudSessionCycle(
+  conductorWorkspaceId: string,
+  sessionId: string
+): CloudSessionCycleWrite {
+  const key = cloudSessionCycleKey(conductorWorkspaceId, sessionId);
+  const previous = parseCloudSessionCycle(getMetaValue(key));
+  // Stamped before any network I/O so a crash mid-send still leaves an
+  // expirable reservation rather than a permanently in-flight thread.
+  const startedAt = Date.now();
+  const currentValue = encodeCloudSessionCycle({ phase: "pending", startedAt });
+  setMetaValue(key, currentValue);
+  return { key, previous, currentValue, startedAt };
+}
+
+function writeCloudSessionCycle(
+  write: CloudSessionCycleWrite,
+  cycle: CloudSessionCycle
+): boolean {
+  if (getMetaValue(write.key) !== write.currentValue) return false;
+  // Carry the reservation timestamp forward so the TTL measures the whole
+  // cycle, not just the time since the last phase transition.
+  write.currentValue = encodeCloudSessionCycle({
+    startedAt: write.startedAt,
+    ...cycle,
+  });
+  setMetaValue(write.key, write.currentValue);
+  return true;
+}
+
+function restoreCloudSessionCycleAfterSendFailure(
+  write: CloudSessionCycleWrite
+): void {
+  // Do not overwrite evidence recorded by a poll that raced the failed send.
+  if (getMetaValue(write.key) !== write.currentValue) return;
+  setMetaValue(
+    write.key,
+    encodeCloudSessionCycle(write.previous ?? { phase: "complete" })
+  );
 }
 
 async function steerRemoteSession(
@@ -2356,11 +3511,13 @@ async function steerRemoteSession(
   prompt: string,
   attachmentSourcePaths: string[]
 ): Promise<SendSuccess | SendError> {
-  if (REMOTE_STEERING_MODE !== "queue") {
-    return remoteObserveOnlyError(wsInfo);
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    return conductorApiSendError(wsInfo, error);
   }
-  const capability = getMetaValue(steerCapabilityKey(wsInfo.workspaceId));
-  if (capability === "observe") {
+  if (!client) {
     return remoteObserveOnlyError(wsInfo);
   }
 
@@ -2374,164 +3531,82 @@ async function steerRemoteSession(
       ? `⚠️ ${droppedCount === 1 ? "The attachment" : `${droppedCount} attachments`} couldn't be delivered — ☁️ cloud workspaces can't receive Telegram files yet. Only the text was sent.`
       : undefined;
 
-  const queued = queueUserMessageInConductorDb(
-    target.sessionId,
-    text,
-    target.model
+  const existingCycle = getCloudSessionCycle(
+    wsInfo.workspaceId,
+    target.sessionId
   );
-  if (!queued) {
+  if (cloudCycleIsInFlight(existingCycle)) {
     return {
-      error: `Could not queue a message for "${wsInfo.displayName}" — this Conductor version may not support message queueing.`,
+      error:
+        `☁️ "${wsInfo.displayName}" still has queued or running work in that thread. ` +
+        "Wait for it to finish or stop it before sending another message.",
+      reason: "cloud_session_busy",
     };
   }
 
-  const sessionBusy = target.status === "working";
-  if (sessionBusy && capability === "queue") {
-    // Verified workspace with a busy agent: the app dispatches queued
-    // messages when the agent frees up, same as sending from the app UI.
-    console.log(
-      `[steer] message queued behind busy agent for ${wsInfo.displayName} (${target.sessionId})`
-    );
-    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
-  }
-
-  const dispatched = await waitForQueuedDispatch(queued.messageId);
-  if (dispatched) {
-    setMetaValue(steerCapabilityKey(wsInfo.workspaceId), "queue");
-    console.log(
-      `[steer] queued message dispatched for ${wsInfo.displayName} (${target.sessionId})`
-    );
-    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
-  }
-
-  removeQueuedMessageIfUndispatched(queued.messageId);
-  if (sessionBusy) {
-    // Can't distinguish "app never dispatches bot rows" from "agent is just
-    // busy" — don't poison the capability cache; ask the user to retry.
-    return {
-      error: `The agent in ☁️ "${wsInfo.displayName}" is busy and steering isn't verified yet for this workspace. Try again once it's idle.`,
-      reason: "remote_steer_unverified",
-    };
-  }
-  setMetaValue(steerCapabilityKey(wsInfo.workspaceId), "observe");
-  console.warn(
-    `[steer] queued message was not dispatched for ${wsInfo.displayName}; marking workspace observe-only`
+  const pendingCycle = reserveCloudSessionCycle(
+    wsInfo.workspaceId,
+    target.sessionId
   );
-  return remoteObserveOnlyError(wsInfo);
-}
-
-function queueUserMessageInConductorDb(
-  sessionId: string,
-  text: string,
-  model: string | null
-): { messageId: string } | null {
   try {
-    const db = new Database(CONDUCTOR_DB_PATH);
-    const columns = getTableColumns(db, "session_messages");
-    if (!columns.has("queue_order")) {
-      db.close();
-      return null;
+    const [status, latest] = await Promise.all([
+      client.getSessionStatus(target.sessionId),
+      client.getLatestSessionMessage(target.sessionId),
+    ]);
+    if (status.workspaceId !== wsInfo.workspaceId) {
+      throw new ConductorApiError(
+        "Conductor API returned the thread for a different workspace"
+      );
+    }
+    if (
+      status.status !== "idle" ||
+      (latest && conductorApiMessageRole(latest) === "user")
+    ) {
+      restoreCloudSessionCycleAfterSendFailure(pendingCycle);
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" still has queued or running work in that thread. ` +
+          "Wait for it to finish or stop it before sending another message.",
+        reason: "cloud_session_busy",
+      };
     }
 
     const messageId = randomUUID();
-    const now = new Date().toISOString();
-    // Mirror the app's own queued-row shape (sampled from a live 0.72 DB):
-    // turn_id = id, model = raw session model, sender_id = the app's client
-    // user id, sent_at NULL until the app dispatches.
-    const nextOrder = db.prepare(
-      `SELECT COALESCE(MAX(queue_order), 0) + 1 as next_order
-       FROM session_messages
-       WHERE session_id = ? AND sent_at IS NULL AND queue_order IS NOT NULL`
-    ).get(sessionId) as { next_order?: number } | undefined;
-    const senderId = db.prepare(
-      "SELECT value FROM settings WHERE key = 'roundhouse_client_user_id'"
-    ).get() as { value?: string } | undefined;
-
-    const insertColumns = [
-      "id", "session_id", "role", "content", "created_at", "sent_at",
-      "model", "turn_id", "queue_order",
-    ];
-    const values: unknown[] = [
-      messageId, sessionId, "user", text, now, null,
-      model, messageId, nextOrder?.next_order ?? 1,
-    ];
-    if (columns.has("sender_id")) {
-      insertColumns.push("sender_id");
-      values.push(senderId?.value ?? null);
-    }
-
-    db.prepare(
-      `INSERT INTO session_messages (${insertColumns.join(", ")})
-       VALUES (${insertColumns.map(() => "?").join(", ")})`
-    ).run(...values);
-    db.close();
-    return { messageId };
-  } catch (err) {
-    console.error(`[steer] Failed to queue message:`, err);
-    return null;
+    writeCloudSessionCycle(pendingCycle, {
+      phase: "pending",
+      outboundMessageId: messageId,
+      ...(latest
+        ? { baselineRowid: Math.max(0, Math.trunc(latest.sessionIndex)) }
+        : {}),
+    });
+    const sent = await client.sendMessage({
+      sessionId: target.sessionId,
+      message: text,
+      messageId,
+    });
+    console.log(
+      `[conductor-api] message ${sent.state} for ${wsInfo.displayName} (${target.sessionId})`
+    );
+    return { ok: true, done: Promise.resolve({ isError: false, exitCode: 0 }), warning };
+  } catch (error) {
+    restoreCloudSessionCycleAfterSendFailure(pendingCycle);
+    return conductorApiSendError(wsInfo, error);
   }
 }
 
-async function waitForQueuedDispatch(messageId: string): Promise<boolean> {
-  const deadline = Date.now() + STEER_DISPATCH_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    await sleep(STEER_POLL_INTERVAL_MS);
-    try {
-      const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-      const row = db.prepare(
-        "SELECT sent_at FROM session_messages WHERE id = ?"
-      ).get(messageId) as { sent_at?: string | null } | undefined;
-      db.close();
-      if (row && row.sent_at) return true;
-      if (!row) return false; // The app removed the row — treat as rejected.
-    } catch {
-      // Transient read error (WAL churn): keep polling until the deadline.
-    }
-  }
-  return false;
-}
-
-function removeQueuedMessageIfUndispatched(messageId: string): void {
-  try {
-    const db = new Database(CONDUCTOR_DB_PATH);
-    db.prepare(
-      "DELETE FROM session_messages WHERE id = ? AND sent_at IS NULL"
-    ).run(messageId);
-    db.close();
-  } catch (err) {
-    console.error(`[steer] Failed to clean up queued message:`, err);
-  }
-}
-
-/**
- * Get session status from Conductor's DB.
- */
-export function getSessionStatus(
-  workspaceName: string,
-  repoPath: string | null = null
-): string | null {
-  try {
-    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
-    const where = ["w.directory_name = ?"];
-    const params: any[] = [workspaceName];
-    if (repoPath) {
-      where.push("r.root_path = ?");
-      params.push(repoPath);
-    }
-    const rows = db.prepare(
-      `SELECT s.status FROM sessions s
-       JOIN workspaces w ON w.active_session_id = s.id
-       LEFT JOIN repos r ON r.id = w.repository_id
-       WHERE ${where.join(" AND ")}
-       ORDER BY w.updated_at DESC`
-    ).all(...params) as any[];
-    db.close();
-    if (!repoPath && rows.length > 1) return null;
-    const row = rows[0];
-    return row?.status ?? null;
-  } catch {
-    return null;
-  }
+function conductorApiSendError(
+  wsInfo: Pick<ConductorWorkspaceInfo, "displayName">,
+  error: unknown
+): SendError {
+  const detail =
+    error instanceof ConductorApiError
+      ? error.message
+      : `Conductor API request failed: ${(error as Error).message}`;
+  console.error(`[conductor-api] ${wsInfo.displayName}: ${detail}`);
+  return {
+    error: `Could not steer ☁️ "${wsInfo.displayName}" through the Conductor API: ${detail}`,
+    reason: "conductor_api_unavailable",
+  };
 }
 
 /**
@@ -2546,6 +3621,7 @@ export interface SessionResult {
 }
 
 export interface SessionMessage {
+  messageId: string | null;
   rowid: number;
   role: string;
   content: string;
@@ -2632,28 +3708,96 @@ export function getSessionResultBySessionId(
   }
 }
 
-export function getMaxSessionMessageRowId(sessionId: string): number {
+export interface SessionMessageCursor {
+  rowid: number;
+  messageId: string | null;
+}
+
+export async function getMaxSessionMessageCursor(
+  sessionId: string,
+  backendKind?: "local" | "cloud-api"
+): Promise<SessionMessageCursor> {
+  const transport = getSessionTransportInfo(sessionId);
+  const explicitCloud = backendKind === "cloud-api";
+  if (explicitCloud || transport?.isRemote) {
+    try {
+      const client = createConductorApiClientFromEnv();
+      if (client) {
+        const latest = await client.getLatestSessionMessage(sessionId);
+        if (latest) {
+          return {
+            rowid: Math.max(0, Math.trunc(latest.sessionIndex)),
+            messageId: latest.id,
+          };
+        }
+        return { rowid: 0, messageId: null };
+      }
+    } catch (error) {
+      console.warn(
+        `[conductor-api] Could not establish transcript cursor for ${sessionId}:`,
+        error
+      );
+    }
+    // API message IDs and SQLite row IDs are different cursor namespaces.
+    // The read-only desktop mirror may still establish a row baseline, but it
+    // always leaves messageId null so a later API recovery replaces it with a
+    // fresh API cursor instead of reusing a SQLite identifier.
+  }
+
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const row = db.prepare(
       "SELECT MAX(rowid) as maxRowId FROM session_messages WHERE session_id = ?"
     ).get(sessionId) as any;
     db.close();
-    return Number(row?.maxRowId ?? 0);
+    return { rowid: Number(row?.maxRowId ?? 0), messageId: null };
   } catch {
-    return 0;
+    return { rowid: 0, messageId: null };
   }
 }
 
-export function getSessionMessagesAfter(
+export async function getSessionMessagesAfter(
   sessionId: string,
   afterRowid: number,
-  limit = 25
-): SessionMessage[] {
+  limit = 25,
+  options: {
+    afterMessageId?: string | null;
+    backendKind?: "local" | "cloud-api";
+  } = {}
+): Promise<SessionMessage[]> {
+  const transport = getSessionTransportInfo(sessionId);
+  const explicitCloud = options.backendKind === "cloud-api";
+  if (explicitCloud || transport?.isRemote) {
+    try {
+      const client = createConductorApiClientFromEnv();
+      if (client && options.afterMessageId) {
+        const messages = await client.listSessionMessages({
+          sessionId,
+          after: options.afterMessageId,
+          limit,
+        });
+        return messages.slice(0, limit).map(mapConductorApiMessage);
+      }
+      // A missing API cursor means this is either the first rollout against an
+      // existing cloud thread or the API is disabled. Do not replay an entire
+      // historical transcript; the poller first establishes a latest cursor.
+      if (client) return [];
+    } catch (error) {
+      console.warn(
+        `[conductor-api] Could not poll transcript for ${sessionId}:`,
+        error
+      );
+    }
+    // Preserve an established API cursor during outages. If no API cursor has
+    // ever been established, the desktop DB remains a safe read-only mirror;
+    // mirrored rows below deliberately return messageId=null.
+    if (explicitCloud && options.afterMessageId) return [];
+  }
+
   try {
     const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
     const rows = db.prepare(
-      `SELECT rowid, role, content, created_at, sent_at
+      `SELECT id, rowid, role, content, created_at, sent_at
        FROM session_messages
        WHERE session_id = ? AND rowid > ?
        ORDER BY rowid ASC
@@ -2662,6 +3806,9 @@ export function getSessionMessagesAfter(
     db.close();
 
     return rows.map((row) => ({
+      // SQLite row IDs and Cloud API message IDs are separate cursor
+      // namespaces. Local polling advances only by rowid.
+      messageId: null,
       rowid: Number(row.rowid),
       role: row.role,
       content: row.content,
@@ -2671,6 +3818,94 @@ export function getSessionMessagesAfter(
   } catch {
     return [];
   }
+}
+
+function mapConductorApiMessage(message: ConductorApiMessage): SessionMessage {
+  const role = conductorApiMessageRole(message);
+  return {
+    messageId: message.id,
+    rowid: Math.max(0, Math.trunc(message.sessionIndex)),
+    role,
+    content: canonicalConductorApiMessageContent(message, role),
+    createdAt: message.receivedAt,
+    sentAt: message.receivedAt,
+  };
+}
+
+function conductorApiMessageRole(message: ConductorApiMessage): string {
+  const content =
+    message.content && typeof message.content === "object"
+      ? (message.content as Record<string, any>)
+      : null;
+  const candidates = [
+    content?.role,
+    content?.message?.role,
+    content?.type,
+    message.type,
+  ]
+    .filter((candidate): candidate is string => typeof candidate === "string")
+    .map((candidate) => candidate.toLowerCase());
+  if (
+    candidates.some(
+      (candidate) =>
+        candidate === "assistant" ||
+        candidate.includes("assistant") ||
+        candidate.includes("agent")
+    )
+  ) {
+    return "assistant";
+  }
+  if (
+    candidates.some(
+      (candidate) =>
+        candidate === "user" ||
+        candidate.includes("user") ||
+        candidate.includes("human")
+    )
+  ) {
+    return "user";
+  }
+  if (candidates.some((candidate) => candidate.includes("result"))) {
+    return "assistant";
+  }
+  return message.type;
+}
+
+function canonicalConductorApiMessageContent(
+  message: ConductorApiMessage,
+  role: string
+): string {
+  const content = message.content;
+  if (
+    content &&
+    typeof content === "object" &&
+    typeof (content as Record<string, unknown>).type === "string"
+  ) {
+    return JSON.stringify(content);
+  }
+  if (role !== "assistant") {
+    return typeof content === "string" ? content : JSON.stringify(content);
+  }
+
+  let messageContent: unknown = content;
+  if (
+    content &&
+    typeof content === "object" &&
+    !Array.isArray(content) &&
+    typeof (content as Record<string, unknown>).text === "string"
+  ) {
+    messageContent = (content as Record<string, unknown>).text;
+  } else if (
+    content &&
+    typeof content === "object" &&
+    !Array.isArray(content)
+  ) {
+    messageContent = JSON.stringify(content);
+  }
+  return JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: messageContent },
+  });
 }
 
 /**
@@ -2697,10 +3932,19 @@ function execAsync(cmd: string): Promise<string> {
   });
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+function execFileAsync(
+  command: string,
+  args: string[],
+  cwd?: string
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { cwd }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

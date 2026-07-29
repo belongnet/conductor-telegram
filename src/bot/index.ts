@@ -21,7 +21,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
-  getMaxSessionMessageRowId,
+  canUseConductorCloudApi,
+  getCloudWorkspaceSessionInfo,
+  getMaxSessionMessageCursor,
   getConductorWorkspaceSessions,
   getSessionMessagesAfter,
   getSessionResultBySessionId,
@@ -47,7 +49,7 @@ import {
   setMetaValue,
   updateThreadCursor,
   upsertThreadCursor,
-  updateWorkspaceConductorSession,
+  updateWorkspaceConductorBinding,
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
   updateWorkspaceThreadId,
@@ -80,19 +82,29 @@ import {
   syncWorkspaceTopic,
 } from "./forum.js";
 import {
-  classifyByExtension,
   extractInlineMedia,
+  resolveWorkspaceMediaFile,
   TELEGRAM_CAPTION_MAX,
   TELEGRAM_MEDIA_GROUP_MAX,
-  TELEGRAM_MAX_UPLOAD_BYTES,
   type InlineMediaItem,
 } from "./media.js";
-import { existsSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { refreshWorkspacePr } from "./github.js";
 import { formatPrCard, prKeyboard } from "./pr-ui.js";
+import {
+  advanceCloudSessionCycle,
+  canCompletePolledWorkspace,
+  cloudCycleIsInFlight,
+  cloudSessionCycleKey,
+  encodeCloudSessionCycle,
+  parseCloudSessionCycle,
+  shouldPollTrackedWorkspace,
+  type CloudSessionCycle,
+} from "./polling-policy.js";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const POLL_INTERVAL_MS = 5000;
+const CLOUD_POLL_INTERVAL_MS = 15_000;
 const STALE_WORKSPACE_MS = 15 * 60 * 1000;
 
 const lifecycleLog = getLogger("bot");
@@ -418,128 +430,298 @@ function isDeletedThreadError(err: any): boolean {
 // ── Conductor session status polling ─────────────────────────
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let cloudPollTimer: ReturnType<typeof setInterval> | null = null;
 
 function startSessionPoller(): void {
-  pollTimer = supervisedInterval("poller", () => {
-      const tracked = getAllWorkspaces(100);
-      for (const ws of tracked) {
-        if (!ws.conductorWorkspaceName) continue;
-        const sessionInfo = getWorkspaceSessionInfo(
-          ws.conductorWorkspaceName,
-          ws.repoPath
-        );
-        if (!sessionInfo) {
-          markWorkspaceStaleIfNeeded(ws);
-          continue;
-        }
-        if (
-          !isConductorWorkspaceVisible(sessionInfo) &&
-          (sessionInfo.state === "archived" ||
-            sessionInfo.sessionHidden ||
-            ws.status !== "running")
-        ) {
-          syncHiddenConductorWorkspace(ws);
-          continue;
-        }
+  pollTimer = supervisedInterval(
+    "poller",
+    () => pollConductorWorkspaces(false),
+    POLL_INTERVAL_MS
+  );
+  cloudPollTimer = supervisedInterval(
+    "cloud-poller",
+    () => pollConductorWorkspaces(true),
+    CLOUD_POLL_INTERVAL_MS
+  );
+}
 
-        if (ws.conductorSessionId !== sessionInfo.sessionId) {
-          updateWorkspaceConductorSession(ws.id, sessionInfo.sessionId);
-        }
+async function pollConductorWorkspaces(cloudOnly: boolean): Promise<void> {
+  const tracked = getAllWorkspaces(100);
+  for (const ws of tracked) {
+    await pollConductorWorkspace(ws, cloudOnly).catch((error) => {
+      pollerLog.error(
+        `${cloudOnly ? "cloud " : ""}workspace poll failed for ${ws.id}:`,
+        error
+      );
+    });
+  }
+}
 
-        const sessions = getConductorWorkspaceSessions(sessionInfo.workspaceId);
-        const visibleSessions =
-          sessions.length > 0 ? sessions : [activeSessionFromWorkspaceInfo(sessionInfo)];
-        const hasMultipleThreads = visibleSessions.length > 1;
-        const wsDir = workspaceDirFor(ws);
-        deleteThreadCursorsNotIn(
-          ws.id,
-          visibleSessions.map((session) => session.sessionId)
-        );
+async function pollConductorWorkspace(
+  ws: Workspace,
+  cloudOnly: boolean
+): Promise<void> {
+  if (!ws.conductorWorkspaceName) return;
+  if (!shouldPollTrackedWorkspace({ status: ws.status, cloudOnly })) return;
+  const persistedCloud = Boolean(
+    ws.conductorBackendKind === "cloud-api" &&
+      ws.conductorWorkspaceId &&
+      ws.conductorSessionId
+  );
+  const discoveredInfo = persistedCloud
+    ? null
+    : getWorkspaceSessionInfo(
+        ws.conductorWorkspaceName,
+        ws.repoPath,
+        ws
+      );
+  const discoveredCloud = Boolean(
+    discoveredInfo && isRemoteConductorWorkspace(discoveredInfo)
+  );
+  const isCloudWorkspace = persistedCloud || discoveredCloud;
+  if (isCloudWorkspace !== cloudOnly) {
+    // Discovery is local and cheap. Persist the cloud identity now, then
+    // let the independent cloud poller perform all network I/O.
+    if (isCloudWorkspace && discoveredInfo) {
+      updateWorkspaceConductorBinding(ws.id, {
+        workspaceId: discoveredInfo.workspaceId,
+        sessionId: ws.conductorSessionId ?? discoveredInfo.sessionId,
+        backendKind: "cloud-api",
+      });
+    }
+    return;
+  }
+  const sessionInfo = persistedCloud
+    ? await getCloudWorkspaceSessionInfo(
+        ws.conductorWorkspaceName,
+        ws.repoPath,
+        ws,
+        { includeMetadata: false }
+      )
+    : discoveredInfo;
+  if (!sessionInfo) {
+    markWorkspaceStaleIfNeeded(ws);
+    return;
+  }
+  if (
+    !isConductorWorkspaceVisible(sessionInfo) &&
+    (sessionInfo.state === "archived" ||
+      sessionInfo.sessionHidden ||
+      ws.status !== "running")
+  ) {
+    syncHiddenConductorWorkspace(ws);
+    return;
+  }
 
-        for (const session of visibleSessions) {
-          const title = formatThreadTitle(session);
-          const cursor = ensureThreadCursor(ws, session, title);
-          const newMessages = getSessionMessagesAfter(
-            session.sessionId,
-            cursor.lastForwardedRowid
-          );
-          if (newMessages.length === 0) {
-            rememberThreadStatus(ws, session, hasMultipleThreads);
-            continue;
-          }
+  const remote = isRemoteConductorWorkspace(sessionInfo);
+  const routedSessionId = remote
+    ? ws.conductorSessionId ?? sessionInfo.sessionId
+    : sessionInfo.sessionId;
+  const backendKind = remote ? "cloud-api" : "local";
+  if (
+    ws.conductorWorkspaceId !== sessionInfo.workspaceId ||
+    ws.conductorSessionId !== routedSessionId ||
+    ws.conductorBackendKind !== backendKind
+  ) {
+    updateWorkspaceConductorBinding(ws.id, {
+      workspaceId: sessionInfo.workspaceId,
+      sessionId: routedSessionId,
+      backendKind,
+    });
+  }
 
-          for (const message of newMessages) {
-            const forwarded = formatForwardedMessage(
-              ws.conductorWorkspaceName,
-              message,
-              wsDir,
-              hasMultipleThreads ? title : null
-            );
-            if (!forwarded) continue;
-            sendForwardToWorkspaceTopic(
-              ws,
-              forwarded.text,
-              forwarded.media,
-              session.sessionId
-            )
-              .catch((err) => pollerLog.error("forward error:", err));
-          }
-          const lastRowid = newMessages[newMessages.length - 1].rowid;
-          updateThreadCursor(ws.id, session.sessionId, lastRowid, title);
-          if (session.sessionId === sessionInfo.sessionId) {
-            updateWorkspaceForwardCursor(ws.id, lastRowid);
-          }
-          rememberThreadStatus(ws, session, hasMultipleThreads);
-        }
+  const sessions = await getConductorWorkspaceSessions(
+    sessionInfo.workspaceId,
+    routedSessionId,
+    backendKind
+  );
+  const visibleSessions =
+    sessions.length > 0
+      ? sessions
+      : [activeSessionFromWorkspaceInfo(sessionInfo)];
+  const hasMultipleThreads = visibleSessions.length > 1;
+  const wsDir = workspaceDirFor(ws);
+  const cancelingDuringPoll = new Set<string>();
+  if (!remote) {
+    deleteThreadCursorsNotIn(
+      ws.id,
+      visibleSessions.map((session) => session.sessionId)
+    );
+  }
 
-        const anyWorking = visibleSessions.some((session) => session.status === "working");
-        const anyError = visibleSessions.some((session) => session.status === "error");
-        if (anyWorking && ws.status !== "running") {
-          updateWorkspaceStatus(ws.id, "running");
-          if (ws.telegramThreadId) {
-            syncWorkspaceTopic(bot.telegram, { ...ws, status: "running" }).catch((err) =>
-              forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
-            );
-          }
-        }
-
-        if (!anyWorking && !anyError && ws.status === "running") {
-          updateWorkspaceStatus(ws.id, "done");
-          const active = visibleSessions.find((session) => session.sessionId === sessionInfo.sessionId);
-          const notifyDone = !hasMultipleThreads;
-          const doneNotify = notifyDone
-            ? sendToWorkspaceTopic(ws, buildFinishedMessage(ws, active ?? null, false), {
-              parse_mode: "HTML",
-              ...postDoneKeyboard(ws),
-            })
-            : Promise.resolve();
-          doneNotify
-            .then(() => {
-              if (ws.telegramThreadId) {
-                syncWorkspaceTopic(bot.telegram, { ...ws, status: "done" }).catch((err) =>
-                  forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
-                );
-              }
-            })
-            .catch((err) => pollerLog.error("notify error:", err));
-        } else if (anyError && ws.status !== "failed") {
-          updateWorkspaceStatus(ws.id, "failed");
-          const name = ws.conductorWorkspaceName ?? ws.name;
-          sendToWorkspaceTopic(ws, `🔴 <b>${esc(name)}</b> encountered an error.`, {
-              parse_mode: "HTML",
-              ...styledButtons([btn("Archive", `archive:${ws.id}`)]),
-            })
-            .then(() => {
-              if (ws.telegramThreadId) {
-                syncWorkspaceTopic(bot.telegram, { ...ws, status: "failed" }).catch((err) =>
-                  forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
-                );
-              }
-            })
-            .catch((err) => pollerLog.error("notify error:", err));
-        }
+  for (const session of visibleSessions) {
+    const title = formatThreadTitle(session);
+    const cursor = await ensureThreadCursor(ws, session, title);
+    const newMessages = await getSessionMessagesAfter(
+      session.sessionId,
+      cursor.lastForwardedRowid,
+      25,
+      {
+        afterMessageId: cursor.lastMessageId,
+        backendKind: session.backendKind,
       }
-  }, POLL_INTERVAL_MS);
+    );
+    const wasCanceling =
+      session.backendKind === "cloud-api" &&
+      getCloudSessionCycle(sessionInfo.workspaceId, session.sessionId)?.phase ===
+        "canceling";
+    if (wasCanceling) cancelingDuringPoll.add(session.sessionId);
+    rememberCloudWorkEvidence(sessionInfo.workspaceId, session, newMessages);
+    if (newMessages.length === 0) {
+      rememberThreadStatus(
+        ws,
+        session,
+        hasMultipleThreads,
+        wasCanceling
+      );
+      continue;
+    }
+
+    for (const message of newMessages) {
+      const forwarded = formatForwardedMessage(
+        ws.conductorWorkspaceName,
+        message,
+        remote ? null : wsDir,
+        hasMultipleThreads ? title : null
+      );
+      if (forwarded) {
+        await sendForwardToWorkspaceTopic(
+          ws,
+          forwarded.text,
+          forwarded.media,
+          session.sessionId
+        );
+      }
+      updateThreadCursor(
+        ws.id,
+        session.sessionId,
+        message.rowid,
+        title,
+        message.messageId,
+        session.backendKind
+      );
+      if (session.sessionId === sessionInfo.sessionId) {
+        updateWorkspaceForwardCursor(ws.id, message.rowid);
+      }
+    }
+    rememberThreadStatus(
+      ws,
+      session,
+      hasMultipleThreads,
+      wasCanceling
+    );
+  }
+
+  const cycleSessionIds = new Set(
+    visibleSessions.map((session) => session.sessionId)
+  );
+  if (remote) cycleSessionIds.add(routedSessionId);
+  const cloudCycles = remote
+    ? [...cycleSessionIds].map((sessionId) => ({
+        sessionId,
+        cycle: getCloudSessionCycle(sessionInfo.workspaceId, sessionId),
+      }))
+    : [];
+  const cancelingSessionIds = new Set(
+    cloudCycles
+      .filter(({ cycle }) => cycle?.phase === "canceling")
+      .map(({ sessionId }) => sessionId)
+  );
+  for (const sessionId of cancelingDuringPoll) {
+    cancelingSessionIds.add(sessionId);
+  }
+  const anyWorking = visibleSessions.some(
+    (session) =>
+      session.status === "working" &&
+      !cancelingSessionIds.has(session.sessionId)
+  );
+  const anyError = visibleSessions.some(
+    (session) =>
+      session.status === "error" &&
+      !cancelingSessionIds.has(session.sessionId)
+  );
+  const cloudWorkPending = cloudCycles.some(({ cycle }) =>
+    cloudCycleIsInFlight(cycle)
+  );
+  const cloudWorkObserved =
+    !remote ||
+    cloudCycles.some(({ cycle }) => cycle?.phase === "observed");
+  if (anyWorking && ws.status !== "running") {
+    updateWorkspaceStatus(ws.id, "running");
+    if (ws.telegramThreadId) {
+      syncWorkspaceTopic(bot.telegram, { ...ws, status: "running" }).catch((err) =>
+        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
+      );
+    }
+  }
+
+  if (
+    canCompletePolledWorkspace({
+      remote,
+      sessions: visibleSessions,
+      cloudWorkObserved,
+      cloudWorkPending,
+    }) &&
+    (remote || ws.status === "running")
+  ) {
+    updateWorkspaceStatus(ws.id, "done");
+    if (remote) {
+      completeObservedCloudCycles(
+        sessionInfo.workspaceId,
+        cycleSessionIds
+      );
+    }
+    const active = visibleSessions.find(
+      (session) => session.sessionId === sessionInfo.sessionId
+    );
+    const notifyDone = !hasMultipleThreads;
+    const doneNotify = notifyDone
+      ? sendToWorkspaceTopic(
+          ws,
+          buildFinishedMessage(ws, active ?? null, false),
+          {
+            parse_mode: "HTML",
+            ...postDoneKeyboard(ws),
+          }
+        )
+      : Promise.resolve();
+    doneNotify
+      .then(() => {
+        if (ws.telegramThreadId) {
+          syncWorkspaceTopic(bot.telegram, { ...ws, status: "done" }).catch((err) =>
+            forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
+          );
+        }
+      })
+      .catch((err) => pollerLog.error("notify error:", err));
+  } else if (anyError && ws.status !== "failed") {
+    updateWorkspaceStatus(ws.id, "failed");
+    if (remote) {
+      completeCloudCycles(
+        sessionInfo.workspaceId,
+        visibleSessions
+          .filter(
+            (session) =>
+              session.status === "error" &&
+              !cancelingSessionIds.has(session.sessionId)
+          )
+          .map((session) => session.sessionId)
+      );
+    }
+    const name = ws.conductorWorkspaceName ?? ws.name;
+    sendToWorkspaceTopic(ws, `🔴 <b>${esc(name)}</b> encountered an error.`, {
+      parse_mode: "HTML",
+      ...styledButtons([btn("Archive", `archive:${ws.id}`)]),
+    })
+      .then(() => {
+        if (ws.telegramThreadId) {
+          syncWorkspaceTopic(bot.telegram, { ...ws, status: "failed" }).catch((err) =>
+            forumLog.error(`topic sync error ${ws.telegramThreadId}:`, err)
+          );
+        }
+      })
+      .catch((err) => pollerLog.error("notify error:", err));
+  }
 }
 
 function activeSessionFromWorkspaceInfo(
@@ -556,6 +738,7 @@ function activeSessionFromWorkspaceInfo(
     claudeSessionId: info.agentSessionId,
     isActive: true,
     createdAt: null,
+    backendKind: isRemoteConductorWorkspace(info) ? "cloud-api" : "local",
   };
 }
 
@@ -566,22 +749,51 @@ function formatThreadTitle(session: ConductorSessionInfo): string {
   return `Thread ${session.sessionId.slice(0, 8)}`;
 }
 
-function ensureThreadCursor(
+async function ensureThreadCursor(
   ws: Workspace,
   session: ConductorSessionInfo,
   title: string
-): ThreadCursor {
+): Promise<ThreadCursor> {
   const existing = getThreadCursor(ws.id, session.sessionId);
-  if (existing) return existing;
+  if (existing) {
+    if (
+      session.backendKind === "cloud-api" &&
+      (existing.backendKind !== "cloud-api" || !existing.lastMessageId) &&
+      canUseConductorCloudApi()
+    ) {
+      const latest = await getMaxSessionMessageCursor(
+        session.sessionId,
+        session.backendKind
+      );
+      return upsertThreadCursor({
+        workspaceId: ws.id,
+        sessionId: session.sessionId,
+        backendKind: session.backendKind,
+        lastForwardedRowid: latest.rowid,
+        lastMessageId: latest.messageId,
+        title,
+      });
+    }
+    if (existing.backendKind === session.backendKind) return existing;
+  }
 
   const baseline =
+    session.backendKind === "local" &&
     session.sessionId === ws.conductorSessionId
-      ? ws.lastForwardedMessageRowid
-      : getMaxSessionMessageRowId(session.sessionId);
+      ? {
+          rowid: ws.lastForwardedMessageRowid,
+          messageId: null,
+        }
+      : await getMaxSessionMessageCursor(
+          session.sessionId,
+          session.backendKind
+        );
   return upsertThreadCursor({
     workspaceId: ws.id,
     sessionId: session.sessionId,
-    lastForwardedRowid: baseline,
+    backendKind: session.backendKind,
+    lastForwardedRowid: baseline.rowid,
+    lastMessageId: baseline.messageId,
     title,
   });
 }
@@ -590,10 +802,69 @@ function threadStatusKey(workspaceId: string, sessionId: string): string {
   return `thread_status:${workspaceId}:${sessionId}`;
 }
 
+function rememberCloudWorkEvidence(
+  conductorWorkspaceId: string,
+  session: ConductorSessionInfo,
+  messages: SessionMessage[]
+): void {
+  if (session.backendKind !== "cloud-api") return;
+  const key = cloudSessionCycleKey(
+    conductorWorkspaceId,
+    session.sessionId
+  );
+  const currentValue = getMetaValue(key);
+  const next = advanceCloudSessionCycle({
+    cycle: parseCloudSessionCycle(currentValue),
+    status: session.status,
+    messages,
+  });
+  const nextValue = next ? encodeCloudSessionCycle(next) : null;
+  if (nextValue && nextValue !== currentValue) {
+    setMetaValue(key, nextValue);
+  }
+}
+
+function getCloudSessionCycle(
+  conductorWorkspaceId: string,
+  sessionId: string
+): CloudSessionCycle | null {
+  return parseCloudSessionCycle(
+    getMetaValue(cloudSessionCycleKey(conductorWorkspaceId, sessionId))
+  );
+}
+
+function completeObservedCloudCycles(
+  conductorWorkspaceId: string,
+  sessionIds: Iterable<string>
+): void {
+  for (const sessionId of sessionIds) {
+    const key = cloudSessionCycleKey(conductorWorkspaceId, sessionId);
+    if (parseCloudSessionCycle(getMetaValue(key))?.phase === "observed") {
+      setMetaValue(
+        key,
+        encodeCloudSessionCycle({ phase: "complete" })
+      );
+    }
+  }
+}
+
+function completeCloudCycles(
+  conductorWorkspaceId: string,
+  sessionIds: Iterable<string>
+): void {
+  for (const sessionId of sessionIds) {
+    setMetaValue(
+      cloudSessionCycleKey(conductorWorkspaceId, sessionId),
+      encodeCloudSessionCycle({ phase: "complete" })
+    );
+  }
+}
+
 function rememberThreadStatus(
   ws: Workspace,
   session: ConductorSessionInfo,
-  hasMultipleThreads: boolean
+  hasMultipleThreads: boolean,
+  suppressTerminalNotification = false
 ): void {
   const status = session.status ?? "unknown";
   const key = threadStatusKey(ws.id, session.sessionId);
@@ -601,7 +872,13 @@ function rememberThreadStatus(
   if (previous === status) return;
   setMetaValue(key, status);
 
-  if (!hasMultipleThreads || previous !== "working") return;
+  if (
+    suppressTerminalNotification ||
+    !hasMultipleThreads ||
+    previous !== "working"
+  ) {
+    return;
+  }
 
   if (status === "idle") {
     sendToWorkspaceTopic(ws, buildFinishedMessage(ws, session, true), {
@@ -878,22 +1155,8 @@ function resolveArtifactFile(
   // Reuse the same shape as text-extracted media: only honor local-file refs,
   // skip remote URLs (they keep their <a href> link rendering above).
   const url = artifact.url ?? "";
-  if (!url || /^https?:\/\//i.test(url)) return null;
-
-  let p = url.startsWith("file://") ? url.slice("file://".length) : url;
-  if (!path.isAbsolute(p) && wsDir) p = path.join(wsDir, p);
-  if (!existsSync(p)) return null;
-  try {
-    const stat = statSync(p);
-    if (!stat.isFile() || stat.size > TELEGRAM_MAX_UPLOAD_BYTES) return null;
-  } catch {
-    return null;
-  }
-  return {
-    kind: classifyByExtension(p),
-    filePath: p,
-    filename: path.basename(p),
-  };
+  if (!url || !wsDir) return null;
+  return resolveWorkspaceMediaFile(url, wsDir);
 }
 
 function extractAssistantText(content: string): string | null {
@@ -994,6 +1257,7 @@ async function sendBootAnnouncement(
   }
 }
 
+
 // ── Start ───────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -1010,6 +1274,7 @@ async function main(): Promise<void> {
     heartbeat.stop();
     maintenance.stop();
     if (pollTimer) clearInterval(pollTimer);
+    if (cloudPollTimer) clearInterval(cloudPollTimer);
     if (eventPollTimer) clearInterval(eventPollTimer);
     try {
       bot.stop("SIGTERM");

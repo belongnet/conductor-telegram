@@ -4,6 +4,39 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-28
+
+### Added
+- Shared `.conductor/settings.toml` scripts provide reproducible Node 22 setup, test, typecheck, and build actions.
+- Conductor's official API now powers cloud message delivery, ordinary thread creation, transcript/status polling, cancellation, and workspace archive. API workspace/session IDs, backend kind, and incremental message cursors are persisted for restart recovery.
+- Foreground commands and the macOS launchd service can now enter a configured Doppler project/config runtime, while persisting only non-secret references locally.
+- Pull requests run typecheck, tests, and a build on Node 22 and 24, plus a macOS job that parses the gateway deploy script under the system bash 3.2.
+
+### Security
+- Doppler injection is restricted to an explicit bot-runtime allowlist; availability probes return names only, launchd installation ignores ephemeral service-token state, managed values are removed from local bot config, and plists never contain credential values or a Doppler token.
+- `service install` no longer captures secrets that were only present in the ambient environment. Values read from the environment stay in the running process; only the existing config file, explicit flags, and the non-secret Doppler references are written to disk, and the write happens before launchd bootstrap so a bootstrap failure cannot strand un-stripped secrets.
+- Workspace agent launches receive an isolated temporary HOME and a minimal environment without Telegram, Conductor API, or provider API-key environment variables. Authenticated CLI launches still use the operator's CLI credential store, and full-access launches additionally reach the operator's git, gh, and ssh configuration so they can still commit and open PRs; restricted review launches do not. This covers agents started for a workspace — the natural-language router still spawns Claude with the bot's own environment.
+- Restricted Claude launches disable project MCP servers and other ambient extension surfaces; restricted Codex review launches fail closed because its read-only sandbox does not isolate that credential store. The user prompt is passed after a `--` separator so a message shaped like a flag cannot reach Codex as one.
+- PR merges now require an approved review, passing checks, GitHub mergeability, a stable head SHA, a second expiring confirmation, and GitHub's head-commit match guard.
+- Cloud writes no longer mutate Conductor's private SQLite schema. The Conductor API key remains in the bot parent process, is excluded from child-agent environments, and cloud review work fails closed when the API cannot enforce the required permission policy.
+- Cloud API endpoints require HTTPS except for explicit loopback development origins. Cloud transcript text cannot request local file uploads, and outbound attachment paths are constrained to the canonical workspace directory by real path.
+- Inbound Telegram attachments can no longer steer where they are staged. The extension derived from an attacker-supplied `mime_type` is constrained, and the staged path is verified to be a direct child of the downloads directory.
+
+### Fixed
+- Cloud polling no longer overlaps slow ticks, floods the beta API every five seconds, or falls back across incompatible API-message and SQLite-row cursor namespaces. A cursor relabelled to the cloud backend now drops its SQLite-row position instead of carrying a value that no API message id could ever exceed, which previously stranded a thread's transcript permanently.
+- Polling isolates failures per workspace, and transcript cursors advance message-by-message only after Telegram delivery succeeds, so one bad workspace or failed send cannot drop the rest of a cycle.
+- Per-tick session status requests are capped, so a workspace with many sessions no longer fans out one concurrent request per session and provokes a retry storm against the beta API.
+- A cloud send cycle interrupted before its outbound message was recorded now expires instead of blocking every later send to that thread and preventing the workspace from ever completing.
+- Agents can reach the oversight database again: `DB_PATH` and `CONDUCTOR_DB_PATH` are passed through the isolated environment, so `report_status`, `report_artifact`, and `request_human` no longer write to a throwaway database that is deleted on exit.
+- `conductor-telegram doctor` and `status` still report when the Doppler CLI is missing or unauthenticated, rather than aborting with a single fatal error. `start` continues to fail closed.
+- Entering the Doppler runtime is guarded by an explicit sentinel and a case-insensitive reference comparison, so a project or config name that Doppler canonicalises differently no longer re-execs the CLI without bound.
+- The gateway deploy script expands its optional `service install` arguments in a form macOS's bash 3.2 accepts, so a deploy without Doppler configured no longer aborts after the global install but before the service restart.
+
+### Changed
+- The shipped Codex fallback model is `gpt-5.5`, and the legacy Claude permission default is `acceptEdits` instead of unrestricted bypass mode.
+- `TELEGRAM_REMOTE_STEERING=queue` is superseded by `CONDUCTOR_CLOUD_BACKEND=auto|api|off`; `auto` uses the official API only when `CONDUCTOR_API_KEY` is configured and otherwise remains observe-only.
+- Mac gateway deploys now use Node 22 and fail unless post-restart diagnostics pass.
+
 ## [0.4.7] - 2026-07-16
 
 ### Added

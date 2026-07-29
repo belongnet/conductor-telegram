@@ -11,25 +11,44 @@ import os from "node:os";
 
 const CONFIG_DIR = path.join(os.homedir(), ".conductor-telegram");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+const DOPPLER_REFERENCE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
-const ConfigSchema = z.object({
-  version: z.literal(1),
-  botToken: z.string().min(1, "Bot token is required"),
-  ownerChatId: z.string().min(1, "Owner chat ID is required"),
-  ownerUserId: z.string().optional(),
-  dbPath: z.string().optional(),
-  conductorDbPath: z.string().optional(),
-  conductorWorkspacesDir: z.string().optional(),
-  conductorReposDir: z.string().optional(),
-  downloadsDir: z.string().optional(),
-  claudeBin: z.string().optional(),
-  codexBin: z.string().optional(),
-  permissionMode: z.string().optional(),
-  defaultAgentType: z.string().optional(),
-  defaultModel: z.string().optional(),
-  reviewAgentType: z.string().optional(),
-  reviewModel: z.string().optional(),
-});
+const ConfigSchema = z
+  .object({
+    version: z.literal(1),
+    // Empty values are valid only for a Doppler-backed service installation.
+    // The start command still fails closed unless the merged runtime config
+    // supplies both values.
+    botToken: z.string(),
+    ownerChatId: z.string(),
+    ownerUserId: z.string().optional(),
+    dbPath: z.string().optional(),
+    conductorDbPath: z.string().optional(),
+    conductorWorkspacesDir: z.string().optional(),
+    conductorReposDir: z.string().optional(),
+    downloadsDir: z.string().optional(),
+    claudeBin: z.string().optional(),
+    codexBin: z.string().optional(),
+    permissionMode: z.string().optional(),
+    defaultAgentType: z.string().optional(),
+    defaultModel: z.string().optional(),
+    reviewAgentType: z.string().optional(),
+    reviewModel: z.string().optional(),
+    conductorApiBaseUrl: z.string().url().optional(),
+    conductorApiKey: z.string().optional(),
+    conductorCloudBackend: z.enum(["auto", "api", "off"]).optional(),
+    dopplerProject: z.string().regex(DOPPLER_REFERENCE_RE).optional(),
+    dopplerConfig: z.string().regex(DOPPLER_REFERENCE_RE).optional(),
+  })
+  .superRefine((config, context) => {
+    if (Boolean(config.dopplerProject) !== Boolean(config.dopplerConfig)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["dopplerProject"],
+        message: "Doppler project and config must be set together",
+      });
+    }
+  });
 
 export type Config = z.infer<typeof ConfigSchema>;
 
@@ -37,6 +56,8 @@ export interface CLIFlags {
   token?: string;
   chatId?: string;
   dbPath?: string;
+  dopplerProject?: string;
+  dopplerConfig?: string;
 }
 
 const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {
@@ -63,11 +84,16 @@ const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {
     os.homedir(),
     "Library/Application Support/com.conductor.app/bin/codex"
   ),
-  permissionMode: "bypassPermissions",
+  permissionMode: "acceptEdits",
   defaultAgentType: undefined,
   defaultModel: undefined,
   reviewAgentType: undefined,
   reviewModel: undefined,
+  conductorApiBaseUrl: "https://api.conductor.build",
+  conductorApiKey: undefined,
+  conductorCloudBackend: "auto",
+  dopplerProject: undefined,
+  dopplerConfig: undefined,
 };
 
 type EnvConfigSource = Record<string, string | undefined>;
@@ -98,6 +124,23 @@ function configFromEnvSource(env: EnvConfigSource): Partial<Config> {
     config.reviewAgentType = env.TELEGRAM_REVIEW_AGENT_TYPE;
   }
   if (env.TELEGRAM_REVIEW_MODEL) config.reviewModel = env.TELEGRAM_REVIEW_MODEL;
+  if (env.CONDUCTOR_API_BASE_URL) {
+    config.conductorApiBaseUrl = env.CONDUCTOR_API_BASE_URL;
+  }
+  if (env.CONDUCTOR_API_KEY) config.conductorApiKey = env.CONDUCTOR_API_KEY;
+  if (
+    env.CONDUCTOR_CLOUD_BACKEND === "auto" ||
+    env.CONDUCTOR_CLOUD_BACKEND === "api" ||
+    env.CONDUCTOR_CLOUD_BACKEND === "off"
+  ) {
+    config.conductorCloudBackend = env.CONDUCTOR_CLOUD_BACKEND;
+  }
+  if (env.CONDUCTOR_TELEGRAM_DOPPLER_PROJECT) {
+    config.dopplerProject = env.CONDUCTOR_TELEGRAM_DOPPLER_PROJECT;
+  }
+  if (env.CONDUCTOR_TELEGRAM_DOPPLER_CONFIG) {
+    config.dopplerConfig = env.CONDUCTOR_TELEGRAM_DOPPLER_CONFIG;
+  }
   return config;
 }
 
@@ -120,6 +163,8 @@ function applyFlags(flags: CLIFlags): Partial<Config> {
   if (flags.token) result.botToken = flags.token;
   if (flags.chatId) result.ownerChatId = flags.chatId;
   if (flags.dbPath) result.dbPath = flags.dbPath;
+  if (flags.dopplerProject) result.dopplerProject = flags.dopplerProject;
+  if (flags.dopplerConfig) result.dopplerConfig = flags.dopplerConfig;
   return result;
 }
 
@@ -147,6 +192,39 @@ export function loadConfig(flags: CLIFlags = {}): Config {
   return ConfigSchema.parse(merged);
 }
 
+/**
+ * Doppler references are non-secret pointers, so they may persist from the
+ * environment. `scripts/deploy-mac-gateway.sh` sets them exactly this way.
+ */
+const PERSISTABLE_ENV_KEYS = ["dopplerProject", "dopplerConfig"] as const;
+
+/**
+ * Config that is safe to write back to disk.
+ *
+ * `loadConfig` merges the ambient environment, which is right for a running
+ * process but wrong for persistence: a secret exported for a single command
+ * would be captured into config.json and silently outlive the shell that set
+ * it. Only the existing file, explicit flags, and the non-secret Doppler
+ * references survive here.
+ */
+export function loadPersistableConfig(flags: CLIFlags = {}): Config {
+  const fileConfig = stripUndefined(readConfigFile() as Record<string, unknown>);
+  const envConfig = stripUndefined(readEnvVars() as Record<string, unknown>);
+  const flagConfig = stripUndefined(applyFlags(flags) as Record<string, unknown>);
+
+  const persistableEnv: Record<string, unknown> = {};
+  for (const key of PERSISTABLE_ENV_KEYS) {
+    if (envConfig[key] !== undefined) persistableEnv[key] = envConfig[key];
+  }
+
+  return ConfigSchema.parse({
+    ...DEFAULTS,
+    ...fileConfig,
+    ...persistableEnv,
+    ...flagConfig,
+  });
+}
+
 /** Try to load config, returning null instead of throwing on validation errors. */
 export function tryLoadConfig(flags: CLIFlags = {}): Config | null {
   try {
@@ -158,9 +236,13 @@ export function tryLoadConfig(flags: CLIFlags = {}): Config | null {
 
 /** Save config to disk with 0600 permissions. */
 export function saveConfig(config: Config): void {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(CONFIG_DIR, 0o700);
   const content = JSON.stringify(config, null, 2) + "\n";
   fs.writeFileSync(CONFIG_PATH, content, { mode: 0o600 });
+  // `mode` only applies when a file is created, so always repair permissions
+  // for existing secret-bearing configuration files.
+  fs.chmodSync(CONFIG_PATH, 0o600);
 }
 
 /** Check if config file exists. */

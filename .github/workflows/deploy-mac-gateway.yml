@@ -22,7 +22,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/setup-node@v6
         with:
-          node-version: 24
+          node-version: 22
           package-manager-cache: false
       - name: Build, install, and restart gateway
         run: scripts/deploy-mac-gateway.sh

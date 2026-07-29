@@ -18,17 +18,17 @@ That's it. The setup wizard walks you through Telegram bot creation, configurati
 
 ```
 ┌──────────────┐     ┌─────────────────┐     ┌─────────────────────┐
-│   Telegram   │◄───►│  conductor-     │◄───►│  Conductor          │
+│   Telegram   │◄───►│  conductor-     │◄───►│  Local Conductor    │
 │   (you)      │     │  telegram bot   │     │  workspaces/agents  │
-└──────────────┘     └────────┬────────┘     └──────────┬──────────┘
-                              │                         │
-                              │   ┌─────────────────┐   │
-                              └──►│   SQLite (WAL)   │◄──┘
-                                  └─────────────────┘
-                                    shared via MCP
+└──────────────┘     └──────┬────┬─────┘     └──────────┬──────────┘
+                            │    │                      │
+              official API │    │   ┌──────────────┐   │
+                            │    └──►│ SQLite (WAL) │◄──┘
+                            ▼        └──────────────┘
+                    Conductor Cloud
 ```
 
-The bot polls Conductor sessions every 5 seconds, forwarding agent messages to Telegram. When an agent uses the MCP server to ask a question, the bot surfaces it as an interactive Telegram message with buttons or free-form reply.
+The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 15 seconds, forwarding agent messages to Telegram. When an agent uses the MCP server to ask a question, the bot surfaces it as an interactive Telegram message with buttons or free-form reply.
 
 ## Architecture
 
@@ -53,6 +53,8 @@ src/
 ├── store/             # Database layer
 │   ├── db.ts          # SQLite init, schema, migrations
 │   └── queries.ts     # CRUD operations
+├── integrations/
+│   └── conductor-api.ts  # Supported Conductor Cloud API transport
 └── types/
     └── index.ts       # TypeScript interfaces
 ```
@@ -87,7 +89,9 @@ Ways to target work from Telegram:
 
 Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
 
-Conductor Cloud workspaces are observe-first. The bot marks them with `☁️`, forwards activity that Conductor syncs into the local DB, and can attempt queued-message steering when `TELEGRAM_REMOTE_STEERING=queue` is enabled.
+Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can send messages, create ordinary threads, poll transcripts/status, cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
+
+The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
 
 Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
@@ -153,6 +157,8 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | `--token` | `BOT_TOKEN` | Telegram bot token |
 | `--chat-id` | `OWNER_CHAT_ID` | Your Telegram chat ID |
 | `--db-path` | `DB_PATH` | SQLite database path |
+| `--doppler-project` | `CONDUCTOR_TELEGRAM_DOPPLER_PROJECT` | Doppler project used by foreground and launchd runtimes |
+| `--doppler-config` | `CONDUCTOR_TELEGRAM_DOPPLER_CONFIG` | Doppler config used by foreground and launchd runtimes |
 | | `OWNER_USER_ID` | Your Telegram user ID (required for forum mode) |
 | | `CONDUCTOR_WORKSPACES_DIR` | Conductor workspaces directory |
 | | `CONDUCTOR_REPOS_DIR` | Repository directory |
@@ -161,11 +167,28 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | | `TELEGRAM_DEFAULT_MODEL` | Default model for agents |
 | | `TELEGRAM_REVIEW_AGENT_TYPE` | Agent type for `/review` sessions |
 | | `TELEGRAM_REVIEW_MODEL` | Model for `/review` sessions |
-| | `TELEGRAM_AGENT_PERMISSION_MODE` | Permission mode (default: `bypassPermissions`) |
-| | `TELEGRAM_REMOTE_STEERING` | Cloud steering mode: `queue` (default) or `off` |
+| | `TELEGRAM_AGENT_PERMISSION_MODE` | Legacy Claude permission mode (default: `acceptEdits`) |
+| | `CONDUCTOR_API_BASE_URL` | Conductor API origin (default: `https://api.conductor.build`) |
+| | `CONDUCTOR_API_KEY` | Bearer API key for supported Conductor Cloud operations |
+| | `CONDUCTOR_CLOUD_BACKEND` | `auto` (use API when keyed), `api` (require key), or `off` |
 | | `TELEGRAM_WHISPER_MODEL` | whisper.cpp model name or path (default: `base`) |
 
 Conductor app settings are read from `~/.conductor/settings.toml` first, with the legacy Conductor DB `settings` table as fallback. The bot uses Conductor's default/review model settings, Codex thinking levels, Claude effort levels, and git branch prefix settings when Telegram-specific env vars are not set.
+
+To keep runtime secrets in Doppler, persist only the non-secret project/config references:
+
+```bash
+conductor-telegram service install \
+  --doppler-project <project> \
+  --doppler-config <config>
+conductor-telegram doctor
+```
+
+The installer verifies the persistent Doppler identity available to launchd, removes each Doppler-managed value from `config.json`, and writes a plist containing only the Doppler executable, project/config references, and an explicit allowlist of secret names—not secret values or a Doppler service token. The allowed names are `BOT_TOKEN`, `OWNER_CHAT_ID`, `OWNER_USER_ID`, `CONDUCTOR_API_BASE_URL`, `CONDUCTOR_API_KEY`, and `CONDUCTOR_CLOUD_BACKEND`. Use `BOT_TOKEN` exactly; `TELEGRAM_BOT_TOKEN` is not an alias.
+
+`start`, `status`, and `doctor` automatically re-enter the configured Doppler runtime. Run `service install` again after adding a new allowed secret name. A value-only rotation needs only a service restart.
+
+If Doppler is not configured, keep `CONDUCTOR_API_KEY` only in the bot's mode-`0600` config file or service environment. It is excluded from child-agent environments and must not be copied into repositories, Conductor workspace environment variables, prompts, or MCP configuration.
 
 Existing `.env` files are auto-detected and can be imported during setup.
 
@@ -197,6 +220,7 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
 | `thread_cursors` | Per-Conductor-session forwarding cursors for thread fan-out |
 | `pr_records` | GitHub PR/check/merge state verified by repo + branch |
+| `merge_intents` | Expiring requester-bound confirmations for an exact PR head SHA |
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
 | `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
 
@@ -233,6 +257,7 @@ $ conductor-telegram doctor
   Bot token   ✓ @MyBot connected
   Database    ✓ ~/.conductor-telegram/conductor-telegram.db
   Conductor   ✓ ~/Library/Application Support/com.conductor.app/conductor.db
+  Conductor Cloud API  ✓ api-key authenticated
   GitHub CLI  ✓ gh version 2.x.x
   MCP Plugin  ✓ ~/.claude/plugins/conductor-telegram-mcp installed
   Repos       ✓ ~/conductor/repos (4 repositories)
@@ -255,13 +280,15 @@ Config is preserved across upgrades. The `doctor` command validates everything s
 
 ## Mac gateway deployment
 
-The production Mac gateway is redeployed by GitHub Actions whenever `main` is updated or a release is published. The workflow expects a self-hosted macOS runner labeled `conductor-telegram-gateway`.
+The macOS gateway is redeployed by GitHub Actions whenever `main` is updated or a release is published. The workflow expects a self-hosted macOS runner labeled `conductor-telegram-gateway`.
 
-On each deploy it checks out the merged revision, runs typecheck/tests/build, installs that checkout globally, reinstalls the launchd service, and restarts it:
+On each deploy it checks out the merged revision, runs the Node 22 typecheck/tests/build, installs that checkout globally, reinstalls and restarts the launchd service, and runs `doctor` as a fail-closed configuration and connectivity gate:
 
 ```bash
 scripts/deploy-mac-gateway.sh
 ```
+
+Saved Doppler project/config references survive this reinstall, so deployment never needs to materialize secret values in the checkout or launchd plist. When Doppler is configured, the runner account must already have a scoped service identity; the workflow does not accept or persist a Doppler token.
 
 ## License
 

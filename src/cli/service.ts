@@ -19,6 +19,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  configExists,
+  loadConfig,
+  loadPersistableConfig,
+  saveConfig,
+  tryLoadConfig,
+  type CLIFlags,
+} from "./config.js";
+import {
+  DOPPLER_RUNTIME_SECRET_NAMES,
+  buildServiceDopplerEnvironment,
+  buildDopplerRunArgs,
+  readAvailableDopplerRuntimeSecretNames,
+  resolveDopplerRuntime,
+  stripDopplerManagedConfig,
+  type DopplerRuntime,
+} from "./doppler.js";
 
 const LABEL = "net.belong.conductor-telegram";
 const WATCHDOG_LABEL = "net.belong.conductor-telegram.watchdog";
@@ -69,9 +86,33 @@ function xmlEscape(s: string): string {
     .replace(/>/g, "&gt;");
 }
 
-function buildBotPlist(): string {
-  const nodePath = xmlEscape(process.execPath);
-  const cliPath = xmlEscape(findCliEntrypoint());
+interface BotPlistOptions {
+  doppler?: DopplerRuntime | null;
+  nodePath?: string;
+  cliPath?: string;
+}
+
+export function buildBotProgramArguments(
+  options: BotPlistOptions = {}
+): string[] {
+  const directCommand = [
+    options.nodePath ?? process.execPath,
+    options.cliPath ?? findCliEntrypoint(),
+    "start",
+    "--quiet",
+    "--no-color",
+  ];
+  if (!options.doppler) return directCommand;
+  return [
+    options.doppler.executable,
+    ...buildDopplerRunArgs(options.doppler, directCommand),
+  ];
+}
+
+export function buildBotPlist(options: BotPlistOptions = {}): string {
+  const programArguments = buildBotProgramArguments(options)
+    .map((argument) => `    <string>${xmlEscape(argument)}</string>`)
+    .join("\n");
   const logPath = xmlEscape(BOT_LOG);
   const stateDir = xmlEscape(STATE_DIR);
   const pathEnv = xmlEscape(
@@ -94,11 +135,7 @@ function buildBotPlist(): string {
   <string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
-    <string>${cliPath}</string>
-    <string>start</string>
-    <string>--quiet</string>
-    <string>--no-color</string>
+${programArguments}
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -218,23 +255,96 @@ function kickstart(label: string, kill = false): { ok: boolean; detail: string }
   return { ok: true, detail: "kickstarted" };
 }
 
-function quietConfigExists(): boolean {
-  const configPath = path.join(STATE_DIR, "config.json");
-  return fs.existsSync(configPath);
-}
-
-async function cmdInstall(): Promise<void> {
-  if (!quietConfigExists()) {
+async function cmdInstall(flags: CLIFlags): Promise<void> {
+  if (
+    Boolean(flags.dopplerProject) !== Boolean(flags.dopplerConfig)
+  ) {
+    console.error(
+      "Both --doppler-project and --doppler-config are required together."
+    );
+    process.exit(1);
+  }
+  if (
+    !configExists() &&
+    !flags.token &&
+    !(flags.dopplerProject && flags.dopplerConfig)
+  ) {
     console.error("No config.json found.");
     console.error(
-      `Run 'conductor-telegram setup' first — the LaunchAgent reads config from ${STATE_DIR}/config.json`
+      "Run 'conductor-telegram setup' first, or install with both Doppler flags."
     );
     process.exit(1);
   }
 
+  let config;
+  try {
+    config = loadConfig(flags);
+  } catch (error) {
+    console.error(
+      `Invalid service configuration: ${error instanceof Error ? error.message : error}`
+    );
+    process.exit(1);
+  }
+
+  let doppler: DopplerRuntime | null = null;
+  let dopplerSecretNames: ReadonlySet<string> | null = null;
+  try {
+    doppler = resolveDopplerRuntime(config);
+    if (doppler) {
+      const names = readAvailableDopplerRuntimeSecretNames(
+        doppler,
+        buildServiceDopplerEnvironment()
+      );
+      const scopedSecretNames = DOPPLER_RUNTIME_SECRET_NAMES.filter((name) =>
+        names.has(name)
+      );
+      doppler = {
+        ...doppler,
+        secretNames: scopedSecretNames,
+      };
+      if (scopedSecretNames.length === 0) {
+        throw new Error(
+          "Doppler contains none of conductor-telegram's allowed runtime keys"
+        );
+      }
+      const missingRuntimeKeys = [
+        !config.botToken && !names.has("BOT_TOKEN") ? "BOT_TOKEN" : null,
+        !config.ownerChatId && !names.has("OWNER_CHAT_ID")
+          ? "OWNER_CHAT_ID"
+          : null,
+      ].filter(Boolean);
+      if (missingRuntimeKeys.length > 0) {
+        throw new Error(
+          `Doppler is missing required runtime keys: ${missingRuntimeKeys.join(", ")}`
+        );
+      }
+      const optionalCloudKeys = ["CONDUCTOR_API_KEY"];
+      const availableCloudKeys = optionalCloudKeys.filter((name) =>
+        names.has(name)
+      );
+      console.log(
+        `Doppler: configured runtime accessible ` +
+          `(${availableCloudKeys.length}/${optionalCloudKeys.length} optional cloud keys present)`
+      );
+      config = stripDopplerManagedConfig(config, names);
+      dopplerSecretNames = names;
+    }
+  } catch (error) {
+    console.error(
+      `Doppler runtime validation failed: ${error instanceof Error ? error.message : error}`
+    );
+    process.exit(1);
+  }
+
+  const shouldSaveConfig =
+    !configExists() ||
+    flags.dopplerProject ||
+    flags.dopplerConfig ||
+    Boolean(doppler);
+
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
-  const botPlist = buildBotPlist();
+  const botPlist = buildBotPlist({ doppler });
   const watchdogPlist = buildWatchdogPlist();
 
   writePlist(PLIST_PATH, botPlist);
@@ -242,6 +352,18 @@ async function cmdInstall(): Promise<void> {
 
   console.log(`  wrote ${PLIST_PATH}`);
   console.log(`  wrote ${WATCHDOG_PLIST_PATH}`);
+
+  // Persist before bootstrapping. A bootstrap failure exits, and leaving
+  // Doppler-managed secrets in config.json while the service is already live
+  // under Doppler is the outcome this whole flow exists to avoid.
+  if (shouldSaveConfig) {
+    let persisted = loadPersistableConfig(flags);
+    if (dopplerSecretNames) {
+      persisted = stripDopplerManagedConfig(persisted, dopplerSecretNames);
+    }
+    saveConfig(persisted);
+    console.log(`  saved runtime configuration to ${STATE_DIR}/config.json`);
+  }
 
   const bot = bootstrap(LABEL, PLIST_PATH);
   if (!bot.ok) {
@@ -330,6 +452,12 @@ async function cmdStatus(): Promise<void> {
   console.log(`  plist (bot)      ${fs.existsSync(PLIST_PATH) ? PLIST_PATH : "not installed"}`);
   console.log(`  plist (wd)       ${fs.existsSync(WATCHDOG_PLIST_PATH) ? WATCHDOG_PLIST_PATH : "not installed"}`);
   console.log(`  log              ${BOT_LOG}`);
+  const config = tryLoadConfig();
+  if (config?.dopplerProject && config.dopplerConfig) {
+    console.log("  runtime secrets  Doppler configured");
+  } else {
+    console.log("  runtime secrets  config.json / process environment");
+  }
 
   try {
     getDb();
@@ -408,7 +536,10 @@ async function cmdWatchdog(): Promise<void> {
   log(`kickstart result: ${k.ok ? "ok" : "fail"} — ${k.detail}`);
 }
 
-export async function runService(args: string[]): Promise<void> {
+export async function runService(
+  args: string[],
+  flags: CLIFlags = {}
+): Promise<void> {
   const sub = args[0] ?? "status";
 
   if (process.platform !== "darwin") {
@@ -418,7 +549,7 @@ export async function runService(args: string[]): Promise<void> {
 
   switch (sub) {
     case "install":
-      await cmdInstall();
+      await cmdInstall(flags);
       return;
     case "uninstall":
     case "remove":

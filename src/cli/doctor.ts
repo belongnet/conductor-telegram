@@ -15,6 +15,14 @@ import {
 } from "./config.js";
 import { EXIT_GENERAL } from "./errors.js";
 import { describeConductorSettingsSource } from "../store/conductor-settings.js";
+import {
+  ConductorApiError,
+  createConductorApiClientFromEnv,
+} from "../integrations/conductor-api.js";
+import {
+  isDopplerRuntimeActive,
+  resolveDopplerRuntime,
+} from "./doppler.js";
 
 const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
@@ -240,6 +248,99 @@ function checkConductor072Schema(conductorDbPath: string | undefined): CheckResu
   }
 }
 
+async function checkConductorCloudApi(
+  config: Config | null
+): Promise<CheckResult> {
+  const mode = config?.conductorCloudBackend ?? "auto";
+  if (mode === "off") {
+    return {
+      name: "Conductor Cloud API",
+      ok: true,
+      detail: "disabled; cloud workspaces are observe-only",
+    };
+  }
+  if (!config?.conductorApiKey) {
+    return {
+      name: "Conductor Cloud API",
+      ok: mode !== "api",
+      detail:
+        mode === "api"
+          ? "CONDUCTOR_CLOUD_BACKEND=api but no API key is configured"
+          : "not configured; cloud workspaces are observe-only",
+      fix:
+        mode === "api"
+          ? "Set CONDUCTOR_API_KEY or change CONDUCTOR_CLOUD_BACKEND to auto"
+          : undefined,
+    };
+  }
+
+  try {
+    const client = createConductorApiClientFromEnv({
+      CONDUCTOR_API_BASE_URL:
+        config.conductorApiBaseUrl ?? "https://api.conductor.build",
+      CONDUCTOR_API_KEY: config.conductorApiKey,
+      CONDUCTOR_CLOUD_BACKEND: mode,
+    });
+    if (!client) {
+      throw new ConductorApiError("Conductor Cloud API is disabled");
+    }
+    const identity = await client.getIdentity();
+    return {
+      name: "Conductor Cloud API",
+      ok: true,
+      detail: `${identity.authMethod} authenticated`,
+    };
+  } catch (error) {
+    return {
+      name: "Conductor Cloud API",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+      fix:
+        "Check CONDUCTOR_API_KEY and CONDUCTOR_API_BASE_URL in ~/.conductor-telegram/config.json",
+    };
+  }
+}
+
+export function checkDopplerRuntime(config: Config | null): CheckResult {
+  if (!config?.dopplerProject && !config?.dopplerConfig) {
+    return {
+      name: "Doppler runtime",
+      ok: true,
+      detail: "not configured; using config.json / process environment",
+    };
+  }
+  try {
+    const runtime = resolveDopplerRuntime(config);
+    if (!runtime) {
+      throw new Error("Doppler reference is incomplete");
+    }
+    if (!isDopplerRuntimeActive(runtime)) {
+      return {
+        name: "Doppler runtime",
+        ok: false,
+        detail: "configured but not active",
+        fix:
+          "Run through the CLI normally; it automatically re-executes start/doctor/status under Doppler",
+      };
+    }
+    return {
+      name: "Doppler runtime",
+      ok: true,
+      detail:
+        "active; Doppler-managed values remain outside config.json and the launchd plist",
+    };
+  } catch (error) {
+    return {
+      name: "Doppler runtime",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+      fix:
+        "Install the Doppler CLI and verify the configured project/config token access",
+    };
+  }
+}
+
+
 function checkPlugin(): CheckResult {
   const pluginDir = path.join(
     os.homedir(),
@@ -347,6 +448,8 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     checkConductor(config?.conductorDbPath),
     checkConductorSettings(),
     checkConductor072Schema(config?.conductorDbPath),
+    checkDopplerRuntime(config),
+    await checkConductorCloudApi(config),
     await checkLaunchModels(config),
     await checkGithub(),
     checkPlugin(),
@@ -360,9 +463,11 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     const pad = " ".repeat(maxName - check.name.length);
     const icon = check.ok ? green("✓") : red("✗");
     console.log(`  ${check.name}${pad}  ${icon} ${check.detail}`);
-    if (!check.ok && check.fix) {
-      console.log(`  ${" ".repeat(maxName)}    ${dim(check.fix)}`);
+    if (!check.ok) {
       hasFailures = true;
+      if (check.fix) {
+        console.log(`  ${" ".repeat(maxName)}    ${dim(check.fix)}`);
+      }
     }
   }
 
