@@ -315,26 +315,44 @@ export class ConductorApiClient {
     return status;
   }
 
-  async listWorkspaceSessions(workspaceId: string): Promise<ConductorApiSession[]> {
-    const sessions: ConductorApiSession[] = [];
+  /**
+   * Walk a paginated collection to its end. `keep` bounds accumulation so
+   * tail reads do not hold an entire transcript in memory.
+   */
+  private async walkPages<T>(
+    pathFor: (offset: number) => string,
+    schema: z.ZodType<{ data: T[]; offset: number; hasMore: boolean }>,
+    noun: string,
+    options: { keep?: number; validate?: (data: T[]) => void } = {}
+  ): Promise<T[]> {
+    const kept: T[] = [];
     let offset = 0;
     for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
-      const page = await this.request(
-        "GET",
-        withQuery(
-          `/v0/workspaces/${encodeURIComponent(workspaceId)}/sessions`,
-          { limit: PAGE_SIZE, offset }
-        ),
-        SessionPageSchema
-      );
-      sessions.push(...page.data);
+      const page = await this.request("GET", pathFor(offset), schema);
+      options.validate?.(page.data);
+      kept.push(...page.data);
+      if (options.keep !== undefined && kept.length > options.keep) {
+        kept.splice(0, kept.length - options.keep);
+      }
       if (!page.hasMore || page.data.length === 0) {
-        return sessions;
+        return kept;
       }
       offset += page.data.length;
     }
     throw new ConductorApiError(
-      `Conductor API session pagination exceeded ${MAX_PAGES} pages`
+      `Conductor API ${noun} pagination exceeded ${MAX_PAGES} pages`
+    );
+  }
+
+  listWorkspaceSessions(workspaceId: string): Promise<ConductorApiSession[]> {
+    return this.walkPages(
+      (offset) =>
+        withQuery(
+          `/v0/workspaces/${encodeURIComponent(workspaceId)}/sessions`,
+          { limit: PAGE_SIZE, offset }
+        ),
+      SessionPageSchema,
+      "session"
     );
   }
 
@@ -356,32 +374,35 @@ export class ConductorApiClient {
     return page.data;
   }
 
+  /**
+   * The last `limit` messages of a session's transcript, in transcript
+   * order. Used to re-anchor a dead poll cursor without dropping every
+   * undelivered message between the dead anchor and the tail.
+   */
+  getSessionMessageTail(
+    sessionId: string,
+    limit: number
+  ): Promise<ConductorApiMessage[]> {
+    return this.walkPages(
+      (offset) =>
+        withQuery(`/v0/sessions/${encodeURIComponent(sessionId)}/messages`, {
+          limit: PAGE_SIZE,
+          offset,
+        }),
+      MessagePageSchema,
+      "message",
+      {
+        keep: Math.max(1, limit),
+        validate: (data) => assertMessageMembership(sessionId, data),
+      }
+    );
+  }
+
   async getLatestSessionMessage(
     sessionId: string
   ): Promise<ConductorApiMessage | null> {
-    let offset = 0;
-    let latest: ConductorApiMessage | null = null;
-    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
-      const page = await this.request(
-        "GET",
-        withQuery(
-          `/v0/sessions/${encodeURIComponent(sessionId)}/messages`,
-          { limit: PAGE_SIZE, offset }
-        ),
-        MessagePageSchema
-      );
-      assertMessageMembership(sessionId, page.data);
-      if (page.data.length > 0) {
-        latest = page.data[page.data.length - 1];
-      }
-      if (!page.hasMore || page.data.length === 0) {
-        return latest;
-      }
-      offset += page.data.length;
-    }
-    throw new ConductorApiError(
-      `Conductor API message pagination exceeded ${MAX_PAGES} pages`
-    );
+    const tail = await this.getSessionMessageTail(sessionId, 1);
+    return tail[tail.length - 1] ?? null;
   }
 
   async sendMessage(input: {
@@ -489,23 +510,11 @@ export class ConductorApiClient {
     return result;
   }
 
-  async listProjects(): Promise<ConductorApiProject[]> {
-    const projects: ConductorApiProject[] = [];
-    let offset = 0;
-    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
-      const page = await this.request(
-        "GET",
-        withQuery("/v0/projects", { limit: PAGE_SIZE, offset }),
-        ProjectPageSchema
-      );
-      projects.push(...page.data);
-      if (!page.hasMore || page.data.length === 0) {
-        return projects;
-      }
-      offset += page.data.length;
-    }
-    throw new ConductorApiError(
-      `Conductor API project pagination exceeded ${MAX_PAGES} pages`
+  listProjects(): Promise<ConductorApiProject[]> {
+    return this.walkPages(
+      (offset) => withQuery("/v0/projects", { limit: PAGE_SIZE, offset }),
+      ProjectPageSchema,
+      "project"
     );
   }
 
@@ -519,28 +528,15 @@ export class ConductorApiClient {
     return project;
   }
 
-  async listProjectWorkspaces(
-    projectId: string
-  ): Promise<ConductorApiWorkspace[]> {
-    const workspaces: ConductorApiWorkspace[] = [];
-    let offset = 0;
-    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
-      const page = await this.request(
-        "GET",
-        withQuery(
-          `/v0/projects/${encodeURIComponent(projectId)}/workspaces`,
-          { limit: PAGE_SIZE, offset }
-        ),
-        WorkspacePageSchema
-      );
-      workspaces.push(...page.data);
-      if (!page.hasMore || page.data.length === 0) {
-        return workspaces;
-      }
-      offset += page.data.length;
-    }
-    throw new ConductorApiError(
-      `Conductor API workspace pagination exceeded ${MAX_PAGES} pages`
+  listProjectWorkspaces(projectId: string): Promise<ConductorApiWorkspace[]> {
+    return this.walkPages(
+      (offset) =>
+        withQuery(`/v0/projects/${encodeURIComponent(projectId)}/workspaces`, {
+          limit: PAGE_SIZE,
+          offset,
+        }),
+      WorkspacePageSchema,
+      "workspace"
     );
   }
 

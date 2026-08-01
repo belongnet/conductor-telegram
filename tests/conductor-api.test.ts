@@ -444,6 +444,46 @@ test("runaway pagination fails instead of looping forever", async () => {
   await assert.rejects(client.listProjects(), /pagination exceeded 100 pages/);
 });
 
+test("transcript tails keep only the newest messages across pages", async () => {
+  const urls: string[] = [];
+  const pages = [
+    [
+      apiMessage("message-1", 1, "assistant", "a"),
+      apiMessage("message-2", 2, "assistant", "b"),
+    ],
+    [
+      apiMessage("message-3", 3, "assistant", "c"),
+      apiMessage("message-4", 4, "assistant", "d"),
+    ],
+    [apiMessage("message-5", 5, "assistant", "e")],
+  ];
+  const fetcher = (async (url: string | URL | Request) => {
+    const parsed = new URL(String(url));
+    urls.push(parsed.toString());
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const index = Math.floor(offset / 2);
+    const data = pages[index] ?? [];
+    return new Response(
+      JSON.stringify({ data, offset, hasMore: index < pages.length - 1 }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  // The tail bound trims while walking, so a giant transcript never
+  // accumulates in memory, yet the final slice stays in transcript order.
+  const tail = await client.getSessionMessageTail("session-1", 3);
+  assert.deepEqual(
+    tail.map((message) => message.id),
+    ["message-3", "message-4", "message-5"]
+  );
+  assert.equal(urls.length, 3, "walks every page to reach the tail");
+
+  // getLatestSessionMessage is the keep=1 special case of the same walk.
+  const latest = await client.getLatestSessionMessage("session-1");
+  assert.equal(latest?.id, "message-5");
+});
+
 test("cloud-workspace env wires attribution and the CONDUCTOR_API_URL fallback", async () => {
   const fromEnv = conductorApiConfigFromEnv({
     CONDUCTOR_API_KEY: "secret",
