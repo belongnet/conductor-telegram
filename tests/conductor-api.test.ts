@@ -261,6 +261,226 @@ test("beta response schema drift fails visibly", async () => {
   );
 });
 
+test("project listing paginates and preserves order", async () => {
+  const urls: string[] = [];
+  const fetcher = (async (url: string | URL | Request) => {
+    const parsed = new URL(String(url));
+    urls.push(parsed.toString());
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const page =
+      offset === 0
+        ? {
+            data: [
+              { id: "project-1", name: "api", gitRemote: "git@host:org/api.git" },
+            ],
+            offset: 0,
+            hasMore: true,
+          }
+        : {
+            data: [
+              { id: "project-2", name: "web", gitRemote: "git@host:org/web.git" },
+            ],
+            offset,
+            hasMore: false,
+          };
+    return new Response(JSON.stringify(page), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const projects = await client.listProjects();
+
+  assert.deepEqual(
+    projects.map((project) => project.id),
+    ["project-1", "project-2"]
+  );
+  assert.equal(urls.length, 2);
+  assert.match(urls[0], /\/v0\/projects\?limit=100&offset=0$/);
+});
+
+test("project and message reads reject mismatched identities", async () => {
+  const projectFetcher = (async () =>
+    new Response(
+      JSON.stringify({ id: "project-other", name: "api", gitRemote: "remote" }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    )) as typeof fetch;
+  await assert.rejects(
+    new ConductorApiClient(config(), projectFetcher).getProject("project-1"),
+    /mismatched project identity/
+  );
+
+  const messageFetcher = (async () =>
+    new Response(
+      JSON.stringify(apiMessage("message-other", 4, "assistant", "hi")),
+      { status: 200, headers: { "content-type": "application/json" } }
+    )) as typeof fetch;
+  await assert.rejects(
+    new ConductorApiClient(config(), messageFetcher).getMessage("message-1"),
+    /mismatched message identity/
+  );
+});
+
+test("renames send the new name and reject foreign identities", async () => {
+  const calls: Array<{ url: string; body: any }> = [];
+  const fetcher = (async (url: string | URL | Request, init: RequestInit = {}) => {
+    calls.push({
+      url: String(url),
+      body: init.body ? JSON.parse(String(init.body)) : null,
+    });
+    return new Response(
+      JSON.stringify({
+        id: "workspace-1",
+        name: "renamed",
+        createdAt: "2026-07-30T00:00:00.000Z",
+        deepLink: "conductor://workspace-1",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const workspace = await client.renameWorkspace("workspace-1", "renamed");
+  assert.equal(workspace.name, "renamed");
+  assert.equal(
+    calls[0].url,
+    "https://conductor.test/v0/workspaces/workspace-1/rename"
+  );
+  assert.deepEqual(calls[0].body, { name: "renamed" });
+
+  const foreignFetcher = (async () =>
+    new Response(
+      JSON.stringify({ id: "session-other", deepLink: "conductor://x" }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    )) as typeof fetch;
+  await assert.rejects(
+    new ConductorApiClient(config(), foreignFetcher).renameSession(
+      "session-1",
+      "renamed"
+    ),
+    /mismatched session identity/
+  );
+});
+
+test("sql queries post the query and parse the row envelope", async () => {
+  const calls: Array<{ url: string; body: any }> = [];
+  const fetcher = (async (url: string | URL | Request, init: RequestInit = {}) => {
+    calls.push({
+      url: String(url),
+      body: init.body ? JSON.parse(String(init.body)) : null,
+    });
+    return new Response(
+      JSON.stringify({
+        rows: [{ workspace_id: "workspace-1", workspace_name: "api-fix" }],
+        rowCount: 1,
+        truncated: false,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const result = await client.runSql(
+    "SELECT workspace_id FROM session_transcripts_view"
+  );
+
+  assert.equal(calls[0].url, "https://conductor.test/v0/sql");
+  assert.deepEqual(calls[0].body, {
+    query: "SELECT workspace_id FROM session_transcripts_view",
+  });
+  assert.equal(result.rowCount, 1);
+  assert.equal(result.rows[0].workspace_name, "api-fix");
+});
+
+test("project workspace listing paginates against the project path", async () => {
+  const urls: string[] = [];
+  const workspace = (id: string, name: string) => ({
+    id,
+    name,
+    createdAt: "2026-07-30T00:00:00.000Z",
+    deepLink: `conductor://${id}`,
+  });
+  const fetcher = (async (url: string | URL | Request) => {
+    const parsed = new URL(String(url));
+    urls.push(parsed.toString());
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const page =
+      offset === 0
+        ? { data: [workspace("workspace-1", "api-fix")], offset: 0, hasMore: true }
+        : { data: [workspace("workspace-2", "web-fix")], offset, hasMore: false };
+    return new Response(JSON.stringify(page), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const workspaces = await client.listProjectWorkspaces("project 1");
+
+  assert.deepEqual(
+    workspaces.map((entry) => entry.id),
+    ["workspace-1", "workspace-2"]
+  );
+  assert.equal(urls.length, 2);
+  assert.match(
+    urls[0],
+    /\/v0\/projects\/project%201\/workspaces\?limit=100&offset=0$/
+  );
+});
+
+test("runaway pagination fails instead of looping forever", async () => {
+  const fetcher = (async () =>
+    new Response(
+      JSON.stringify({
+        data: [{ id: "project-1", name: "api", gitRemote: "remote" }],
+        offset: 0,
+        hasMore: true,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    )) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  await assert.rejects(client.listProjects(), /pagination exceeded 100 pages/);
+});
+
+test("cloud-workspace env wires attribution and the CONDUCTOR_API_URL fallback", async () => {
+  const fromEnv = conductorApiConfigFromEnv({
+    CONDUCTOR_API_KEY: "secret",
+    CONDUCTOR_API_URL: "https://api.conductor.build/v0",
+    CONDUCTOR_SESSION_ID: "session-self",
+  });
+  assert.equal(fromEnv?.baseUrl, "https://api.conductor.build");
+  assert.equal(fromEnv?.attributedSessionId, "session-self");
+
+  // An explicit CONDUCTOR_API_BASE_URL wins over the injected fallback.
+  assert.equal(
+    conductorApiConfigFromEnv({
+      CONDUCTOR_API_KEY: "secret",
+      CONDUCTOR_API_BASE_URL: "https://api.explicit.example",
+      CONDUCTOR_API_URL: "https://api.conductor.build",
+    })?.baseUrl,
+    "https://api.explicit.example"
+  );
+
+  const headers: Array<Record<string, string>> = [];
+  const fetcher = (async (_url: string | URL | Request, init: RequestInit = {}) => {
+    headers.push(init.headers as Record<string, string>);
+    return new Response(
+      JSON.stringify({ userId: "user-1", authMethod: "api-key" }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  await new ConductorApiClient(
+    config({ attributedSessionId: "session-self" }),
+    fetcher
+  ).getIdentity();
+  assert.equal(headers[0]["X-Conductor-Session-Id"], "session-self");
+
+  await new ConductorApiClient(config(), fetcher).getIdentity();
+  assert.equal("X-Conductor-Session-Id" in headers[1], false);
+});
+
 function config(
   override: Partial<ConstructorParameters<typeof ConductorApiClient>[0]> = {}
 ) {

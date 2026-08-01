@@ -50,6 +50,30 @@ const SessionPageSchema = z.object({
   hasMore: z.boolean(),
 });
 
+const ProjectSchema = z.object({
+  id: IdSchema,
+  name: z.string(),
+  gitRemote: z.string(),
+});
+
+const ProjectPageSchema = z.object({
+  data: z.array(ProjectSchema),
+  offset: z.number().finite().nonnegative(),
+  hasMore: z.boolean(),
+});
+
+const WorkspacePageSchema = z.object({
+  data: z.array(WorkspaceSchema),
+  offset: z.number().finite().nonnegative(),
+  hasMore: z.boolean(),
+});
+
+const SqlResultSchema = z.object({
+  rows: z.array(z.record(z.string(), z.unknown())),
+  rowCount: z.number().finite().nonnegative(),
+  truncated: z.boolean(),
+});
+
 const SessionStatusSchema = z.object({
   workspaceId: IdSchema,
   sessionId: IdSchema,
@@ -122,6 +146,8 @@ export type ConductorApiWorkspace = z.infer<typeof WorkspaceSchema>;
 export type ConductorApiSessionStatus = z.infer<typeof SessionStatusSchema>;
 export type ConductorApiWorkspaceStatus = z.infer<typeof WorkspaceStatusSchema>;
 export type ConductorApiIdentity = z.infer<typeof IdentitySchema>;
+export type ConductorApiProject = z.infer<typeof ProjectSchema>;
+export type ConductorApiSqlResult = z.infer<typeof SqlResultSchema>;
 
 export type ConductorCloudBackendMode = "auto" | "api" | "off";
 
@@ -131,6 +157,11 @@ export interface ConductorApiConfig {
   apiKey: string;
   timeoutMs: number;
   maxRetries: number;
+  /**
+   * Session to attribute requests to via X-Conductor-Session-Id when the bot
+   * itself runs inside a Conductor cloud workspace (CONDUCTOR_SESSION_ID).
+   */
+  attributedSessionId?: string;
 }
 
 export class ConductorApiError extends Error {
@@ -179,8 +210,12 @@ export function conductorApiConfigFromEnv(
     return null;
   }
 
+  // Cloud workspaces export CONDUCTOR_API_URL; an explicit
+  // CONDUCTOR_API_BASE_URL still wins so operators can override it.
   const baseUrl = normalizeApiBaseUrl(
-    env.CONDUCTOR_API_BASE_URL?.trim() || DEFAULT_BASE_URL
+    env.CONDUCTOR_API_BASE_URL?.trim() ||
+      env.CONDUCTOR_API_URL?.trim() ||
+      DEFAULT_BASE_URL
   );
   const timeoutMs = parsePositiveInteger(
     env.CONDUCTOR_API_TIMEOUT_MS,
@@ -207,6 +242,7 @@ export function conductorApiConfigFromEnv(
     apiKey,
     timeoutMs,
     maxRetries,
+    attributedSessionId: env.CONDUCTOR_SESSION_ID?.trim() || undefined,
   };
 }
 
@@ -453,6 +489,109 @@ export class ConductorApiClient {
     return result;
   }
 
+  async listProjects(): Promise<ConductorApiProject[]> {
+    const projects: ConductorApiProject[] = [];
+    let offset = 0;
+    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
+      const page = await this.request(
+        "GET",
+        withQuery("/v0/projects", { limit: PAGE_SIZE, offset }),
+        ProjectPageSchema
+      );
+      projects.push(...page.data);
+      if (!page.hasMore || page.data.length === 0) {
+        return projects;
+      }
+      offset += page.data.length;
+    }
+    throw new ConductorApiError(
+      `Conductor API project pagination exceeded ${MAX_PAGES} pages`
+    );
+  }
+
+  async getProject(projectId: string): Promise<ConductorApiProject> {
+    const project = await this.request(
+      "GET",
+      `/v0/projects/${encodeURIComponent(projectId)}`,
+      ProjectSchema
+    );
+    assertApiIdentity("project", projectId, project.id);
+    return project;
+  }
+
+  async listProjectWorkspaces(
+    projectId: string
+  ): Promise<ConductorApiWorkspace[]> {
+    const workspaces: ConductorApiWorkspace[] = [];
+    let offset = 0;
+    for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
+      const page = await this.request(
+        "GET",
+        withQuery(
+          `/v0/projects/${encodeURIComponent(projectId)}/workspaces`,
+          { limit: PAGE_SIZE, offset }
+        ),
+        WorkspacePageSchema
+      );
+      workspaces.push(...page.data);
+      if (!page.hasMore || page.data.length === 0) {
+        return workspaces;
+      }
+      offset += page.data.length;
+    }
+    throw new ConductorApiError(
+      `Conductor API workspace pagination exceeded ${MAX_PAGES} pages`
+    );
+  }
+
+  async renameWorkspace(
+    workspaceId: string,
+    name: string
+  ): Promise<ConductorApiWorkspace> {
+    const workspace = await this.request(
+      "POST",
+      `/v0/workspaces/${encodeURIComponent(workspaceId)}/rename`,
+      WorkspaceSchema,
+      // Renaming to the same name twice is a no-op, so retries are safe.
+      { body: { name }, retrySafe: true }
+    );
+    assertApiIdentity("workspace", workspaceId, workspace.id);
+    return workspace;
+  }
+
+  async renameSession(
+    sessionId: string,
+    name: string
+  ): Promise<ConductorApiSession> {
+    const session = await this.request(
+      "POST",
+      `/v0/sessions/${encodeURIComponent(sessionId)}/rename`,
+      SessionSchema,
+      { body: { name }, retrySafe: true }
+    );
+    assertApiIdentity("session", sessionId, session.id);
+    return session;
+  }
+
+  async getMessage(messageId: string): Promise<ConductorApiMessage> {
+    const message = await this.request(
+      "GET",
+      `/v0/messages/${encodeURIComponent(messageId)}`,
+      ApiMessageSchema
+    );
+    assertApiIdentity("message", messageId, message.id);
+    return message;
+  }
+
+  runSql(query: string): Promise<ConductorApiSqlResult> {
+    // The endpoint only accepts read-only SELECTs over
+    // session_transcripts_view, so replaying on failure is safe.
+    return this.request("POST", "/v0/sql", SqlResultSchema, {
+      body: { query },
+      retrySafe: true,
+    });
+  }
+
   private async request<T>(
     method: "GET" | "POST",
     apiPath: string,
@@ -475,6 +614,9 @@ export class ConductorApiClient {
             Authorization: `Bearer ${this.config.apiKey}`,
             "Content-Type": "application/json",
             "User-Agent": "conductor-telegram",
+            ...(this.config.attributedSessionId
+              ? { "X-Conductor-Session-Id": this.config.attributedSessionId }
+              : {}),
           },
           body:
             options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -545,16 +687,18 @@ export function createConductorApiClientFromEnv(
 }
 
 function normalizeApiBaseUrl(raw: string): string {
+  // The value may come from CONDUCTOR_API_BASE_URL or, inside a cloud
+  // workspace, the injected CONDUCTOR_API_URL — name both so the error
+  // points at whichever the operator actually set.
+  const sourceVars = "CONDUCTOR_API_BASE_URL / CONDUCTOR_API_URL";
   let parsed: URL;
   try {
     parsed = new URL(raw);
   } catch {
-    throw new ConductorApiError("CONDUCTOR_API_BASE_URL is not a valid URL");
+    throw new ConductorApiError(`${sourceVars} is not a valid URL`);
   }
   if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new ConductorApiError(
-      "CONDUCTOR_API_BASE_URL must use http or https"
-    );
+    throw new ConductorApiError(`${sourceVars} must use http or https`);
   }
   const isLoopback =
     parsed.hostname === "localhost" ||
@@ -562,7 +706,7 @@ function normalizeApiBaseUrl(raw: string): string {
     parsed.hostname === "[::1]";
   if (parsed.protocol !== "https:" && !isLoopback) {
     throw new ConductorApiError(
-      "CONDUCTOR_API_BASE_URL must use HTTPS except for a loopback development origin"
+      `${sourceVars} must use HTTPS except for a loopback development origin`
     );
   }
   const normalizedPath = parsed.pathname.replace(/\/+$/, "");
@@ -574,7 +718,7 @@ function normalizeApiBaseUrl(raw: string): string {
     (normalizedPath && normalizedPath !== "/v0")
   ) {
     throw new ConductorApiError(
-      "CONDUCTOR_API_BASE_URL must be an HTTP(S) origin, optionally ending in /v0, without credentials, query, or fragment"
+      `${sourceVars} must be an HTTP(S) origin, optionally ending in /v0, without credentials, query, or fragment`
     );
   }
   return parsed.origin;
