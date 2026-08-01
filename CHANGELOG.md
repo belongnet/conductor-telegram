@@ -4,6 +4,29 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-31
+
+Adopts the remaining surface of the Conductor API launched with Conductor 0.78.0 / Conductor Cloud. Every documented endpoint now has a consumer, and the bot can drive a cloud fleet with no Conductor desktop app involved.
+
+### Added
+- `/cloud <project> <prompt>` creates a Conductor Cloud workspace and its first session entirely through the API (`POST /v0/workspaces`), queues the prompt, and binds it to a Telegram topic. The whole flow — discovery, delivery, polling — works with the Conductor desktop app closed or absent; a failed launch archives the incomplete workspace, and multi-word project names resolve correctly instead of leaking words into the prompt.
+- `/projects [name]` lists cloud projects (`GET /v0/projects`) or one project's live record and recent workspaces (`GET /v0/projects/{id}`, `GET /v0/projects/{id}/workspaces`). Long project lists are capped and truncated safely under Telegram's message-size limit.
+- `/fleet [hours]` reports org-wide cloud activity via read-only transcript search (`POST /v0/sql` over `session_transcripts_view`), warns when the report window hits its row cap, and calls out schema drift instead of reporting a false "no activity".
+- `/rename` and `/renamethread` rename cloud workspaces and threads (`POST /v0/workspaces/{id}/rename`, `POST /v0/sessions/{id}/rename`) and keep the Telegram topic name in sync.
+- Cloud sessions started for the Claude agent now honor the `default_claude_effort_level` / `review_claude_effort_level` Conductor settings, mirroring the existing Codex thinking-level support.
+- When the bot itself runs inside a Conductor cloud workspace it now honors `CONDUCTOR_API_URL` as the API origin and attributes its requests with the `X-Conductor-Session-Id` header.
+- `doctor` now reports how many cloud projects the configured API key can see, separating "authenticates" from "can reach the org's repositories".
+
+### Fixed
+- A cloud transcript cursor whose anchor message no longer exists (archived thread, rebuilt transcript) previously stalled polling forever. The poller now validates the cursor with `GET /v0/messages/{id}`, re-anchors at the latest message, and clears the persisted anchor first so a rebuilt transcript with lower message indexes can actually replace it. Re-anchoring requires a successful latest-message fetch so auth or availability failures are never mistaken for a dead cursor, and failed recovery probes back off instead of re-querying every poll tick.
+- Opening the bot database concurrently from several processes (bot, MCP server, doctor) could crash on `SQLITE_BUSY` while switching to WAL journal mode. The switch now retries with a bounded, low-latency wait and accepts a file another process already switched.
+- Workspace forum topics with long names no longer abort launches: composed topic names are clamped to Telegram's 128-character limit.
+- Truncated Telegram messages can no longer be rejected by Telegram: truncation never cuts inside HTML markup or entities and closes tags in proper nesting order.
+- "Open in Conductor" links render as clickable anchors only for conductor.build hosts; anything else displays as inert text.
+
+### Security
+- Cloud commands act org-wide with the configured API key; the README now documents setting `OWNER_USER_ID` in group chats so only the owner can create, rename, or query org resources.
+
 ## [0.5.0] - 2026-07-28
 
 ### Added

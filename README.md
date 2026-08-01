@@ -65,6 +65,11 @@ src/
 |---------|-------|-------------|
 | `/setup` | `/setup` | Check setup diagnostics and apply current chat |
 | `/run` | `/run <repo> <prompt>` | Start a new workspace with an AI agent |
+| `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
+| `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
+| `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h) |
+| `/rename` | `/rename <name>` (inside a topic) | Rename the current cloud workspace via the API |
+| `/renamethread` | `/renamethread <name>` (inside a topic) | Rename the current cloud thread via the API |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
 | `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
@@ -89,7 +94,11 @@ Ways to target work from Telegram:
 
 Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
 
-Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can send messages, create ordinary threads, poll transcripts/status, cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
+Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can create cloud workspaces (`/cloud`), browse projects (`/projects`), send messages, create ordinary threads, poll transcripts/status, rename workspaces and threads, search org-wide transcripts (`/fleet`), cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
+
+Cloud workspaces created with `/cloud` are driven entirely over the API — discovery, prompt delivery, and polling work even when the Conductor desktop app is closed or absent. When the bot itself runs inside a Conductor cloud workspace, it honors `CONDUCTOR_API_URL` and attributes its requests via `X-Conductor-Session-Id`.
+
+Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, or query (`/fleet`) org resources — without it, every member of the configured group shares that privilege.
 
 The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
 
