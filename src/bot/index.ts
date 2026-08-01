@@ -67,6 +67,7 @@ import {
   expandableQuote,
   formatStats,
   markdownToTelegramHtml,
+  formatAgo,
   maybeExpandableQuote,
   styledButtons,
   styledKeyboard,
@@ -461,7 +462,15 @@ async function pollConductorWorkspace(
   ws: Workspace,
   cloudOnly: boolean
 ): Promise<void> {
-  if (!ws.conductorWorkspaceName) return;
+  if (!ws.conductorWorkspaceName) {
+    // Normally a row is only briefly nameless mid-launch. If the bot died
+    // between an API-side cloud create and persisting the binding, the row
+    // would otherwise sit in "starting" forever while a live cloud workspace
+    // runs untracked — the stale grace period turns that into a visible
+    // failure instead of a silent hang.
+    markWorkspaceStaleIfNeeded(ws);
+    return;
+  }
   if (!shouldPollTrackedWorkspace({ status: ws.status, cloudOnly })) return;
   const persistedCloud = Boolean(
     ws.conductorBackendKind === "cloud-api" &&
@@ -956,7 +965,9 @@ function markWorkspaceStaleIfNeeded(ws: Workspace): void {
   updateWorkspaceStatus(ws.id, "failed");
   const name = ws.conductorWorkspaceName ?? ws.name;
   const text =
-    `⚠️ <b>${esc(name)}</b> lost its Conductor session.\n\n` +
+    (ws.conductorWorkspaceName
+      ? `⚠️ <b>${esc(name)}</b> lost its Conductor session.\n\n`
+      : `⚠️ <b>${esc(name)}</b> never completed its launch — if this was a ☁️ cloud launch, check the bot log for the created workspace id.\n\n`) +
     `<i>Marked failed so it no longer attracts new routed work. No branch or workspace cleanup was performed.</i>`;
   sendToWorkspaceTopic(ws, text, {
     parse_mode: "HTML",
@@ -1211,18 +1222,7 @@ function logSetupHints(): void {
   }
 }
 
-function formatAgo(fromIso: string | null | undefined, nowMs: number): string {
-  if (!fromIso) return "never";
-  const then = Date.parse(fromIso);
-  if (!Number.isFinite(then)) return fromIso;
-  const secs = Math.max(0, Math.round((nowMs - then) / 1000));
-  if (secs < 60) return `${secs}s ago`;
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 48) return `${hrs}h ago`;
-  return `${Math.round(hrs / 24)}d ago`;
-}
+// Shared with the CLI service status; lives in format.ts.
 
 async function sendBootAnnouncement(
   previous: { lastKnownAliveAt: string | null; lastExitReason: string | null } | undefined,

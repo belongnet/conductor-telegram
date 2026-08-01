@@ -181,10 +181,14 @@ test("a dead cursor re-anchors the poll at the latest transcript message", async
     deadListingError()
   );
   assert.ok(recovered, "a deleted cursor message must re-anchor the poll");
-  assert.equal(recovered.length, 1);
-  assert.equal(recovered[0].messageId, "message-8");
-  assert.equal(recovered[0].rowid, 7);
-  assert.equal(recovered[0].role, "assistant");
+  // The whole transcript tail is delivered, not just the newest message, so
+  // replies posted before recovery ran still reach Telegram.
+  assert.deepEqual(
+    recovered.map((message) => message.messageId),
+    ["message-7", "message-8"]
+  );
+  assert.equal(recovered[1].rowid, 7);
+  assert.equal(recovered[1].role, "assistant");
 
   // A cursor that now resolves into a different session is equally dead.
   const moved = clientWith({
