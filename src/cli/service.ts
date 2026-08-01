@@ -18,6 +18,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { formatAgo } from "../bot/format.js";
 import { fileURLToPath } from "node:url";
 import {
   configExists,
@@ -427,18 +428,7 @@ async function cmdRestart(): Promise<void> {
   }
 }
 
-function formatAgo(iso: string | null | undefined): string {
-  if (!iso) return "never";
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return iso;
-  const secs = Math.max(0, Math.round((Date.now() - ms) / 1000));
-  if (secs < 60) return `${secs}s ago`;
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 48) return `${hrs}h ago`;
-  return `${Math.round(hrs / 24)}d ago`;
-}
+// Shared with the bot status view; lives in bot/format.ts.
 
 async function cmdStatus(): Promise<void> {
   const { getDb } = await import("../store/db.js");

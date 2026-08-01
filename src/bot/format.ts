@@ -61,6 +61,45 @@ export function truncateHtml(html: string, maxLen: number): string {
 }
 
 /**
+ * Human-readable "how long ago" bucketing shared by the workspace lists,
+ * the CLI status output, and the cloud project views. Accepts unknown input
+ * because SQL rows and API payloads arrive untyped.
+ */
+export function formatRelativeTime(value: unknown): string {
+  const date =
+    typeof value === "string" || typeof value === "number"
+      ? new Date(value)
+      : null;
+  if (!date || Number.isNaN(date.getTime())) return "unknown";
+  const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+/**
+ * Status-line "how long ago" with second resolution, "never" for absent
+ * values, and the raw string echoed for unparseable input. Shared by the bot
+ * poll status view and the CLI service status.
+ */
+export function formatAgo(
+  iso: string | null | undefined,
+  nowMs: number = Date.now()
+): string {
+  if (!iso) return "never";
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return iso;
+  const secs = Math.max(0, Math.round((nowMs - then) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+/**
  * Wrap text in an expandable blockquote (collapsed by default, ~3 lines shown).
  * Only wraps if the text exceeds `minLength` characters.
  */
