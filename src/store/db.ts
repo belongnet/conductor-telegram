@@ -158,6 +158,44 @@ const SCHEMA = `
 
 let _db: Database.Database | null = null;
 
+const WAL_SWITCH_ATTEMPTS = 10;
+const WAL_SWITCH_RETRY_MS = 250;
+
+/**
+ * Switching to WAL needs a moment with no other connection mid-write, which
+ * busy_timeout does not fully cover: with several processes opening the same
+ * database at once (bot, MCP server, doctor, tests) the pragma can throw
+ * SQLITE_BUSY outright. The journal mode is a persistent property of the
+ * database file, so once any one process succeeds every later open is a
+ * no-op — retry briefly and accept an already-switched file before giving up
+ * as loudly as before.
+ */
+function enableWalWithRetry(db: Database.Database): void {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < WAL_SWITCH_ATTEMPTS; attempt += 1) {
+    try {
+      db.pragma("journal_mode = WAL");
+      return;
+    } catch (error) {
+      lastError = error;
+      let mode: unknown = null;
+      try {
+        mode = db.pragma("journal_mode", { simple: true });
+      } catch {
+        // Reading the mode can hit the same contention; keep retrying.
+      }
+      if (mode === "wal") return;
+      Atomics.wait(
+        new Int32Array(new SharedArrayBuffer(4)),
+        0,
+        0,
+        WAL_SWITCH_RETRY_MS
+      );
+    }
+  }
+  throw lastError;
+}
+
 export function getDb(dbPath?: string): Database.Database {
   if (_db) return _db;
 
@@ -171,7 +209,7 @@ export function getDb(dbPath?: string): Database.Database {
 
   // WAL mode for concurrent writes from multiple MCP server instances
   _db.pragma("busy_timeout = 5000");
-  _db.pragma("journal_mode = WAL");
+  enableWalWithRetry(_db);
 
   try {
     _db.exec("BEGIN IMMEDIATE");
