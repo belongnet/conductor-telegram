@@ -250,9 +250,12 @@ npm run build
 
 # Type check
 npm run typecheck
+
+# Run tests
+npm test
 ```
 
-Requires Node.js v22+.
+Requires Node.js v22+. See [CONTRIBUTING.md](CONTRIBUTING.md) for branching, commit style, and PR guidelines.
 
 ## Troubleshooting
 
@@ -266,7 +269,7 @@ $ conductor-telegram doctor
   Bot token   ✓ @MyBot connected
   Database    ✓ ~/.conductor-telegram/conductor-telegram.db
   Conductor   ✓ ~/Library/Application Support/com.conductor.app/conductor.db
-  Conductor Cloud API  ✓ api-key authenticated
+  Conductor Cloud API  ✓ api-key authenticated; 3 cloud project(s) visible
   GitHub CLI  ✓ gh version 2.x.x
   MCP Plugin  ✓ ~/.claude/plugins/conductor-telegram-mcp installed
   Repos       ✓ ~/conductor/repos (4 repositories)
@@ -285,7 +288,7 @@ npm i -g conductor-telegram@latest
 conductor-telegram doctor
 ```
 
-Config is preserved across upgrades. The `doctor` command validates everything still works.
+Config is preserved across upgrades. The `doctor` command validates everything still works. Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Mac gateway deployment
 

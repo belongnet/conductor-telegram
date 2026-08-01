@@ -11,6 +11,7 @@ What does this PR do? Why?
 How did you test this? Include output of `conductor-telegram doctor` if relevant.
 
 - [ ] `npm run typecheck` passes
+- [ ] `npm test` passes
 - [ ] Tested with a real Telegram bot (if applicable)
 
 ## Related issues
