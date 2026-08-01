@@ -248,7 +248,8 @@ function checkConductor072Schema(conductorDbPath: string | undefined): CheckResu
   }
 }
 
-async function checkConductorCloudApi(
+/** @internal exported for doctor unit tests; not part of the public CLI API. */
+export async function checkConductorCloudApi(
   config: Config | null
 ): Promise<CheckResult> {
   const mode = config?.conductorCloudBackend ?? "auto";
@@ -285,10 +286,22 @@ async function checkConductorCloudApi(
       throw new ConductorApiError("Conductor Cloud API is disabled");
     }
     const identity = await client.getIdentity();
+    // Projects visibility separates "the key authenticates" from "the key can
+    // actually reach the org's repositories" (e.g. a workspace-scoped key).
+    let projectsDetail: string;
+    try {
+      const projects = await client.listProjects();
+      projectsDetail =
+        projects.length === 0
+          ? "no cloud projects visible"
+          : `${projects.length} cloud project(s) visible`;
+    } catch (error) {
+      projectsDetail = `projects unavailable (${error instanceof Error ? error.message : String(error)})`;
+    }
     return {
       name: "Conductor Cloud API",
       ok: true,
-      detail: `${identity.authMethod} authenticated`,
+      detail: `${identity.authMethod} authenticated; ${projectsDetail}`,
     };
   } catch (error) {
     return {

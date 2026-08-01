@@ -18,6 +18,7 @@ import {
   addEvent,
   getMetaValue,
   getWorkspaceByName as getTrackedWorkspaceByName,
+  resetCloudThreadCursorAnchors,
   setMetaValue,
 } from "../store/queries.js";
 import { getConductorSetting } from "../store/conductor-settings.js";
@@ -34,9 +35,17 @@ import {
   ConductorApiError,
   createConductorApiClientFromEnv,
   isConductorCloudApiConfigured,
+  type ConductorApiClient,
   type ConductorApiMessage,
   type ConductorApiSession,
 } from "../integrations/conductor-api.js";
+
+/**
+ * The env guidance shared by every observe-only refusal. One source so the
+ * variable names cannot drift between the three surfaces that print it.
+ */
+export const CLOUD_OBSERVE_ONLY_HINT =
+  "Set CONDUCTOR_API_KEY and leave CONDUCTOR_CLOUD_BACKEND=auto (or set it to api)";
 
 export const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
@@ -128,6 +137,7 @@ interface ResolvedLaunchConfig {
   launchMode: LaunchMode;
   reviewBaseBranch: string | null;
   codexThinkingLevel: string | null;
+  claudeEffortLevel: string | null;
   accessMode: AgentAccessMode;
 }
 
@@ -379,6 +389,27 @@ function resolveCodexThinkingLevel(launchMode: LaunchMode): string | null {
   return getSettingValue(settingKey);
 }
 
+function resolveClaudeEffortLevel(launchMode: LaunchMode): string | null {
+  const settingKey =
+    launchMode === "review"
+      ? "review_claude_effort_level"
+      : "default_claude_effort_level";
+  return getSettingValue(settingKey);
+}
+
+function resolveCloudSessionEffort(
+  config: Pick<
+    ResolvedLaunchConfig,
+    "agentType" | "codexThinkingLevel" | "claudeEffortLevel"
+  >
+): string | undefined {
+  const level =
+    config.agentType === "codex"
+      ? config.codexThinkingLevel
+      : config.claudeEffortLevel;
+  return level ?? undefined;
+}
+
 function deriveSessionTitle(
   prompt: string,
   fallback: string
@@ -428,6 +459,8 @@ export function resolveLaunchConfig(
       options.accessMode ?? (launchMode === "review" ? "read-only" : "legacy"),
     codexThinkingLevel:
       agentType === "codex" ? resolveCodexThinkingLevel(launchMode) : null,
+    claudeEffortLevel:
+      agentType === "claude" ? resolveClaudeEffortLevel(launchMode) : null,
   };
 }
 
@@ -2190,45 +2223,21 @@ export async function launchWorkspaceSession(
       options.model
     );
     let session: ConductorApiSession | null = null;
-    let pendingCycle: CloudSessionCycleWrite | null = null;
     try {
       const createdSession = await client.createSession({
         workspaceId: wsInfo.workspaceId,
         name: launchConfig.title,
         agent: launchConfig.agentType,
         model: apiModel,
-        effort:
-          launchConfig.agentType === "codex"
-            ? launchConfig.codexThinkingLevel ?? undefined
-            : undefined,
+        effort: resolveCloudSessionEffort(launchConfig),
       });
-      const createdStatus = await client.getSessionStatus(createdSession.id);
-      if (createdStatus.workspaceId !== wsInfo.workspaceId) {
-        throw new ConductorApiError(
-          "Conductor API created the thread in a different workspace"
-        );
-      }
       session = createdSession;
-      const messageId = randomUUID();
-      pendingCycle = reserveCloudSessionCycle(
+      const sent = await queueFirstCloudPrompt(
+        client,
         wsInfo.workspaceId,
-        session.id
+        createdSession.id,
+        prompt
       );
-      writeCloudSessionCycle(pendingCycle, {
-        phase: "pending",
-        outboundMessageId: messageId,
-      });
-      const sent = await client.sendMessage({
-        sessionId: session.id,
-        message: prompt.trim() || "(empty message)",
-        messageId,
-      });
-      // A new session has no older transcript backlog, and callers persist
-      // this receipt as the initial API cursor.
-      writeCloudSessionCycle(pendingCycle, {
-        phase: "boundary",
-        outboundMessageId: sent.messageId,
-      });
       return {
         sessionId: session.id,
         done: Promise.resolve({ isError: false, exitCode: 0 }),
@@ -2240,9 +2249,6 @@ export async function launchWorkspaceSession(
         backendKind: "cloud-api",
       };
     } catch (error) {
-      if (pendingCycle) {
-        restoreCloudSessionCycleAfterSendFailure(pendingCycle);
-      }
       if (session) {
         await client.archiveSession(session.id).catch((cleanupError) => {
           console.error(
@@ -2330,6 +2336,165 @@ export async function launchWorkspaceSession(
     workspaceId: wsInfo.workspaceId,
     backendKind: "local",
   };
+}
+
+export interface CloudWorkspaceLaunchResult {
+  workspaceId: string;
+  sessionId: string;
+  deepLink: string;
+  workspaceName: string;
+  agentType: AgentType;
+  model: string;
+  initialCursorRowid: number;
+  initialCursorMessageId: string | null;
+  backendKind: "cloud-api";
+}
+
+/**
+ * Create a Conductor Cloud workspace (and its first session) entirely through
+ * the supported HTTP API, then queue the initial prompt. No local Conductor
+ * install is involved: the returned binding is enough for the poll loop to
+ * follow the thread over the API.
+ */
+export async function launchCloudWorkspace(input: {
+  projectId: string;
+  prompt: string;
+  name?: string | null;
+  branch?: string | null;
+  agentType?: AgentType;
+  model?: string | null;
+}): Promise<CloudWorkspaceLaunchResult | SendError> {
+  const displayName = input.name?.trim() || "new cloud workspace";
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    return conductorApiSendError({ displayName }, error);
+  }
+  if (!client) {
+    return {
+      error:
+        "☁️ Conductor Cloud is in observe-only mode. " +
+        `${CLOUD_OBSERVE_ONLY_HINT} to create cloud workspaces from Telegram.`,
+      reason: "conductor_api_unavailable",
+    };
+  }
+
+  const launchConfig = resolveLaunchConfig({
+    agentType: input.agentType,
+    model: input.model ?? undefined,
+    title: input.name ?? undefined,
+    launchMode: "prompt",
+  });
+  const apiModel = resolveAgentModelForConductorApi(
+    launchConfig.agentType,
+    launchConfig.launchMode,
+    input.model
+  );
+
+  let createdWorkspace: {
+    workspaceId: string;
+    sessionId: string;
+    deepLink: string;
+  } | null = null;
+  try {
+    createdWorkspace = await client.createWorkspace({
+      projectId: input.projectId,
+      branch: input.branch?.trim() || undefined,
+      name: input.name?.trim() || undefined,
+      agent: launchConfig.agentType,
+      model: apiModel,
+      effort: resolveCloudSessionEffort(launchConfig),
+    });
+    // Breadcrumb for crash recovery: if the bot dies before the caller
+    // persists this binding, the log line is the only pointer to the live
+    // cloud workspace this call just created.
+    console.log(
+      `[conductor-api] Created cloud workspace ${createdWorkspace.workspaceId} (session ${createdWorkspace.sessionId}) in project ${input.projectId}`
+    );
+    const sent = await queueFirstCloudPrompt(
+      client,
+      createdWorkspace.workspaceId,
+      createdWorkspace.sessionId,
+      input.prompt
+    );
+    // Unnamed workspaces get a Conductor-assigned city name; read it back so
+    // topics and bindings show the real name rather than a UUID.
+    const workspaceName =
+      input.name?.trim() ||
+      (await client
+        .getWorkspace(createdWorkspace.workspaceId)
+        .then((workspace) => workspace.name.trim() || null)
+        .catch(() => null)) ||
+      createdWorkspace.workspaceId;
+    return {
+      workspaceId: createdWorkspace.workspaceId,
+      sessionId: createdWorkspace.sessionId,
+      deepLink: createdWorkspace.deepLink,
+      workspaceName,
+      agentType: launchConfig.agentType,
+      model: apiModel,
+      initialCursorRowid: 0,
+      initialCursorMessageId: sent.messageId,
+      backendKind: "cloud-api",
+    };
+  } catch (error) {
+    if (createdWorkspace) {
+      await client
+        .archiveWorkspace(createdWorkspace.workspaceId)
+        .catch((cleanupError) => {
+          console.error(
+            `[conductor-api] Failed to archive incomplete cloud workspace ${createdWorkspace?.workspaceId}:`,
+            cleanupError
+          );
+        });
+    }
+    return conductorApiSendError({ displayName }, error);
+  }
+}
+
+/**
+ * Queue the first prompt into a freshly created cloud session under the
+ * cloud-cycle protocol: verify the session landed in the expected workspace,
+ * reserve the cycle before any network send, stamp the boundary receipt that
+ * becomes the initial transcript cursor, and restore the cycle if the send
+ * fails so the thread is not left permanently in-flight.
+ */
+async function queueFirstCloudPrompt(
+  client: ConductorApiClient,
+  workspaceId: string,
+  sessionId: string,
+  prompt: string
+): Promise<{ messageId: string }> {
+  const createdStatus = await client.getSessionStatus(sessionId);
+  if (createdStatus.workspaceId !== workspaceId) {
+    throw new ConductorApiError(
+      "Conductor API created the session in a different workspace"
+    );
+  }
+  const messageId = randomUUID();
+  const pendingCycle = reserveCloudSessionCycle(workspaceId, sessionId);
+  writeCloudSessionCycle(pendingCycle, {
+    phase: "pending",
+    outboundMessageId: messageId,
+  });
+  try {
+    const sent = await client.sendMessage({
+      sessionId,
+      message: prompt.trim() || "(empty message)",
+      messageId,
+    });
+    // A new session has no older transcript backlog, and callers persist
+    // this receipt as the initial API cursor.
+    writeCloudSessionCycle(pendingCycle, {
+      phase: "boundary",
+      outboundMessageId: sent.messageId,
+    });
+    return sent;
+  } catch (error) {
+    restoreCloudSessionCycleAfterSendFailure(pendingCycle);
+    throw error;
+  }
 }
 
 /**
@@ -3440,7 +3605,7 @@ function remoteObserveOnlyError(wsInfo: ConductorWorkspaceInfo): SendError {
   return {
     error:
       `☁️ "${wsInfo.displayName}" is a Conductor Cloud workspace in observe-only mode. ` +
-      "Set CONDUCTOR_API_KEY and leave CONDUCTOR_CLOUD_BACKEND=auto (or set it to api) to steer it from Telegram.",
+      `${CLOUD_OBSERVE_ONLY_HINT} to steer it from Telegram.`,
     reason: "conductor_api_unavailable",
   };
 }
@@ -3713,6 +3878,107 @@ export interface SessionMessageCursor {
   messageId: string | null;
 }
 
+/**
+ * A poll cursor names a concrete transcript message, and Conductor rejects the
+ * whole listing when that message no longer exists (archived thread, rebuilt
+ * transcript). GET /v0/messages/{id} disambiguates a dead cursor from a
+ * transient failure; on a dead cursor the poll re-anchors at the latest
+ * message instead of stalling forever. Re-anchoring only happens after a
+ * successful latest-message fetch, so auth or availability failures never
+ * masquerade as a dead cursor.
+ *
+ * @internal exported for cursor-recovery unit tests; not part of the public bot API.
+ */
+const CURSOR_RECOVERY_PROBE_COOLDOWN_MS = 10 * 60_000;
+const CURSOR_RECOVERY_PROBE_CAP = 512;
+// Matches the poll loop's per-tick batch size.
+const CURSOR_RECOVERY_TAIL_LIMIT = 25;
+const cursorRecoveryProbes = new Map<string, number>();
+
+/**
+ * A dead cursor that cannot re-anchor yet (empty transcript, persistent
+ * non-retryable failure) would otherwise re-pay the recovery probes — up to
+ * three API calls — on every poll tick. Let a probe through at most once per
+ * cooldown per cursor; a successful re-anchor moves the cursor id, which
+ * retires its key naturally.
+ */
+function shouldProbeCursorRecovery(
+  sessionId: string,
+  afterMessageId: string | null | undefined
+): boolean {
+  if (!afterMessageId) return true; // recovery no-ops without a cursor
+  const key = `${sessionId}:${afterMessageId}`;
+  const now = Date.now();
+  const last = cursorRecoveryProbes.get(key);
+  if (last !== undefined && now - last < CURSOR_RECOVERY_PROBE_COOLDOWN_MS) {
+    return false;
+  }
+  if (cursorRecoveryProbes.size >= CURSOR_RECOVERY_PROBE_CAP) {
+    cursorRecoveryProbes.clear();
+  }
+  cursorRecoveryProbes.set(key, now);
+  return true;
+}
+
+export async function recoverCloudTranscriptCursor(
+  client: NonNullable<ReturnType<typeof createConductorApiClientFromEnv>>,
+  sessionId: string,
+  afterMessageId: string | null | undefined,
+  error: unknown
+): Promise<SessionMessage[] | null> {
+  if (!afterMessageId) return null;
+  if (
+    !(error instanceof ConductorApiError) ||
+    error.retryable ||
+    error.status === null
+  ) {
+    return null;
+  }
+  try {
+    const cursorMessage = await client.getMessage(afterMessageId);
+    // The cursor still resolves to this session's transcript; the listing
+    // failed for some other reason, so leave the cursor untouched.
+    if (cursorMessage.sessionId === sessionId) return null;
+  } catch (cursorError) {
+    const cursorGone =
+      cursorError instanceof ConductorApiError &&
+      !cursorError.retryable &&
+      cursorError.status !== null;
+    if (!cursorGone) return null;
+  }
+  try {
+    // Deliver the transcript tail rather than only the newest message, so
+    // agent replies posted between the dead anchor and the tail still reach
+    // Telegram after a rebuild.
+    const tail = await client.getSessionMessageTail(
+      sessionId,
+      CURSOR_RECOVERY_TAIL_LIMIT
+    );
+    try {
+      // A rebuilt transcript can number its messages BELOW the stored cursor
+      // position, and upsertThreadCursor deliberately never moves a cloud
+      // cursor backwards — clear the persisted anchor so the re-anchored
+      // messages (or the next baseline pass) can actually replace it.
+      resetCloudThreadCursorAnchors(sessionId);
+    } catch (resetError) {
+      console.warn(
+        `[conductor-api] Could not reset the thread cursor for ${sessionId}:`,
+        resetError
+      );
+    }
+    console.warn(
+      `[conductor-api] Transcript cursor ${afterMessageId} for ${sessionId} no longer resolves; re-anchoring at ${
+        tail.length > 0
+          ? `the last ${tail.length} message(s)`
+          : "the empty transcript"
+      }`
+    );
+    return tail.map(mapConductorApiMessage);
+  } catch {
+    return null;
+  }
+}
+
 export async function getMaxSessionMessageCursor(
   sessionId: string,
   backendKind?: "local" | "cloud-api"
@@ -3768,25 +4034,45 @@ export async function getSessionMessagesAfter(
   const transport = getSessionTransportInfo(sessionId);
   const explicitCloud = options.backendKind === "cloud-api";
   if (explicitCloud || transport?.isRemote) {
+    let client: ReturnType<typeof createConductorApiClientFromEnv> = null;
     try {
-      const client = createConductorApiClientFromEnv();
-      if (client && options.afterMessageId) {
-        const messages = await client.listSessionMessages({
-          sessionId,
-          after: options.afterMessageId,
-          limit,
-        });
-        return messages.slice(0, limit).map(mapConductorApiMessage);
-      }
-      // A missing API cursor means this is either the first rollout against an
-      // existing cloud thread or the API is disabled. Do not replay an entire
-      // historical transcript; the poller first establishes a latest cursor.
-      if (client) return [];
+      client = createConductorApiClientFromEnv();
     } catch (error) {
       console.warn(
         `[conductor-api] Could not poll transcript for ${sessionId}:`,
         error
       );
+    }
+    if (client) {
+      try {
+        if (options.afterMessageId) {
+          const messages = await client.listSessionMessages({
+            sessionId,
+            after: options.afterMessageId,
+            limit,
+          });
+          return messages.slice(0, limit).map(mapConductorApiMessage);
+        }
+        // A missing API cursor means no cursor was ever established for this
+        // thread (first rollout against it, or the API was previously
+        // disabled). Do not replay an entire historical transcript; the
+        // poller first establishes a latest cursor.
+        return [];
+      } catch (error) {
+        console.warn(
+          `[conductor-api] Could not poll transcript for ${sessionId}:`,
+          error
+        );
+        if (shouldProbeCursorRecovery(sessionId, options.afterMessageId)) {
+          const recovered = await recoverCloudTranscriptCursor(
+            client,
+            sessionId,
+            options.afterMessageId,
+            error
+          );
+          if (recovered) return recovered;
+        }
+      }
     }
     // Preserve an established API cursor during outages. If no API cursor has
     // ever been established, the desktop DB remains a safe read-only mirror;

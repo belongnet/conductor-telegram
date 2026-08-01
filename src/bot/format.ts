@@ -27,24 +27,76 @@ export function truncateHtml(html: string, maxLen: number): string {
   if (html.length <= maxLen) return html;
   // Cut to last newline before maxLen to avoid splitting HTML tags mid-tag
   let cut = html.lastIndexOf("\n", maxLen - 4);
-  if (cut < maxLen * 0.3) cut = maxLen - 4; // fallback if no good newline
-  let result = html.slice(0, cut) + "\n…";
-  // Close any open tags
-  const openTags = (result.match(/<(b|i|s|u|code|pre|blockquote)[^>]*>/gi) ?? []).map(
-    (t) => t.match(/<(\w+)/)?.[1] ?? ""
-  );
-  const closeTags = (result.match(/<\/(b|i|s|u|code|pre|blockquote)>/gi) ?? []).map(
-    (t) => t.match(/<\/(\w+)/)?.[1] ?? ""
-  );
-  // Count open vs close for each tag
-  for (const tag of [...new Set(openTags)]) {
-    const opens = openTags.filter((t) => t === tag).length;
-    const closes = closeTags.filter((t) => t === tag).length;
-    for (let j = 0; j < opens - closes; j++) {
-      result += `</${tag}>`;
+  if (cut < maxLen * 0.3) {
+    // Fallback for one long unbroken line: a raw index cut may land inside
+    // `<...>` markup or an `&...;` entity, which Telegram rejects outright,
+    // so back the cut out of any partial token first.
+    cut = maxLen - 4;
+    const openAngle = html.lastIndexOf("<", cut - 1);
+    if (openAngle > html.lastIndexOf(">", cut - 1)) cut = openAngle;
+    const amp = html.lastIndexOf("&", cut - 1);
+    if (amp > cut - 10 && amp !== -1 && !html.slice(amp, cut).includes(";")) {
+      cut = amp;
     }
   }
+  let result = html.slice(0, cut) + "\n…";
+  // Close still-open tags in reverse nesting order — Telegram rejects
+  // interleaved closers like <b><i>…</b></i>.
+  const stack: string[] = [];
+  const tokenRe = /<(\/?)(b|i|s|u|code|pre|blockquote)(?:\s[^>]*)?>/gi;
+  let token: RegExpExecArray | null;
+  while ((token = tokenRe.exec(result))) {
+    const name = token[2].toLowerCase();
+    if (token[1] !== "/") {
+      stack.push(name);
+    } else {
+      const openIndex = stack.lastIndexOf(name);
+      if (openIndex !== -1) stack.splice(openIndex, 1);
+    }
+  }
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    result += `</${stack[i]}>`;
+  }
   return result;
+}
+
+/**
+ * Human-readable "how long ago" bucketing shared by the workspace lists,
+ * the CLI status output, and the cloud project views. Accepts unknown input
+ * because SQL rows and API payloads arrive untyped.
+ */
+export function formatRelativeTime(value: unknown): string {
+  const date =
+    typeof value === "string" || typeof value === "number"
+      ? new Date(value)
+      : null;
+  if (!date || Number.isNaN(date.getTime())) return "unknown";
+  const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+/**
+ * Status-line "how long ago" with second resolution, "never" for absent
+ * values, and the raw string echoed for unparseable input. Shared by the bot
+ * poll status view and the CLI service status.
+ */
+export function formatAgo(
+  iso: string | null | undefined,
+  nowMs: number = Date.now()
+): string {
+  if (!iso) return "never";
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return iso;
+  const secs = Math.max(0, Math.round((nowMs - then) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
 }
 
 /**

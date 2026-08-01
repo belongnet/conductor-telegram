@@ -10,6 +10,7 @@ cd conductor-telegram
 npm install
 npm run dev        # Start with live reload
 npm run typecheck  # Check types before committing
+npm test           # Run the test suite
 ```
 
 ## Development
@@ -44,7 +45,7 @@ docs: add MCP server documentation
 - TypeScript, strict mode
 - ESM modules (`"type": "module"` in package.json)
 - Node.js >= 22
-- Run `npm run typecheck` before opening a PR
+- Run `npm run typecheck` and `npm test` before opening a PR
 
 ## Design system
 
@@ -54,7 +55,7 @@ Read `DESIGN.md` before making any visual changes. All colors, fonts, and spacin
 
 1. Fork the repo and create your branch from `main`
 2. Make your changes
-3. Run `npm run typecheck`
+3. Run `npm run typecheck` and `npm test`
 4. Open a PR with a clear description of what changed and why
 5. Link any related issues
 

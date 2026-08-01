@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { syncWorkspaceTopic } from "../src/bot/forum.js";
+import {
+  buildRepoTopicName,
+  buildTopicName,
+  syncWorkspaceTopic,
+} from "../src/bot/forum.js";
 import type { Workspace, WorkspaceStatus } from "../src/types/index.js";
 
 function sampleWorkspace(status: WorkspaceStatus): Workspace {
@@ -43,4 +47,23 @@ test("terminal workspace topics use the folder icon", async () => {
     edits.map((edit) => edit.icon_custom_emoji_id),
     ["folder-icon", "folder-icon", "folder-icon"]
   );
+});
+
+test("topic names clamp to Telegram's 128-character limit", () => {
+  // Short names pass through untouched.
+  assert.equal(buildTopicName("repo", "quiet-city"), "quiet-city · repo");
+
+  // A combined name over the limit clamps to exactly 128 with an ellipsis,
+  // keeping the workspace-name prefix that identifies the topic.
+  const clamped = buildTopicName("r".repeat(200), "workspace");
+  assert.equal(clamped.length, 128);
+  assert.ok(clamped.endsWith("…"));
+  assert.ok(clamped.startsWith("workspace · "));
+
+  // Exactly at the limit is legal and must not be shortened.
+  const exact = "x".repeat(128);
+  assert.equal(buildRepoTopicName(exact), exact);
+  const over = buildRepoTopicName("x".repeat(129));
+  assert.equal(over.length, 128);
+  assert.ok(over.endsWith("…"));
 });

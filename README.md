@@ -65,10 +65,15 @@ src/
 |---------|-------|-------------|
 | `/setup` | `/setup` | Check setup diagnostics and apply current chat |
 | `/run` | `/run <repo> <prompt>` | Start a new workspace with an AI agent |
+| `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
+| `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
+| `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
+| `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
+| `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
 | `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
-| `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md |
+| `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md or AGENTS.md |
 | `/skill` | `/skill <workspace> <name> [instructions]` | Invoke a specific workspace skill |
 | `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
 | `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
@@ -76,6 +81,7 @@ src/
 | `/prs`, `/ship_status` | `/prs` | Show PR, check, merge, and stale-branch status for tracked workspaces |
 | `/decisions` | `/decisions` | Show unanswered agent questions for this chat |
 | `/status` | `/status` | Show active workspace summary |
+| `/ping` | `/ping` | Bot liveness check (uptime, heartbeat, version) |
 | `/stop` | `/stop <name>` | Stop a running workspace |
 | `/repos` | `/repos` | List available repositories (tap to select) |
 | `/help` | `/help` | Show help message |
@@ -89,7 +95,11 @@ Ways to target work from Telegram:
 
 Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
 
-Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can send messages, create ordinary threads, poll transcripts/status, cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
+Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can create cloud workspaces (`/cloud`), browse projects (`/projects`), send messages, create ordinary threads, poll transcripts/status, rename workspaces and threads, search org-wide transcripts (`/fleet`), cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
+
+Cloud workspaces created with `/cloud` are driven entirely over the API — discovery, prompt delivery, and polling work even when the Conductor desktop app is closed or absent. Project arguments to `/cloud` and `/projects` accept a list number from `/projects`, a project id, an exact name, or a unique name prefix. When the bot itself runs inside a Conductor cloud workspace, it honors `CONDUCTOR_API_URL` and attributes its requests via an `X-Conductor-Session-Id` header taken from `CONDUCTOR_SESSION_ID` — both injected by the cloud workspace environment, not user config.
+
+Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, or query (`/projects`, `/fleet`) org resources — without it, every member of the configured group shares that privilege.
 
 The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
 
@@ -241,9 +251,12 @@ npm run build
 
 # Type check
 npm run typecheck
+
+# Run tests
+npm test
 ```
 
-Requires Node.js v22+.
+Requires Node.js v22+. See [CONTRIBUTING.md](CONTRIBUTING.md) for branching, commit style, and PR guidelines.
 
 ## Troubleshooting
 
@@ -257,7 +270,7 @@ $ conductor-telegram doctor
   Bot token   ✓ @MyBot connected
   Database    ✓ ~/.conductor-telegram/conductor-telegram.db
   Conductor   ✓ ~/Library/Application Support/com.conductor.app/conductor.db
-  Conductor Cloud API  ✓ api-key authenticated
+  Conductor Cloud API  ✓ api-key authenticated; 3 cloud project(s) visible
   GitHub CLI  ✓ gh version 2.x.x
   MCP Plugin  ✓ ~/.claude/plugins/conductor-telegram-mcp installed
   Repos       ✓ ~/conductor/repos (4 repositories)
@@ -276,7 +289,7 @@ npm i -g conductor-telegram@latest
 conductor-telegram doctor
 ```
 
-Config is preserved across upgrades. The `doctor` command validates everything still works.
+Config is preserved across upgrades. The `doctor` command validates everything still works. Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Mac gateway deployment
 

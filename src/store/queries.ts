@@ -356,6 +356,24 @@ export function upsertThreadCursor(input: {
   return cursor;
 }
 
+/**
+ * Drop the persisted anchor for a cloud thread so the next forwarded message
+ * re-establishes it from scratch. Needed when a transcript rebuild hands out
+ * new message ids with LOWER session indexes: upsertThreadCursor deliberately
+ * never moves a cloud cursor backwards, so without this reset a re-anchored
+ * message would be forwarded without ever replacing the dead cursor.
+ */
+export function resetCloudThreadCursorAnchors(sessionId: string): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE thread_cursors
+     SET last_forwarded_rowid = 0,
+         last_message_id = NULL,
+         updated_at = ?
+     WHERE session_id = ? AND backend_kind = 'cloud-api'`
+  ).run(new Date().toISOString(), sessionId);
+}
+
 export function getThreadCursor(
   workspaceId: string,
   sessionId: string
