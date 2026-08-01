@@ -161,6 +161,11 @@ let _db: Database.Database | null = null;
 const WAL_SWITCH_ATTEMPTS = 10;
 const WAL_SWITCH_RETRY_MS = 250;
 
+export interface WalRetryOptions {
+  attempts?: number;
+  retryMs?: number;
+}
+
 /**
  * Switching to WAL needs a moment with no other connection mid-write, which
  * busy_timeout does not fully cover: with several processes opening the same
@@ -169,31 +174,51 @@ const WAL_SWITCH_RETRY_MS = 250;
  * database file, so once any one process succeeds every later open is a
  * no-op — retry briefly and accept an already-switched file before giving up
  * as loudly as before.
+ *
+ * @internal exported for WAL-retry unit tests; not part of the public store API.
  */
-function enableWalWithRetry(db: Database.Database): void {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < WAL_SWITCH_ATTEMPTS; attempt += 1) {
-    try {
-      db.pragma("journal_mode = WAL");
-      return;
-    } catch (error) {
-      lastError = error;
-      let mode: unknown = null;
+export function enableWalWithRetry(
+  db: Database.Database,
+  options: WalRetryOptions = {}
+): void {
+  const attempts = options.attempts ?? WAL_SWITCH_ATTEMPTS;
+  const retryMs = options.retryMs ?? WAL_SWITCH_RETRY_MS;
+  // With the connection's normal busy_timeout, each failed switch attempt can
+  // also block inside SQLite for seconds, compounding across retries into
+  // tens of seconds of synchronous stall. The loop supplies its own pacing,
+  // so use a minimal in-SQLite wait during the switch and restore the
+  // caller's timeout afterwards.
+  const previousBusyTimeout = Number(
+    db.pragma("busy_timeout", { simple: true })
+  );
+  db.pragma(`busy_timeout = ${Math.min(previousBusyTimeout || 250, 250)}`);
+  try {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
-        mode = db.pragma("journal_mode", { simple: true });
-      } catch {
-        // Reading the mode can hit the same contention; keep retrying.
+        db.pragma("journal_mode = WAL");
+        return;
+      } catch (error) {
+        lastError = error;
+        let mode: unknown = null;
+        try {
+          mode = db.pragma("journal_mode", { simple: true });
+        } catch {
+          // Reading the mode can hit the same contention; keep retrying.
+        }
+        if (mode === "wal") return;
+        Atomics.wait(
+          new Int32Array(new SharedArrayBuffer(4)),
+          0,
+          0,
+          retryMs
+        );
       }
-      if (mode === "wal") return;
-      Atomics.wait(
-        new Int32Array(new SharedArrayBuffer(4)),
-        0,
-        0,
-        WAL_SWITCH_RETRY_MS
-      );
     }
+    throw lastError;
+  } finally {
+    db.pragma(`busy_timeout = ${previousBusyTimeout}`);
   }
-  throw lastError;
 }
 
 export function getDb(dbPath?: string): Database.Database {
