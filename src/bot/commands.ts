@@ -3,6 +3,7 @@ import {
   answerPendingStdinDecision,
   archiveConductorWorkspace,
   canUseConductorCloudApi,
+  CLOUD_OBSERVE_ONLY_HINT,
   formatAttachmentReference,
   getConductorWorkspaceSessions,
   getMaxSessionMessageCursor,
@@ -11,6 +12,7 @@ import {
   isConductorWorkspaceVisible,
   isRemoteConductorWorkspace,
   launchCloudWorkspace,
+  type CloudWorkspaceLaunchResult,
   launchWorkspace,
   launchWorkspaceSession,
   sendToSession,
@@ -68,7 +70,7 @@ import {
   type ConductorApiProject,
 } from "../integrations/conductor-api.js";
 import type { Decision, PrRecord, RepoTopic, RouteSource, Workspace } from "../types/index.js";
-import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate, truncateHtml, TELEGRAM_MAX_TEXT } from "./format.js";
+import { btn, escHtml, formatRelativeTime, statusIcon, styledButtons, styledKeyboard, truncate, truncateHtml, TELEGRAM_MAX_TEXT } from "./format.js";
 import { detectExplicitTarget, routeVoiceMessage, routeTextMessage, transcribeVoiceMessage, type RouteResult } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -985,30 +987,50 @@ async function startWorkspaceFromMessage(
   );
 }
 
-async function startWorkspaceForRepo(
+/** The persisted launch fields every tracked-workspace start must produce. */
+interface TrackedLaunchBinding {
+  workspaceId: string;
+  sessionId: string;
+  backendKind: "local" | "cloud-api";
+  initialCursorRowid: number;
+  initialCursorMessageId: string | null;
+  workspaceName: string;
+}
+
+/**
+ * Shared chat scaffolding for starting a tracked workspace: create the bot-DB
+ * record, give it a forum topic when the chat supports one (any topic failure
+ * other than "no forum" is fatal), post the starting message, run the
+ * supplied launch, and persist its binding. Callers provide the user-facing
+ * copy and handle launch-specific follow-up via the returned handles.
+ */
+async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
   ctx: Context,
-  target: RepoLaunchTarget,
-  prompt: string,
-  attachmentSourcePaths: string[] = []
-): Promise<void> {
-  const { repoName, repoPath } = target;
-  const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
+  input: {
+    displayName: string;
+    recordName: string;
+    repoPath: string;
+    prompt: string;
+    startingHtml: string;
+    failedHtml: (error: string) => string;
+    successHtml: (launched: S) => string;
+    launch: (workspace: Workspace) => Promise<S | { error: string }>;
+  }
+): Promise<{ workspace: Workspace; launched: S | null }> {
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
 
-  // Create record in our DB
   const workspace = createWorkspace({
-    name: `${repoName}-${Date.now()}`,
-    prompt,
-    repoPath,
+    name: input.recordName,
+    prompt: input.prompt,
+    repoPath: input.repoPath,
     telegramChatId: chatIdStr,
   });
 
-  // Try to create a forum topic for this workspace
   const topicResult = await createWorkspaceTopic(
     ctx.telegram,
     chatIdStr,
-    repoName,
+    input.displayName,
     workspace.name
   );
   let threadId: number | undefined;
@@ -1021,10 +1043,10 @@ async function startWorkspaceForRepo(
         : `Telegram returned: <code>${escHtml(topicResult.message)}</code>`;
     updateWorkspaceStatus(workspace.id, "failed");
     await ctx.reply(
-      `⚠️ Could not create a forum topic for <b>${escHtml(repoName)}</b>. ${explanation}\n\nWorkspace was not started.`,
+      `⚠️ Could not create a forum topic for <b>${escHtml(input.displayName)}</b>. ${explanation}\n\nWorkspace was not started.`,
       { parse_mode: "HTML" }
     );
-    return;
+    return { workspace, launched: null };
   }
   if (threadId) {
     updateWorkspaceThreadId(workspace.id, threadId);
@@ -1032,20 +1054,13 @@ async function startWorkspaceForRepo(
   }
 
   const threadOpts = threadId ? { message_thread_id: threadId } : {};
-
-  // Send initial message (into the topic if created)
-  const msg = await ctx.telegram.sendMessage(
-    chatId,
-    `Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
-    { parse_mode: "HTML", ...threadOpts }
-  );
-
+  const msg = await ctx.telegram.sendMessage(chatId, input.startingHtml, {
+    parse_mode: "HTML",
+    ...threadOpts,
+  });
   updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
 
-  // Launch the workspace and spawn the agent process.
-  const result = await launchWorkspace(repoPath, prompt, (output) => {
-    console.log(`[${workspace.id}] ${output.slice(0, 200)}`);
-  }, attachmentSourcePaths);
+  const result = await input.launch(workspace);
 
   if ("error" in result) {
     updateWorkspaceStatus(workspace.id, "failed");
@@ -1053,13 +1068,12 @@ async function startWorkspaceForRepo(
       chatId,
       msg.message_id,
       undefined,
-      `Failed to start workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(result.error)}`,
+      input.failedHtml(result.error),
       { parse_mode: "HTML" }
     );
-    return;
+    return { workspace, launched: null };
   }
 
-  // Workspace created and agent running
   updateWorkspaceConductorName(workspace.id, result.workspaceName);
   persistConductorLaunchBinding(workspace.id, result);
   updateWorkspaceStatus(workspace.id, "running");
@@ -1078,16 +1092,52 @@ async function startWorkspaceForRepo(
     chatId,
     msg.message_id,
     undefined,
-    `🟢 <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
+    input.successHtml(result),
     {
       parse_mode: "HTML",
-      ...styledKeyboard([
-        [btn("Stop", `stop:${workspace.id}`)],
-      ]),
+      ...styledKeyboard([[btn("Stop", `stop:${workspace.id}`)]]),
     }
   );
 
-  observeAgentCompletion(ctx, workspace, result.workspaceName, result.done);
+  return { workspace, launched: result };
+}
+
+async function startWorkspaceForRepo(
+  ctx: Context,
+  target: RepoLaunchTarget,
+  prompt: string,
+  attachmentSourcePaths: string[] = []
+): Promise<void> {
+  const { repoName, repoPath } = target;
+  const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
+  type RepoLaunchSuccess = Exclude<
+    Awaited<ReturnType<typeof launchWorkspace>>,
+    { error: string }
+  >;
+  const { workspace, launched } = await startTrackedWorkspace<RepoLaunchSuccess>(ctx, {
+    displayName: repoName,
+    recordName: `${repoName}-${Date.now()}`,
+    repoPath,
+    prompt,
+    startingHtml: `Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    failedHtml: (error) =>
+      `Failed to start workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(error)}`,
+    successHtml: (result) =>
+      `🟢 <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
+    launch: (workspace) =>
+      launchWorkspace(
+        repoPath,
+        prompt,
+        (output) => {
+          console.log(`[${workspace.id}] ${output.slice(0, 200)}`);
+        },
+        attachmentSourcePaths
+      ),
+  });
+
+  if (launched) {
+    observeAgentCompletion(ctx, workspace, launched.workspaceName, launched.done);
+  }
 }
 
 async function startWorkspaceFromRepoTopic(
@@ -1146,7 +1196,7 @@ async function getCloudApiClientOrExplain(
   }
   if (!client) {
     await ctx.reply(
-      "☁️ Conductor Cloud is in observe-only mode. Set CONDUCTOR_API_KEY (and keep CONDUCTOR_CLOUD_BACKEND=auto or api) to use cloud commands."
+      `☁️ Conductor Cloud is in observe-only mode. ${CLOUD_OBSERVE_ONLY_HINT} to use cloud commands.`
     );
     return null;
   }
@@ -1234,26 +1284,26 @@ export function formatConductorDeepLink(deepLink: string): string {
     : `<code>${safe}</code>`;
 }
 
-/** @internal exported for cloud command unit tests; not part of the public bot API. */
-export function formatRelativeTime(value: unknown): string {
-  const date =
-    typeof value === "string" || typeof value === "number"
-      ? new Date(value)
-      : null;
-  if (!date || Number.isNaN(date.getTime())) return "unknown";
-  const minutes = Math.max(0, Math.round((Date.now() - date.getTime()) / 60000));
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 48) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
+/** @internal re-exported for cloud command unit tests; lives in format.ts. */
+export { formatRelativeTime };
+
+/**
+ * Strip a leading /command (with an optional @botname mention) from a
+ * message. One dialect for every handler, so `/run@bot` parses like `/run`.
+ */
+function stripCommandPrefix(text: string, command: string): string {
+  return text.replace(new RegExp(`^\\/${command}(?:@\\S+)?\\s*`), "").trim();
 }
 
-async function handleProjects(ctx: Context): Promise<void> {
-  const text = (ctx.message as any)?.text ?? "";
-  const arg = text.replace(/^\/projects(?:@\S+)?\s*/, "").trim();
-  const client = await getCloudApiClientOrExplain(ctx);
-  if (!client) return;
-
+/**
+ * The shared /projects + /cloud opener: list the org's projects or explain
+ * why the listing is empty/unavailable. Returns null when the handler should
+ * stop (the user has already been told why).
+ */
+async function listCloudProjectsOrExplain(
+  ctx: Context,
+  client: ConductorApiClient
+): Promise<ConductorApiProject[] | null> {
   let projects: ConductorApiProject[];
   try {
     projects = sortCloudProjects(await client.listProjects());
@@ -1262,14 +1312,26 @@ async function handleProjects(ctx: Context): Promise<void> {
       `Could not list cloud projects: ${escHtml(describeApiError(error))}`,
       { parse_mode: "HTML" }
     );
-    return;
+    return null;
   }
   if (projects.length === 0) {
     await ctx.reply(
       "No cloud projects are visible to this API key yet. Connect a repository in Conductor's Cloud settings first."
     );
-    return;
+    return null;
   }
+  return projects;
+}
+
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleProjects(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const arg = stripCommandPrefix(text, "projects");
+  const client = await getCloudApiClientOrExplain(ctx);
+  if (!client) return;
+
+  const projects = await listCloudProjectsOrExplain(ctx, client);
+  if (!projects) return;
 
   if (arg) {
     const resolved = resolveCloudProject(projects, arg);
@@ -1331,28 +1393,15 @@ async function handleProjects(ctx: Context): Promise<void> {
   );
 }
 
-async function handleCloud(ctx: Context): Promise<void> {
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleCloud(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
-  const args = text.replace(/^\/cloud(?:@\S+)?\s*/, "").trim();
+  const args = stripCommandPrefix(text, "cloud");
   const client = await getCloudApiClientOrExplain(ctx);
   if (!client) return;
 
-  let projects: ConductorApiProject[];
-  try {
-    projects = sortCloudProjects(await client.listProjects());
-  } catch (error) {
-    await ctx.reply(
-      `Could not list cloud projects: ${escHtml(describeApiError(error))}`,
-      { parse_mode: "HTML" }
-    );
-    return;
-  }
-  if (projects.length === 0) {
-    await ctx.reply(
-      "No cloud projects are visible to this API key yet. Connect a repository in Conductor's Cloud settings first."
-    );
-    return;
-  }
+  const projects = await listCloudProjectsOrExplain(ctx, client);
+  if (!projects) return;
 
   if (!args) {
     await ctx.reply(
@@ -1415,96 +1464,24 @@ async function startCloudWorkspaceForProject(
   prompt: string
 ): Promise<void> {
   const promptPreview = previewOutgoingText(prompt, []);
-  const chatId = ctx.chat!.id;
-  const chatIdStr = chatId.toString();
-
-  const workspace = createWorkspace({
-    name: `${project.name}-${Date.now()}`,
-    prompt,
+  await startTrackedWorkspace<CloudWorkspaceLaunchResult>(ctx, {
+    displayName: project.name,
+    recordName: `${project.name}-${Date.now()}`,
     repoPath: cloudRepoSentinel(project.name),
-    telegramChatId: chatIdStr,
-  });
-
-  const topicResult = await createWorkspaceTopic(
-    ctx.telegram,
-    chatIdStr,
-    project.name,
-    workspace.name
-  );
-  let threadId: number | undefined;
-  if (topicResult.ok) {
-    threadId = topicResult.threadId;
-  } else if (topicResult.kind !== "no_forum") {
-    const explanation =
-      topicResult.kind === "no_permission"
-        ? "The bot needs the <b>Manage Topics</b> admin permission in this chat."
-        : `Telegram returned: <code>${escHtml(topicResult.message)}</code>`;
-    updateWorkspaceStatus(workspace.id, "failed");
-    await ctx.reply(
-      `⚠️ Could not create a forum topic for <b>${escHtml(project.name)}</b>. ${explanation}\n\nWorkspace was not started.`,
-      { parse_mode: "HTML" }
-    );
-    return;
-  }
-  if (threadId) {
-    updateWorkspaceThreadId(workspace.id, threadId);
-    workspace.telegramThreadId = threadId;
-  }
-
-  const threadOpts = threadId ? { message_thread_id: threadId } : {};
-  const msg = await ctx.telegram.sendMessage(
-    chatId,
-    `Starting ☁️ cloud workspace in <b>${escHtml(project.name)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
-    { parse_mode: "HTML", ...threadOpts }
-  );
-  updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
-
-  const result = await launchCloudWorkspace({
-    projectId: project.id,
     prompt,
+    startingHtml: `Starting ☁️ cloud workspace in <b>${escHtml(project.name)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    failedHtml: (error) =>
+      `Failed to start ☁️ cloud workspace in <b>${escHtml(project.name)}</b>:\n${escHtml(error)}`,
+    successHtml: (result) =>
+      `🟢 ☁️ <b>${escHtml(result.workspaceName)}</b> running in <b>${escHtml(project.name)}</b> (${escHtml(result.model)})\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>\n\n${formatConductorDeepLink(result.deepLink)}`,
+    launch: () => launchCloudWorkspace({ projectId: project.id, prompt }),
   });
-
-  if ("error" in result) {
-    updateWorkspaceStatus(workspace.id, "failed");
-    await ctx.telegram.editMessageText(
-      chatId,
-      msg.message_id,
-      undefined,
-      `Failed to start ☁️ cloud workspace in <b>${escHtml(project.name)}</b>:\n${escHtml(result.error)}`,
-      { parse_mode: "HTML" }
-    );
-    return;
-  }
-
-  updateWorkspaceConductorName(workspace.id, result.workspaceName);
-  persistConductorLaunchBinding(workspace.id, result);
-  updateWorkspaceStatus(workspace.id, "running");
-  workspace.conductorWorkspaceName = result.workspaceName;
-  workspace.status = "running";
-
-  if (threadId) {
-    try {
-      await syncWorkspaceTopic(ctx.telegram, workspace);
-    } catch (err) {
-      console.error(`[forum] could not rename topic ${threadId}:`, err);
-    }
-  }
-
-  await ctx.telegram.editMessageText(
-    chatId,
-    msg.message_id,
-    undefined,
-    `🟢 ☁️ <b>${escHtml(result.workspaceName)}</b> running in <b>${escHtml(project.name)}</b> (${escHtml(result.model)})\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>\n\n${formatConductorDeepLink(result.deepLink)}`,
-    {
-      parse_mode: "HTML",
-      ...styledKeyboard([[btn("Stop", `stop:${workspace.id}`)]]),
-    }
-  );
 }
 
-async function handleRename(ctx: Context): Promise<void> {
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleRename(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
-  const newName = text.replace(/^\/rename(?:@\S+)?\s*/, "").trim();
+  const newName = stripCommandPrefix(text, "rename");
   if (!newName) {
     await ctx.reply(
       "Usage: /rename <new name> — run inside a workspace topic or as a reply to a workspace message."
@@ -1555,9 +1532,10 @@ async function handleRename(ctx: Context): Promise<void> {
   }
 }
 
-async function handleRenameThread(ctx: Context): Promise<void> {
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleRenameThread(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
-  const newName = text.replace(/^\/renamethread(?:@\S+)?\s*/, "").trim();
+  const newName = stripCommandPrefix(text, "renamethread");
   if (!newName) {
     await ctx.reply(
       "Usage: /renamethread <new name> — run inside a workspace topic (or reply to a specific thread's message)."
@@ -1620,9 +1598,10 @@ export function parseFleetHours(arg: string): number | null {
   return parsed;
 }
 
-async function handleFleet(ctx: Context): Promise<void> {
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleFleet(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
-  const arg = text.replace(/^\/fleet(?:@\S+)?\s*/, "").trim();
+  const arg = stripCommandPrefix(text, "fleet");
   const hours = parseFleetHours(arg);
   if (hours === null) {
     await ctx.reply(
