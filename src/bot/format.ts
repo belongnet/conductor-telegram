@@ -27,22 +27,35 @@ export function truncateHtml(html: string, maxLen: number): string {
   if (html.length <= maxLen) return html;
   // Cut to last newline before maxLen to avoid splitting HTML tags mid-tag
   let cut = html.lastIndexOf("\n", maxLen - 4);
-  if (cut < maxLen * 0.3) cut = maxLen - 4; // fallback if no good newline
-  let result = html.slice(0, cut) + "\n…";
-  // Close any open tags
-  const openTags = (result.match(/<(b|i|s|u|code|pre|blockquote)[^>]*>/gi) ?? []).map(
-    (t) => t.match(/<(\w+)/)?.[1] ?? ""
-  );
-  const closeTags = (result.match(/<\/(b|i|s|u|code|pre|blockquote)>/gi) ?? []).map(
-    (t) => t.match(/<\/(\w+)/)?.[1] ?? ""
-  );
-  // Count open vs close for each tag
-  for (const tag of [...new Set(openTags)]) {
-    const opens = openTags.filter((t) => t === tag).length;
-    const closes = closeTags.filter((t) => t === tag).length;
-    for (let j = 0; j < opens - closes; j++) {
-      result += `</${tag}>`;
+  if (cut < maxLen * 0.3) {
+    // Fallback for one long unbroken line: a raw index cut may land inside
+    // `<...>` markup or an `&...;` entity, which Telegram rejects outright,
+    // so back the cut out of any partial token first.
+    cut = maxLen - 4;
+    const openAngle = html.lastIndexOf("<", cut - 1);
+    if (openAngle > html.lastIndexOf(">", cut - 1)) cut = openAngle;
+    const amp = html.lastIndexOf("&", cut - 1);
+    if (amp > cut - 10 && amp !== -1 && !html.slice(amp, cut).includes(";")) {
+      cut = amp;
     }
+  }
+  let result = html.slice(0, cut) + "\n…";
+  // Close still-open tags in reverse nesting order — Telegram rejects
+  // interleaved closers like <b><i>…</b></i>.
+  const stack: string[] = [];
+  const tokenRe = /<(\/?)(b|i|s|u|code|pre|blockquote)(?:\s[^>]*)?>/gi;
+  let token: RegExpExecArray | null;
+  while ((token = tokenRe.exec(result))) {
+    const name = token[2].toLowerCase();
+    if (token[1] !== "/") {
+      stack.push(name);
+    } else {
+      const openIndex = stack.lastIndexOf(name);
+      if (openIndex !== -1) stack.splice(openIndex, 1);
+    }
+  }
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    result += `</${stack[i]}>`;
   }
   return result;
 }

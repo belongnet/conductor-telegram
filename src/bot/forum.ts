@@ -244,15 +244,24 @@ export async function createRepoTopic(
   }
 }
 
+/** Telegram rejects forum topic names longer than 128 characters. */
+const MAX_TOPIC_NAME_LENGTH = 128;
+
+function clampTopicName(name: string): string {
+  return name.length > MAX_TOPIC_NAME_LENGTH
+    ? `${name.slice(0, MAX_TOPIC_NAME_LENGTH - 1)}…`
+    : name;
+}
+
 export function buildRepoTopicName(repoName: string): string {
-  return repoName;
+  return clampTopicName(repoName);
 }
 
 /**
  * Build the canonical topic name for a workspace.
  */
 export function buildTopicName(repoName: string, workspaceName: string): string {
-  return `${workspaceName} · ${repoName}`;
+  return clampTopicName(`${workspaceName} · ${repoName}`);
 }
 
 export async function renameWorkspaceTopic(
