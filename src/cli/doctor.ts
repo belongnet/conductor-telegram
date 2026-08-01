@@ -248,7 +248,8 @@ function checkConductor072Schema(conductorDbPath: string | undefined): CheckResu
   }
 }
 
-async function checkConductorCloudApi(
+/** @internal exported for doctor unit tests; not part of the public CLI API. */
+export async function checkConductorCloudApi(
   config: Config | null
 ): Promise<CheckResult> {
   const mode = config?.conductorCloudBackend ?? "auto";
