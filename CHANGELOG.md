@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-19
+
+### Fixed
+- `service install` no longer aborts with launchd's "5: Input/output error" when reinstalling over a running agent: launchd removes a booted-out job asynchronously, so the installer now waits for the teardown to finish and retries the bootstrap with backoff. This was hit by the very first live auto-deploy — the install step booted the running bot out, failed to re-register it, and left the gateway down until manual recovery.
+
 ## [0.6.1] - 2026-08-19
 
 The Mac gateway now updates itself. The GitHub Actions deploy added in 0.4.7 required a self-hosted runner that was never provisioned, so pushes to `main` queued for 24 hours and died — the gateway silently ran stale code. A local launchd updater replaces it: within a minute of any push to `main`, an enrolled machine fetches, tests, builds, and redeploys itself, and it keeps doing so across reboots with no GitHub credentials, webhooks, or runners involved.

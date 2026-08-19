@@ -402,19 +402,37 @@ function writePlist(plistPath: string, contents: string): void {
   fs.writeFileSync(plistPath, contents, { mode: 0o644 });
 }
 
+function sleepSync(seconds: number): void {
+  spawnSync("/bin/sleep", [String(seconds)]);
+}
+
 function bootstrap(label: string, plistPath: string): { ok: boolean; detail: string } {
   if (isLoaded(label)) {
     launchctl(["bootout", domainTarget(label)]);
+    // launchd tears the job down asynchronously; bootstrapping while the
+    // label still exists fails with "5: Input/output error". Wait for the
+    // teardown to finish before re-registering.
+    for (let i = 0; i < 20 && isLoaded(label); i++) {
+      sleepSync(0.5);
+    }
   }
-  const { code, stderr, stdout } = launchctl([
-    "bootstrap",
-    `gui/${getUid()}`,
-    plistPath,
-  ]);
-  if (code !== 0) {
-    return { ok: false, detail: (stderr || stdout || "bootstrap failed").trim() };
+  let detail = "bootstrap failed";
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { code, stderr, stdout } = launchctl([
+      "bootstrap",
+      `gui/${getUid()}`,
+      plistPath,
+    ]);
+    if (code === 0) {
+      return {
+        ok: true,
+        detail: attempt === 1 ? "bootstrapped" : `bootstrapped (attempt ${attempt})`,
+      };
+    }
+    detail = (stderr || stdout || "bootstrap failed").trim();
+    sleepSync(attempt);
   }
-  return { ok: true, detail: "bootstrapped" };
+  return { ok: false, detail };
 }
 
 function bootout(label: string): { ok: boolean; detail: string } {
