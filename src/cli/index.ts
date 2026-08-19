@@ -32,6 +32,8 @@ function parseFlags(args: string[]): {
       flags.dopplerProject = args[++i];
     } else if (arg === "--doppler-config" && i + 1 < args.length) {
       flags.dopplerConfig = args[++i];
+    } else if (arg === "--with-updater") {
+      flags.withUpdater = true;
     } else if (arg === "--version" || arg === "-v") {
       console.log(getVersionString());
       process.exit(0);
@@ -74,6 +76,8 @@ function printHelp(): void {
                      Doppler project used by foreground and launchd runtime
     --doppler-config NAME
                      Doppler config used by foreground and launchd runtime
+    --with-updater   With 'service install': also enroll this machine in
+                     auto-deploys from the repo's main branch (gateway hosts)
     --quiet          Suppress startup banner
     --no-color       Disable colored output (also respects NO_COLOR env)
     --version, -v    Show version

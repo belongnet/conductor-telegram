@@ -4,6 +4,29 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-19
+
+The Mac gateway now updates itself. The GitHub Actions deploy added in 0.4.7 required a self-hosted runner that was never provisioned, so pushes to `main` queued for 24 hours and died — the gateway silently ran stale code. A local launchd updater replaces it: within a minute of any push to `main`, an enrolled machine fetches, tests, builds, and redeploys itself, and it keeps doing so across reboots with no GitHub credentials, webhooks, or runners involved.
+
+### Added
+- `conductor-telegram service install --with-updater` enrolls a machine in auto-deploys: a third LaunchAgent (`net.belong.conductor-telegram.updater`) polls `origin/main` every 60 seconds into a canonical checkout at `~/.conductor-telegram/gateway/repo`, cloning it on first run so a fresh machine self-bootstraps. Enrollment is strictly opt-in — a plain `service install` never signs a normal npm install up for continuous deployment.
+- Deploy outcomes are pushed to the owner's Telegram chat (best-effort, only when the bot token lives in `config.json`): one message per successful update with the new version, one per failure with the log location and retry time.
+- The updater refuses non-fast-forward (force-pushed) branch tips instead of silently rolling the gateway back, logs how to accept a deliberate history rewrite, and retries failed deploys on a 30-minute backoff with a hard 40-minute deploy timeout.
+- `service stop` now sticks: auto-deploys leave a deliberately stopped bot down until `service start`, instead of resurrecting it on the next push.
+- `service status` reports the updater agent, the deployed gateway revision, and an operator-stop notice; `service uninstall` removes the updater and lists what it leaves behind.
+- Gateway overrides (`CONDUCTOR_TELEGRAM_GATEWAY_HOME` / `_REMOTE` / `_BRANCH` / `_LOG`) are baked into the updater agent when set at install time.
+
+### Changed
+- Deploys install a packed release tarball instead of `npm install -g <checkout>` (which symlinks): the live gateway is now a copy, so a deploy's `git reset`/`npm ci` can no longer gut the running bot's dependencies before tests pass, and a failed deploy leaves the previous build untouched.
+- The deploy drives the freshly installed CLI by absolute path (`npm root -g`), immune to stale shims earlier in `PATH`.
+- The npm package ships only `dist` and the one runtime script (`scripts/gateway-update.sh`) instead of the whole `scripts/` directory.
+
+### Fixed
+- launchd plists now embed the stable Homebrew node symlink instead of the versioned Cellar path that `process.execPath` resolves to — previously any `brew upgrade node` would break the bot, watchdog, and every restart until a manual reinstall.
+
+### Removed
+- The `Deploy Mac gateway` GitHub Actions workflow. It targeted a self-hosted runner label that no machine carries, so every push spawned a run that queued for 24 hours and was cancelled.
+
 ## [0.6.0] - 2026-07-31
 
 Adopts the remaining surface of the Conductor API launched with Conductor 0.78.0 / Conductor Cloud. Every documented endpoint now has a consumer, and the bot can drive a cloud fleet with no Conductor desktop app involved.
