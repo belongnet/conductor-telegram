@@ -293,15 +293,24 @@ Config is preserved across upgrades. The `doctor` command validates everything s
 
 ## Mac gateway deployment
 
-The macOS gateway is redeployed by GitHub Actions whenever `main` is updated or a release is published. The workflow expects a self-hosted macOS runner labeled `conductor-telegram-gateway`.
-
-On each deploy it checks out the merged revision, runs the Node 22 typecheck/tests/build, installs that checkout globally, reinstalls and restarts the launchd service, and runs `doctor` as a fail-closed configuration and connectivity gate:
+A gateway host keeps itself current. Enrolling is opt-in:
 
 ```bash
-scripts/deploy-mac-gateway.sh
+conductor-telegram service install --with-updater
 ```
 
-Saved Doppler project/config references survive this reinstall, so deployment never needs to materialize secret values in the checkout or launchd plist. When Doppler is configured, the runner account must already have a scoped service identity; the workflow does not accept or persist a Doppler token.
+This registers a third LaunchAgent, `net.belong.conductor-telegram.updater`, alongside the bot and its watchdog (a plain `service install` never enrolls you — published-package users keep the normal `npm i -g conductor-telegram@latest` upgrade contract). Every minute the agent fetches `origin/main` into a canonical checkout at `~/.conductor-telegram/gateway/repo` (cloning it on first run, so a fresh machine self-bootstraps), and whenever the remote moves it redeploys:
+
+```bash
+scripts/gateway-update.sh       # the poller — copied to ~/.conductor-telegram/bin/ at install
+scripts/deploy-mac-gateway.sh   # the deploy it triggers
+```
+
+Each deploy runs the Node 22 typecheck/tests/build in the checkout, then packs a release tarball and installs *that* globally — the live gateway is a copy, so nothing the deploy does to the checkout (git reset, `npm ci`) can touch running code before all gates pass. Only then does it reinstall and restart the launchd service and run `doctor` as a configuration/connectivity gate. A failure before the install step leaves the previous gateway untouched and running; a failure at the doctor stage means the new build is already live and gets retried. Failed revisions retry on a 30-minute backoff until a new push lands. Deploys have a hard 40-minute timeout, refuse non-fast-forward (force-pushed) branch tips, and report success/failure straight to the owner's Telegram chat when the bot token is in `config.json`. All three agents are `RunAtLoad`, so a reboot restarts the bot and immediately catches up on any pushes it slept through. Progress lands in `~/.conductor-telegram/update.log`; `service status` shows the deployed revision; `service stop` is respected — auto-deploys will not resurrect a bot the operator stopped.
+
+Polling means no self-hosted runner, no inbound webhook, and no GitHub credentials on the machine — the repo is public, so the updater fetches anonymously. Note the flip side: enrolling a machine means anyone who can push to `main` can run code on it within a minute. Saved Doppler project/config references survive each reinstall, so deployment never needs to materialize secret values in the checkout or launchd plist.
+
+Updater environment overrides, baked into the agent when set at `service install --with-updater` time: `CONDUCTOR_TELEGRAM_GATEWAY_HOME` (state + checkout root, default `~/.conductor-telegram/gateway`), `CONDUCTOR_TELEGRAM_GATEWAY_REMOTE` (git URL), `CONDUCTOR_TELEGRAM_GATEWAY_BRANCH` (default `main`), `CONDUCTOR_TELEGRAM_GATEWAY_LOG` (default `~/.conductor-telegram/update.log`).
 
 ## License
 
