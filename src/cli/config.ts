@@ -58,6 +58,7 @@ export interface CLIFlags {
   dbPath?: string;
   dopplerProject?: string;
   dopplerConfig?: string;
+  withUpdater?: boolean;
 }
 
 const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {
@@ -148,7 +149,15 @@ function readConfigFile(): Partial<Config> {
   try {
     if (!fs.existsSync(CONFIG_PATH)) return {};
     const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    // v0.4.x wrote the bot token under `token`. Accept it so a gateway
+    // auto-upgrading across the rename keeps authenticating instead of
+    // coming up with an empty token.
+    if (parsed && typeof parsed === "object" && parsed.token && !parsed.botToken) {
+      parsed.botToken = parsed.token;
+      delete parsed.token;
+    }
+    return parsed;
   } catch {
     return {};
   }
