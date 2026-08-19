@@ -31,16 +31,30 @@ jobs:
       - run: npm run build
 
   deploy-script:
-    name: Deploy script parses under macOS bash
+    name: Gateway scripts on macOS (bash 3.2 + BSD userland)
     runs-on: macos-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
       # macOS ships bash 3.2, where `set -u` rejects "${arr[@]}" on an empty
-      # array. The gateway deploy runs on this shell, so guard the syntax and
-      # the no-Doppler argument path here rather than discovering it mid-deploy.
+      # array. The gateway updater and deploy run on this shell, so guard the
+      # syntax and the no-Doppler argument path here rather than discovering
+      # it mid-deploy.
       - name: Syntax-check under bash 3.2
-        run: /bin/bash -n scripts/deploy-mac-gateway.sh
+        run: |
+          /bin/bash -n scripts/deploy-mac-gateway.sh
+          /bin/bash -n scripts/gateway-update.sh
+      # The updater's behavioral suite exercises BSD ps/find/touch/tail and
+      # real /bin/bash 3.2 semantics (process-group kill, wait) that the
+      # ubuntu matrix cannot — a linux-green/mac-red regression would
+      # otherwise land as a production deploy-failure loop.
+      - run: npm ci
+      - name: Updater behavioral suite on macOS
+        run: node --import tsx --test tests/gateway-update-script.test.ts tests/gateway-updater.test.ts
       - name: Service install arguments expand with and without Doppler
         run: |
           /bin/bash -euo pipefail -c '
