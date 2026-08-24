@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-19
+
+### Fixed
+- Repo topic "ready" messages are pinned automatically (without notification), so each forum topic keeps its routing entry point visible; a failed pin is logged and never blocks topic creation.
+
 ## [0.6.2] - 2026-08-19
 
 ### Fixed
