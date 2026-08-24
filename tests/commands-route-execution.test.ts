@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveRouteExecutionPlan } from "../src/bot/commands.js";
+import {
+  resolveRepoTopicLaunchTarget,
+  resolveRouteExecutionPlan,
+} from "../src/bot/commands.js";
 import type { RouteResult } from "../src/bot/ai-router.js";
 import type { Workspace } from "../src/types/index.js";
 
@@ -26,7 +29,9 @@ function workspace(overrides: Partial<Workspace> = {}): Workspace {
     telegramChatId: chatId,
     telegramMessageId: null,
     conductorWorkspaceName: "rotterdam",
+    conductorWorkspaceId: null,
     conductorSessionId: null,
+    conductorBackendKind: null,
     lastForwardedMessageRowid: 0,
     telegramThreadId: null,
     archivedAt: null,
@@ -34,12 +39,25 @@ function workspace(overrides: Partial<Workspace> = {}): Workspace {
   };
 }
 
+test("repo topic launch targets preserve the stored repo path", () => {
+  const target = resolveRepoTopicLaunchTarget({
+    repoName: "ai-deploy-clo",
+    repoPath: "/custom/repos/ai-deploy-clo",
+  });
+
+  assert.deepEqual(target, {
+    repoName: "ai-deploy-clo",
+    repoPath: "/custom/repos/ai-deploy-clo",
+  });
+});
+
 test("route execution sends valid existing routes to the workspace", () => {
   const plan = resolveRouteExecutionPlan(
     chatId,
     route({ workspaceId: "workspace-1" }),
     {
       getWorkspace: () => workspace(),
+      getActiveWorkspaces: () => [],
       resolveRepo: () => {
         assert.fail("existing workspace route should not resolve a repo");
       },
@@ -59,6 +77,7 @@ test("route execution falls back to a new workspace when existing route has only
       getWorkspace: () => {
         assert.fail("missing workspaceId should not query workspace storage");
       },
+      getActiveWorkspaces: () => [],
       resolveRepo: (input) => input,
     }
   );
@@ -78,6 +97,7 @@ test("route execution rejects existing routes without workspace or repo target",
       getWorkspace: () => {
         assert.fail("missing workspaceId should not query workspace storage");
       },
+      getActiveWorkspaces: () => [],
       resolveRepo: () => {
         assert.fail("missing repoName should not resolve a repo");
       },
@@ -97,6 +117,7 @@ test("route execution preserves rejection reason when falling back to a repo", (
     route({ repoName: "conductor-telegram", workspaceId: "workspace-1" }),
     {
       getWorkspace: () => workspace({ telegramChatId: "other-chat" }),
+      getActiveWorkspaces: () => [],
       resolveRepo: (input) => input,
     }
   );
@@ -105,5 +126,50 @@ test("route execution preserves rejection reason when falling back to a repo", (
     kind: "new",
     repoName: "conductor-telegram",
     existingRejection: "wrong chat",
+  });
+});
+
+test("existing route with only repo steers to the single running workspace in that repo", () => {
+  const target = workspace({ id: "workspace-target", repoPath: "/repos/conductor-telegram" });
+  const plan = resolveRouteExecutionPlan(
+    chatId,
+    route({ repoName: "conductor-telegram", workspaceId: undefined }),
+    {
+      getWorkspace: () => {
+        assert.fail("missing workspaceId should not query workspace storage");
+      },
+      getActiveWorkspaces: () => [
+        workspace({ id: "workspace-other", repoPath: "/repos/other-repo" }),
+        target,
+      ],
+      resolveRepo: (input) => input,
+    }
+  );
+
+  assert.equal(plan.kind, "existing");
+  if (plan.kind !== "existing") assert.fail("expected existing workspace plan");
+  assert.equal(plan.workspace.id, "workspace-target");
+});
+
+test("existing route with only repo does not steer when multiple workspaces match", () => {
+  const plan = resolveRouteExecutionPlan(
+    chatId,
+    route({ repoName: "conductor-telegram", workspaceId: undefined }),
+    {
+      getWorkspace: () => {
+        assert.fail("missing workspaceId should not query workspace storage");
+      },
+      getActiveWorkspaces: () => [
+        workspace({ id: "workspace-1", repoPath: "/repos/conductor-telegram" }),
+        workspace({ id: "workspace-2", repoPath: "/repos/conductor-telegram" }),
+      ],
+      resolveRepo: (input) => input,
+    }
+  );
+
+  assert.deepEqual(plan, {
+    kind: "new",
+    repoName: "conductor-telegram",
+    existingRejection: "ambiguous running workspaces in repo",
   });
 });

@@ -2,14 +2,25 @@ import type { Context, Telegraf } from "telegraf";
 import {
   answerPendingStdinDecision,
   archiveConductorWorkspace,
+  canUseConductorCloudApi,
+  CLOUD_OBSERVE_ONLY_HINT,
   formatAttachmentReference,
+  getConductorWorkspaceSessions,
+  getMaxSessionMessageCursor,
+  getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
+  isRemoteConductorWorkspace,
+  launchCloudWorkspace,
+  type CloudWorkspaceLaunchResult,
   launchWorkspace,
   launchWorkspaceSession,
   sendToSession,
   stageAttachmentPaths,
-  stopAgent,
+  setConductorActiveSession,
+  stopConductorAgent,
+  type AgentResult,
+  type ConductorSessionInfo,
 } from "./launcher.js";
 import {
   archiveWorkspace,
@@ -24,13 +35,19 @@ import {
   updateWorkspaceStatus,
   updateWorkspaceTelegramMessage,
   updateWorkspaceConductorName,
+  updateWorkspaceConductorBinding,
   updateWorkspaceThreadId,
   answerDecision,
   updateWorkspaceConductorSession,
   updateWorkspaceForwardCursor,
-  getWorkspaceByTelegramMessage,
+  getWorkspaceMessageTarget,
   getHeartbeat,
+  getThreadCursor,
+  updateThreadCursor,
   getPrRecordsForWorkspaces,
+  consumeMergeIntent,
+  createMergeIntent,
+  getMergeIntent,
   deleteRepoTopic,
   getRepoTopic,
   getRepoTopicByThreadId,
@@ -43,12 +60,17 @@ import {
   createWorkspaceTopic,
   createRepoTopic,
   closeWorkspaceTopic,
-  deleteWorkspaceTopic,
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
+import {
+  ConductorApiError,
+  createConductorApiClientFromEnv,
+  type ConductorApiClient,
+  type ConductorApiProject,
+} from "../integrations/conductor-api.js";
 import type { Decision, PrRecord, RepoTopic, RouteSource, Workspace } from "../types/index.js";
-import { btn, escHtml, statusIcon, styledButtons, styledKeyboard, truncate } from "./format.js";
+import { btn, escHtml, formatRelativeTime, statusIcon, styledButtons, styledKeyboard, truncate, truncateHtml, TELEGRAM_MAX_TEXT } from "./format.js";
 import { detectExplicitTarget, routeVoiceMessage, routeTextMessage, transcribeVoiceMessage, type RouteResult } from "./ai-router.js";
 import { saveConfig, tryLoadConfig, type Config } from "../cli/config.js";
 import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -73,8 +95,14 @@ function describeWorkspaceRejection(
 
 type RouteExecutionPlannerDeps = {
   getWorkspace: (id: string) => Workspace | undefined;
+  getActiveWorkspaces: () => Workspace[];
   resolveRepo: (input: string) => string | null;
 };
+
+interface RepoLaunchTarget {
+  repoName: string;
+  repoPath: string;
+}
 
 export type RouteExecutionPlan =
   | { kind: "existing"; workspace: Workspace }
@@ -90,7 +118,7 @@ export type RouteExecutionPlan =
 export function resolveRouteExecutionPlan(
   chatId: string,
   result: RouteResult,
-  deps: RouteExecutionPlannerDeps = { getWorkspace, resolveRepo }
+  deps: RouteExecutionPlannerDeps = { getWorkspace, getActiveWorkspaces, resolveRepo }
 ): RouteExecutionPlan {
   let existingRejection: string | undefined;
 
@@ -110,6 +138,25 @@ export function resolveRouteExecutionPlan(
   if (result.repoName) {
     const resolved = deps.resolveRepo(result.repoName);
     if (resolved) {
+      if (result.action === "existing" && !result.workspaceId) {
+        const candidates = deps
+          .getActiveWorkspaces()
+          .filter(
+            (workspace) =>
+              workspace.telegramChatId === chatId &&
+              workspace.status === "running" &&
+              workspace.conductorWorkspaceName &&
+              path.basename(workspace.repoPath) === resolved
+          );
+
+        if (candidates.length === 1) {
+          return { kind: "existing", workspace: candidates[0] };
+        }
+
+        if (candidates.length > 1) {
+          existingRejection = "ambiguous running workspaces in repo";
+        }
+      }
       return { kind: "new", repoName: resolved, existingRejection };
     }
     return {
@@ -123,11 +170,38 @@ export function resolveRouteExecutionPlan(
   return { kind: "unroutable", reason: "missing_target", existingRejection };
 }
 
+/** @internal exported for route executor unit tests; not part of the public bot API. */
+export function resolveRepoTopicLaunchTarget(
+  topic: Pick<RepoTopic, "repoName" | "repoPath">
+): RepoLaunchTarget {
+  return {
+    repoName: topic.repoName,
+    repoPath: topic.repoPath,
+  };
+}
+
 // Map Telegram message IDs to decision IDs (for reply-based answering)
 const messageToDecision = new Map<number, number>();
 
 // Track repo-selection confirmation messages so replies create a workspace directly
 const messageToRepoSelection = new Map<string, string>(); // chatId:messageId → repoName
+const messageToThreadStart = new Map<
+  string,
+  { conductorName: string; repoPath: string | null }
+>(); // chatId:messageId → target workspace
+
+interface PendingThreadAction {
+  chatId: string;
+  action: "select" | "new";
+  conductorName: string;
+  repoPath: string | null;
+  workspaceId: string;
+  sessionId?: string;
+  backendKind?: "local" | "cloud-api";
+  createdAt: number;
+}
+
+const pendingThreadActions = new Map<string, PendingThreadAction>();
 
 /**
  * Register a Telegram message ID as associated with a decision,
@@ -151,15 +225,34 @@ async function downloadTelegramFile(ctx: Context, fileId: string, ext: string = 
   const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
 
   // Determine extension from Telegram's file_path if not provided
-  const fileExt = ext || path.extname(file.file_path ?? "") || ".bin";
-  const localName = `${Date.now()}-${fileId.slice(-8)}${fileExt}`;
+  const fileExt = safeExtension(ext || path.extname(file.file_path ?? ""));
+  const safeId = fileId.slice(-8).replace(/[^A-Za-z0-9_-]/g, "");
+  const localName = `${Date.now()}-${safeId}${fileExt}`;
 
   mkdirSync(TELEGRAM_DOWNLOADS_DIR, { recursive: true });
   const localPath = path.join(TELEGRAM_DOWNLOADS_DIR, localName);
+  if (
+    path.dirname(path.resolve(localPath)) !==
+    path.resolve(TELEGRAM_DOWNLOADS_DIR)
+  ) {
+    throw new Error("Refusing to stage a download outside the downloads directory");
+  }
 
   const data = await fetchBuffer(url);
   writeFileSync(localPath, data);
   return localPath;
+}
+
+/**
+ * Constrain a Telegram-supplied extension to something that cannot steer the
+ * download path. `mime_type` is attacker-controlled and reaches here verbatim,
+ * so a value like `application/../../../.claude/settings.json` would otherwise
+ * be normalised by path.join into an arbitrary file write.
+ */
+export function safeExtension(ext: string): string {
+  return /^\.[A-Za-z0-9][A-Za-z0-9+._-]{0,15}$/.test(ext.trim())
+    ? ext.trim()
+    : ".bin";
 }
 
 function fetchBuffer(url: string): Promise<Buffer> {
@@ -180,10 +273,6 @@ function fetchBuffer(url: string): Promise<Buffer> {
 const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ??
   `${process.env.HOME}/conductor/repos`;
-
-const CONDUCTOR_WORKSPACES_DIR =
-  process.env.CONDUCTOR_WORKSPACES_DIR ??
-  `${process.env.HOME}/conductor/workspaces`;
 
 function getRepoList(): string[] {
   try {
@@ -215,6 +304,7 @@ interface WorkspaceTarget {
   repoPath: string | null;
   repoName: string | null;
   targetBranch: string | null;
+  sessionId: string | null;
 }
 
 interface SkillRoute {
@@ -251,8 +341,14 @@ const WELL_KNOWN_SKILLS: WellKnownSkill[] = [
 const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "setup", description: "Check setup and apply this chat" },
   { command: "run", description: "Start a new workspace run" },
+  { command: "cloud", description: "Start a ☁️ cloud workspace via the Conductor API" },
+  { command: "projects", description: "List ☁️ cloud projects and workspaces" },
+  { command: "fleet", description: "☁️ cloud activity report (last 24h)" },
+  { command: "rename", description: "Rename a ☁️ cloud workspace" },
+  { command: "renamethread", description: "Rename a ☁️ cloud thread" },
   { command: "review", description: "Start a review session for a workspace" },
   { command: "send", description: "Send a follow-up to a workspace" },
+  { command: "threads", description: "List or switch Conductor threads" },
   { command: "skills", description: "List available skills" },
   { command: "skill", description: "Invoke a workspace skill by name" },
   { command: "gstack", description: "Ask the agent to use GStack skills" },
@@ -313,14 +409,18 @@ function findTrackedWorkspace(
 
 function resolveWorkspaceTarget(
   identifier: string,
-  opts: { chatId?: string; repoPath?: string | null } = {}
+  opts: { chatId?: string; repoPath?: string | null; sessionId?: string | null } = {}
 ): WorkspaceTarget | null | "ambiguous" {
   const tracked = findTrackedWorkspace(identifier, opts.chatId);
   if (tracked === "ambiguous") return "ambiguous";
   const trackedWorkspace = tracked ?? null;
   const conductorName = trackedWorkspace?.conductorWorkspaceName ?? identifier;
   const repoPath = opts.repoPath ?? trackedWorkspace?.repoPath ?? null;
-  const sessionInfo = getWorkspaceSessionInfo(conductorName, repoPath);
+  const sessionInfo = getWorkspaceSessionInfo(
+    conductorName,
+    repoPath,
+    trackedWorkspace
+  );
   if (!sessionInfo) {
     return null;
   }
@@ -334,6 +434,7 @@ function resolveWorkspaceTarget(
     repoPath: sessionInfo.repoPath,
     repoName: sessionInfo.repoName,
     targetBranch: sessionInfo.targetBranch,
+    sessionId: opts.sessionId ?? null,
   };
 }
 
@@ -354,13 +455,16 @@ function getReplyWorkspaceTarget(ctx: Context): WorkspaceTarget | null {
   if (!chatId) {
     return null;
   }
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (!repliedWorkspace?.conductorWorkspaceName) {
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  const conductorName = repliedTarget?.workspace.conductorWorkspaceName;
+  if (!conductorName) {
     return null;
   }
-  const target = resolveWorkspaceTarget(repliedWorkspace.conductorWorkspaceName, {
+  const repliedWorkspace = repliedTarget.workspace;
+  const target = resolveWorkspaceTarget(conductorName, {
     chatId,
     repoPath: repliedWorkspace.repoPath,
+    sessionId: repliedTarget.sessionId,
   });
   return target === "ambiguous" ? null : target;
 }
@@ -391,10 +495,7 @@ function getThreadRepoTopic(ctx: Context, chatId: string): RepoTopic | null {
 }
 
 function getWorkspaceDirectory(target: WorkspaceTarget): string | null {
-  if (!target.repoName) {
-    return null;
-  }
-  return path.join(CONDUCTOR_WORKSPACES_DIR, target.repoName, target.conductorName);
+  return getWorkspaceDir(target.conductorName, target.repoPath);
 }
 
 function parseSkillRoutes(text: string): SkillRoute[] {
@@ -516,13 +617,41 @@ function ensureTrackedWorkspace(
   return workspace;
 }
 
+function persistConductorLaunchBinding(
+  workspaceId: string,
+  launch: {
+    workspaceId: string;
+    sessionId: string;
+    backendKind: "local" | "cloud-api";
+    initialCursorRowid: number;
+    initialCursorMessageId: string | null;
+  }
+): void {
+  updateWorkspaceConductorBinding(workspaceId, {
+    workspaceId: launch.workspaceId,
+    sessionId: launch.sessionId,
+    backendKind: launch.backendKind,
+  });
+  updateWorkspaceForwardCursor(workspaceId, launch.initialCursorRowid);
+  updateThreadCursor(
+    workspaceId,
+    launch.sessionId,
+    launch.initialCursorRowid,
+    null,
+    launch.initialCursorMessageId,
+    launch.backendKind
+  );
+}
+
 async function sendPromptToTarget(
   ctx: Context,
   target: WorkspaceTarget,
   prompt: string
 ): Promise<void> {
   if (target.trackedWorkspace) {
-    await sendMessageToWorkspace(ctx, target.trackedWorkspace, prompt);
+    await sendMessageToWorkspace(ctx, target.trackedWorkspace, prompt, [], {
+      sessionId: target.sessionId,
+    });
     return;
   }
 
@@ -532,6 +661,7 @@ async function sendPromptToTarget(
 
   const result = await sendToSession(target.conductorName, prompt, [], {
     repoPath: target.repoPath,
+    sessionId: target.sessionId,
   });
   if ("error" in result) {
     await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
@@ -548,6 +678,11 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.start(handleSetup);
   bot.command("setup", handleSetup);
   bot.command("run", handleRun);
+  bot.command("cloud", handleCloud);
+  bot.command("projects", handleProjects);
+  bot.command("fleet", handleFleet);
+  bot.command("rename", handleRename);
+  bot.command("renamethread", handleRenameThread);
   bot.command("workspaces", handleWorkspaces);
   bot.command("prs", handlePrs);
   bot.command("ship_status", handlePrs);
@@ -556,6 +691,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.command("stop", handleStop);
   bot.command("repos", handleRepos);
   bot.command("send", handleSend);
+  bot.command("threads", handleThreads);
   bot.command("review", handleReview);
   bot.command("skills", handleSkills);
   bot.command("skill", handleSkill);
@@ -574,8 +710,10 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^repotopic:(\d+)$/, handleRepoTopicCallback);
   bot.action(/^routeconfirm:([a-f0-9]+):(yes|cancel)$/, handleRouteConfirmCallback);
   bot.action(/^setup:apply:(\d+)$/, handleSetupApplyCallback);
+  bot.action(/^thread:(set|new):([a-f0-9]+)$/, handleThreadCallback);
   bot.action(/^postdone:(review|pr):(.+)$/, handlePostDoneCallback);
   bot.action(/^pr:(refresh|fix|merge):(.+)$/, handlePrCallback);
+  bot.action(/^pr:mergeconfirm:([a-f0-9]+)$/, handlePrMergeConfirmCallback);
   bot.action(/^archive:(.+)$/, handleArchiveCallback);
 
   // Media and text handlers
@@ -841,24 +979,58 @@ async function startWorkspaceFromMessage(
   prompt: string,
   attachmentSourcePaths: string[] = []
 ): Promise<void> {
-  const repoPath = path.join(CONDUCTOR_REPOS_DIR, repoName);
-  const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
+  await startWorkspaceForRepo(
+    ctx,
+    { repoName, repoPath: path.join(CONDUCTOR_REPOS_DIR, repoName) },
+    prompt,
+    attachmentSourcePaths
+  );
+}
+
+/** The persisted launch fields every tracked-workspace start must produce. */
+interface TrackedLaunchBinding {
+  workspaceId: string;
+  sessionId: string;
+  backendKind: "local" | "cloud-api";
+  initialCursorRowid: number;
+  initialCursorMessageId: string | null;
+  workspaceName: string;
+}
+
+/**
+ * Shared chat scaffolding for starting a tracked workspace: create the bot-DB
+ * record, give it a forum topic when the chat supports one (any topic failure
+ * other than "no forum" is fatal), post the starting message, run the
+ * supplied launch, and persist its binding. Callers provide the user-facing
+ * copy and handle launch-specific follow-up via the returned handles.
+ */
+async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
+  ctx: Context,
+  input: {
+    displayName: string;
+    recordName: string;
+    repoPath: string;
+    prompt: string;
+    startingHtml: string;
+    failedHtml: (error: string) => string;
+    successHtml: (launched: S) => string;
+    launch: (workspace: Workspace) => Promise<S | { error: string }>;
+  }
+): Promise<{ workspace: Workspace; launched: S | null }> {
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
 
-  // Create record in our DB
   const workspace = createWorkspace({
-    name: `${repoName}-${Date.now()}`,
-    prompt,
-    repoPath,
+    name: input.recordName,
+    prompt: input.prompt,
+    repoPath: input.repoPath,
     telegramChatId: chatIdStr,
   });
 
-  // Try to create a forum topic for this workspace
   const topicResult = await createWorkspaceTopic(
     ctx.telegram,
     chatIdStr,
-    repoName,
+    input.displayName,
     workspace.name
   );
   let threadId: number | undefined;
@@ -871,10 +1043,10 @@ async function startWorkspaceFromMessage(
         : `Telegram returned: <code>${escHtml(topicResult.message)}</code>`;
     updateWorkspaceStatus(workspace.id, "failed");
     await ctx.reply(
-      `⚠️ Could not create a forum topic for <b>${escHtml(repoName)}</b>. ${explanation}\n\nWorkspace was not started.`,
+      `⚠️ Could not create a forum topic for <b>${escHtml(input.displayName)}</b>. ${explanation}\n\nWorkspace was not started.`,
       { parse_mode: "HTML" }
     );
-    return;
+    return { workspace, launched: null };
   }
   if (threadId) {
     updateWorkspaceThreadId(workspace.id, threadId);
@@ -882,20 +1054,13 @@ async function startWorkspaceFromMessage(
   }
 
   const threadOpts = threadId ? { message_thread_id: threadId } : {};
-
-  // Send initial message (into the topic if created)
-  const msg = await ctx.telegram.sendMessage(
-    chatId,
-    `Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
-    { parse_mode: "HTML", ...threadOpts }
-  );
-
+  const msg = await ctx.telegram.sendMessage(chatId, input.startingHtml, {
+    parse_mode: "HTML",
+    ...threadOpts,
+  });
   updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
 
-  // Launch the workspace and spawn the agent process.
-  const result = await launchWorkspace(repoPath, prompt, (output) => {
-    console.log(`[${workspace.id}] ${output.slice(0, 200)}`);
-  }, attachmentSourcePaths);
+  const result = await input.launch(workspace);
 
   if ("error" in result) {
     updateWorkspaceStatus(workspace.id, "failed");
@@ -903,16 +1068,14 @@ async function startWorkspaceFromMessage(
       chatId,
       msg.message_id,
       undefined,
-      `Failed to start workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(result.error)}`,
+      input.failedHtml(result.error),
       { parse_mode: "HTML" }
     );
-    return;
+    return { workspace, launched: null };
   }
 
-  // Workspace created and agent running
   updateWorkspaceConductorName(workspace.id, result.workspaceName);
-  updateWorkspaceConductorSession(workspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(workspace.id, result.initialCursorRowid);
+  persistConductorLaunchBinding(workspace.id, result);
   updateWorkspaceStatus(workspace.id, "running");
   workspace.conductorWorkspaceName = result.workspaceName;
   workspace.status = "running";
@@ -929,14 +1092,52 @@ async function startWorkspaceFromMessage(
     chatId,
     msg.message_id,
     undefined,
-    `🟢 <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
+    input.successHtml(result),
     {
       parse_mode: "HTML",
-      ...styledKeyboard([
-        [btn("Stop", `stop:${workspace.id}`)],
-      ]),
+      ...styledKeyboard([[btn("Stop", `stop:${workspace.id}`)]]),
     }
   );
+
+  return { workspace, launched: result };
+}
+
+async function startWorkspaceForRepo(
+  ctx: Context,
+  target: RepoLaunchTarget,
+  prompt: string,
+  attachmentSourcePaths: string[] = []
+): Promise<void> {
+  const { repoName, repoPath } = target;
+  const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
+  type RepoLaunchSuccess = Exclude<
+    Awaited<ReturnType<typeof launchWorkspace>>,
+    { error: string }
+  >;
+  const { workspace, launched } = await startTrackedWorkspace<RepoLaunchSuccess>(ctx, {
+    displayName: repoName,
+    recordName: `${repoName}-${Date.now()}`,
+    repoPath,
+    prompt,
+    startingHtml: `Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    failedHtml: (error) =>
+      `Failed to start workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(error)}`,
+    successHtml: (result) =>
+      `🟢 <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
+    launch: (workspace) =>
+      launchWorkspace(
+        repoPath,
+        prompt,
+        (output) => {
+          console.log(`[${workspace.id}] ${output.slice(0, 200)}`);
+        },
+        attachmentSourcePaths
+      ),
+  });
+
+  if (launched) {
+    observeAgentCompletion(ctx, workspace, launched.workspaceName, launched.done);
+  }
 }
 
 async function startWorkspaceFromRepoTopic(
@@ -955,7 +1156,553 @@ async function startWorkspaceFromRepoTopic(
     repoName: topic.repoName,
     status: "routed",
   });
-  await startWorkspaceFromMessage(ctx, topic.repoName, prompt, attachmentSourcePaths);
+  await startWorkspaceForRepo(
+    ctx,
+    resolveRepoTopicLaunchTarget(topic),
+    prompt,
+    attachmentSourcePaths
+  );
+}
+
+// ── Conductor Cloud (/projects, /cloud, /rename, /fleet) ────
+
+/**
+ * Bot-DB workspace rows require a repo_path; cloud workspaces have no local
+ * checkout, so they carry a sentinel that display code basenames into the
+ * project name and existsSync guards treat as absent.
+ */
+function cloudRepoSentinel(projectName: string): string {
+  return `conductor-cloud://${projectName}`;
+}
+
+function describeApiError(error: unknown): string {
+  return error instanceof ConductorApiError
+    ? error.message
+    : String((error as Error)?.message ?? error);
+}
+
+async function getCloudApiClientOrExplain(
+  ctx: Context
+): Promise<ConductorApiClient | null> {
+  let client: ConductorApiClient | null = null;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    await ctx.reply(
+      `☁️ Conductor Cloud configuration error: ${escHtml(describeApiError(error))}`,
+      { parse_mode: "HTML" }
+    );
+    return null;
+  }
+  if (!client) {
+    await ctx.reply(
+      `☁️ Conductor Cloud is in observe-only mode. ${CLOUD_OBSERVE_ONLY_HINT} to use cloud commands.`
+    );
+    return null;
+  }
+  return client;
+}
+
+function sortCloudProjects(
+  projects: ConductorApiProject[]
+): ConductorApiProject[] {
+  return [...projects].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** @internal exported for cloud command unit tests; not part of the public bot API. */
+export function resolveCloudProject(
+  projects: ConductorApiProject[],
+  input: string
+): ConductorApiProject | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) {
+    const byIndex = projects[Number(trimmed) - 1];
+    if (byIndex) return byIndex;
+    // An out-of-range number may still be a literal project name or id.
+  }
+  const exactId = projects.find((project) => project.id === trimmed);
+  if (exactId) return exactId;
+  const lower = trimmed.toLowerCase();
+  const exactName = projects.filter(
+    (project) => project.name.toLowerCase() === lower
+  );
+  if (exactName.length === 1) return exactName[0];
+  const prefixed = projects.filter((project) =>
+    project.name.toLowerCase().startsWith(lower)
+  );
+  return prefixed.length === 1 ? prefixed[0] : null;
+}
+
+const CLOUD_PROJECTS_MAX_SHOWN = 25;
+
+function cloudProjectLines(projects: ConductorApiProject[]): string {
+  // Unbounded lists blow through Telegram's 4096-char message cap and the
+  // whole reply is rejected, so cap the rendering like /fleet does. Numbers
+  // stay valid for /cloud <number> because resolution uses the same sort.
+  const shown = projects.slice(0, CLOUD_PROJECTS_MAX_SHOWN);
+  const lines = shown.map(
+    (project, index) =>
+      `${index + 1}. <b>${escHtml(project.name)}</b> — <code>${escHtml(project.gitRemote)}</code>`
+  );
+  if (projects.length > shown.length) {
+    lines.push(
+      `…and ${projects.length - shown.length} more project(s) — pick them by exact name or id.`
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Only linkify deep links that point at Conductor itself. The value comes
+ * from the Conductor API, but a clickable "Open in Conductor" anchor is a
+ * phishing surface if the API (or a future proxy) ever returned a foreign
+ * host, so anything else renders as inert code.
+ *
+ * @internal exported for cloud command unit tests; not part of the public bot API.
+ */
+export function isTrustedConductorLink(deepLink: string): boolean {
+  try {
+    const url = new URL(deepLink);
+    if (!["http:", "https:"].includes(url.protocol)) return false;
+    return (
+      url.hostname === "conductor.build" ||
+      url.hostname.endsWith(".conductor.build")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** @internal exported for cloud command unit tests; not part of the public bot API. */
+export function formatConductorDeepLink(deepLink: string): string {
+  // escHtml leaves double quotes alone; escape them so the href attribute
+  // cannot be truncated by a quoted deep link.
+  const safe = escHtml(deepLink).replace(/"/g, "&quot;");
+  return isTrustedConductorLink(deepLink)
+    ? `<a href="${safe}">Open in Conductor</a>`
+    : `<code>${safe}</code>`;
+}
+
+/** @internal re-exported for cloud command unit tests; lives in format.ts. */
+export { formatRelativeTime };
+
+/**
+ * Strip a leading /command (with an optional @botname mention) from a
+ * message. One dialect for every handler, so `/run@bot` parses like `/run`.
+ */
+function stripCommandPrefix(text: string, command: string): string {
+  return text.replace(new RegExp(`^\\/${command}(?:@\\S+)?\\s*`), "").trim();
+}
+
+/**
+ * The shared /projects + /cloud opener: list the org's projects or explain
+ * why the listing is empty/unavailable. Returns null when the handler should
+ * stop (the user has already been told why).
+ */
+async function listCloudProjectsOrExplain(
+  ctx: Context,
+  client: ConductorApiClient
+): Promise<ConductorApiProject[] | null> {
+  let projects: ConductorApiProject[];
+  try {
+    projects = sortCloudProjects(await client.listProjects());
+  } catch (error) {
+    await ctx.reply(
+      `Could not list cloud projects: ${escHtml(describeApiError(error))}`,
+      { parse_mode: "HTML" }
+    );
+    return null;
+  }
+  if (projects.length === 0) {
+    await ctx.reply(
+      "No cloud projects are visible to this API key yet. Connect a repository in Conductor's Cloud settings first."
+    );
+    return null;
+  }
+  return projects;
+}
+
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleProjects(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const arg = stripCommandPrefix(text, "projects");
+  const client = await getCloudApiClientOrExplain(ctx);
+  if (!client) return;
+
+  const projects = await listCloudProjectsOrExplain(ctx, client);
+  if (!projects) return;
+
+  if (arg) {
+    const resolved = resolveCloudProject(projects, arg);
+    if (!resolved) {
+      await ctx.reply(
+        truncateHtml(
+          `Project "${escHtml(arg)}" not found.\n\n☁️ Cloud projects:\n${cloudProjectLines(projects)}`,
+          TELEGRAM_MAX_TEXT
+        ),
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+    try {
+      // The detail view re-reads the single project so the reply reflects the
+      // API's current record rather than the cached listing.
+      const [project, workspaces] = await Promise.all([
+        client.getProject(resolved.id),
+        client.listProjectWorkspaces(resolved.id),
+      ]);
+      const recent = [...workspaces]
+        .sort((a, b) =>
+          (b.lastActivityAt ?? b.createdAt).localeCompare(
+            a.lastActivityAt ?? a.createdAt
+          )
+        )
+        .slice(0, 10);
+      const workspaceLines =
+        recent.length === 0
+          ? "No workspaces yet."
+          : recent
+              .map(
+                (workspace) =>
+                  `• <b>${escHtml(workspace.name)}</b> — active ${formatRelativeTime(workspace.lastActivityAt ?? workspace.createdAt)}`
+              )
+              .join("\n");
+      await ctx.reply(
+        truncateHtml(
+          `☁️ <b>${escHtml(project.name)}</b>\n<code>${escHtml(project.gitRemote)}</code>\n\n${workspaces.length} workspace(s)${workspaces.length > recent.length ? ` (showing ${recent.length} most recent)` : ""}:\n${workspaceLines}\n\nStart work: <code>/cloud ${escHtml(project.name)} &lt;prompt&gt;</code>`,
+          TELEGRAM_MAX_TEXT
+        ),
+        { parse_mode: "HTML" }
+      );
+    } catch (error) {
+      await ctx.reply(
+        `Could not inspect ${escHtml(resolved.name)}: ${escHtml(describeApiError(error))}`,
+        { parse_mode: "HTML" }
+      );
+    }
+    return;
+  }
+
+  await ctx.reply(
+    truncateHtml(
+      `☁️ <b>Cloud projects</b>\n\n${cloudProjectLines(projects)}\n\nStart work: <code>/cloud &lt;number|name&gt; &lt;prompt&gt;</code>\nDetails: <code>/projects &lt;name&gt;</code>`,
+      TELEGRAM_MAX_TEXT
+    ),
+    { parse_mode: "HTML" }
+  );
+}
+
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleCloud(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = stripCommandPrefix(text, "cloud");
+  const client = await getCloudApiClientOrExplain(ctx);
+  if (!client) return;
+
+  const projects = await listCloudProjectsOrExplain(ctx, client);
+  if (!projects) return;
+
+  if (!args) {
+    await ctx.reply(
+      truncateHtml(
+        `Usage: /cloud &lt;project&gt; &lt;prompt&gt;\n\n☁️ Cloud projects (use number or name):\n${cloudProjectLines(projects)}\n\nExample:\n<code>/cloud 1 Fix the auth bug</code>`,
+        TELEGRAM_MAX_TEXT
+      ),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const spaceIdx = args.indexOf(" ");
+  if (spaceIdx === -1) {
+    await ctx.reply(
+      "Please provide both a project and a prompt.\n\nExample: /cloud 1 Fix the auth bug"
+    );
+    return;
+  }
+  // Project names may contain spaces; prefer the longest leading exact-name
+  // match so "/cloud Belong Network fix bug" targets "Belong Network" instead
+  // of leaking "Network" into the agent's prompt via prefix resolution.
+  let projectInput = args.slice(0, spaceIdx);
+  let prompt = args.slice(spaceIdx + 1).trim();
+  const lowerArgs = args.toLowerCase();
+  for (const candidate of [...projects].sort(
+    (a, b) => b.name.length - a.name.length
+  )) {
+    const lowerName = candidate.name.toLowerCase();
+    if (lowerName.includes(" ") && lowerArgs.startsWith(`${lowerName} `)) {
+      projectInput = args.slice(0, candidate.name.length);
+      prompt = args.slice(candidate.name.length + 1).trim();
+      break;
+    }
+  }
+  if (!prompt) {
+    await ctx.reply(
+      "Please provide both a project and a prompt.\n\nExample: /cloud 1 Fix the auth bug"
+    );
+    return;
+  }
+  const project = resolveCloudProject(projects, projectInput);
+  if (!project) {
+    await ctx.reply(
+      truncateHtml(
+        `Project "${escHtml(projectInput)}" not found.\n\n☁️ Cloud projects:\n${cloudProjectLines(projects)}`,
+        TELEGRAM_MAX_TEXT
+      ),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  await startCloudWorkspaceForProject(ctx, project, prompt);
+}
+
+async function startCloudWorkspaceForProject(
+  ctx: Context,
+  project: ConductorApiProject,
+  prompt: string
+): Promise<void> {
+  const promptPreview = previewOutgoingText(prompt, []);
+  await startTrackedWorkspace<CloudWorkspaceLaunchResult>(ctx, {
+    displayName: project.name,
+    recordName: `${project.name}-${Date.now()}`,
+    repoPath: cloudRepoSentinel(project.name),
+    prompt,
+    startingHtml: `Starting ☁️ cloud workspace in <b>${escHtml(project.name)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    failedHtml: (error) =>
+      `Failed to start ☁️ cloud workspace in <b>${escHtml(project.name)}</b>:\n${escHtml(error)}`,
+    successHtml: (result) =>
+      `🟢 ☁️ <b>${escHtml(result.workspaceName)}</b> running in <b>${escHtml(project.name)}</b> (${escHtml(result.model)})\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>\n\n${formatConductorDeepLink(result.deepLink)}`,
+    launch: () => launchCloudWorkspace({ projectId: project.id, prompt }),
+  });
+}
+
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleRename(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const newName = stripCommandPrefix(text, "rename");
+  if (!newName) {
+    await ctx.reply(
+      "Usage: /rename <new name> — run inside a workspace topic or as a reply to a workspace message."
+    );
+    return;
+  }
+  const target = getContextualTarget(ctx);
+  if (!target) {
+    await ctx.reply(
+      "Couldn't tell which workspace to rename. Use /rename inside a workspace topic or reply to one of its messages."
+    );
+    return;
+  }
+  const tracked = target.trackedWorkspace;
+  const wsInfo = getWorkspaceSessionInfo(
+    target.conductorName,
+    target.repoPath,
+    tracked ?? null
+  );
+  if (!wsInfo || !isRemoteConductorWorkspace(wsInfo)) {
+    await ctx.reply(
+      "Renaming is only available for ☁️ cloud workspaces — the Conductor API does not manage local workspaces."
+    );
+    return;
+  }
+  const client = await getCloudApiClientOrExplain(ctx);
+  if (!client) return;
+  try {
+    const renamed = await client.renameWorkspace(wsInfo.workspaceId, newName);
+    if (tracked) {
+      updateWorkspaceConductorName(tracked.id, renamed.name);
+      syncWorkspaceTopic(ctx.telegram, {
+        ...tracked,
+        conductorWorkspaceName: renamed.name,
+      }).catch((err) =>
+        console.error(`[forum] topic sync error after rename:`, err)
+      );
+    }
+    await ctx.reply(
+      `✏️ ☁️ Workspace renamed to <b>${escHtml(renamed.name)}</b>.`,
+      { parse_mode: "HTML" }
+    );
+  } catch (error) {
+    await ctx.reply(
+      `Could not rename ☁️ "${escHtml(wsInfo.displayName)}": ${escHtml(describeApiError(error))}`,
+      { parse_mode: "HTML" }
+    );
+  }
+}
+
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleRenameThread(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const newName = stripCommandPrefix(text, "renamethread");
+  if (!newName) {
+    await ctx.reply(
+      "Usage: /renamethread <new name> — run inside a workspace topic (or reply to a specific thread's message)."
+    );
+    return;
+  }
+  const target = getContextualTarget(ctx);
+  if (!target) {
+    await ctx.reply(
+      "Couldn't tell which thread to rename. Use /renamethread inside a workspace topic or reply to a thread's message."
+    );
+    return;
+  }
+  const wsInfo = getWorkspaceSessionInfo(
+    target.conductorName,
+    target.repoPath,
+    target.trackedWorkspace ?? null
+  );
+  if (!wsInfo || !isRemoteConductorWorkspace(wsInfo)) {
+    await ctx.reply(
+      "Thread renaming is only available for ☁️ cloud workspaces — the Conductor API does not manage local threads."
+    );
+    return;
+  }
+  const sessionId = target.sessionId ?? wsInfo.sessionId;
+  const client = await getCloudApiClientOrExplain(ctx);
+  if (!client) return;
+  try {
+    const renamed = await client.renameSession(sessionId, newName);
+    await ctx.reply(
+      `✏️ ☁️ Thread renamed to <b>${escHtml(renamed.name ?? newName)}</b>.`,
+      { parse_mode: "HTML" }
+    );
+  } catch (error) {
+    await ctx.reply(
+      `Could not rename the thread: ${escHtml(describeApiError(error))}`,
+      { parse_mode: "HTML" }
+    );
+  }
+}
+
+const FLEET_MAX_HOURS = 168;
+const FLEET_ROW_LIMIT = 200;
+const FLEET_MAX_WORKSPACES_SHOWN = 25;
+
+/**
+ * This is the only guard between user input and the interval literal inlined
+ * into the /v0/sql query, so it accepts nothing but a plain bounded integer
+ * (no signs, decimals, exponents, or trailing text).
+ *
+ * @internal exported for cloud command unit tests; not part of the public bot API.
+ */
+export function parseFleetHours(arg: string): number | null {
+  if (!arg) return 24;
+  if (!/^\d+$/.test(arg)) return null;
+  const parsed = Number(arg);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > FLEET_MAX_HOURS) {
+    return null;
+  }
+  return parsed;
+}
+
+/** @internal exported for cloud handler unit tests; not part of the public bot API. */
+export async function handleFleet(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const arg = stripCommandPrefix(text, "fleet");
+  const hours = parseFleetHours(arg);
+  if (hours === null) {
+    await ctx.reply(
+      `Usage: /fleet [hours] — hours must be an integer between 1 and ${FLEET_MAX_HOURS}.`
+    );
+    return;
+  }
+
+  const client = await getCloudApiClientOrExplain(ctx);
+  if (!client) return;
+
+  // hours is a validated integer, so inlining it into the interval is safe;
+  // the endpoint itself is restricted to read-only SQL over this view.
+  const query =
+    "SELECT workspace_id, workspace_name, session_title, transcript_updated_at " +
+    "FROM session_transcripts_view " +
+    `WHERE transcript_updated_at >= now() - interval '${hours} hours' ` +
+    `ORDER BY transcript_updated_at DESC LIMIT ${FLEET_ROW_LIMIT}`;
+  let result;
+  try {
+    result = await client.runSql(query);
+  } catch (error) {
+    await ctx.reply(
+      `Could not query cloud transcripts: ${escHtml(describeApiError(error))}`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  interface FleetEntry {
+    name: string;
+    threads: number;
+    titles: string[];
+    latest: string | null;
+  }
+  const byWorkspace = new Map<string, FleetEntry>();
+  for (const row of result.rows) {
+    const workspaceId = row.workspace_id == null ? "" : String(row.workspace_id);
+    if (!workspaceId) continue;
+    const entry = byWorkspace.get(workspaceId) ?? {
+      name:
+        row.workspace_name == null || row.workspace_name === ""
+          ? "unnamed"
+          : String(row.workspace_name),
+      threads: 0,
+      titles: [],
+      latest:
+        row.transcript_updated_at == null
+          ? null
+          : String(row.transcript_updated_at),
+    };
+    entry.threads += 1;
+    const title = row.session_title == null ? "" : String(row.session_title).trim();
+    if (title && entry.titles.length < 2 && !entry.titles.includes(title)) {
+      entry.titles.push(title);
+    }
+    byWorkspace.set(workspaceId, entry);
+  }
+
+  if (byWorkspace.size === 0) {
+    if (result.rowCount > 0) {
+      // Rows came back but none carried a workspace_id — the view's schema
+      // has drifted from what this report expects. Say so instead of
+      // presenting a false "no activity" all-clear.
+      await ctx.reply(
+        `⚠️ The transcript view returned ${result.rowCount} row(s) without the expected workspace_id column. Conductor's session_transcripts_view schema may have changed; /fleet needs an update.`
+      );
+      return;
+    }
+    await ctx.reply(
+      `☁️ No cloud session activity in the last ${hours}h.`
+    );
+    return;
+  }
+
+  const entries = [...byWorkspace.values()];
+  const shown = entries.slice(0, FLEET_MAX_WORKSPACES_SHOWN);
+  const lines = shown.map((entry) => {
+    const titles =
+      entry.titles.length > 0
+        ? `\n   <i>${escHtml(truncate(entry.titles.join(" · "), 120))}</i>`
+        : "";
+    return `• <b>${escHtml(entry.name)}</b> — ${entry.threads} thread(s), active ${formatRelativeTime(entry.latest)}${titles}`;
+  });
+  const overflow =
+    entries.length > shown.length
+      ? `\n…and ${entries.length - shown.length} more workspace(s).`
+      : "";
+  // The query's own LIMIT caps rows before the server's truncation flag can
+  // fire, so a full page means the window may be incomplete either way.
+  const truncatedNote =
+    result.truncated || result.rowCount >= FLEET_ROW_LIMIT
+      ? "\n\n⚠️ The report hit its row cap; older activity in this window may be missing."
+      : "";
+  await ctx.reply(
+    truncateHtml(
+      `☁️ <b>Cloud activity — last ${hours}h</b>\n${entries.length} workspace(s), ${result.rowCount} active thread(s)\n\n${lines.join("\n")}${overflow}${truncatedNote}`,
+      TELEGRAM_MAX_TEXT
+    ),
+    { parse_mode: "HTML" }
+  );
 }
 
 // ── /workspaces ─────────────────────────────────────────────
@@ -973,8 +1720,12 @@ async function handleWorkspaces(ctx: Context): Promise<void> {
   const lines = workspaces.map((ws) => {
     const icon = statusIcon(ws.status);
     const name = ws.conductorWorkspaceName ?? ws.name;
+    const sessionInfo = ws.conductorWorkspaceName
+      ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath, ws)
+      : null;
+    const cloud = sessionInfo && isRemoteConductorWorkspace(sessionInfo) ? " ☁️" : "";
     const pr = compactPrBadge(prRecords.get(ws.id));
-    return `${icon} <b>${escHtml(name)}</b> — ${ws.status} · <code>${escHtml(pr)}</code>\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
+    return `${icon} <b>${escHtml(name)}${cloud}</b> — ${ws.status} · <code>${escHtml(pr)}</code>\n   <i>${escHtml(truncate(ws.prompt, 60))}</i>`;
   });
 
   const stopRows = workspaces
@@ -1058,7 +1809,11 @@ async function handleStatus(ctx: Context): Promise<void> {
   const summary = active
     .map((ws) => {
       const name = ws.conductorWorkspaceName ?? ws.name;
-      return `${statusIcon(ws.status)} <b>${escHtml(name)}</b>: ${ws.status}`;
+      const sessionInfo = ws.conductorWorkspaceName
+        ? getWorkspaceSessionInfo(ws.conductorWorkspaceName, ws.repoPath, ws)
+        : null;
+      const cloud = sessionInfo && isRemoteConductorWorkspace(sessionInfo) ? " ☁️" : "";
+      return `${statusIcon(ws.status)} <b>${escHtml(name)}${cloud}</b>: ${ws.status}`;
     })
     .join("\n");
 
@@ -1123,11 +1878,33 @@ async function handleStop(ctx: Context): Promise<void> {
     await ctx.reply(`Workspace "${idOrName}" not found.`);
     return;
   }
-
   const wsName = workspace.conductorWorkspaceName ?? workspace.name;
+  const conductorInfo = workspace.conductorWorkspaceName
+    ? getWorkspaceSessionInfo(
+        workspace.conductorWorkspaceName,
+        workspace.repoPath,
+        workspace
+      )
+    : null;
   const killed = workspace.conductorWorkspaceName
-    ? stopAgent(workspace.conductorWorkspaceName, workspace.repoPath)
+    ? await stopConductorAgent(
+        workspace.conductorWorkspaceName,
+        workspace.repoPath,
+        workspace.conductorSessionId,
+        workspace
+      )
     : false;
+  if (
+    conductorInfo &&
+    isRemoteConductorWorkspace(conductorInfo) &&
+    !killed
+  ) {
+    await ctx.reply(
+      `Could not stop ☁️ <b>${escHtml(wsName)}</b> through the Conductor API.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
 
   updateWorkspaceStatus(workspace.id, "stopped");
   if (workspace.telegramThreadId) {
@@ -1403,6 +2180,9 @@ async function tryAnswerDecisionReplyWithFormatter(
 
 // ── Photo handler ────────────────────────────────────────────
 
+const IMAGE_REVIEW_FALLBACK_PROMPT =
+  "The user sent a screenshot/image; it is attached below as a file reference. Open the attached image with the Read tool, then respond to what it shows.";
+
 async function handlePhotoMessage(ctx: Context): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
   if (!chatId) return;
@@ -1432,12 +2212,14 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
     const message = caption
       ? applySkillHashtag(caption)
-      : "The user sent a screenshot/image. Please review it.";
-    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+      : IMAGE_REVIEW_FALLBACK_PROMPT;
+    await sendMessageToWorkspace(ctx, repliedTarget.workspace, message, [localPath], {
+      sessionId: repliedTarget.sessionId,
+    });
     return;
   }
 
@@ -1448,7 +2230,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
     if (threadWorkspace) {
       const message = caption
         ? applySkillHashtag(caption)
-        : "The user sent a screenshot/image. Please review it.";
+        : IMAGE_REVIEW_FALLBACK_PROMPT;
       await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
       return;
     }
@@ -1458,7 +2240,7 @@ async function handlePhotoMessage(ctx: Context): Promise<void> {
   if (repoTopic) {
     const message = caption
       ? applySkillHashtag(caption)
-      : "The user sent a screenshot/image. Please review it.";
+      : IMAGE_REVIEW_FALLBACK_PROMPT;
     await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
     return;
   }
@@ -1483,6 +2265,7 @@ type AttachmentKind = "document" | "audio" | "video" | "animation";
 interface TelegramFileSpec {
   fileId: string;
   ext: string;
+  mimeType?: string;
   label: string;
   fallbackPrompt: string;
 }
@@ -1513,6 +2296,7 @@ function describeAttachment(ctx: Context, kind: AttachmentKind): TelegramFileSpe
   return {
     fileId: meta.file_id,
     ext,
+    mimeType,
     label: `${prettyKind}${dur}${niceName}`,
     fallbackPrompt: `The user sent a ${kind}${dur}${niceName}. Please review the attached file.`,
   };
@@ -1520,6 +2304,32 @@ function describeAttachment(ctx: Context, kind: AttachmentKind): TelegramFileSpe
 
 function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+const TRANSCRIBABLE_AUDIO_EXTS = new Set([
+  ".mp3", ".m4a", ".wav", ".ogg", ".oga", ".opus", ".flac", ".aac",
+]);
+
+function isTranscribableAudio(kind: AttachmentKind, spec: TelegramFileSpec): boolean {
+  return kind === "audio" ||
+    TRANSCRIBABLE_AUDIO_EXTS.has(spec.ext.toLowerCase()) ||
+    spec.mimeType?.startsWith("audio/") === true;
+}
+
+async function buildAudioMessageOrAttachment(
+  localPath: string,
+  caption: string,
+  fallbackPrompt: string
+): Promise<{ message: string; attachments: string[] }> {
+  const transcript = await transcribeVoiceMessage(localPath);
+  if (transcript) {
+    const text = caption ? `${caption}\n\n${transcript}` : transcript;
+    return { message: applySkillHashtag(text), attachments: [] };
+  }
+  return {
+    message: caption ? applySkillHashtag(caption) : fallbackPrompt,
+    attachments: [localPath],
+  };
 }
 
 async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Promise<void> {
@@ -1540,6 +2350,7 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
   }
 
   const localPath = await downloadTelegramFile(ctx, spec.fileId, spec.ext);
+  const audioLike = isTranscribableAudio(kind, spec);
 
   // Decision-reply path: stage and forward as a markdown image/link ref so
   // Conductor renders the file inline and agents can echo the same syntax back.
@@ -1553,10 +2364,17 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
     return;
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
-    const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
-    await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
+    const routed = audioLike
+      ? await buildAudioMessageOrAttachment(localPath, caption, spec.fallbackPrompt)
+      : {
+          message: caption ? applySkillHashtag(caption) : spec.fallbackPrompt,
+          attachments: [localPath],
+        };
+    await sendMessageToWorkspace(ctx, repliedTarget.workspace, routed.message, routed.attachments, {
+      sessionId: repliedTarget.sessionId,
+    });
     return;
   }
 
@@ -1564,17 +2382,32 @@ async function handleAttachmentMessage(ctx: Context, kind: AttachmentKind): Prom
   if (threadId) {
     const threadWorkspace = getWorkspaceByThreadId(chatId, threadId);
     if (threadWorkspace) {
-      const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
-      await sendMessageToWorkspace(ctx, threadWorkspace, message, [localPath]);
+      const routed = audioLike
+        ? await buildAudioMessageOrAttachment(localPath, caption, spec.fallbackPrompt)
+        : {
+            message: caption ? applySkillHashtag(caption) : spec.fallbackPrompt,
+            attachments: [localPath],
+          };
+      await sendMessageToWorkspace(ctx, threadWorkspace, routed.message, routed.attachments);
       return;
     }
   }
 
   const repoTopic = getThreadRepoTopic(ctx, chatId);
   if (repoTopic) {
-    const message = caption ? applySkillHashtag(caption) : spec.fallbackPrompt;
-    await startWorkspaceFromRepoTopic(ctx, repoTopic, message, [localPath]);
+    const routed = audioLike
+      ? await buildAudioMessageOrAttachment(localPath, caption, spec.fallbackPrompt)
+      : {
+          message: caption ? applySkillHashtag(caption) : spec.fallbackPrompt,
+          attachments: [localPath],
+        };
+    await startWorkspaceFromRepoTopic(ctx, repoTopic, routed.message, routed.attachments);
     return;
+  }
+
+  if (audioLike) {
+    const routed = await tryAutoRouteVoice(ctx, chatId, localPath, caption);
+    if (routed) return;
   }
 
   if (caption) {
@@ -1910,17 +2743,21 @@ async function handleVoiceMessage(ctx: Context): Promise<void> {
     return;
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
     const transcript = await transcribeVoiceMessage(localPath);
     if (transcript) {
       const text = caption ? `${caption}\n\n${transcript}` : transcript;
-      await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(text));
+      await sendMessageToWorkspace(ctx, repliedTarget.workspace, applySkillHashtag(text), [], {
+        sessionId: repliedTarget.sessionId,
+      });
     } else {
       const message = caption
         ? `${caption}\n\nThe user sent a voice message (${duration}s). Please review the attached recording.`
         : `The user sent a voice message (${duration}s). Please review the attached recording.`;
-      await sendMessageToWorkspace(ctx, repliedWorkspace, message, [localPath]);
+      await sendMessageToWorkspace(ctx, repliedTarget.workspace, message, [localPath], {
+        sessionId: repliedTarget.sessionId,
+      });
     }
     return;
   }
@@ -1985,8 +2822,29 @@ async function handleTextMessage(ctx: Context): Promise<void> {
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;
 
-  // Check if this is a reply to a repo-selection confirmation message
+  // Check if this is a reply to a "new thread" prompt
   const replyToMsgId = (ctx.message as any)?.reply_to_message?.message_id;
+  if (replyToMsgId) {
+    const replyMessageKey = getRepoSelectionMessageKey(chatId, replyToMsgId);
+    const threadStart = messageToThreadStart.get(replyMessageKey);
+    if (threadStart) {
+      messageToThreadStart.delete(replyMessageKey);
+      const target = resolveWorkspaceTarget(threadStart.conductorName, {
+        chatId,
+        repoPath: threadStart.repoPath,
+      });
+      if (!target || target === "ambiguous") {
+        await ctx.reply(`Workspace "${escHtml(threadStart.conductorName)}" is no longer available.`, {
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      await startThreadForTarget(ctx, target, text);
+      return;
+    }
+  }
+
+  // Check if this is a reply to a repo-selection confirmation message
   if (replyToMsgId) {
     const replyMessageKey = getRepoSelectionMessageKey(chatId, replyToMsgId);
     const repoName = messageToRepoSelection.get(replyMessageKey);
@@ -1999,9 +2857,11 @@ async function handleTextMessage(ctx: Context): Promise<void> {
     }
   }
 
-  const repliedWorkspace = getReplyTargetWorkspace(ctx, chatId);
-  if (repliedWorkspace) {
-    await sendMessageToWorkspace(ctx, repliedWorkspace, applySkillHashtag(text));
+  const repliedTarget = getReplyTargetWorkspace(ctx, chatId);
+  if (repliedTarget) {
+    await sendMessageToWorkspace(ctx, repliedTarget.workspace, applySkillHashtag(text), [], {
+      sessionId: repliedTarget.sessionId,
+    });
     return;
   }
 
@@ -2103,6 +2963,205 @@ async function handleSend(ctx: Context): Promise<void> {
   await sendMessageToWorkspace(ctx, workspace, message);
 }
 
+// ── /threads [workspace] [new <prompt>] ─────────────────────
+
+async function handleThreads(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const args = text.replace(/^\/threads\s*/, "").trim();
+  const chatId = ctx.chat?.id?.toString();
+  const contextualTarget = getContextualTarget(ctx);
+
+  let target: WorkspaceTarget | null = null;
+  let tail = "";
+
+  if (!args) {
+    target = contextualTarget;
+  } else {
+    const [head, rest] = splitHead(args);
+    if (head.toLowerCase() === "new" && contextualTarget) {
+      target = contextualTarget;
+      tail = args;
+    } else {
+      const explicitTarget = resolveWorkspaceTarget(head, { chatId });
+      if (explicitTarget === "ambiguous") {
+        await ctx.reply(`Workspace "${escHtml(head)}" is ambiguous in this chat. Use the workspace id instead.`, {
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      if (explicitTarget) {
+        target = explicitTarget;
+        tail = rest;
+      } else if (contextualTarget) {
+        target = contextualTarget;
+        tail = args;
+      }
+    }
+  }
+
+  if (!target) {
+    await ctx.reply(
+      "Usage: /threads <workspace-name>\n\nInside a workspace topic or reply, use /threads. To start a thread: /threads <workspace-name> new <prompt>."
+    );
+    return;
+  }
+
+  const [maybeNew, newPrompt] = splitHead(tail);
+  if (maybeNew.toLowerCase() === "new") {
+    if (!newPrompt) {
+      await ctx.reply("Usage: /threads <workspace-name> new <prompt>");
+      return;
+    }
+    await startThreadForTarget(ctx, target, newPrompt);
+    return;
+  }
+
+  await showThreadList(ctx, target);
+}
+
+function formatSessionTitle(session: ConductorSessionInfo): string {
+  const title = session.title?.trim();
+  if (title) return title;
+  if (session.isActive) return "Active thread";
+  return `Thread ${session.sessionId.slice(0, 8)}`;
+}
+
+function rememberThreadAction(input: Omit<
+  PendingThreadAction,
+  "createdAt"
+>): string {
+  pruneThreadActions();
+  const token = randomUUID().replace(/-/g, "").slice(0, 12);
+  pendingThreadActions.set(token, { ...input, createdAt: Date.now() });
+  return token;
+}
+
+function pruneThreadActions(): void {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [token, action] of pendingThreadActions) {
+    if (action.createdAt < cutoff) pendingThreadActions.delete(token);
+  }
+}
+
+async function showThreadList(ctx: Context, target: WorkspaceTarget): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  const info = getWorkspaceSessionInfo(
+    target.conductorName,
+    target.repoPath,
+    target.trackedWorkspace
+  );
+  if (!info) {
+    await ctx.reply(`Workspace "${escHtml(target.conductorName)}" was not found in Conductor.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const sessions = await getConductorWorkspaceSessions(
+    info.workspaceId,
+    target.trackedWorkspace?.conductorSessionId ?? info.sessionId,
+    target.trackedWorkspace?.conductorBackendKind ??
+      (isRemoteConductorWorkspace(info) ? "cloud-api" : "local")
+  );
+  const remoteBadge = isRemoteConductorWorkspace(info) ? " ☁️" : "";
+  const lines = sessions.length > 0
+    ? sessions.map((session, index) => {
+        const marker = session.isActive ? "▶" : " ";
+        const title = formatSessionTitle(session);
+        const agent = session.rawAgentType ?? session.agentType;
+        return `${marker} ${index + 1}. <b>${escHtml(title)}</b> · <code>${escHtml(session.status ?? "unknown")}</code> · <code>${escHtml(agent)}</code>${session.model ? ` · <code>${escHtml(session.model)}</code>` : ""}`;
+      })
+    : ["No visible threads found."];
+
+  const rows = sessions
+    .filter((session) => !session.isActive)
+    .slice(0, 8)
+    .map((session) => {
+      const token = rememberThreadAction({
+        chatId: chatId ?? "",
+        action: "select",
+        conductorName: target.conductorName,
+        repoPath: target.repoPath,
+        workspaceId: info.workspaceId,
+        sessionId: session.sessionId,
+        backendKind: session.backendKind,
+      });
+      return [btn(`Use ${formatSessionTitle(session)}`, `thread:set:${token}`)];
+    });
+
+  if (!isRemoteConductorWorkspace(info) || canUseConductorCloudApi()) {
+    const token = rememberThreadAction({
+      chatId: chatId ?? "",
+      action: "new",
+      conductorName: target.conductorName,
+      repoPath: target.repoPath,
+      workspaceId: info.workspaceId,
+      backendKind: isRemoteConductorWorkspace(info) ? "cloud-api" : "local",
+    });
+    rows.push([btn("New Thread", `thread:new:${token}`)]);
+  }
+
+  await ctx.reply(
+    `<b>${escHtml(info.displayName)}${remoteBadge} threads</b>\n\n${lines.join("\n")}`,
+    {
+      parse_mode: "HTML",
+      ...(rows.length > 0 ? styledKeyboard(rows) : {}),
+    }
+  );
+}
+
+async function startThreadForTarget(
+  ctx: Context,
+  target: WorkspaceTarget,
+  prompt: string
+): Promise<void> {
+  const trackedWorkspace = ensureTrackedWorkspace(ctx, target, prompt);
+  if (!trackedWorkspace) {
+    await ctx.reply(`Could not resolve repo details for <b>${escHtml(target.conductorName)}</b>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  const threadOpts = trackedWorkspace.telegramThreadId
+    ? { message_thread_id: trackedWorkspace.telegramThreadId }
+    : {};
+  const progress = await ctx.reply(
+    `Starting a new thread for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(prompt, 200))}</i>`,
+    { parse_mode: "HTML", ...threadOpts }
+  );
+  updateWorkspaceTelegramMessage(trackedWorkspace.id, progress.message_id.toString());
+
+  const result = await launchWorkspaceSession(target.conductorName, prompt, {
+    repoPath: target.repoPath,
+    launchMode: "prompt",
+    binding: trackedWorkspace,
+  });
+
+  if ("error" in result) {
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `Failed to start a new thread for <b>${escHtml(target.conductorName)}</b>:\n${escHtml(result.error)}`,
+      { parse_mode: "HTML", ...threadOpts }
+    );
+    return;
+  }
+
+  updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
+  persistConductorLaunchBinding(trackedWorkspace.id, result);
+  updateWorkspaceStatus(trackedWorkspace.id, "running");
+  await ctx.telegram.editMessageText(
+    ctx.chat!.id,
+    progress.message_id,
+    undefined,
+    `🟢 New thread running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
+    { parse_mode: "HTML", ...threadOpts }
+  );
+
+  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
+}
+
 // ── /review <workspace> [instructions] ──────────────────────
 
 async function handleReview(ctx: Context): Promise<void> {
@@ -2149,7 +3208,6 @@ async function handleReview(ctx: Context): Promise<void> {
     });
     return;
   }
-
   const progress = await ctx.reply(
     `Starting review for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(reviewPrompt, 200))}</i>`,
     { parse_mode: "HTML" }
@@ -2161,6 +3219,7 @@ async function handleReview(ctx: Context): Promise<void> {
     title: "Review Changes",
     reviewBaseBranch: target.targetBranch,
     repoPath: target.repoPath,
+    binding: trackedWorkspace,
   });
 
   if ("error" in result) {
@@ -2176,8 +3235,7 @@ async function handleReview(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
-  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  persistConductorLaunchBinding(trackedWorkspace.id, result);
   updateWorkspaceStatus(trackedWorkspace.id, "running");
 
   await ctx.telegram.editMessageText(
@@ -2187,6 +3245,8 @@ async function handleReview(ctx: Context): Promise<void> {
     `🟢 Review running for <b>${escHtml(target.conductorName)}</b> via <b>${escHtml(result.agentType)}</b> (<code>${escHtml(result.model)}</code>)`,
     { parse_mode: "HTML" }
   );
+
+  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
 }
 
 // ── /skills <workspace> ─────────────────────────────────────
@@ -2427,7 +3487,13 @@ Commands:
 /setup — Check setup and apply this chat
 /run &lt;repo&gt; &lt;prompt&gt; — Start a new workspace
 /run &lt;number&gt; &lt;prompt&gt; — Start using repo number
+/cloud &lt;project&gt; &lt;prompt&gt; — Start a ☁️ cloud workspace (no Mac needed)
+/projects [name] — List ☁️ cloud projects, or one project's workspaces
+/fleet [hours] — ☁️ org-wide cloud activity report
+/rename &lt;name&gt; — Rename the current ☁️ cloud workspace
+/renamethread &lt;name&gt; — Rename the current ☁️ cloud thread
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
+/threads [workspace] — List, switch, or start Conductor threads
 /review &lt;workspace&gt; [instructions] — Start a review session
 /skills [workspace] — List built-in and workspace skills
 /skill &lt;workspace&gt; &lt;skill&gt; [instructions] — Ask the agent to invoke a skill
@@ -2445,6 +3511,7 @@ Commands:
 <b>Invoking skills</b>
 • Tag <code>#skill</code> anywhere in a message: <code>#ship</code>, <code>#qa find auth bugs</code>, <code>#gstack</code>.
 • Inside a workspace topic or reply, the hashtag targets that workspace automatically.
+• Replying to a forwarded thread message targets that exact Conductor thread.
 • Slash shortcuts (like <code>/ship</code>) accept an optional workspace name and instructions.
 • Use <code>/skills</code> any time to see the full list.
 
@@ -2542,6 +3609,85 @@ async function handleRouteConfirmCallback(ctx: Context): Promise<void> {
   }
 }
 
+async function handleThreadCallback(ctx: Context): Promise<void> {
+  const match = (ctx as any).match;
+  const action = match?.[1] as "set" | "new" | undefined;
+  const token = match?.[2];
+  const chatId = ctx.chat?.id?.toString();
+  if (!action || !token || !chatId) return;
+
+  const pending = pendingThreadActions.get(token);
+  if (!pending || pending.chatId !== chatId || pending.action !== (action === "set" ? "select" : "new")) {
+    await ctx.answerCbQuery("This thread action expired");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    return;
+  }
+
+  pendingThreadActions.delete(token);
+
+  if (action === "set") {
+    if (!pending.sessionId) return;
+    const ok = await setConductorActiveSession(
+      pending.workspaceId,
+      pending.sessionId,
+      pending.backendKind
+    );
+    if (!ok) {
+      await ctx.answerCbQuery("Thread no longer exists");
+      return;
+    }
+
+    const tracked = getWorkspaceByName(pending.conductorName, {
+      chatId,
+      repoPath: pending.repoPath ?? undefined,
+    });
+    if (tracked) {
+      const cursor = getThreadCursor(tracked.id, pending.sessionId);
+      const latest =
+        cursor ??
+        (await getMaxSessionMessageCursor(
+          pending.sessionId,
+          pending.backendKind
+        ));
+      const rowid =
+        "lastForwardedRowid" in latest
+          ? latest.lastForwardedRowid
+          : latest.rowid;
+      if (!cursor) {
+        updateThreadCursor(
+          tracked.id,
+          pending.sessionId,
+          rowid,
+          null,
+          "messageId" in latest ? latest.messageId : null,
+          pending.backendKind
+        );
+      }
+      updateWorkspaceConductorSession(tracked.id, pending.sessionId);
+      updateWorkspaceForwardCursor(tracked.id, rowid);
+    }
+
+    await ctx.answerCbQuery("Default thread updated");
+    await ctx.reply(`Default thread updated for <b>${escHtml(pending.conductorName)}</b>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const prompt = await ctx.reply(
+    `Reply to this message with the first prompt for a new thread in <b>${escHtml(pending.conductorName)}</b>.`,
+    { parse_mode: "HTML" }
+  );
+  messageToThreadStart.set(
+    getRepoSelectionMessageKey(chatId, prompt.message_id),
+    {
+      conductorName: pending.conductorName,
+      repoPath: pending.repoPath,
+    }
+  );
+  await ctx.answerCbQuery("Reply with the first prompt");
+}
+
 async function handleStopCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
   const workspaceId = match?.[1];
@@ -2549,7 +3695,21 @@ async function handleStopCallback(ctx: Context): Promise<void> {
 
   const workspace = getWorkspace(workspaceId);
   if (workspace?.conductorWorkspaceName) {
-    stopAgent(workspace.conductorWorkspaceName, workspace.repoPath);
+    const info = getWorkspaceSessionInfo(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace
+    );
+    const stopped = await stopConductorAgent(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace.conductorSessionId,
+      workspace
+    );
+    if (info && isRemoteConductorWorkspace(info) && !stopped) {
+      await ctx.answerCbQuery("Conductor API could not stop this cloud session");
+      return;
+    }
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
@@ -2587,14 +3747,31 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
-
-  archiveWorkspace(workspaceId);
   if (workspace.conductorWorkspaceName) {
-    archiveConductorWorkspace(workspace.conductorWorkspaceName, workspace.repoPath);
+    const info = getWorkspaceSessionInfo(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace
+    );
+    const archived = await archiveConductorWorkspace(
+      workspace.conductorWorkspaceName,
+      workspace.repoPath,
+      workspace
+    );
+    if (info && isRemoteConductorWorkspace(info) && !archived) {
+      await ctx.answerCbQuery("Conductor API could not archive this cloud workspace");
+      return;
+    }
   }
+  archiveWorkspace(workspaceId);
 
   if (workspace.telegramThreadId) {
-    await deleteWorkspaceTopic(
+    try {
+      await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "archived" });
+    } catch (err) {
+      console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err);
+    }
+    await closeWorkspaceTopic(
       ctx.telegram,
       workspace.telegramChatId,
       workspace.telegramThreadId
@@ -2658,7 +3835,6 @@ async function handlePrCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
-
   if (action === "refresh") {
     await ctx.answerCbQuery("Refreshing PR status...");
     const { record } = await refreshWorkspacePr(workspace);
@@ -2678,7 +3854,7 @@ async function handlePrCallback(ctx: Context): Promise<void> {
       workspace.conductorWorkspaceName,
       prompt,
       [],
-      { repoPath: workspace.repoPath }
+      { repoPath: workspace.repoPath, binding: workspace }
     );
     if ("error" in result) {
       await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
@@ -2696,8 +3872,74 @@ async function handlePrCallback(ctx: Context): Promise<void> {
     await ctx.reply("PR is not eligible to merge yet. Refresh after checks pass.");
     return;
   }
+  if (!record.prNumber || !record.headSha) {
+    await ctx.reply("PR identity is incomplete. Refresh and try again.");
+    return;
+  }
+  const intent = createMergeIntent({
+    workspaceId: workspace.id,
+    prNumber: record.prNumber,
+    headSha: record.headSha,
+    requestedBy: ctx.from!.id.toString(),
+  });
+  await ctx.reply(
+    [
+      "<b>Confirm merge</b>",
+      `PR: <code>#${record.prNumber}</code>`,
+      `Exact reviewed head: <code>${escHtml(record.headSha.slice(0, 12))}</code>`,
+      "This confirmation expires in 10 minutes and becomes invalid if the PR head changes.",
+    ].join("\n"),
+    {
+      parse_mode: "HTML",
+      ...styledKeyboard([
+        [btn("Confirm exact SHA merge", `pr:mergeconfirm:${intent.intentId}`)],
+      ]),
+    }
+  );
+}
 
-  const merged = await mergeWorkspacePr(workspace, record);
+async function handlePrMergeConfirmCallback(ctx: Context): Promise<void> {
+  const intentId = (ctx as any).match?.[1] as string | undefined;
+  if (!intentId || !ctx.from) return;
+
+  const intent = getMergeIntent(intentId);
+  if (!intent || intent.requestedBy !== ctx.from.id.toString()) {
+    await ctx.answerCbQuery("Merge confirmation is invalid");
+    return;
+  }
+  if (intent.consumedAt || Date.parse(intent.expiresAt) <= Date.now()) {
+    await ctx.answerCbQuery("Merge confirmation expired");
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    return;
+  }
+
+  const workspace = getWorkspace(intent.workspaceId);
+  if (!workspace) {
+    await ctx.answerCbQuery("Workspace not found");
+    return;
+  }
+  await ctx.answerCbQuery("Re-checking exact PR head...");
+  const { record } = await refreshWorkspacePr(workspace);
+  if (
+    !canMergePr(record) ||
+    record.prNumber !== intent.prNumber ||
+    record.headSha?.toLowerCase() !== intent.headSha.toLowerCase()
+  ) {
+    await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+    await ctx.reply(
+      "Merge stopped: the PR, review, checks, mergeability, or exact head SHA changed. Request a fresh merge confirmation."
+    );
+    await editOrSendPrCard(ctx, workspace, record);
+    return;
+  }
+  const consumed = consumeMergeIntent(intentId, ctx.from.id.toString());
+  if (!consumed) {
+    await ctx.reply("Merge confirmation was already used or expired.");
+    return;
+  }
+  await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+
+  const merged = await mergeWorkspacePr(workspace, record, intent.headSha);
   if (!merged.ok) {
     await ctx.reply(`Merge failed: ${escHtml(merged.message)}`, { parse_mode: "HTML" });
     const refreshed = await refreshWorkspacePr(workspace);
@@ -2705,9 +3947,13 @@ async function handlePrCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  await ctx.reply(`Merged PR: ${escHtml(merged.message)}`, { parse_mode: "HTML" });
   const refreshed = await refreshWorkspacePr(workspace);
-  await editOrSendPrCard(ctx, workspace, refreshed.record);
+  await ctx.reply(`Merged PR: ${escHtml(merged.message)}`, { parse_mode: "HTML" }).catch((error) =>
+    console.error(`[pr:${record.prNumber}] merge notice failed:`, error)
+  );
+  await editOrSendPrCard(ctx, workspace, refreshed.record).catch((error) =>
+    console.error(`[pr:${record.prNumber}] merged PR card failed:`, error)
+  );
 }
 
 async function editOrSendPrCard(
@@ -2762,7 +4008,6 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
-
   const conductorName = workspace.conductorWorkspaceName;
   const actionLabel = action === "review" ? "Review" : "PR generation";
 
@@ -2791,6 +4036,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     repoPath: workspace.repoPath,
     repoName: workspace.repoPath ? path.basename(workspace.repoPath) : null,
     targetBranch: null,
+    sessionId: null,
   }, prompt);
 
   if (!trackedWorkspace) {
@@ -2814,6 +4060,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     launchMode: action === "review" ? "review" : "prompt",
     title: action === "review" ? "Review Changes" : "Generate PR",
     repoPath: workspace.repoPath,
+    binding: trackedWorkspace,
   });
 
   if ("error" in result) {
@@ -2829,8 +4076,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceConductorName(trackedWorkspace.id, conductorName);
-  updateWorkspaceConductorSession(trackedWorkspace.id, result.sessionId);
-  updateWorkspaceForwardCursor(trackedWorkspace.id, result.initialCursorRowid);
+  persistConductorLaunchBinding(trackedWorkspace.id, result);
   updateWorkspaceStatus(trackedWorkspace.id, "running");
 
   await ctx.telegram.editMessageText(
@@ -2841,6 +4087,8 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     { parse_mode: "HTML" }
   );
 
+  observeAgentCompletion(ctx, trackedWorkspace, conductorName, result.done);
+
   if (action === "pr") {
     await sendPrStatusCard(ctx, { ...workspace, status: "running" });
   }
@@ -2849,15 +4097,15 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
 function getReplyTargetWorkspace(
   ctx: Context,
   chatId: string
-): Workspace | undefined {
+): { workspace: Workspace; sessionId: string | null } | undefined {
   const reply = (ctx.message as any)?.reply_to_message;
   const replyToMessageId = reply?.message_id;
   if (!replyToMessageId) return undefined;
 
-  const linked = getWorkspaceByTelegramMessage(chatId, String(replyToMessageId));
+  const linked = getWorkspaceMessageTarget(chatId, String(replyToMessageId));
   if (linked) {
     console.log(
-      `[reply-route] linked message ${replyToMessageId} -> ${linked.conductorWorkspaceName ?? linked.name}`
+      `[reply-route] linked message ${replyToMessageId} -> ${linked.workspace.conductorWorkspaceName ?? linked.workspace.name}${linked.sessionId ? ` (${linked.sessionId})` : ""}`
     );
     return linked;
   }
@@ -2870,7 +4118,7 @@ function getReplyTargetWorkspace(
   } else {
     console.log(`[reply-route] no match for replied message ${replyToMessageId}`);
   }
-  return inferred;
+  return inferred ? { workspace: inferred, sessionId: null } : undefined;
 }
 
 function inferWorkspaceFromReply(reply: any, chatId: string): Workspace | undefined {
@@ -2895,7 +4143,8 @@ async function sendMessageToWorkspace(
   ctx: Context,
   workspace: Workspace,
   message: string,
-  attachmentSourcePaths: string[] = []
+  attachmentSourcePaths: string[] = [],
+  options: { sessionId?: string | null } = {}
 ): Promise<void> {
   const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
   const messagePreview = previewOutgoingText(message, attachmentSourcePaths);
@@ -2918,6 +4167,8 @@ async function sendMessageToWorkspace(
 
   const result = await sendToSession(conductorName, message, attachmentSourcePaths, {
     repoPath: workspace.repoPath,
+    sessionId: options.sessionId ?? null,
+    binding: workspace,
   });
 
   if ("error" in result) {
@@ -2937,6 +4188,53 @@ async function sendMessageToWorkspace(
     `📨 Message sent to <b>${escHtml(conductorName)}</b>:\n<i>${escHtml(truncate(messagePreview, 200))}</i>`,
     { parse_mode: "HTML" }
   );
+
+  if (result.warning) {
+    await ctx.reply(result.warning);
+  }
+
+  observeAgentCompletion(ctx, workspace, conductorName, result.done);
+}
+
+/**
+ * Watch a spawned agent run and surface hard failures in Telegram. Without
+ * this, a run that dies before producing output looks like a clean
+ * "finished" with nothing to show.
+ */
+function observeAgentCompletion(
+  ctx: Context,
+  workspace: Workspace,
+  conductorName: string,
+  done: Promise<AgentResult>
+): void {
+  done
+    .then(async (agentResult) => {
+      if (!agentResult.isError) return;
+
+      updateWorkspaceStatus(workspace.id, "failed");
+      if (workspace.telegramThreadId) {
+        syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "failed" }).catch((err) =>
+          console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+        );
+      }
+
+      const exitNote =
+        typeof agentResult.exitCode === "number" ? ` (exit ${agentResult.exitCode})` : "";
+      let text = `🔴 <b>${escHtml(conductorName)}</b> agent run failed${exitNote}.`;
+      const detail = agentResult.stderrTail?.trim();
+      if (detail) {
+        text += `\n<pre>${escHtml(truncate(detail, 600))}</pre>`;
+      }
+      if (workspace.telegramThreadId) {
+        await ctx.telegram.sendMessage(workspace.telegramChatId, text, {
+          parse_mode: "HTML",
+          message_thread_id: workspace.telegramThreadId,
+        });
+      } else {
+        await ctx.reply(text, { parse_mode: "HTML" });
+      }
+    })
+    .catch((err) => console.error("[send] agent completion watch error:", err));
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -2964,12 +4262,13 @@ function stageDecisionAttachment(decision: Decision, sourcePath: string): string
     return sourcePath;
   }
 
-  const repoName = path.basename(workspace.repoPath);
-  const workspaceDir = path.join(
-    CONDUCTOR_WORKSPACES_DIR,
-    repoName,
-    workspace.conductorWorkspaceName
+  const workspaceDir = getWorkspaceDir(
+    workspace.conductorWorkspaceName,
+    workspace.repoPath
   );
+  if (!workspaceDir) {
+    return sourcePath;
+  }
 
   try {
     const [stagedPath] = stageAttachmentPaths(workspaceDir, [sourcePath]);

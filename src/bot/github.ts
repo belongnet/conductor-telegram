@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
 import type { PrChecksStatus, PrRecord, PrState, Workspace } from "../types/index.js";
 import { upsertPrRecord } from "../store/queries.js";
+import { getWorkspaceBranchName } from "./launcher.js";
 
 const COMMAND_TIMEOUT_MS = 30_000;
+const GIT_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 
 interface CommandResult {
   code: number;
@@ -17,6 +19,7 @@ interface GithubPrJson {
   state?: string;
   isDraft?: boolean;
   headRefName?: string;
+  headRefOid?: string;
   baseRefName?: string;
   reviewDecision?: string | null;
   mergeStateStatus?: string | null;
@@ -31,15 +34,56 @@ export interface PrRefreshResult {
 
 export function workspaceBranch(workspace: Workspace): string | null {
   if (!workspace.conductorWorkspaceName) return null;
-  return `belongcond/${workspace.conductorWorkspaceName}`;
+  return (
+    getWorkspaceBranchName(workspace.conductorWorkspaceName, workspace.repoPath) ??
+    `belongcond/${workspace.conductorWorkspaceName}`
+  );
 }
 
 export function canMergePr(record: PrRecord): boolean {
   if (record.state !== "open") return false;
   if (record.isDraft) return false;
+  if (!record.prNumber || !Number.isInteger(record.prNumber)) return false;
+  if (!record.headSha || !GIT_OID_RE.test(record.headSha)) return false;
+  if (record.reviewDecision?.toUpperCase() !== "APPROVED") return false;
   if (record.checksStatus !== "passing") return false;
+  if (record.mergeable?.toUpperCase() !== "MERGEABLE") return false;
   const mergeState = record.mergeStateStatus?.toUpperCase() ?? "";
   return mergeState === "CLEAN" || mergeState === "HAS_HOOKS";
+}
+
+export function matchesExpectedPrHead(
+  record: Pick<PrRecord, "headSha">,
+  expectedHeadSha: string
+): boolean {
+  return (
+    GIT_OID_RE.test(expectedHeadSha) &&
+    record.headSha?.toLowerCase() === expectedHeadSha.toLowerCase()
+  );
+}
+
+export function buildExactHeadMergeArgs(input: {
+  prNumber: number;
+  repoSlug: string;
+  expectedHeadSha: string;
+}): string[] {
+  if (!Number.isInteger(input.prNumber) || input.prNumber <= 0) {
+    throw new Error("Merge requires a positive PR number");
+  }
+  if (!GIT_OID_RE.test(input.expectedHeadSha)) {
+    throw new Error("Merge requires a full Git object ID");
+  }
+  return [
+    "pr",
+    "merge",
+    String(input.prNumber),
+    "--repo",
+    input.repoSlug,
+    "--squash",
+    "--delete-branch",
+    "--match-head-commit",
+    input.expectedHeadSha.toLowerCase(),
+  ];
 }
 
 export async function refreshWorkspacePr(
@@ -109,6 +153,7 @@ export async function refreshWorkspacePr(
       "state",
       "isDraft",
       "headRefName",
+      "headRefOid",
       "baseRefName",
       "reviewDecision",
       "mergeStateStatus",
@@ -175,6 +220,7 @@ export async function refreshWorkspacePr(
       state: normalizePrState(pr.state),
       isDraft: Boolean(pr.isDraft),
       headRef: pr.headRefName ?? branch,
+      headSha: pr.headRefOid ?? null,
       baseRef: pr.baseRefName ?? null,
       reviewDecision: pr.reviewDecision ?? null,
       mergeStateStatus: pr.mergeStateStatus ?? null,
@@ -190,7 +236,8 @@ export async function refreshWorkspacePr(
 
 export async function mergeWorkspacePr(
   workspace: Workspace,
-  record: PrRecord
+  record: PrRecord,
+  expectedHeadSha: string = record.headSha ?? ""
 ): Promise<{ ok: true; message: string } | { ok: false; message: string }> {
   const repoSlug = await resolveRepoSlug(workspace.repoPath);
   if (!repoSlug) {
@@ -202,17 +249,16 @@ export async function mergeWorkspacePr(
   if (!canMergePr(record)) {
     return { ok: false, message: "PR is not currently eligible to merge." };
   }
+  if (!matchesExpectedPrHead(record, expectedHeadSha)) {
+    return { ok: false, message: "PR head changed; request a new merge confirmation." };
+  }
 
   const result = await runGh(
-    [
-      "pr",
-      "merge",
-      String(record.prNumber),
-      "--repo",
+    buildExactHeadMergeArgs({
+      prNumber: record.prNumber,
       repoSlug,
-      "--squash",
-      "--delete-branch",
-    ],
+      expectedHeadSha,
+    }),
     { cwd: workspace.repoPath, timeoutMs: 120_000 }
   );
   if (result.code !== 0) {

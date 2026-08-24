@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
+import Database from "better-sqlite3";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -16,6 +17,9 @@ const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ?? `${process.env.HOME}/conductor/repos`;
 const CONDUCTOR_WORKSPACES_DIR =
   process.env.CONDUCTOR_WORKSPACES_DIR ?? `${process.env.HOME}/conductor/workspaces`;
+const CONDUCTOR_DB_PATH =
+  process.env.CONDUCTOR_DB_PATH ??
+  `${process.env.HOME}/Library/Application Support/com.conductor.app/conductor.db`;
 const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -47,16 +51,54 @@ function getWorkspaceId(): string | null {
 }
 
 function deriveRepoPath(cwd: string): string | null {
+  const rootPath = process.env.CONDUCTOR_ROOT_PATH?.trim();
+  if (rootPath) {
+    return rootPath;
+  }
+
   const relative = path.relative(CONDUCTOR_WORKSPACES_DIR, cwd);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     return null;
   }
 
-  const [repoName] = relative.split(path.sep);
+  const [repoName, workspaceName] = relative.split(path.sep);
   if (!repoName) {
     return null;
   }
-  return path.join(CONDUCTOR_REPOS_DIR, repoName);
+
+  const conductorRepoPath = lookupRepoPathFromConductorDb(repoName, workspaceName);
+  return conductorRepoPath ?? path.join(CONDUCTOR_REPOS_DIR, repoName);
+}
+
+function lookupRepoPathFromConductorDb(
+  repoName: string,
+  workspaceName?: string
+): string | null {
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const row = workspaceName
+      ? db.prepare(
+          `SELECT r.root_path
+           FROM repos r
+           JOIN workspaces w ON w.repository_id = r.id
+           WHERE r.name = ?
+             AND w.directory_name = ?
+           ORDER BY datetime(w.updated_at) DESC, w.updated_at DESC
+           LIMIT 1`
+        ).get(repoName, workspaceName)
+      : db.prepare(
+          `SELECT root_path
+           FROM repos
+           WHERE name = ?
+           LIMIT 1`
+        ).get(repoName);
+    db.close();
+
+    const rootPath = (row as { root_path?: unknown } | undefined)?.root_path;
+    return typeof rootPath === "string" && rootPath.trim() ? rootPath : null;
+  } catch {
+    return null;
+  }
 }
 
 const server = new McpServer({

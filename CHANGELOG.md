@@ -4,9 +4,148 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-19
+
+### Fixed
+- Repo topic "ready" messages are pinned automatically (without notification), so each forum topic keeps its routing entry point visible; a failed pin is logged and never blocks topic creation.
+
+## [0.6.2] - 2026-08-19
+
+### Fixed
+- `service install` no longer aborts with launchd's "5: Input/output error" when reinstalling over a running agent: launchd removes a booted-out job asynchronously, so the installer now waits for the teardown to finish and retries the bootstrap with backoff. This was hit by the very first live auto-deploy — the install step booted the running bot out, failed to re-register it, and left the gateway down until manual recovery.
+
+## [0.6.1] - 2026-08-19
+
+The Mac gateway now updates itself. The GitHub Actions deploy added in 0.4.7 required a self-hosted runner that was never provisioned, so pushes to `main` queued for 24 hours and died — the gateway silently ran stale code. A local launchd updater replaces it: within a minute of any push to `main`, an enrolled machine fetches, tests, builds, and redeploys itself, and it keeps doing so across reboots with no GitHub credentials, webhooks, or runners involved.
+
+### Added
+- `conductor-telegram service install --with-updater` enrolls a machine in auto-deploys: a third LaunchAgent (`net.belong.conductor-telegram.updater`) polls `origin/main` every 60 seconds into a canonical checkout at `~/.conductor-telegram/gateway/repo`, cloning it on first run so a fresh machine self-bootstraps. Enrollment is strictly opt-in — a plain `service install` never signs a normal npm install up for continuous deployment.
+- Deploy outcomes are pushed to the owner's Telegram chat (best-effort, only when the bot token lives in `config.json`): one message per successful update with the new version, one per failure with the log location and retry time.
+- The updater refuses non-fast-forward (force-pushed) branch tips instead of silently rolling the gateway back, logs how to accept a deliberate history rewrite, and retries failed deploys on a 30-minute backoff with a hard 40-minute deploy timeout.
+- `service stop` now sticks: auto-deploys leave a deliberately stopped bot down until `service start`, instead of resurrecting it on the next push.
+- `service status` reports the updater agent, the deployed gateway revision, and an operator-stop notice; `service uninstall` removes the updater and lists what it leaves behind.
+- Gateway overrides (`CONDUCTOR_TELEGRAM_GATEWAY_HOME` / `_REMOTE` / `_BRANCH` / `_LOG`) are baked into the updater agent when set at install time.
+
+### Changed
+- Deploys install a packed release tarball instead of `npm install -g <checkout>` (which symlinks): the live gateway is now a copy, so a deploy's `git reset`/`npm ci` can no longer gut the running bot's dependencies before tests pass, and a failed deploy leaves the previous build untouched.
+- The deploy drives the freshly installed CLI by absolute path (`npm root -g`), immune to stale shims earlier in `PATH`.
+- The npm package ships only `dist` and the one runtime script (`scripts/gateway-update.sh`) instead of the whole `scripts/` directory.
+
+### Fixed
+- launchd plists now embed the stable Homebrew node symlink instead of the versioned Cellar path that `process.execPath` resolves to — previously any `brew upgrade node` would break the bot, watchdog, and every restart until a manual reinstall.
+
+### Removed
+- The `Deploy Mac gateway` GitHub Actions workflow. It targeted a self-hosted runner label that no machine carries, so every push spawned a run that queued for 24 hours and was cancelled.
+
+## [0.6.0] - 2026-07-31
+
+Adopts the remaining surface of the Conductor API launched with Conductor 0.78.0 / Conductor Cloud. Every documented endpoint now has a consumer, and the bot can drive a cloud fleet with no Conductor desktop app involved.
+
+### Added
+- `/cloud <project> <prompt>` creates a Conductor Cloud workspace and its first session entirely through the API (`POST /v0/workspaces`), queues the prompt, and binds it to a Telegram topic. The whole flow — discovery, delivery, polling — works with the Conductor desktop app closed or absent; a failed launch archives the incomplete workspace, and multi-word project names resolve correctly instead of leaking words into the prompt.
+- `/projects [name]` lists cloud projects (`GET /v0/projects`) or one project's live record and recent workspaces (`GET /v0/projects/{id}`, `GET /v0/projects/{id}/workspaces`). Long project lists are capped and truncated safely under Telegram's message-size limit.
+- `/fleet [hours]` reports org-wide cloud activity via read-only transcript search (`POST /v0/sql` over `session_transcripts_view`), warns when the report window hits its row cap, and calls out schema drift instead of reporting a false "no activity".
+- `/rename` and `/renamethread` rename cloud workspaces and threads (`POST /v0/workspaces/{id}/rename`, `POST /v0/sessions/{id}/rename`); `/rename` also keeps the workspace's Telegram topic name in sync.
+- Cloud sessions started for the Claude agent now honor the `default_claude_effort_level` / `review_claude_effort_level` Conductor settings, mirroring the existing Codex thinking-level support.
+- When the bot itself runs inside a Conductor cloud workspace it now honors `CONDUCTOR_API_URL` as the API origin and attributes its requests with the `X-Conductor-Session-Id` header.
+- `doctor` now reports how many cloud projects the configured API key can see, separating "authenticates" from "can reach the org's repositories".
+
+### Fixed
+- A cloud transcript cursor whose anchor message no longer exists (archived thread, rebuilt transcript) previously stalled polling forever. The poller now validates the cursor with `GET /v0/messages/{id}`, re-anchors by delivering the transcript's tail (so agent replies posted before recovery ran still reach Telegram), and clears the persisted anchor first so a rebuilt transcript with lower message indexes can actually replace it. Re-anchoring requires a successful tail fetch so auth or availability failures are never mistaken for a dead cursor, and failed recovery probes back off instead of re-querying every poll tick.
+- A bot crash between creating a cloud workspace and persisting its Telegram binding no longer leaves the row spinning in "starting" forever: such rows are marked failed after the stale grace period, with the created workspace id in the bot log for manual recovery.
+- Opening the bot database concurrently from several processes (bot, MCP server, doctor) could crash on `SQLITE_BUSY` while switching to WAL journal mode. The switch now retries with a bounded, low-latency wait and accepts a file another process already switched.
+- Workspace forum topics with long names no longer abort launches: composed topic names are clamped to Telegram's 128-character limit.
+- Truncated Telegram messages can no longer be rejected by Telegram: truncation never cuts inside HTML markup or entities and closes tags in proper nesting order.
+- "Open in Conductor" links render as clickable anchors only for conductor.build hosts; anything else displays as inert text.
+
+### Security
+- Cloud commands act org-wide with the configured API key; the README now documents setting `OWNER_USER_ID` in group chats so only the owner can create, rename, or query org resources.
+
+## [0.5.0] - 2026-07-28
+
+### Added
+- Shared `.conductor/settings.toml` scripts provide reproducible Node 22 setup, test, typecheck, and build actions.
+- Conductor's official API now powers cloud message delivery, ordinary thread creation, transcript/status polling, cancellation, and workspace archive. API workspace/session IDs, backend kind, and incremental message cursors are persisted for restart recovery.
+- Foreground commands and the macOS launchd service can now enter a configured Doppler project/config runtime, while persisting only non-secret references locally.
+- Pull requests run typecheck, tests, and a build on Node 22 and 24, plus a macOS job that parses the gateway deploy script under the system bash 3.2.
+
+### Security
+- Doppler injection is restricted to an explicit bot-runtime allowlist; availability probes return names only, launchd installation ignores ephemeral service-token state, managed values are removed from local bot config, and plists never contain credential values or a Doppler token.
+- `service install` no longer captures secrets that were only present in the ambient environment. Values read from the environment stay in the running process; only the existing config file, explicit flags, and the non-secret Doppler references are written to disk, and the write happens before launchd bootstrap so a bootstrap failure cannot strand un-stripped secrets.
+- Workspace agent launches receive an isolated temporary HOME and a minimal environment without Telegram, Conductor API, or provider API-key environment variables. Authenticated CLI launches still use the operator's CLI credential store, and full-access launches additionally reach the operator's git, gh, and ssh configuration so they can still commit and open PRs; restricted review launches do not. This covers agents started for a workspace — the natural-language router still spawns Claude with the bot's own environment.
+- Restricted Claude launches disable project MCP servers and other ambient extension surfaces; restricted Codex review launches fail closed because its read-only sandbox does not isolate that credential store. The user prompt is passed after a `--` separator so a message shaped like a flag cannot reach Codex as one.
+- PR merges now require an approved review, passing checks, GitHub mergeability, a stable head SHA, a second expiring confirmation, and GitHub's head-commit match guard.
+- Cloud writes no longer mutate Conductor's private SQLite schema. The Conductor API key remains in the bot parent process, is excluded from child-agent environments, and cloud review work fails closed when the API cannot enforce the required permission policy.
+- Cloud API endpoints require HTTPS except for explicit loopback development origins. Cloud transcript text cannot request local file uploads, and outbound attachment paths are constrained to the canonical workspace directory by real path.
+- Inbound Telegram attachments can no longer steer where they are staged. The extension derived from an attacker-supplied `mime_type` is constrained, and the staged path is verified to be a direct child of the downloads directory.
+
+### Fixed
+- Cloud polling no longer overlaps slow ticks, floods the beta API every five seconds, or falls back across incompatible API-message and SQLite-row cursor namespaces. A cursor relabelled to the cloud backend now drops its SQLite-row position instead of carrying a value that no API message id could ever exceed, which previously stranded a thread's transcript permanently.
+- Polling isolates failures per workspace, and transcript cursors advance message-by-message only after Telegram delivery succeeds, so one bad workspace or failed send cannot drop the rest of a cycle.
+- Per-tick session status requests are capped, so a workspace with many sessions no longer fans out one concurrent request per session and provokes a retry storm against the beta API.
+- A cloud send cycle interrupted before its outbound message was recorded now expires instead of blocking every later send to that thread and preventing the workspace from ever completing.
+- Agents can reach the oversight database again: `DB_PATH` and `CONDUCTOR_DB_PATH` are passed through the isolated environment, so `report_status`, `report_artifact`, and `request_human` no longer write to a throwaway database that is deleted on exit.
+- `conductor-telegram doctor` and `status` still report when the Doppler CLI is missing or unauthenticated, rather than aborting with a single fatal error. `start` continues to fail closed.
+- Entering the Doppler runtime is guarded by an explicit sentinel and a case-insensitive reference comparison, so a project or config name that Doppler canonicalises differently no longer re-execs the CLI without bound.
+- The gateway deploy script expands its optional `service install` arguments in a form macOS's bash 3.2 accepts, so a deploy without Doppler configured no longer aborts after the global install but before the service restart.
+
+### Changed
+- The shipped Codex fallback model is `gpt-5.5`, and the legacy Claude permission default is `acceptEdits` instead of unrestricted bypass mode.
+- `TELEGRAM_REMOTE_STEERING=queue` is superseded by `CONDUCTOR_CLOUD_BACKEND=auto|api|off`; `auto` uses the official API only when `CONDUCTOR_API_KEY` is configured and otherwise remains observe-only.
+- Mac gateway deploys now use Node 22 and fail unless post-restart diagnostics pass.
+
+## [0.4.7] - 2026-07-16
+
+### Added
+- GitHub Actions now redeploys the self-hosted macOS gateway on `main` pushes and published releases, installing the merged checkout globally and restarting the launchd service.
+
+## [0.4.6] - 2026-07-15
+
+### Fixed
+- Existing installations now receive the shipped Fable 5 and gpt-5.6-sol defaults instead of reusing deprecated Conductor settings or models from earlier sessions. Explicit overrides, current settings.toml values, and legacy settings from pre-0.72 installs still take precedence.
+- `conductor-telegram doctor` now shows the resolved prompt and review agent/model pairs so stale or explicit configuration is visible before launch.
+
+## [0.4.4] - 2026-07-15
+
+### Changed
+- Completed, stopped, and archived workspace forum topics now switch to the folder topic icon, and the Archive button closes the topic after syncing that visual state instead of deleting it from the Telegram sidebar.
+
+## [0.4.3] - 2026-07-15
+
+### Changed
+- New Claude workspaces now launch on Fable 5 by default (full model id `claude-fable-5`), and the launcher recognizes the Fable family when inferring agent type and simplifying model names. The default Codex model moves to `gpt-5.6-sol`.
+
+## [0.4.2] - 2026-07-14
+
+### Fixed
+- Telegram-launched workspaces now auto-register valid git repositories in Conductor's repo database when the repo is visible on disk but missing from Conductor metadata.
+- Repo-only `"existing"` route decisions now continue the single running workspace in that repo instead of always starting a new workspace, while ambiguous matches still fall back safely.
+
+## [0.4.1] - 2026-07-04
+
+### Fixed
+- Existing bot databases now add `telegram_message_links.session_id` before creating the session index, so upgrading from 0.3.x no longer crashes startup with `no such column: session_id`.
+
+## [0.4.0] - 2026-07-04
+
+### Added
+- Conductor 0.72 thread support. The poller now follows every visible Conductor session in a tracked workspace, labels forwarded messages with the thread title when there is more than one thread, and stores a per-session forwarding cursor.
+- `/threads` lists Conductor threads for a workspace, switches the default active thread, and can start a new thread from Telegram.
+- Reply routing now preserves the Conductor session behind a forwarded Telegram message, so replies land in the exact thread that produced the message.
+- Conductor Cloud workspaces are detected from the local Conductor DB and marked with ☁️ in Telegram lists. Remote workspaces use queued-message steering when Conductor dispatches bot-inserted rows, and fall back to clear observe-only notices when steering is unavailable.
+- `conductor-telegram doctor` now reports `~/.conductor/settings.toml` and Conductor 0.72 schema capabilities, including cloud, thread titles, and queued messages.
+
+### Changed
+- Conductor settings are read from `~/.conductor/settings.toml` first, with the legacy `settings` DB table as fallback. This covers default/review models, Codex thinking levels, Claude effort levels, and git branch prefix settings.
+- Bot-created workspaces follow Conductor's current branch prefix convention, including explicit `git.branch_prefix` and GitHub-username prefixes.
+- Voice/audio polish: audio files sent as Telegram audio or documents are transcribed like voice notes when possible, and `TELEGRAM_WHISPER_MODEL=base` resolves to the bundled whisper.cpp base model path.
+- Cursor-agent sessions are treated as observe-only instead of being resumed with the wrong local CLI.
+
+## [0.3.11] - 2026-06-03
+
 ### Fixed
 - Launching with no `TELEGRAM_DEFAULT_AGENT_TYPE` now picks the agent that matches Conductor's configured `default_model` (and `TELEGRAM_DEFAULT_MODEL`), so an OpenAI model like `gpt-5.5` no longer launches the Claude CLI. Incompatible historical models are skipped when resolving the per-agent default.
-- Repo topic ready messages are pinned automatically so each forum topic keeps its routing entry point visible.
+- Messages, files, screenshots, and voice notes sent in durable repo topics now start work from the repo path stored for that topic, so custom repo roots no longer launch in the wrong repository.
 
 ## [0.3.10] - 2026-05-27
 

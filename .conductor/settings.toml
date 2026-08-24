@@ -1,0 +1,18 @@
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[scripts]
+setup = "if [ -s \"$HOME/.nvm/nvm.sh\" ]; then . \"$HOME/.nvm/nvm.sh\" && nvm use 22 >/dev/null; fi; case \"$(node --version)\" in v22.*) ;; *) echo 'Node 22 is required' >&2; exit 1 ;; esac; npm ci"
+run_mode = "concurrent"
+
+[scripts.run.test]
+command = "if [ -s \"$HOME/.nvm/nvm.sh\" ]; then . \"$HOME/.nvm/nvm.sh\" && nvm use 22 >/dev/null; fi; case \"$(node --version)\" in v22.*) ;; *) echo 'Node 22 is required' >&2; exit 1 ;; esac; npm test"
+default = true
+icon = "test-tube"
+
+[scripts.run.typecheck]
+command = "if [ -s \"$HOME/.nvm/nvm.sh\" ]; then . \"$HOME/.nvm/nvm.sh\" && nvm use 22 >/dev/null; fi; case \"$(node --version)\" in v22.*) ;; *) echo 'Node 22 is required' >&2; exit 1 ;; esac; npm run typecheck"
+icon = "check"
+
+[scripts.run.build]
+command = "if [ -s \"$HOME/.nvm/nvm.sh\" ]; then . \"$HOME/.nvm/nvm.sh\" && nvm use 22 >/dev/null; fi; case \"$(node --version)\" in v22.*) ;; *) echo 'Node 22 is required' >&2; exit 1 ;; esac; npm run build"
+icon = "wrench"

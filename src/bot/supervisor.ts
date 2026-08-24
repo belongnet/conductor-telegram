@@ -84,11 +84,19 @@ export function supervisedInterval(
   intervalMs: number
 ): ReturnType<typeof setInterval> {
   const scoped = createLogger(scope);
+  let running = false;
   return setInterval(async () => {
+    if (running) {
+      scoped.warn("previous interval tick is still running; skipping overlap");
+      return;
+    }
+    running = true;
     try {
       await fn();
     } catch (err) {
       scoped.error("loop error:", err);
+    } finally {
+      running = false;
     }
   }, intervalMs);
 }

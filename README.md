@@ -18,17 +18,17 @@ That's it. The setup wizard walks you through Telegram bot creation, configurati
 
 ```
 ┌──────────────┐     ┌─────────────────┐     ┌─────────────────────┐
-│   Telegram   │◄───►│  conductor-     │◄───►│  Conductor          │
+│   Telegram   │◄───►│  conductor-     │◄───►│  Local Conductor    │
 │   (you)      │     │  telegram bot   │     │  workspaces/agents  │
-└──────────────┘     └────────┬────────┘     └──────────┬──────────┘
-                              │                         │
-                              │   ┌─────────────────┐   │
-                              └──►│   SQLite (WAL)   │◄──┘
-                                  └─────────────────┘
-                                    shared via MCP
+└──────────────┘     └──────┬────┬─────┘     └──────────┬──────────┘
+                            │    │                      │
+              official API │    │   ┌──────────────┐   │
+                            │    └──►│ SQLite (WAL) │◄──┘
+                            ▼        └──────────────┘
+                    Conductor Cloud
 ```
 
-The bot polls Conductor sessions every 5 seconds, forwarding agent messages to Telegram. When an agent uses the MCP server to ask a question, the bot surfaces it as an interactive Telegram message with buttons or free-form reply.
+The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 15 seconds, forwarding agent messages to Telegram. When an agent uses the MCP server to ask a question, the bot surfaces it as an interactive Telegram message with buttons or free-form reply.
 
 ## Architecture
 
@@ -53,6 +53,8 @@ src/
 ├── store/             # Database layer
 │   ├── db.ts          # SQLite init, schema, migrations
 │   └── queries.ts     # CRUD operations
+├── integrations/
+│   └── conductor-api.ts  # Supported Conductor Cloud API transport
 └── types/
     └── index.ts       # TypeScript interfaces
 ```
@@ -63,9 +65,15 @@ src/
 |---------|-------|-------------|
 | `/setup` | `/setup` | Check setup diagnostics and apply current chat |
 | `/run` | `/run <repo> <prompt>` | Start a new workspace with an AI agent |
+| `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
+| `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
+| `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
+| `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
+| `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
-| `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md |
+| `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
+| `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md or AGENTS.md |
 | `/skill` | `/skill <workspace> <name> [instructions]` | Invoke a specific workspace skill |
 | `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
 | `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
@@ -73,18 +81,29 @@ src/
 | `/prs`, `/ship_status` | `/prs` | Show PR, check, merge, and stale-branch status for tracked workspaces |
 | `/decisions` | `/decisions` | Show unanswered agent questions for this chat |
 | `/status` | `/status` | Show active workspace summary |
+| `/ping` | `/ping` | Bot liveness check (uptime, heartbeat, version) |
 | `/stop` | `/stop <name>` | Stop a running workspace |
 | `/repos` | `/repos` | List available repositories (tap to select) |
 | `/help` | `/help` | Show help message |
 
 Ways to target work from Telegram:
 
-1. **Reply** to any forwarded workspace message with `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut.
-2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically.
+1. **Reply** to any forwarded workspace message with text, media, `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut. If that message came from a specific Conductor thread, the reply goes back to that exact thread.
+2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically. Plain messages go to the workspace's active Conductor thread.
 3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message.
 4. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
 
-Photos, screenshots, and voice notes sent as replies are staged to the workspace for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
+Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
+
+Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can create cloud workspaces (`/cloud`), browse projects (`/projects`), send messages, create ordinary threads, poll transcripts/status, rename workspaces and threads, search org-wide transcripts (`/fleet`), cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
+
+Cloud workspaces created with `/cloud` are driven entirely over the API — discovery, prompt delivery, and polling work even when the Conductor desktop app is closed or absent. Project arguments to `/cloud` and `/projects` accept a list number from `/projects`, a project id, an exact name, or a unique name prefix. When the bot itself runs inside a Conductor cloud workspace, it honors `CONDUCTOR_API_URL` and attributes its requests via an `X-Conductor-Session-Id` header taken from `CONDUCTOR_SESSION_ID` — both injected by the cloud workspace environment, not user config.
+
+Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, or query (`/projects`, `/fleet`) org resources — without it, every member of the configured group shares that privilege.
+
+The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
+
+Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
 ## Manual Telegram setup
 
@@ -148,6 +167,8 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | `--token` | `BOT_TOKEN` | Telegram bot token |
 | `--chat-id` | `OWNER_CHAT_ID` | Your Telegram chat ID |
 | `--db-path` | `DB_PATH` | SQLite database path |
+| `--doppler-project` | `CONDUCTOR_TELEGRAM_DOPPLER_PROJECT` | Doppler project used by foreground and launchd runtimes |
+| `--doppler-config` | `CONDUCTOR_TELEGRAM_DOPPLER_CONFIG` | Doppler config used by foreground and launchd runtimes |
 | | `OWNER_USER_ID` | Your Telegram user ID (required for forum mode) |
 | | `CONDUCTOR_WORKSPACES_DIR` | Conductor workspaces directory |
 | | `CONDUCTOR_REPOS_DIR` | Repository directory |
@@ -156,7 +177,28 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | | `TELEGRAM_DEFAULT_MODEL` | Default model for agents |
 | | `TELEGRAM_REVIEW_AGENT_TYPE` | Agent type for `/review` sessions |
 | | `TELEGRAM_REVIEW_MODEL` | Model for `/review` sessions |
-| | `TELEGRAM_AGENT_PERMISSION_MODE` | Permission mode (default: `bypassPermissions`) |
+| | `TELEGRAM_AGENT_PERMISSION_MODE` | Legacy Claude permission mode (default: `acceptEdits`) |
+| | `CONDUCTOR_API_BASE_URL` | Conductor API origin (default: `https://api.conductor.build`) |
+| | `CONDUCTOR_API_KEY` | Bearer API key for supported Conductor Cloud operations |
+| | `CONDUCTOR_CLOUD_BACKEND` | `auto` (use API when keyed), `api` (require key), or `off` |
+| | `TELEGRAM_WHISPER_MODEL` | whisper.cpp model name or path (default: `base`) |
+
+Conductor app settings are read from `~/.conductor/settings.toml` first, with the legacy Conductor DB `settings` table as fallback. The bot uses Conductor's default/review model settings, Codex thinking levels, Claude effort levels, and git branch prefix settings when Telegram-specific env vars are not set.
+
+To keep runtime secrets in Doppler, persist only the non-secret project/config references:
+
+```bash
+conductor-telegram service install \
+  --doppler-project <project> \
+  --doppler-config <config>
+conductor-telegram doctor
+```
+
+The installer verifies the persistent Doppler identity available to launchd, removes each Doppler-managed value from `config.json`, and writes a plist containing only the Doppler executable, project/config references, and an explicit allowlist of secret names—not secret values or a Doppler service token. The allowed names are `BOT_TOKEN`, `OWNER_CHAT_ID`, `OWNER_USER_ID`, `CONDUCTOR_API_BASE_URL`, `CONDUCTOR_API_KEY`, and `CONDUCTOR_CLOUD_BACKEND`. Use `BOT_TOKEN` exactly; `TELEGRAM_BOT_TOKEN` is not an alias.
+
+`start`, `status`, and `doctor` automatically re-enter the configured Doppler runtime. Run `service install` again after adding a new allowed secret name. A value-only rotation needs only a service restart.
+
+If Doppler is not configured, keep `CONDUCTOR_API_KEY` only in the bot's mode-`0600` config file or service environment. It is excluded from child-agent environments and must not be copied into repositories, Conductor workspace environment variables, prompts, or MCP configuration.
 
 Existing `.env` files are auto-detected and can be imported during setup.
 
@@ -186,7 +228,9 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `events` | Status updates, artifacts, and human requests from MCP |
 | `decisions` | Questions posed to the operator with answers |
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
+| `thread_cursors` | Per-Conductor-session forwarding cursors for thread fan-out |
 | `pr_records` | GitHub PR/check/merge state verified by repo + branch |
+| `merge_intents` | Expiring requester-bound confirmations for an exact PR head SHA |
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
 | `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
 
@@ -207,9 +251,12 @@ npm run build
 
 # Type check
 npm run typecheck
+
+# Run tests
+npm test
 ```
 
-Requires Node.js v22+.
+Requires Node.js v22+. See [CONTRIBUTING.md](CONTRIBUTING.md) for branching, commit style, and PR guidelines.
 
 ## Troubleshooting
 
@@ -223,6 +270,7 @@ $ conductor-telegram doctor
   Bot token   ✓ @MyBot connected
   Database    ✓ ~/.conductor-telegram/conductor-telegram.db
   Conductor   ✓ ~/Library/Application Support/com.conductor.app/conductor.db
+  Conductor Cloud API  ✓ api-key authenticated; 3 cloud project(s) visible
   GitHub CLI  ✓ gh version 2.x.x
   MCP Plugin  ✓ ~/.claude/plugins/conductor-telegram-mcp installed
   Repos       ✓ ~/conductor/repos (4 repositories)
@@ -241,7 +289,28 @@ npm i -g conductor-telegram@latest
 conductor-telegram doctor
 ```
 
-Config is preserved across upgrades. The `doctor` command validates everything still works.
+Config is preserved across upgrades. The `doctor` command validates everything still works. Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
+## Mac gateway deployment
+
+A gateway host keeps itself current. Enrolling is opt-in:
+
+```bash
+conductor-telegram service install --with-updater
+```
+
+This registers a third LaunchAgent, `net.belong.conductor-telegram.updater`, alongside the bot and its watchdog (a plain `service install` never enrolls you — published-package users keep the normal `npm i -g conductor-telegram@latest` upgrade contract). Every minute the agent fetches `origin/main` into a canonical checkout at `~/.conductor-telegram/gateway/repo` (cloning it on first run, so a fresh machine self-bootstraps), and whenever the remote moves it redeploys:
+
+```bash
+scripts/gateway-update.sh       # the poller — copied to ~/.conductor-telegram/bin/ at install
+scripts/deploy-mac-gateway.sh   # the deploy it triggers
+```
+
+Each deploy runs the Node 22 typecheck/tests/build in the checkout, then packs a release tarball and installs *that* globally — the live gateway is a copy, so nothing the deploy does to the checkout (git reset, `npm ci`) can touch running code before all gates pass. Only then does it reinstall and restart the launchd service and run `doctor` as a configuration/connectivity gate. A failure before the install step leaves the previous gateway untouched and running; a failure at the doctor stage means the new build is already live and gets retried. Failed revisions retry on a 30-minute backoff until a new push lands. Deploys have a hard 40-minute timeout, refuse non-fast-forward (force-pushed) branch tips, and report success/failure straight to the owner's Telegram chat when the bot token is in `config.json`. All three agents are `RunAtLoad`, so a reboot restarts the bot and immediately catches up on any pushes it slept through. Progress lands in `~/.conductor-telegram/update.log`; `service status` shows the deployed revision; `service stop` is respected — auto-deploys will not resurrect a bot the operator stopped.
+
+Polling means no self-hosted runner, no inbound webhook, and no GitHub credentials on the machine — the repo is public, so the updater fetches anonymously. Note the flip side: enrolling a machine means anyone who can push to `main` can run code on it within a minute. Saved Doppler project/config references survive each reinstall, so deployment never needs to materialize secret values in the checkout or launchd plist.
+
+Updater environment overrides, baked into the agent when set at `service install --with-updater` time: `CONDUCTOR_TELEGRAM_GATEWAY_HOME` (state + checkout root, default `~/.conductor-telegram/gateway`), `CONDUCTOR_TELEGRAM_GATEWAY_REMOTE` (git URL), `CONDUCTOR_TELEGRAM_GATEWAY_BRANCH` (default `main`), `CONDUCTOR_TELEGRAM_GATEWAY_LOG` (default `~/.conductor-telegram/update.log`).
 
 ## License
 

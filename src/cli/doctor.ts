@@ -6,8 +6,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { CONFIG_PATH, tryLoadConfig, type CLIFlags } from "./config.js";
+import Database from "better-sqlite3";
+import {
+  CONFIG_PATH,
+  tryLoadConfig,
+  type CLIFlags,
+  type Config,
+} from "./config.js";
 import { EXIT_GENERAL } from "./errors.js";
+import { describeConductorSettingsSource } from "../store/conductor-settings.js";
+import {
+  ConductorApiError,
+  createConductorApiClientFromEnv,
+} from "../integrations/conductor-api.js";
+import {
+  isDopplerRuntimeActive,
+  resolveDopplerRuntime,
+} from "./doppler.js";
 
 const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
@@ -164,6 +179,181 @@ function checkConductor(conductorDbPath: string | undefined): CheckResult {
   return { name: "Conductor", ok: true, detail: p };
 }
 
+function checkConductorSettings(): CheckResult {
+  const source = describeConductorSettingsSource();
+  if (!source.tomlReadable) {
+    return {
+      name: "Conductor settings",
+      ok: true,
+      detail: `${source.tomlPath} not found; falling back to legacy DB settings`,
+    };
+  }
+  return {
+    name: "Conductor settings",
+    ok: true,
+    detail: `${source.tomlPath} (${source.tomlKeys} keys)`,
+  };
+}
+
+function tableColumns(db: Database.Database, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+function checkConductor072Schema(conductorDbPath: string | undefined): CheckResult {
+  const p =
+    conductorDbPath ??
+    path.join(
+      os.homedir(),
+      "Library/Application Support/com.conductor.app/conductor.db"
+    );
+  if (!fs.existsSync(p)) {
+    return {
+      name: "Conductor 0.72 schema",
+      ok: false,
+      detail: "Conductor DB not found",
+    };
+  }
+
+  try {
+    const db = new Database(p, { readonly: true });
+    const workspaceColumns = tableColumns(db, "workspaces");
+    const sessionColumns = tableColumns(db, "sessions");
+    const messageColumns = tableColumns(db, "session_messages");
+    db.close();
+
+    const features = [
+      workspaceColumns.has("workspace_name") && "workspace names",
+      workspaceColumns.has("hosting_server_url") && "cloud hosting",
+      workspaceColumns.has("sandbox_provider") && "cloud provider",
+      sessionColumns.has("title") && "thread titles",
+      messageColumns.has("queue_order") && "queued messages",
+    ].filter(Boolean);
+
+    return {
+      name: "Conductor 0.72 schema",
+      ok: true,
+      detail: features.length > 0
+        ? features.join(", ")
+        : "legacy schema; threads/cloud steering will be limited",
+    };
+  } catch (err) {
+    return {
+      name: "Conductor 0.72 schema",
+      ok: false,
+      detail: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/** @internal exported for doctor unit tests; not part of the public CLI API. */
+export async function checkConductorCloudApi(
+  config: Config | null
+): Promise<CheckResult> {
+  const mode = config?.conductorCloudBackend ?? "auto";
+  if (mode === "off") {
+    return {
+      name: "Conductor Cloud API",
+      ok: true,
+      detail: "disabled; cloud workspaces are observe-only",
+    };
+  }
+  if (!config?.conductorApiKey) {
+    return {
+      name: "Conductor Cloud API",
+      ok: mode !== "api",
+      detail:
+        mode === "api"
+          ? "CONDUCTOR_CLOUD_BACKEND=api but no API key is configured"
+          : "not configured; cloud workspaces are observe-only",
+      fix:
+        mode === "api"
+          ? "Set CONDUCTOR_API_KEY or change CONDUCTOR_CLOUD_BACKEND to auto"
+          : undefined,
+    };
+  }
+
+  try {
+    const client = createConductorApiClientFromEnv({
+      CONDUCTOR_API_BASE_URL:
+        config.conductorApiBaseUrl ?? "https://api.conductor.build",
+      CONDUCTOR_API_KEY: config.conductorApiKey,
+      CONDUCTOR_CLOUD_BACKEND: mode,
+    });
+    if (!client) {
+      throw new ConductorApiError("Conductor Cloud API is disabled");
+    }
+    const identity = await client.getIdentity();
+    // Projects visibility separates "the key authenticates" from "the key can
+    // actually reach the org's repositories" (e.g. a workspace-scoped key).
+    let projectsDetail: string;
+    try {
+      const projects = await client.listProjects();
+      projectsDetail =
+        projects.length === 0
+          ? "no cloud projects visible"
+          : `${projects.length} cloud project(s) visible`;
+    } catch (error) {
+      projectsDetail = `projects unavailable (${error instanceof Error ? error.message : String(error)})`;
+    }
+    return {
+      name: "Conductor Cloud API",
+      ok: true,
+      detail: `${identity.authMethod} authenticated; ${projectsDetail}`,
+    };
+  } catch (error) {
+    return {
+      name: "Conductor Cloud API",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+      fix:
+        "Check CONDUCTOR_API_KEY and CONDUCTOR_API_BASE_URL in ~/.conductor-telegram/config.json",
+    };
+  }
+}
+
+export function checkDopplerRuntime(config: Config | null): CheckResult {
+  if (!config?.dopplerProject && !config?.dopplerConfig) {
+    return {
+      name: "Doppler runtime",
+      ok: true,
+      detail: "not configured; using config.json / process environment",
+    };
+  }
+  try {
+    const runtime = resolveDopplerRuntime(config);
+    if (!runtime) {
+      throw new Error("Doppler reference is incomplete");
+    }
+    if (!isDopplerRuntimeActive(runtime)) {
+      return {
+        name: "Doppler runtime",
+        ok: false,
+        detail: "configured but not active",
+        fix:
+          "Run through the CLI normally; it automatically re-executes start/doctor/status under Doppler",
+      };
+    }
+    return {
+      name: "Doppler runtime",
+      ok: true,
+      detail:
+        "active; Doppler-managed values remain outside config.json and the launchd plist",
+    };
+  } catch (error) {
+    return {
+      name: "Doppler runtime",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+      fix:
+        "Install the Doppler CLI and verify the configured project/config token access",
+    };
+  }
+}
+
+
 function checkPlugin(): CheckResult {
   const pluginDir = path.join(
     os.homedir(),
@@ -224,6 +414,40 @@ function checkRepos(reposDir: string | undefined): CheckResult {
   }
 }
 
+export async function checkLaunchModels(
+  config: Config | null
+): Promise<CheckResult> {
+  try {
+    // Mirror the env injection the start command performs so the resolved
+    // models match what the running bot would actually launch.
+    if (config?.conductorDbPath)
+      process.env.CONDUCTOR_DB_PATH = config.conductorDbPath;
+    if (config?.defaultAgentType)
+      process.env.TELEGRAM_DEFAULT_AGENT_TYPE = config.defaultAgentType;
+    if (config?.defaultModel)
+      process.env.TELEGRAM_DEFAULT_MODEL = config.defaultModel;
+    if (config?.reviewAgentType)
+      process.env.TELEGRAM_REVIEW_AGENT_TYPE = config.reviewAgentType;
+    if (config?.reviewModel)
+      process.env.TELEGRAM_REVIEW_MODEL = config.reviewModel;
+    const { resolveLaunchConfig } = await import("../bot/launcher.js");
+    const prompt = resolveLaunchConfig({});
+    const review = resolveLaunchConfig({ launchMode: "review" });
+    return {
+      name: "Launch models",
+      ok: true,
+      detail: `prompt → ${prompt.agentType}/${prompt.model} · review → ${review.agentType}/${review.model}`,
+    };
+  } catch (err) {
+    return {
+      name: "Launch models",
+      ok: false,
+      detail: `could not resolve: ${err instanceof Error ? err.message : String(err)}`,
+      fix: "Check conductorDbPath and model overrides in ~/.conductor-telegram/config.json",
+    };
+  }
+}
+
 export async function runDoctor(flags: CLIFlags): Promise<void> {
   const config = tryLoadConfig(flags);
 
@@ -235,6 +459,11 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     await checkBotToken(config?.botToken),
     checkDatabase(config?.dbPath),
     checkConductor(config?.conductorDbPath),
+    checkConductorSettings(),
+    checkConductor072Schema(config?.conductorDbPath),
+    checkDopplerRuntime(config),
+    await checkConductorCloudApi(config),
+    await checkLaunchModels(config),
     await checkGithub(),
     checkPlugin(),
     checkRepos(config?.conductorReposDir),
@@ -247,9 +476,11 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     const pad = " ".repeat(maxName - check.name.length);
     const icon = check.ok ? green("✓") : red("✗");
     console.log(`  ${check.name}${pad}  ${icon} ${check.detail}`);
-    if (!check.ok && check.fix) {
-      console.log(`  ${" ".repeat(maxName)}    ${dim(check.fix)}`);
+    if (!check.ok) {
       hasFailures = true;
+      if (check.fix) {
+        console.log(`  ${" ".repeat(maxName)}    ${dim(check.fix)}`);
+      }
     }
   }
 
