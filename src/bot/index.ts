@@ -31,18 +31,24 @@ import {
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
   isRemoteConductorWorkspace,
+  reconcilePendingCloudLaunch,
+  reconcilePendingCloudMessages,
+  reconcilePendingCloudTerminalIntent,
   type ConductorSessionInfo,
   type SessionMessage,
 } from "./launcher.js";
 import {
   archiveWorkspace,
+  acknowledgePendingCloudNotice,
   deleteThreadCursorsNotIn,
   getAllThreadedWorkspaces,
   getAllWorkspaces,
+  getWorkspacesWithPendingCloudWork,
   getArtifactEvents,
   getMaxEventId,
   getMetaValue,
   getNewEvents,
+  getPendingCloudNotices,
   getThreadCursor,
   getWorkspace,
   linkTelegramMessage,
@@ -52,7 +58,9 @@ import {
   updateWorkspaceConductorBinding,
   updateWorkspaceForwardCursor,
   updateWorkspaceStatus,
+  updateWorkspaceTelegramMessage,
   updateWorkspaceThreadId,
+  type PendingCloudNotice,
 } from "../store/queries.js";
 import type {
   ArtifactPayload,
@@ -98,6 +106,7 @@ import {
   cloudCycleIsInFlight,
   cloudSessionCycleKey,
   encodeCloudSessionCycle,
+  chunkTelegramHtmlEntries,
   parseCloudSessionCycle,
   shouldPollTrackedWorkspace,
   type CloudSessionCycle,
@@ -447,7 +456,13 @@ function startSessionPoller(): void {
 }
 
 async function pollConductorWorkspaces(cloudOnly: boolean): Promise<void> {
-  const tracked = getAllWorkspaces(100);
+  const tracked = [
+    ...new Map(
+      [...getAllWorkspaces(100), ...getWorkspacesWithPendingCloudWork()].map(
+        (workspace) => [workspace.id, workspace]
+      )
+    ).values(),
+  ];
   for (const ws of tracked) {
     await pollConductorWorkspace(ws, cloudOnly).catch((error) => {
       pollerLog.error(
@@ -462,6 +477,78 @@ async function pollConductorWorkspace(
   ws: Workspace,
   cloudOnly: boolean
 ): Promise<void> {
+  await publishPendingCloudNotices(ws);
+  const terminalIntent = await reconcilePendingCloudTerminalIntent(ws.id);
+  if (terminalIntent.status === "pending") return;
+  if (terminalIntent.status === "failed") {
+    pollerLog.error(
+      `pending cloud ${terminalIntent.action} failed for ${ws.id}: ${terminalIntent.error}`
+    );
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+    if (ws.telegramThreadId) {
+      await syncWorkspaceTopic(bot.telegram, ws).catch((error) =>
+        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
+      );
+    }
+    return;
+  }
+  if (terminalIntent.status === "completed") {
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+    if (ws.telegramThreadId) {
+      await syncWorkspaceTopic(bot.telegram, ws).catch((error) =>
+        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
+      );
+    }
+    return;
+  }
+  const pendingLaunch = await reconcilePendingCloudLaunch(ws.id, ws);
+  if (pendingLaunch.status === "pending") return;
+  if (pendingLaunch.status === "failed") {
+    pollerLog.error(
+      `pending cloud launch failed for ${ws.id}: ${pendingLaunch.error}`
+    );
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+    if (ws.telegramThreadId) {
+      await syncWorkspaceTopic(bot.telegram, ws).catch((error) =>
+        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
+      );
+    }
+    return;
+  }
+  if (pendingLaunch.status === "queued") {
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+    if (ws.telegramThreadId) {
+      await syncWorkspaceTopic(bot.telegram, ws).catch((error) =>
+        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
+      );
+    }
+  }
+
+  const pendingMessages = await reconcilePendingCloudMessages(ws.id, ws);
+  if (pendingMessages.status === "suppressed") {
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+    return;
+  }
+  if (pendingMessages.status === "failed") {
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+    if (ws.telegramThreadId) {
+      await syncWorkspaceTopic(bot.telegram, ws).catch((error) =>
+        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
+      );
+    }
+    return;
+  }
+  if (pendingMessages.status === "sent") {
+    Object.assign(ws, getWorkspace(ws.id) ?? ws);
+    await publishPendingCloudNotices(ws);
+  }
+
   if (!ws.conductorWorkspaceName) {
     // Normally a row is only briefly nameless mid-launch. If the bot died
     // between an API-side cloud create and persisting the binding, the row
@@ -730,6 +817,161 @@ async function pollConductorWorkspace(
         }
       })
       .catch((err) => pollerLog.error("notify error:", err));
+  }
+}
+
+async function publishCloudReconciliationStatus(
+  ws: Workspace,
+  html: string,
+  includeStopButton: boolean,
+  forceNewMessage = false
+): Promise<boolean> {
+  const keyboard = includeStopButton
+    ? styledKeyboard([[btn("Stop", `stop:${ws.id}`)]])
+    : {};
+  const messageId = Number(ws.telegramMessageId);
+  if (!forceNewMessage && Number.isSafeInteger(messageId) && messageId > 0) {
+    const edited = await bot.telegram
+      .editMessageText(ws.telegramChatId, messageId, undefined, html, {
+        parse_mode: "HTML",
+        ...keyboard,
+      })
+      .then(() => true)
+      .catch((error) => {
+        pollerLog.error(`could not edit recovery status for ${ws.id}:`, error);
+        return false;
+      });
+    if (edited) return true;
+  }
+  return sendToWorkspaceTopic(ws, html, {
+    parse_mode: "HTML",
+    ...keyboard,
+  })
+    .then((replacement) => {
+      updateWorkspaceTelegramMessage(ws.id, String(replacement.message_id));
+      ws.telegramMessageId = String(replacement.message_id);
+      return true;
+    })
+    .catch((error) => {
+      pollerLog.error(`could not post recovery status for ${ws.id}:`, error);
+      return false;
+    });
+}
+
+function formatPendingCloudNotice(notice: PendingCloudNotice): {
+  html: string;
+  includeStopButton: boolean;
+} {
+  const count = Math.max(0, notice.count ?? 0);
+  switch (notice.kind) {
+    case "launch_queued":
+      return {
+        html: "🟢 ☁️ Cloud launch recovered after restart; its original prompt is queued with the same message identity.",
+        includeStopButton: true,
+      };
+    case "launch_failed":
+      return {
+        html: `🔴 Cloud launch recovery failed: <pre>${esc(trunc(notice.error ?? "unknown recovery error", 500))}</pre>`,
+        includeStopButton: false,
+      };
+    case "launch_canceled":
+      return {
+        html: "⏹ Cloud launch cancellation recovered after restart; the provisioned workspace was archived and its prompt was not replayed.",
+        includeStopButton: false,
+      };
+    case "messages_sent":
+      return {
+        html: `🟢 ☁️ Delivered ${count} recovered Telegram request${count === 1 ? "" : "s"} from the durable outbox.`,
+        includeStopButton: true,
+      };
+    case "messages_suppressed":
+      return {
+        html: `⏹ Suppressed ${count} recovered Cloud request${count === 1 ? "" : "s"}: ${esc(trunc(notice.error ?? "workspace became unavailable", 500))}.`,
+        includeStopButton: false,
+      };
+    case "messages_failed":
+      return {
+        html: `🔴 ${count || 1} recovered Cloud request${(count || 1) === 1 ? "" : "s"} could not be delivered safely: <pre>${esc(trunc(notice.error ?? "unknown delivery error", 500))}</pre> Please resend ${((count || 1) === 1) ? "it" : "them"}.`,
+        includeStopButton: false,
+      };
+    case "stop_confirmed":
+      return {
+        html: "⏹ ☁️ The saved Cloud stop request was confirmed after retrying.",
+        includeStopButton: false,
+      };
+    case "archive_confirmed":
+      return {
+        html: "📦 ☁️ The saved Cloud archive request was confirmed after retrying.",
+        includeStopButton: false,
+      };
+    case "stop_failed":
+      return {
+        html: `🔴 The saved Cloud stop request could not be confirmed and was given up on: <pre>${esc(trunc(notice.error ?? "unknown cancellation error", 500))}</pre> Check the workspace in Conductor Cloud before sending more work.`,
+        includeStopButton: false,
+      };
+    case "archive_failed":
+      return {
+        html: `🔴 The saved Cloud archive request could not be confirmed and was given up on: <pre>${esc(trunc(notice.error ?? "unknown archive error", 500))}</pre> Check the workspace in Conductor Cloud.`,
+        includeStopButton: false,
+      };
+  }
+}
+
+const pendingCloudNoticePublications = new Map<string, Promise<void>>();
+
+async function publishPendingCloudNotices(ws: Workspace): Promise<void> {
+  const existing = pendingCloudNoticePublications.get(ws.id);
+  if (existing) return existing;
+  const publication = performPendingCloudNoticePublication(ws).finally(() => {
+    if (pendingCloudNoticePublications.get(ws.id) === publication) {
+      pendingCloudNoticePublications.delete(ws.id);
+    }
+  });
+  pendingCloudNoticePublications.set(ws.id, publication);
+  return publication;
+}
+
+async function performPendingCloudNoticePublication(
+  ws: Workspace
+): Promise<void> {
+  const notices = getPendingCloudNotices(ws.id);
+  if (notices.length === 0) return;
+  const grouped: Array<{ notice: PendingCloudNotice; noticeIds: string[] }> = [];
+  for (const notice of notices) {
+    const previous = grouped.at(-1);
+    if (
+      notice.kind === "messages_sent" &&
+      previous?.notice.kind === notice.kind
+    ) {
+      previous.notice.count =
+        (previous.notice.count ?? 0) + (notice.count ?? 0);
+      previous.noticeIds.push(notice.id);
+    } else {
+      grouped.push({ notice: { ...notice }, noticeIds: [notice.id] });
+    }
+  }
+  Object.assign(ws, getWorkspace(ws.id) ?? ws);
+  const entries = grouped.map(({ notice, noticeIds }) => ({
+    ...formatPendingCloudNotice(notice),
+    noticeIds,
+  }));
+  const chunks = chunkTelegramHtmlEntries(entries);
+  for (const [index, chunk] of chunks.entries()) {
+    const includeStopButton =
+      chunk.some((entry) => entry.includeStopButton) &&
+      ws.status !== "stopped" &&
+      ws.status !== "archived" &&
+      ws.status !== "failed";
+    const published = await publishCloudReconciliationStatus(
+      ws,
+      chunk.map((entry) => entry.html).join("\n\n"),
+      includeStopButton,
+      index > 0
+    );
+    if (!published) return;
+    for (const noticeId of chunk.flatMap((entry) => entry.noticeIds)) {
+      acknowledgePendingCloudNotice(ws.id, noticeId);
+    }
   }
 }
 

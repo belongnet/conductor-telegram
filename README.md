@@ -64,7 +64,7 @@ src/
 | Command | Usage | Description |
 |---------|-------|-------------|
 | `/setup` | `/setup` | Check setup diagnostics and apply current chat |
-| `/run` | `/run <repo> <prompt>` | Start a new workspace with an AI agent |
+| `/run` | `/run <repo> <prompt>` | Start a Cloud-first workspace with a local fallback |
 | `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
 | `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
 | `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
@@ -98,6 +98,10 @@ Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. Whe
 Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can create cloud workspaces (`/cloud`), browse projects (`/projects`), send messages, create ordinary threads, poll transcripts/status, rename workspaces and threads, search org-wide transcripts (`/fleet`), cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
 
 Cloud workspaces created with `/cloud` are driven entirely over the API — discovery, prompt delivery, and polling work even when the Conductor desktop app is closed or absent. Project arguments to `/cloud` and `/projects` accept a list number from `/projects`, a project id, an exact name, or a unique name prefix. When the bot itself runs inside a Conductor cloud workspace, it honors `CONDUCTOR_API_URL` and attributes its requests via an `X-Conductor-Session-Id` header taken from `CONDUCTOR_SESSION_ID` — both injected by the cloud workspace environment, not user config.
+
+Repo-targeted Telegram launches are Cloud-first. `/run`, repo-topic messages, and AI-routed new tasks use Cloud automatically when `CONDUCTOR_API_KEY` is configured and exactly one Cloud project matches the local repository's `origin` URL (SSH and HTTPS forms are treated as the same repository). Missing or ambiguous origins always fall back locally; automatic routing never guesses from a project name or remote basename. The bot states when it falls back to a local workspace because Cloud is unconfigured, project lookup failed, no project matched, or Telegram attachments require the local file bridge. `/cloud` remains available when you want to choose a Cloud project explicitly.
+
+If a local prompt later fails because its CLI login disappeared, the bot can take the same Telegram workspace over through Cloud. Automatic replay is limited to launcher-confirmed startup authentication failures before any assistant or tool activity. The worktree must be clean and its exact commit must already exist on an `origin` branch; the bot rechecks that branch after Cloud provisioning and before it sends work. Because the public Cloud API does not expose the provisioned checkout SHA, the handoff carries the expected SHA and tells the Cloud agent to verify HEAD before any side effect. Dirty files, unpushed commits, and partially executed prompts are never silently replayed. The Cloud binding and first prompt are persisted as a recoverable pending launch before delivery; later overlapping requests use a durable, ordered outbox with stable message identities. Stop intent and uncertain cleanup also survive restarts, so a canceled pending launch cannot be replayed later. Restricted read-only reviews remain local until the public Cloud API exposes equivalent permission-policy enforcement.
 
 Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, or query (`/projects`, `/fleet`) org resources — without it, every member of the configured group shares that privilege.
 
