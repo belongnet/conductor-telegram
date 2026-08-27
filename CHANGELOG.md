@@ -4,6 +4,25 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-27
+
+### Added
+- Telegram work now survives losing your local Conductor login. When a prompt fails because the CLI login disappeared, the bot can hand that same workspace to Conductor Cloud and keep going. It only does this when the worktree is clean and the exact commit is already on `origin`, and only before the agent has done any work, so dirty files, unpushed commits, and half-finished prompts are never silently replayed.
+- Stop and Archive now stick. A stop you press during a Cloud API outage is saved and retried after a restart instead of being lost, and the bot tells you when it has been confirmed.
+- Recovered work reports itself. After a restart the bot says what it replayed, what it suppressed, and what could not be delivered, so a recovery is never silent.
+
+### Changed
+- `/run`, repo-topic messages, and AI-routed new tasks go to Conductor Cloud by default when `CONDUCTOR_API_KEY` is set and exactly one Cloud project matches your repository's `origin`. SSH and HTTPS remotes count as the same repository. Anything ambiguous falls back to a local workspace and the bot says why. Automatic routing never guesses from a project name or a remote's basename.
+- A crash mid-launch no longer loses your first prompt. The Cloud binding and prompt are written down before they are sent, and overlapping follow-ups queue in order with stable message identities, so a retry after a crash cannot deliver the same prompt twice.
+- Read-only `/review` runs stay local until the Cloud API can enforce the same permission policy.
+
+### Fixed
+- A workspace could go permanently silent after a crash. A send that died mid-flight left a lock nobody released, and every later Cloud message was refused with a message telling you to wait for a Stop that was not running. Stale locks now expire.
+- A stop or archive that could never succeed retried forever and blocked all further work in that workspace. It now gives up, says why, and lets you keep working.
+- A single oversized recovery notice could stall one workspace's updates indefinitely. Long notices are trimmed and delivered instead.
+- Recovery notices could grow without limit while Telegram was unreachable.
+- An older queued prompt can no longer be delivered into a newer thread if a workspace is rebound mid-flight.
+
 ## [0.6.3] - 2026-08-19
 
 ### Fixed
