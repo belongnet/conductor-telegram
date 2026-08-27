@@ -1,4 +1,10 @@
-import { exec, execFile, spawn, type ChildProcess } from "node:child_process";
+import {
+  exec,
+  execFile,
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -16,10 +22,39 @@ import Database from "better-sqlite3";
 import {
   createDecision,
   addEvent,
+  beginCloudWorkLease,
+  clearPendingCloudLaunch,
+  clearPendingCloudLaunchWithNotice,
+  clearCloudWorkLease,
+  clearPendingCloudMessages,
+  clearPendingCloudMessagesWithNotice,
+  completeCloudWorkLease,
+  finalizePendingCloudLaunch,
+  completePendingCloudMessageDelivery,
+  completePendingCloudTerminalIntent,
+  cloudWorkLeaseCanSend,
+  getPendingCloudMessages,
+  getPendingCloudMessageOutcome,
+  getPendingCloudLaunch,
+  getPendingCloudTerminalIntent,
+  failPendingCloudTerminalIntent,
+  pendingCloudTerminalIntentIsExhausted,
   getMetaValue,
+  ensurePendingCloudStopIntent,
+  isFinalizedCloudLaunch,
+  markPendingCloudLaunchCanceled,
+  markPendingCloudLaunchForCleanup,
+  markPendingCloudLaunchSent,
+  pendingCloudMessageCanSend,
+  pendingCloudLaunchCanSend,
+  persistPendingCloudLaunch,
+  promotePendingCloudLaunchToSend,
+  restorePendingCloudLaunchBinding,
+  getWorkspace as getTrackedWorkspaceById,
   getWorkspaceByName as getTrackedWorkspaceByName,
   resetCloudThreadCursorAnchors,
   setMetaValue,
+  type PendingCloudLaunch,
 } from "../store/queries.js";
 import { getConductorSetting } from "../store/conductor-settings.js";
 import {
@@ -107,6 +142,10 @@ export interface AgentResult {
   costUsd?: number;
   durationMs?: number;
   numTurns?: number;
+  /** True once the local agent emitted assistant/tool activity that may have side effects. */
+  hadMeaningfulActivity?: boolean;
+  /** Launcher-proven pre-execution auth/capacity failure, safe to replay. */
+  authenticationFailure?: boolean;
   isError: boolean;
   exitCode: number | null;
   /** Last portion of the agent process stderr, set only on failed runs. */
@@ -114,6 +153,87 @@ export interface AgentResult {
 }
 
 const STDERR_TAIL_LIMIT = 2000;
+
+const LOCAL_CLI_PRE_EXECUTION_FAILURE_LINES = [
+  /^(?:error:\s*)?not logged in(?:\s*[.:·—-]\s*please run\s+\/login)?[.!]?$/i,
+  /^(?:error:\s*)?please run\s+\/login[.!]?$/i,
+  /^(?:error:\s*)?run (?:claude\s+)?\/login[.!]?$/i,
+  /^(?:error:\s*)?authentication (?:is )?required(?:[.:]\s*(?:please\s+)?run\s+(?:claude\s+)?\/login(?:\s+to continue)?)?[.!]?$/i,
+  /^(?:error:\s*)?access token is expired[.!]?$/i,
+  /^you(?:'|’)ve hit your weekly limit(?:\s*[·—-]\s*resets\s+.+)?[.!]?$/i,
+];
+
+/** Exact startup auth/capacity copy; surrounding application prose is ignored. */
+export function isKnownCliAuthenticationFailure(
+  result: Pick<AgentResult, "resultText" | "stderrTail">
+): boolean {
+  const detail = [result.resultText, result.stderrTail]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join("\n");
+  const lines = detail
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return (
+    lines.length > 0 &&
+    lines.every((line) =>
+      LOCAL_CLI_PRE_EXECUTION_FAILURE_LINES.some((pattern) => pattern.test(line))
+    )
+  );
+}
+
+function assistantMessageHasMeaningfulActivity(msg: any): boolean {
+  const content = msg?.message?.content;
+  if (Array.isArray(content)) {
+    if (content.some((part) => part?.type === "tool_use")) return true;
+    const text = content
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text.trim())
+      .filter(Boolean)
+      .join("\n");
+    return !text || !isKnownCliAuthenticationFailure({ resultText: text });
+  }
+  if (typeof content === "string") {
+    return !isKnownCliAuthenticationFailure({ resultText: content });
+  }
+  return true;
+}
+
+/** @internal exported for pre-replay activity regression tests. */
+export function claudeEventHasMeaningfulActivity(msg: any): boolean {
+  if (msg?.type === "assistant") {
+    return assistantMessageHasMeaningfulActivity(msg);
+  }
+  // Defense in depth: settings-backed hooks are disabled for replay-eligible
+  // launches, but if a CLI version still emits a hook lifecycle event then
+  // local code has already run and the prompt must never be replayed.
+  if (
+    msg?.type === "system" &&
+    (msg?.subtype === "hook_started" || msg?.subtype === "hook_response")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** @internal exported for Codex stream-ordering regression tests. */
+export function codexEventHasMeaningfulActivity(msg: any): boolean {
+  if (msg?.type !== "item.started" && msg?.type !== "item.completed") {
+    return false;
+  }
+  const itemType = msg.item?.type;
+  if (typeof itemType !== "string" || itemType === "reasoning") return false;
+  // Codex emits an empty agent_message start before its completed text. Wait
+  // for completion so an authentication banner can be classified accurately.
+  if (itemType === "agent_message") {
+    if (msg.type !== "item.completed" || typeof msg.item?.text !== "string") {
+      return false;
+    }
+    return !isKnownCliAuthenticationFailure({ resultText: msg.item.text });
+  }
+  return true;
+}
 
 export type AgentType = "claude" | "codex";
 type LaunchMode = "prompt" | "review";
@@ -534,14 +654,31 @@ export function buildAgentEnvironment(
     if (value !== undefined) result[key] = value;
   }
   const operatorHome = source.HOME?.trim() || os.homedir();
-  const runtimeHome = createAgentRuntimeHome(context.workspaceDir);
+  const accessMode = context.accessMode ?? "legacy";
+  // Claude's supported OAuth lookup depends on the operator HOME in addition
+  // to CLAUDE_CONFIG_DIR (including its keychain account context). Pointing a
+  // legacy launch at a throwaway HOME makes `claude auth status` report a
+  // false logout. Restricted launches still get a private HOME; legacy Claude
+  // keeps the real HOME while the allowlist below continues to withhold bot
+  // and provider API-key environment variables.
+  const usesOperatorClaudeHome =
+    context.agentType === "claude" && accessMode === "legacy";
+  const runtimeHome = usesOperatorClaudeHome
+    ? operatorHome
+    : createAgentRuntimeHome(context.workspaceDir);
   result.HOME = runtimeHome;
   if (context.agentType === "codex") {
     result.CODEX_HOME =
       source.CODEX_HOME?.trim() || path.join(operatorHome, ".codex");
   } else {
-    result.CLAUDE_CONFIG_DIR =
-      source.CLAUDE_CONFIG_DIR?.trim() || path.join(operatorHome, ".claude");
+    // Do not synthesize CLAUDE_CONFIG_DIR. Current Claude builds deliberately
+    // use a different credential store when this variable is present, even
+    // when it points at the conventional ~/.claude directory. With the real
+    // HOME above, leaving it unset preserves the operator's normal login.
+    const configuredClaudeDir = source.CLAUDE_CONFIG_DIR?.trim();
+    if (configuredClaudeDir) {
+      result.CLAUDE_CONFIG_DIR = configuredClaudeDir;
+    }
   }
   result.CONDUCTOR_WORKSPACE_NAME = context.workspaceName;
   result.CONDUCTOR_WORKSPACE_PATH = context.workspaceDir;
@@ -568,7 +705,7 @@ export function buildAgentEnvironment(
   // isolated HOME hides the operator's git/gh/ssh stores. Re-point them at the
   // real ones the way CODEX_HOME/CLAUDE_CONFIG_DIR already are. Restricted
   // launches are review-only and stay without VCS credentials.
-  if ((context.accessMode ?? "legacy") === "legacy") {
+  if (accessMode === "legacy") {
     result.GIT_CONFIG_GLOBAL =
       source.GIT_CONFIG_GLOBAL?.trim() || path.join(operatorHome, ".gitconfig");
     result.GH_CONFIG_DIR =
@@ -647,6 +784,16 @@ function cleanupAgentRuntimeHome(env: NodeJS.ProcessEnv): void {
 }
 
 const EMPTY_MCP_CONFIG = '{"mcpServers":{}}';
+const TRUSTED_TELEGRAM_MCP_CONFIG = JSON.stringify({
+  mcpServers: {
+    "conductor-telegram": {
+      command:
+        process.env.CONDUCTOR_TELEGRAM_MCP_BIN?.trim() ||
+        "conductor-telegram-mcp",
+      args: [],
+    },
+  },
+});
 const CODEX_EXEC_ISOLATION_ARGS = ["--ignore-user-config", "--ignore-rules"];
 
 export function claudeAccessArgs(accessMode: AgentAccessMode): string[] {
@@ -686,7 +833,19 @@ export function claudeAccessArgs(accessMode: AgentAccessMode): string[] {
       "--disable-slash-commands",
     ];
   }
-  return ["--permission-mode", TELEGRAM_AGENT_PERMISSION_MODE];
+  // Suppress settings-backed hooks/plugins while retaining CLAUDE.md and
+  // skills. The only MCP process allowed before the CLI confirms auth/capacity
+  // is our fixed oversight server, whose command is passed without a shell.
+  return [
+    "--permission-mode",
+    TELEGRAM_AGENT_PERMISSION_MODE,
+    "--setting-sources",
+    "",
+    "--no-chrome",
+    "--strict-mcp-config",
+    "--mcp-config",
+    TRUSTED_TELEGRAM_MCP_CONFIG,
+  ];
 }
 
 function codexAccessArgs(accessMode: AgentAccessMode): string[] {
@@ -734,7 +893,7 @@ function spawnAgent(
     launchMode?: LaunchMode;
     accessMode?: AgentAccessMode;
   } = {}
-): { child: ChildProcess; done: Promise<AgentResult> } {
+): { child: ChildProcess | null; done: Promise<AgentResult> } {
   if (agentType === "codex") {
     return spawnCodexAgent(
       conductorSessionId,
@@ -770,7 +929,7 @@ function spawnClaudeAgent(
     isFollowUp?: boolean;
     accessMode?: AgentAccessMode;
   } = {}
-): { child: ChildProcess; done: Promise<AgentResult> } {
+): { child: ChildProcess | null; done: Promise<AgentResult> } {
   const isFollowUp = options.isFollowUp ?? false;
   const sessionFlag = isFollowUp ? "--resume" : "--session-id";
   // App-created threads have a Claude session id that differs from the
@@ -779,6 +938,7 @@ function spawnClaudeAgent(
   const sessionArg = isFollowUp
     ? options.agentSessionId ?? conductorSessionId
     : conductorSessionId;
+  const accessMode = options.accessMode ?? "legacy";
   const args = [
     "-p", prompt,
     "--output-format", "stream-json",
@@ -786,7 +946,7 @@ function spawnClaudeAgent(
     sessionFlag, sessionArg,
     "--max-turns", "1000",
     "--model", model,
-    ...claudeAccessArgs(options.accessMode ?? "legacy"),
+    ...claudeAccessArgs(accessMode),
     "--append-system-prompt", TELEGRAM_INLINE_MEDIA_SYSTEM_PROMPT,
   ];
 
@@ -797,11 +957,22 @@ function spawnClaudeAgent(
 
   const agentEnv = buildAgentEnvironment(process.env, {
     agentType: "claude",
-    accessMode: options.accessMode ?? "legacy",
+    accessMode,
     workspaceName,
     workspaceDir,
     repoPath,
   });
+  if (accessMode === "legacy") {
+    const authFailure = runClaudeAuthenticationPreflight(
+      CLAUDE_BIN,
+      workspaceDir,
+      agentEnv
+    );
+    if (authFailure) {
+      cleanupAgentRuntimeHome(agentEnv);
+      return { child: null, done: Promise.resolve(authFailure) };
+    }
+  }
   const child = spawn(CLAUDE_BIN, args, {
     cwd: workspaceDir,
     stdio: ["pipe", "pipe", "pipe"],
@@ -816,7 +987,11 @@ function spawnClaudeAgent(
   updateSessionStatus(conductorSessionId, "working");
 
   const done = new Promise<AgentResult>((resolve) => {
-    let result: AgentResult = { isError: false, exitCode: null };
+    let result: AgentResult = {
+      isError: false,
+      exitCode: null,
+      hadMeaningfulActivity: false,
+    };
     let buffer = "";
     let stdoutBytes = 0;
     let stderrTail = "";
@@ -834,6 +1009,10 @@ function spawnClaudeAgent(
           const msg = JSON.parse(line);
           processStreamMessage(conductorSessionId, msg, model, workspaceName, repoPath);
 
+          if (claudeEventHasMeaningfulActivity(msg)) {
+            result.hadMeaningfulActivity = true;
+          }
+
           // Extract result info
           if (msg.type === "result") {
             result.resultText = msg.result;
@@ -843,6 +1022,7 @@ function spawnClaudeAgent(
             result.isError = msg.is_error ?? false;
           }
         } catch {
+          result.hadMeaningfulActivity = true;
           console.log(`[agent] Non-JSON output: ${line.slice(0, 100)}`);
         }
       }
@@ -858,6 +1038,7 @@ function spawnClaudeAgent(
     child.on("close", (code) => {
       console.log(`[agent] Process exited with code ${code}`);
       result.exitCode = code;
+      if (buffer.trim()) result.hadMeaningfulActivity = true;
       // code === null means killed by signal (e.g. user pressed Stop) — not an error.
       if (code !== null && code !== 0 && !result.resultText) {
         result.isError = true;
@@ -865,6 +1046,19 @@ function spawnClaudeAgent(
       if (result.isError && stderrTail.trim()) {
         result.stderrTail = stderrTail.trim();
       }
+      if (
+        stderrTail.trim() &&
+        !isKnownCliAuthenticationFailure({
+          resultText: result.resultText,
+          stderrTail,
+        })
+      ) {
+        result.hadMeaningfulActivity = true;
+      }
+      result.authenticationFailure =
+        result.isError &&
+        result.hadMeaningfulActivity === false &&
+        isKnownCliAuthenticationFailure(result);
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       cleanupAgentRuntimeHome(agentEnv);
@@ -876,6 +1070,7 @@ function spawnClaudeAgent(
       result.isError = true;
       result.exitCode = -1;
       result.stderrTail = String(err?.message ?? err);
+      result.authenticationFailure = false;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
       cleanupAgentRuntimeHome(agentEnv);
@@ -884,6 +1079,66 @@ function spawnClaudeAgent(
   });
 
   return { child, done };
+}
+
+function runClaudeAuthenticationPreflight(
+  executable: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv
+): AgentResult | null {
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+  try {
+    stdout = execFileSync(executable, ["auth", "status", "--json"], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 10_000,
+    });
+  } catch (error: any) {
+    stdout = Buffer.isBuffer(error?.stdout)
+      ? error.stdout.toString()
+      : String(error?.stdout ?? "");
+    stderr = Buffer.isBuffer(error?.stderr)
+      ? error.stderr.toString()
+      : String(error?.stderr ?? error?.message ?? "");
+    exitCode = typeof error?.status === "number" ? error.status : 1;
+  }
+
+  let loggedIn: boolean | null = null;
+  try {
+    const parsed = JSON.parse(stdout.trim()) as { loggedIn?: unknown };
+    loggedIn =
+      typeof parsed.loggedIn === "boolean" ? parsed.loggedIn : null;
+  } catch {
+    // Fall through to the exact line-level CLI classifier.
+  }
+  if (exitCode === 0 && loggedIn === true) return null;
+
+  const classified = isKnownCliAuthenticationFailure({
+    resultText: loggedIn === false ? "Not logged in · Please run /login" : stdout,
+    stderrTail: stderr,
+  });
+  if (loggedIn !== false && !classified) {
+    console.warn(
+      "[agent] Claude auth preflight was unavailable; continuing with the controlled legacy launch"
+    );
+    return null;
+  }
+  return {
+    isError: true,
+    exitCode,
+    numTurns: 0,
+    hadMeaningfulActivity: false,
+    authenticationFailure: true,
+    resultText:
+      loggedIn === false
+        ? "Not logged in · Please run /login"
+        : stdout.trim() || undefined,
+    stderrTail: stderr.trim() || undefined,
+  };
 }
 
 function spawnCodexAgent(
@@ -940,7 +1195,11 @@ function spawnCodexAgent(
   updateSessionStatus(conductorSessionId, "working");
 
   const done = new Promise<AgentResult>((resolve) => {
-    let result: AgentResult = { isError: false, exitCode: null };
+    let result: AgentResult = {
+      isError: false,
+      exitCode: null,
+      hadMeaningfulActivity: false,
+    };
     let buffer = "";
     const startedAt = Date.now();
     let turnCount = 0;
@@ -968,10 +1227,14 @@ function spawnCodexAgent(
           if (parsed.assistantText) {
             lastAssistantText = parsed.assistantText;
           }
+          if (codexEventHasMeaningfulActivity(msg)) {
+            result.hadMeaningfulActivity = true;
+          }
           if (msg.type === "turn.completed") {
             turnCount += 1;
           }
         } catch {
+          result.hadMeaningfulActivity = true;
           console.log(`[agent] Non-JSON output: ${line.slice(0, 100)}`);
         }
       }
@@ -987,6 +1250,7 @@ function spawnCodexAgent(
     child.on("close", (code) => {
       console.log(`[agent] Process exited with code ${code}`);
       result.exitCode = code;
+      if (buffer.trim()) result.hadMeaningfulActivity = true;
       result.durationMs = Date.now() - startedAt;
       result.numTurns = turnCount;
       result.resultText = lastAssistantText || result.resultText;
@@ -996,6 +1260,19 @@ function spawnCodexAgent(
       if (result.isError && stderrTail.trim()) {
         result.stderrTail = stderrTail.trim();
       }
+      if (
+        stderrTail.trim() &&
+        !isKnownCliAuthenticationFailure({
+          resultText: result.resultText,
+          stderrTail,
+        })
+      ) {
+        result.hadMeaningfulActivity = true;
+      }
+      result.authenticationFailure =
+        result.isError &&
+        result.hadMeaningfulActivity === false &&
+        isKnownCliAuthenticationFailure(result);
 
       if (lastAssistantText) {
         insertCodexResultMessage(
@@ -1019,6 +1296,7 @@ function spawnCodexAgent(
       result.isError = true;
       result.exitCode = -1;
       result.stderrTail = String(err?.message ?? err);
+      result.authenticationFailure = false;
       result.durationMs = Date.now() - startedAt;
       runningAgents.delete(workspaceAgentKey(repoPath, workspaceName));
       updateSessionStatus(conductorSessionId, "idle");
@@ -1974,7 +2252,11 @@ export interface SendError {
     | "remote_observe_only"
     | "conductor_api_unavailable"
     | "cloud_policy_unsupported"
-    | "cloud_session_busy";
+    | "cloud_session_busy"
+    | "cloud_launch_archived"
+    | "cloud_launch_cleanup_pending"
+    | "cloud_launch_canceled"
+    | "cloud_launch_cancel_pending";
 }
 
 interface SessionSendTarget {
@@ -2009,6 +2291,8 @@ export async function sendToSession(
     sessionId?: string | null;
     accessMode?: AgentAccessMode;
     binding?: TrackedConductorBinding | null;
+    /** Recovery-only: steer an already-running Cloud turn instead of dropping it. */
+    allowCloudSteeringWhileBusy?: boolean;
   } = {}
 ): Promise<SendSuccess | SendError> {
   const wsInfo = resolveConductorWorkspaceInfo(
@@ -2030,6 +2314,34 @@ export async function sendToSession(
   }
 
   const remote = isRemoteConductorWorkspace(wsInfo);
+  const trackedWorkspace = remote
+    ? options.binding?.id
+      ? options.binding
+      : getTrackedWorkspaceByName(workspaceName, {
+          repoPath: options.repoPath ?? wsInfo.repoPath ?? undefined,
+        })
+    : null;
+  const trackedWorkspaceId = trackedWorkspace?.id;
+  if (remote && trackedWorkspaceId) {
+    const terminalIntent = getPendingCloudTerminalIntent(trackedWorkspaceId);
+    if (terminalIntent?.action === "archive") {
+      return {
+        error:
+          "This Cloud workspace has a pending archive request and cannot be reopened.",
+      };
+    }
+    if (terminalIntent?.action === "stop") {
+      const terminal = await reconcilePendingCloudTerminalIntent(
+        trackedWorkspaceId
+      );
+      if (terminal.status === "pending") {
+        return {
+          error:
+            "The previous Cloud stop request is still being confirmed. Retry after cancellation completes.",
+        };
+      }
+    }
+  }
   if (
     remote &&
     options.accessMode !== undefined &&
@@ -2045,10 +2357,7 @@ export async function sendToSession(
 
   const trackedDefaultSessionId =
     remote && !options.sessionId
-      ? options.binding?.conductorSessionId ??
-        getTrackedWorkspaceByName(workspaceName, {
-          repoPath: options.repoPath ?? wsInfo.repoPath ?? undefined,
-        })?.conductorSessionId
+      ? trackedWorkspace?.conductorSessionId
       : null;
   const requestedSessionId =
     options.sessionId ?? trackedDefaultSessionId ?? wsInfo.sessionId;
@@ -2061,16 +2370,7 @@ export async function sendToSession(
     model: wsInfo.model,
     status: wsInfo.status,
   };
-  if (remote) {
-    const remoteTarget = await getRemoteSessionSendTarget(
-      wsInfo,
-      requestedSessionId
-    );
-    if ("error" in remoteTarget) {
-      return remoteTarget;
-    }
-    target = remoteTarget;
-  } else if (requestedSessionId !== wsInfo.sessionId) {
+  if (!remote && requestedSessionId !== wsInfo.sessionId) {
     const session = getConductorSessionById(requestedSessionId);
     if (!session || session.workspaceId !== wsInfo.workspaceId) {
       return {
@@ -2093,7 +2393,67 @@ export async function sendToSession(
   }
 
   if (remote) {
-    return steerRemoteSession(wsInfo, target, prompt, attachmentSourcePaths);
+    const leaseToken = trackedWorkspaceId
+      ? beginCloudWorkLease(trackedWorkspaceId, wsInfo.workspaceId)
+      : null;
+    if (trackedWorkspaceId && !leaseToken) {
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" changed state before the message could be sent. ` +
+          "Retry after its pending Stop or Archive request completes.",
+        reason: "conductor_api_unavailable",
+      };
+    }
+    try {
+      const remoteTarget = await getRemoteSessionSendTarget(
+        wsInfo,
+        requestedSessionId
+      );
+      if ("error" in remoteTarget) {
+        return remoteTarget;
+      }
+      target = remoteTarget;
+      return await steerRemoteSession(
+        wsInfo,
+        target,
+        prompt,
+        attachmentSourcePaths,
+        options.allowCloudSteeringWhileBusy === true,
+        leaseToken && trackedWorkspaceId
+          ? () =>
+              cloudWorkLeaseCanSend(
+                trackedWorkspaceId,
+                wsInfo.workspaceId,
+                leaseToken
+              )
+          : undefined,
+        leaseToken && trackedWorkspaceId
+          ? () =>
+              completeCloudWorkLease(
+                trackedWorkspaceId,
+                wsInfo.workspaceId,
+                leaseToken
+              )
+          : undefined,
+        leaseToken && trackedWorkspaceId
+          ? async () => {
+              if (
+                ensurePendingCloudStopIntent(
+                  trackedWorkspaceId,
+                  wsInfo.workspaceId,
+                  target.sessionId
+                )
+              ) {
+                await reconcilePendingCloudTerminalIntent(trackedWorkspaceId);
+              }
+            }
+          : undefined
+      );
+    } finally {
+      if (leaseToken && trackedWorkspaceId) {
+        clearCloudWorkLease(trackedWorkspaceId, leaseToken);
+      }
+    }
   }
 
   if (!isSpawnableAgentType(target.rawAgentType)) {
@@ -2180,11 +2540,41 @@ export async function launchWorkspaceSession(
     };
   }
 
+  const remote = isRemoteConductorWorkspace(wsInfo);
+  const trackedWorkspace = remote
+    ? options.binding?.id
+      ? options.binding
+      : getTrackedWorkspaceByName(workspaceName, {
+          repoPath: options.repoPath ?? wsInfo.repoPath ?? undefined,
+        })
+    : null;
+  const trackedWorkspaceId = trackedWorkspace?.id;
+  if (remote && trackedWorkspaceId) {
+    const terminalIntent = getPendingCloudTerminalIntent(trackedWorkspaceId);
+    if (terminalIntent?.action === "archive") {
+      return {
+        error:
+          "This Cloud workspace has a pending archive request and cannot start a new thread.",
+      };
+    }
+    if (terminalIntent?.action === "stop") {
+      const terminal = await reconcilePendingCloudTerminalIntent(
+        trackedWorkspaceId
+      );
+      if (terminal.status === "pending") {
+        return {
+          error:
+            "The previous Cloud stop request is still being confirmed. Retry the new thread after cancellation completes.",
+        };
+      }
+    }
+  }
+
   const repoPath = wsInfo.repoPath ?? options.repoPath;
   if (!repoPath) {
     return { error: `Workspace "${workspaceName}" is missing repo path metadata.` };
   }
-  if (isRemoteConductorWorkspace(wsInfo)) {
+  if (remote) {
     const accessMode =
       options.accessMode ??
       (options.launchMode === "review" ? "read-only" : "legacy");
@@ -2222,7 +2612,31 @@ export async function launchWorkspaceSession(
       launchConfig.launchMode,
       options.model
     );
+    const leaseToken = trackedWorkspaceId
+      ? beginCloudWorkLease(trackedWorkspaceId, wsInfo.workspaceId)
+      : null;
+    if (trackedWorkspaceId && !leaseToken) {
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" changed state before the new thread could start. ` +
+          "Retry after its pending Stop or Archive request completes.",
+        reason: "conductor_api_unavailable",
+      };
+    }
     let session: ConductorApiSession | null = null;
+    const messageId = randomUUID();
+    let foregroundIdentity: string | null = null;
+    let persisted = false;
+    const completedResult = () => ({
+      sessionId: session!.id,
+      done: Promise.resolve({ isError: false, exitCode: 0 }),
+      initialCursorRowid: 0,
+      initialCursorMessageId: messageId,
+      agentType: launchConfig.agentType,
+      model: session!.resolvedModel ?? session!.model ?? apiModel,
+      workspaceId: wsInfo.workspaceId,
+      backendKind: "cloud-api" as const,
+    });
     try {
       const createdSession = await client.createSession({
         workspaceId: wsInfo.workspaceId,
@@ -2232,24 +2646,127 @@ export async function launchWorkspaceSession(
         effort: resolveCloudSessionEffort(launchConfig),
       });
       session = createdSession;
+      if (trackedWorkspaceId) {
+        const pending: PendingCloudLaunch = {
+          workspaceId: wsInfo.workspaceId,
+          sessionId: createdSession.id,
+          prompt,
+          messageId,
+          phase: "provisioned",
+          cleanupTarget: "session",
+          conductorWorkspaceName: wsInfo.displayName,
+        };
+        foregroundIdentity = cloudLaunchIdentityKey(pending);
+        foregroundCloudLaunchIdentities.add(foregroundIdentity);
+        const saved = persistPendingCloudLaunch(trackedWorkspaceId, pending, {
+          reopenLeaseToken: leaseToken ?? undefined,
+          expectedPreviousSessionId:
+            trackedWorkspace?.conductorSessionId ?? null,
+        });
+        if (!saved) {
+          throw new ConductorApiError(
+            "The Cloud workspace binding changed while the new thread was being provisioned"
+          );
+        }
+        persisted = true;
+      }
       const sent = await queueFirstCloudPrompt(
         client,
         wsInfo.workspaceId,
         createdSession.id,
-        prompt
+        prompt,
+        undefined,
+        trackedWorkspaceId
+          ? async (stableMessageId, resolvedPrompt) => {
+              const expected = {
+                workspaceId: wsInfo.workspaceId,
+                sessionId: createdSession.id,
+                messageId: stableMessageId,
+              };
+              if (
+                !promotePendingCloudLaunchToSend(
+                  trackedWorkspaceId,
+                  expected,
+                  resolvedPrompt
+                ) ||
+                !pendingCloudLaunchCanSend(trackedWorkspaceId, expected)
+              ) {
+                throw new ConductorApiError(
+                  "The Cloud workspace was stopped or archived before the prompt could be sent"
+                );
+              }
+            }
+          : undefined,
+        messageId
       );
-      return {
-        sessionId: session.id,
-        done: Promise.resolve({ isError: false, exitCode: 0 }),
-        initialCursorRowid: 0,
-        initialCursorMessageId: sent.messageId,
-        agentType: launchConfig.agentType,
-        model: session.resolvedModel ?? session.model ?? apiModel,
-        workspaceId: wsInfo.workspaceId,
-        backendKind: "cloud-api",
-      };
+      if (
+        trackedWorkspaceId &&
+        (!markPendingCloudLaunchSent(
+          trackedWorkspaceId,
+          sent.messageId,
+          wsInfo.workspaceId,
+          createdSession.id
+        ) ||
+          !finalizePendingCloudLaunch({
+            trackedWorkspaceId,
+            conductorWorkspaceName: wsInfo.displayName,
+            workspaceId: wsInfo.workspaceId,
+            sessionId: createdSession.id,
+            messageId: sent.messageId,
+            notice: { kind: "launch_queued" },
+          }))
+      ) {
+        throw new ConductorApiError(
+          "The Cloud workspace was stopped while the first prompt was being delivered"
+        );
+      }
+      return completedResult();
     } catch (error) {
-      if (session) {
+      if (
+        session &&
+        trackedWorkspaceId &&
+        isFinalizedCloudLaunch({
+          trackedWorkspaceId,
+          workspaceId: wsInfo.workspaceId,
+          sessionId: session.id,
+          messageId,
+        })
+      ) {
+        return completedResult();
+      }
+      if (session && trackedWorkspaceId && persisted) {
+        let pending = getPendingCloudLaunch(trackedWorkspaceId);
+        if (pending?.phase === "send" || pending?.phase === "sent") {
+          const reconciled = await reconcilePendingCloudLaunch(
+            trackedWorkspaceId,
+            getTrackedWorkspaceById(trackedWorkspaceId) ?? trackedWorkspace!
+          );
+          if (
+            reconciled.status === "queued" ||
+            isFinalizedCloudLaunch({
+              trackedWorkspaceId,
+              workspaceId: wsInfo.workspaceId,
+              sessionId: session.id,
+              messageId,
+            })
+          ) {
+            return completedResult();
+          }
+          pending = getPendingCloudLaunch(trackedWorkspaceId);
+        }
+        if (pending?.phase === "provisioned") {
+          markPendingCloudLaunchForCleanup(trackedWorkspaceId, pending);
+          pending = getPendingCloudLaunch(trackedWorkspaceId);
+        }
+        if (pending?.phase === "cleanup" || pending?.phase === "cancel") {
+          await cleanupPendingCloudLaunch(
+            client,
+            trackedWorkspaceId,
+            pending,
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      } else if (session) {
         await client.archiveSession(session.id).catch((cleanupError) => {
           console.error(
             `[conductor-api] Failed to archive incomplete session ${session?.id}:`,
@@ -2258,6 +2775,13 @@ export async function launchWorkspaceSession(
         });
       }
       return conductorApiSendError(wsInfo, error);
+    } finally {
+      if (foregroundIdentity) {
+        foregroundCloudLaunchIdentities.delete(foregroundIdentity);
+      }
+      if (leaseToken && trackedWorkspaceId) {
+        clearCloudWorkLease(trackedWorkspaceId, leaseToken);
+      }
     }
   }
   const workspaceDir = getWorkspacePathFromInfo(
@@ -2350,6 +2874,16 @@ export interface CloudWorkspaceLaunchResult {
   backendKind: "cloud-api";
 }
 
+const foregroundCloudLaunchIdentities = new Set<string>();
+
+function cloudLaunchIdentityKey(input: {
+  workspaceId: string;
+  sessionId: string;
+  messageId: string;
+}): string {
+  return `${input.workspaceId}\u0000${input.sessionId}\u0000${input.messageId}`;
+}
+
 /**
  * Create a Conductor Cloud workspace (and its first session) entirely through
  * the supported HTTP API, then queue the initial prompt. No local Conductor
@@ -2359,8 +2893,19 @@ export interface CloudWorkspaceLaunchResult {
 export async function launchCloudWorkspace(input: {
   projectId: string;
   prompt: string;
+  /** Resolve the prompt immediately before the first Cloud send. */
+  promptProvider?: () => string;
   name?: string | null;
   branch?: string | null;
+  /** Re-check a takeover branch after Cloud provisioning, before sending work. */
+  expectedRemoteCommit?: {
+    cwd: string;
+    commit: string;
+  };
+  /** Atomically persist the Cloud binding before the first prompt is sent. */
+  persistBeforePrompt?: (
+    pending: PendingCloudLaunch
+  ) => string | Promise<string>;
   agentType?: AgentType;
   model?: string | null;
 }): Promise<CloudWorkspaceLaunchResult | SendError> {
@@ -2397,10 +2942,45 @@ export async function launchCloudWorkspace(input: {
     sessionId: string;
     deepLink: string;
   } | null = null;
+  let persistedTrackedWorkspaceId: string | null = null;
+  let persistedMessageId: string | null = null;
+  let foregroundIdentity: string | null = null;
+  const provisionedMessageId = randomUUID();
+  const finalizedForegroundResult = (): CloudWorkspaceLaunchResult | null => {
+    if (
+      !persistedTrackedWorkspaceId ||
+      !persistedMessageId ||
+      !createdWorkspace ||
+      !isFinalizedCloudLaunch({
+        trackedWorkspaceId: persistedTrackedWorkspaceId,
+        workspaceId: createdWorkspace.workspaceId,
+        sessionId: createdWorkspace.sessionId,
+        messageId: persistedMessageId,
+      })
+    ) {
+      return null;
+    }
+    const tracked = getTrackedWorkspaceById(persistedTrackedWorkspaceId);
+    return {
+      workspaceId: createdWorkspace.workspaceId,
+      sessionId: createdWorkspace.sessionId,
+      deepLink: createdWorkspace.deepLink,
+      workspaceName:
+        tracked?.conductorWorkspaceName ||
+        input.name?.trim() ||
+        createdWorkspace.workspaceId,
+      agentType: launchConfig.agentType,
+      model: apiModel,
+      initialCursorRowid: 0,
+      initialCursorMessageId: persistedMessageId,
+      backendKind: "cloud-api",
+    };
+  };
   try {
+    const requestedBranch = input.branch?.trim() || undefined;
     createdWorkspace = await client.createWorkspace({
       projectId: input.projectId,
-      branch: input.branch?.trim() || undefined,
+      branch: requestedBranch,
       name: input.name?.trim() || undefined,
       agent: launchConfig.agentType,
       model: apiModel,
@@ -2412,12 +2992,93 @@ export async function launchCloudWorkspace(input: {
     console.log(
       `[conductor-api] Created cloud workspace ${createdWorkspace.workspaceId} (session ${createdWorkspace.sessionId}) in project ${input.projectId}`
     );
+    if (input.persistBeforePrompt) {
+      foregroundIdentity = cloudLaunchIdentityKey({
+        workspaceId: createdWorkspace.workspaceId,
+        sessionId: createdWorkspace.sessionId,
+        messageId: provisionedMessageId,
+      });
+      foregroundCloudLaunchIdentities.add(foregroundIdentity);
+      const trackedWorkspaceId = await input.persistBeforePrompt({
+        workspaceId: createdWorkspace.workspaceId,
+        sessionId: createdWorkspace.sessionId,
+        prompt: input.prompt,
+        messageId: provisionedMessageId,
+        phase: "provisioned",
+      });
+      if (!trackedWorkspaceId) {
+        throw new Error(
+          "Cloud launch persistence did not return its tracked workspace id"
+        );
+      }
+      persistedTrackedWorkspaceId = trackedWorkspaceId;
+      persistedMessageId = provisionedMessageId;
+    }
     const sent = await queueFirstCloudPrompt(
       client,
       createdWorkspace.workspaceId,
       createdWorkspace.sessionId,
-      input.prompt
+      input.promptProvider ?? input.prompt,
+      requestedBranch && input.expectedRemoteCommit
+        ? async () => {
+            const remoteCommit = await resolveRemoteBranchCommit(
+              input.expectedRemoteCommit!.cwd,
+              requestedBranch
+            );
+            if (remoteCommit !== input.expectedRemoteCommit!.commit) {
+              throw new ConductorApiError(
+                `Origin branch ${requestedBranch} moved after local state verification; refusing to send the prompt to an unverified checkout`
+              );
+            }
+          }
+        : undefined,
+      input.persistBeforePrompt
+        ? async (messageId, prompt) => {
+            const trackedWorkspaceId = persistedTrackedWorkspaceId;
+            if (!trackedWorkspaceId) {
+              throw new Error("Cloud launch lost its provisioned binding");
+            }
+            persistedMessageId = messageId;
+            const expected = {
+              workspaceId: createdWorkspace!.workspaceId,
+              sessionId: createdWorkspace!.sessionId,
+              messageId,
+            };
+            if (
+              !promotePendingCloudLaunchToSend(
+                trackedWorkspaceId,
+                expected,
+                prompt
+              )
+            ) {
+              throw new ConductorApiError(
+                "Cloud launch validation lost its durable provisioned lease"
+              );
+            }
+            if (
+              !pendingCloudLaunchCanSend(trackedWorkspaceId, expected)
+            ) {
+              throw new ConductorApiError(
+                "Cloud launch was canceled before its prompt was sent"
+              );
+            }
+          }
+        : undefined,
+      provisionedMessageId
     );
+    if (
+      persistedTrackedWorkspaceId &&
+      !markPendingCloudLaunchSent(
+        persistedTrackedWorkspaceId,
+        sent.messageId,
+        createdWorkspace.workspaceId,
+        createdWorkspace.sessionId
+      )
+    ) {
+      throw new ConductorApiError(
+        "Cloud launch was stopped while its first prompt was being delivered"
+      );
+    }
     // Unnamed workspaces get a Conductor-assigned city name; read it back so
     // topics and bindings show the real name rather than a UUID.
     const workspaceName =
@@ -2427,6 +3088,21 @@ export async function launchCloudWorkspace(input: {
         .then((workspace) => workspace.name.trim() || null)
         .catch(() => null)) ||
       createdWorkspace.workspaceId;
+    if (
+      persistedTrackedWorkspaceId &&
+      !finalizePendingCloudLaunch({
+        trackedWorkspaceId: persistedTrackedWorkspaceId,
+        conductorWorkspaceName: workspaceName,
+        workspaceId: createdWorkspace.workspaceId,
+        sessionId: createdWorkspace.sessionId,
+        messageId: sent.messageId,
+        notice: { kind: "launch_queued" },
+      })
+    ) {
+      throw new ConductorApiError(
+        "Cloud launch was stopped before its durable binding was finalized"
+      );
+    }
     return {
       workspaceId: createdWorkspace.workspaceId,
       sessionId: createdWorkspace.sessionId,
@@ -2439,17 +3115,918 @@ export async function launchCloudWorkspace(input: {
       backendKind: "cloud-api",
     };
   } catch (error) {
-    if (createdWorkspace) {
-      await client
-        .archiveWorkspace(createdWorkspace.workspaceId)
-        .catch((cleanupError) => {
+    // The POST can be accepted even when its response is lost or malformed.
+    // A restart poller may already have observed the stable message ID and
+    // finalized this exact launch while the foreground request was in flight.
+    // In that case cleanup would destroy successfully queued work, so accept
+    // only the durable exact-identity receipt as success.
+    const finalized = finalizedForegroundResult();
+    if (finalized) return finalized;
+    // Once a binding exists, prohibit replay before the first cleanup request.
+    // If stop already won, its cancel phase remains dominant and cleanup still
+    // archives/restores the provisioned workspace.
+    const expectedPending =
+      createdWorkspace && persistedMessageId
+        ? {
+            workspaceId: createdWorkspace.workspaceId,
+            sessionId: createdWorkspace.sessionId,
+            messageId: persistedMessageId,
+          }
+        : null;
+    let ownsCleanup = false;
+    if (persistedTrackedWorkspaceId && expectedPending) {
+      const trackedBeforeCleanup = getTrackedWorkspaceById(
+        persistedTrackedWorkspaceId
+      );
+      const pendingBeforeCleanup = getPendingCloudLaunch(
+        persistedTrackedWorkspaceId
+      );
+      if (
+        pendingBeforeCleanup &&
+        (trackedBeforeCleanup?.status === "stopped" ||
+          trackedBeforeCleanup?.status === "archived")
+      ) {
+        markPendingCloudLaunchCanceled(
+          persistedTrackedWorkspaceId,
+          pendingBeforeCleanup
+        );
+      }
+      const markedForCleanup = markPendingCloudLaunchForCleanup(
+        persistedTrackedWorkspaceId,
+        expectedPending
+      );
+      const currentPending = getPendingCloudLaunch(
+        persistedTrackedWorkspaceId
+      );
+      ownsCleanup = Boolean(
+        markedForCleanup ||
+          (currentPending?.phase === "cancel" &&
+            currentPending.workspaceId === expectedPending.workspaceId &&
+            currentPending.sessionId === expectedPending.sessionId &&
+            currentPending.messageId === expectedPending.messageId)
+      );
+      if (!ownsCleanup) {
+        const concurrentlyFinalized = finalizedForegroundResult();
+        if (concurrentlyFinalized) return concurrentlyFinalized;
+      }
+    }
+    let archived = false;
+    if (createdWorkspace && (!persistedTrackedWorkspaceId || ownsCleanup)) {
+      try {
+        await client.archiveWorkspace(createdWorkspace.workspaceId);
+        archived = true;
+      } catch (cleanupError) {
+        if (cleanupError instanceof ConductorApiError && cleanupError.status === 404) {
+          archived = true;
+        } else {
           console.error(
             `[conductor-api] Failed to archive incomplete cloud workspace ${createdWorkspace?.workspaceId}:`,
             cleanupError
           );
-        });
+        }
+      }
     }
-    return conductorApiSendError({ displayName }, error);
+    const sendError = conductorApiSendError({ displayName }, error);
+    if (persistedTrackedWorkspaceId) {
+      const latestPending = getPendingCloudLaunch(persistedTrackedWorkspaceId);
+      const stillOwnsPending = Boolean(
+        expectedPending &&
+          latestPending?.workspaceId === expectedPending.workspaceId &&
+          latestPending.sessionId === expectedPending.sessionId &&
+          latestPending.messageId === expectedPending.messageId
+      );
+      if (!stillOwnsPending) {
+        const concurrentlyFinalized = finalizedForegroundResult();
+        if (concurrentlyFinalized) return concurrentlyFinalized;
+        return { ...sendError, reason: "cloud_launch_cleanup_pending" };
+      }
+      const canceled = latestPending?.phase === "cancel";
+      const canceledStatus =
+        getTrackedWorkspaceById(persistedTrackedWorkspaceId)?.status ===
+          "archived" || latestPending?.previousBinding?.status === "archived"
+          ? "archived"
+          : "stopped";
+      if (archived) {
+        const restored = restorePendingCloudLaunchBinding(
+          persistedTrackedWorkspaceId,
+          canceled ? canceledStatus : "failed",
+          canceled
+            ? { kind: "launch_canceled" }
+            : { kind: "launch_failed", error: sendError.error },
+          expectedPending ?? undefined
+        );
+        if (!restored) {
+          // Compatibility for pending rows written before previous-binding
+          // snapshots existed: cleanup is confirmed, so retain no stale saga.
+          if (canceled) {
+            clearPendingCloudLaunchWithNotice(
+              persistedTrackedWorkspaceId,
+              { kind: "launch_canceled" },
+              expectedPending ?? undefined
+            );
+          } else {
+            clearPendingCloudLaunchWithNotice(
+              persistedTrackedWorkspaceId,
+              { kind: "launch_failed", error: sendError.error },
+              expectedPending ?? undefined
+            );
+          }
+        }
+        return {
+          ...sendError,
+          reason: canceled ? "cloud_launch_canceled" : "cloud_launch_archived",
+        };
+      }
+      if (canceled) {
+        return { ...sendError, reason: "cloud_launch_cancel_pending" };
+      }
+      if (expectedPending) {
+        markPendingCloudLaunchForCleanup(
+          persistedTrackedWorkspaceId,
+          expectedPending
+        );
+      }
+      return { ...sendError, reason: "cloud_launch_cleanup_pending" };
+    }
+    return sendError;
+  } finally {
+    if (foregroundIdentity) {
+      foregroundCloudLaunchIdentities.delete(foregroundIdentity);
+    }
+  }
+}
+
+export type PendingCloudLaunchReconciliation =
+  | { status: "none" }
+  | { status: "pending" }
+  | { status: "failed"; error: string }
+  | { status: "queued"; sessionId: string; messageId: string };
+
+const pendingCloudLaunchReconciliations = new Map<
+  string,
+  Promise<PendingCloudLaunchReconciliation>
+>();
+
+export type PendingCloudTerminalReconciliation =
+  | { status: "none" }
+  | { status: "pending"; action: "stop" | "archive" }
+  | {
+      status: "completed";
+      action: "stop" | "archive";
+      noticeId: string;
+    }
+  | {
+      status: "failed";
+      action: "stop" | "archive";
+      error: string;
+      noticeId: string | null;
+    };
+
+const pendingCloudTerminalReconciliations = new Map<
+  string,
+  Promise<PendingCloudTerminalReconciliation>
+>();
+
+/** Retry a durable stop/archive request until the exact remote target agrees. */
+export function reconcilePendingCloudTerminalIntent(
+  trackedWorkspaceId: string
+): Promise<PendingCloudTerminalReconciliation> {
+  const existing = pendingCloudTerminalReconciliations.get(trackedWorkspaceId);
+  if (existing) return existing;
+  const attempt = performPendingCloudTerminalReconciliation(
+    trackedWorkspaceId
+  ).finally(() => {
+    if (
+      pendingCloudTerminalReconciliations.get(trackedWorkspaceId) === attempt
+    ) {
+      pendingCloudTerminalReconciliations.delete(trackedWorkspaceId);
+    }
+  });
+  pendingCloudTerminalReconciliations.set(trackedWorkspaceId, attempt);
+  return attempt;
+}
+
+async function performPendingCloudTerminalReconciliation(
+  trackedWorkspaceId: string
+): Promise<PendingCloudTerminalReconciliation> {
+  const intent = getPendingCloudTerminalIntent(trackedWorkspaceId);
+  if (!intent) return { status: "none" };
+  let client: ConductorApiClient | null;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    console.warn("[conductor-api] Could not resume Cloud terminal intent:", error);
+    return { status: "pending", action: intent.action };
+  }
+  if (!client) return { status: "pending", action: intent.action };
+
+  try {
+    if (intent.action === "archive") {
+      await client.archiveWorkspace(intent.workspaceId);
+    } else {
+      setMetaValue(
+        cloudSessionCycleKey(intent.workspaceId, intent.sessionId),
+        encodeCloudSessionCycle({ phase: "canceling" })
+      );
+      const status = await client.getSessionStatus(intent.sessionId);
+      if (status.workspaceId !== intent.workspaceId) {
+        throw new ConductorApiError(
+          `Refusing to cancel session ${intent.sessionId}: workspace identity mismatch`
+        );
+      }
+      if (status.status !== "idle" || intent.forceCancel) {
+        const canceled = await client.cancelSession(intent.sessionId);
+        if (canceled.workspaceId !== intent.workspaceId) {
+          throw new ConductorApiError(
+            `Canceled session ${intent.sessionId} belongs to a different workspace`
+          );
+        }
+      }
+      setMetaValue(
+        cloudSessionCycleKey(intent.workspaceId, intent.sessionId),
+        encodeCloudSessionCycle({ phase: "complete" })
+      );
+    }
+  } catch (error) {
+    if (!(error instanceof ConductorApiError && error.status === 404)) {
+      // A 404 means the target is already gone, which is the outcome we
+      // wanted. Anything else is either worth retrying or fatal — and a fatal
+      // one must retire the intent, because sends and new threads refuse to
+      // run while it is pending. Retrying a deterministic rejection forever
+      // (a stored id the API rejects, the identity-mismatch guard above,
+      // which throws with a null status) silently retires the workspace.
+      const retryable =
+        error instanceof ConductorApiError
+          ? error.retryable
+          : true;
+      const exhausted = pendingCloudTerminalIntentIsExhausted(intent);
+      if (retryable && !exhausted) {
+        console.warn(
+          `[conductor-api] Cloud ${intent.action} intent is not confirmed yet:`,
+          error
+        );
+        return { status: "pending", action: intent.action };
+      }
+      const detail =
+        error instanceof Error ? error.message : String(error);
+      const reason = exhausted
+        ? `${detail} (giving up after retrying for over an hour)`
+        : detail;
+      console.error(
+        `[conductor-api] Cloud ${intent.action} intent failed for ${trackedWorkspaceId}: ${reason}`
+      );
+      const failure = failPendingCloudTerminalIntent(
+        trackedWorkspaceId,
+        intent,
+        reason
+      );
+      if (!failure) {
+        const latest = getPendingCloudTerminalIntent(trackedWorkspaceId);
+        return latest
+          ? { status: "pending", action: latest.action }
+          : { status: "none" };
+      }
+      return {
+        status: "failed",
+        action: intent.action,
+        error: reason,
+        noticeId: failure.id,
+      };
+    }
+  }
+
+  const notice = completePendingCloudTerminalIntent(
+    trackedWorkspaceId,
+    intent
+  );
+  if (!notice) {
+    const latest = getPendingCloudTerminalIntent(trackedWorkspaceId);
+    return latest
+      ? { status: "pending", action: latest.action }
+      : { status: "none" };
+  }
+  return {
+    status: "completed",
+    action: intent.action,
+    noticeId: notice.id,
+  };
+}
+
+/**
+ * Resume the durable first-message phase after a process restart. The API's
+ * caller-supplied message ID makes a retry idempotent when the original send
+ * succeeded but the local acknowledgement did not.
+ */
+export function reconcilePendingCloudLaunch(
+  trackedWorkspaceId: string,
+  binding: TrackedConductorBinding
+): Promise<PendingCloudLaunchReconciliation> {
+  const existing = pendingCloudLaunchReconciliations.get(trackedWorkspaceId);
+  // Only the owner of an attempt may publish its terminal result. Concurrent
+  // pollers wait for it, then defer until their next cycle to avoid duplicate
+  // Telegram notices or normal polling against a saga that just changed.
+  if (existing) return existing.then(() => ({ status: "pending" }));
+  const attempt = performPendingCloudLaunchReconciliation(
+    trackedWorkspaceId,
+    binding
+  ).finally(() => {
+    if (pendingCloudLaunchReconciliations.get(trackedWorkspaceId) === attempt) {
+      pendingCloudLaunchReconciliations.delete(trackedWorkspaceId);
+    }
+  });
+  pendingCloudLaunchReconciliations.set(trackedWorkspaceId, attempt);
+  return attempt;
+}
+
+async function performPendingCloudLaunchReconciliation(
+  trackedWorkspaceId: string,
+  _bindingSnapshot: TrackedConductorBinding
+): Promise<PendingCloudLaunchReconciliation> {
+  const pending = getPendingCloudLaunch(trackedWorkspaceId);
+  if (!pending) return { status: "none" };
+  // Pollers pass snapshots captured before async work. Re-read after observing
+  // the saga so a binding persisted between those steps is never mistaken for
+  // corruption and discarded.
+  const binding = getTrackedWorkspaceById(trackedWorkspaceId);
+
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    console.warn("[conductor-api] Could not reconcile pending launch:", error);
+    return { status: "pending" };
+  }
+  if (!client) return { status: "pending" };
+
+  if (
+    !binding ||
+    binding.conductorBackendKind !== "cloud-api" ||
+    binding.conductorWorkspaceId !== pending.workspaceId ||
+    binding.conductorSessionId !== pending.sessionId
+  ) {
+    // A genuine detached saga may still own a provisioned Cloud workspace.
+    // Archive it before forgetting evidence, but never restore over a newer
+    // binding that another operation deliberately installed.
+    try {
+      await archivePendingCloudResource(client, pending);
+    } catch (error) {
+      if (!(error instanceof ConductorApiError && error.status === 404)) {
+        console.warn("[conductor-api] Detached Cloud cleanup is not ready:", error);
+        return { status: "pending" };
+      }
+    }
+    clearPendingCloudLaunchWithNotice(trackedWorkspaceId, {
+      kind: "launch_failed",
+      error: "pending Cloud launch no longer matches its current binding",
+    }, pending);
+    return {
+      status: "failed",
+      error: "pending Cloud launch no longer matches its current binding",
+    };
+  }
+
+  if (pending.phase === "cancel") {
+    // Pending-launch cancellation always archives the provisioned workspace,
+    // which both prevents prompt replay and lets us restore the old binding.
+    return cleanupPendingCloudLaunch(
+      client,
+      trackedWorkspaceId,
+      pending,
+      "canceled Cloud launch was archived before its prompt could run"
+    );
+  }
+
+  if (pending.phase === "provisioned") {
+    if (
+      foregroundCloudLaunchIdentities.has(cloudLaunchIdentityKey(pending))
+    ) {
+      return { status: "pending" };
+    }
+    markPendingCloudLaunchForCleanup(trackedWorkspaceId, pending);
+    return cleanupPendingCloudLaunch(
+      client,
+      trackedWorkspaceId,
+      pending,
+      "Cloud provisioning did not reach its validated send phase"
+    );
+  }
+
+  if (pending.phase === "cleanup") {
+    return cleanupPendingCloudLaunch(
+      client,
+      trackedWorkspaceId,
+      pending,
+      "incomplete Cloud launch was archived before its prompt could be confirmed"
+    );
+  }
+
+  if (pending.phase === "sent") {
+    return finalizeSentPendingCloudLaunch(
+      client,
+      trackedWorkspaceId,
+      pending
+    );
+  }
+
+  if (binding.status === "stopped") {
+    markPendingCloudLaunchCanceled(trackedWorkspaceId, pending);
+    return { status: "pending" };
+  }
+  if (binding.status === "archived") {
+    markPendingCloudLaunchCanceled(trackedWorkspaceId, pending);
+    return { status: "pending" };
+  }
+  if (binding.status === "failed" || binding.status === "done") {
+    markPendingCloudLaunchForCleanup(trackedWorkspaceId, pending);
+    return { status: "pending" };
+  }
+
+  try {
+    let alreadyQueued = false;
+    try {
+      const message = await client.getMessage(pending.messageId);
+      if (message.sessionId !== pending.sessionId) {
+        throw new ConductorApiError(
+          "Pending Cloud message belongs to a different session"
+        );
+      }
+      alreadyQueued = true;
+    } catch (error) {
+      const missing =
+        error instanceof ConductorApiError &&
+        error.status === 404 &&
+        !error.retryable;
+      if (!missing) throw error;
+    }
+
+    if (!alreadyQueued) {
+      const status = await client.getSessionStatus(pending.sessionId);
+      if (status.workspaceId !== pending.workspaceId) {
+        throw new ConductorApiError(
+          "Pending Cloud session belongs to a different workspace"
+        );
+      }
+      if (!pendingCloudLaunchCanSend(trackedWorkspaceId, pending)) {
+        return { status: "pending" };
+      }
+      const cycle = reserveCloudSessionCycle(
+        pending.workspaceId,
+        pending.sessionId
+      );
+      writeCloudSessionCycle(cycle, {
+        phase: "pending",
+        outboundMessageId: pending.messageId,
+      });
+      try {
+        await client.sendMessage({
+          sessionId: pending.sessionId,
+          message: pending.prompt.trim() || "(empty message)",
+          messageId: pending.messageId,
+        });
+        writeCloudSessionCycle(cycle, {
+          phase: "boundary",
+          outboundMessageId: pending.messageId,
+        });
+      } catch (error) {
+        restoreCloudSessionCycleAfterSendFailure(cycle);
+        throw error;
+      }
+    } else {
+      setMetaValue(
+        cloudSessionCycleKey(pending.workspaceId, pending.sessionId),
+        encodeCloudSessionCycle({
+          phase: "boundary",
+          outboundMessageId: pending.messageId,
+          startedAt: Date.now(),
+        })
+      );
+    }
+
+    if (
+      !markPendingCloudLaunchSent(
+        trackedWorkspaceId,
+        pending.messageId,
+        pending.workspaceId,
+        pending.sessionId
+      )
+    ) {
+      // Stop/cleanup won while the API request was in flight. Keep that phase
+      // durable so the next cycle archives instead of reporting a replay.
+      return { status: "pending" };
+    }
+    return finalizeSentPendingCloudLaunch(
+      client,
+      trackedWorkspaceId,
+      { ...pending, phase: "sent" }
+    );
+  } catch (error) {
+    console.warn("[conductor-api] Pending Cloud launch is not ready:", error);
+    if (
+      error instanceof ConductorApiError &&
+      !error.retryable
+    ) {
+      if (!markPendingCloudLaunchForCleanup(trackedWorkspaceId, pending)) {
+        return { status: "pending" };
+      }
+      const cleanupPending = getPendingCloudLaunch(trackedWorkspaceId);
+      if (!cleanupPending || cleanupPending.phase !== "cleanup") {
+        return { status: "pending" };
+      }
+      return cleanupPendingCloudLaunch(
+        client,
+        trackedWorkspaceId,
+        cleanupPending,
+        error.message
+      );
+    }
+    return { status: "pending" };
+  }
+}
+
+async function finalizeSentPendingCloudLaunch(
+  client: ConductorApiClient,
+  trackedWorkspaceId: string,
+  pending: PendingCloudLaunch
+): Promise<PendingCloudLaunchReconciliation> {
+  const workspaceName =
+    pending.conductorWorkspaceName ??
+    (await client
+      .getWorkspace(pending.workspaceId)
+      .then((workspace) => workspace.name.trim() || pending.workspaceId)
+      .catch(() => pending.workspaceId));
+  if (
+    !finalizePendingCloudLaunch({
+      trackedWorkspaceId,
+      conductorWorkspaceName: workspaceName,
+      workspaceId: pending.workspaceId,
+      sessionId: pending.sessionId,
+      messageId: pending.messageId,
+      notice: { kind: "launch_queued" },
+    })
+  ) {
+    return { status: "pending" };
+  }
+  return {
+    status: "queued",
+    sessionId: pending.sessionId,
+    messageId: pending.messageId,
+  };
+}
+
+async function archivePendingCloudResource(
+  client: ConductorApiClient,
+  pending: PendingCloudLaunch
+): Promise<void> {
+  if (pending.cleanupTarget === "session") {
+    await client.archiveSession(pending.sessionId);
+  } else {
+    await client.archiveWorkspace(pending.workspaceId);
+  }
+}
+
+async function cleanupPendingCloudLaunch(
+  client: ConductorApiClient,
+  trackedWorkspaceId: string,
+  pending: PendingCloudLaunch,
+  failure: string
+): Promise<PendingCloudLaunchReconciliation> {
+  const ownedBeforeArchive = getPendingCloudLaunch(trackedWorkspaceId);
+  if (
+    !ownedBeforeArchive ||
+    ownedBeforeArchive.workspaceId !== pending.workspaceId ||
+    ownedBeforeArchive.sessionId !== pending.sessionId ||
+    ownedBeforeArchive.messageId !== pending.messageId ||
+    (ownedBeforeArchive.phase !== "cleanup" &&
+      ownedBeforeArchive.phase !== "cancel")
+  ) {
+    return { status: "pending" };
+  }
+  try {
+    await archivePendingCloudResource(client, pending);
+  } catch (error) {
+    if (!(error instanceof ConductorApiError && error.status === 404)) {
+      markPendingCloudLaunchForCleanup(trackedWorkspaceId, pending);
+      console.warn("[conductor-api] Pending Cloud cleanup is not ready:", error);
+      return { status: "pending" };
+    }
+  }
+  const latestPending = getPendingCloudLaunch(trackedWorkspaceId);
+  if (
+    !latestPending ||
+    latestPending.workspaceId !== pending.workspaceId ||
+    latestPending.sessionId !== pending.sessionId ||
+    latestPending.messageId !== pending.messageId
+  ) {
+    return { status: "pending" };
+  }
+  const canceled = latestPending?.phase === "cancel";
+  const canceledStatus =
+    getTrackedWorkspaceById(trackedWorkspaceId)?.status === "archived" ||
+    latestPending?.previousBinding?.status === "archived"
+      ? "archived"
+      : "stopped";
+  const rollbackStatus = canceled
+    ? canceledStatus
+    : latestPending.cleanupTarget === "session"
+      ? latestPending.previousBinding?.status
+      : "failed";
+  const restored = restorePendingCloudLaunchBinding(
+    trackedWorkspaceId,
+    rollbackStatus,
+    canceled
+      ? { kind: "launch_canceled" }
+      : { kind: "launch_failed", error: failure },
+    latestPending
+  );
+  if (!restored) {
+    // Legacy pending rows lack a previous binding. Once archive is confirmed,
+    // clearing their saga is safer than retrying cleanup forever.
+    if (canceled) {
+      clearPendingCloudLaunchWithNotice(trackedWorkspaceId, {
+        kind: "launch_canceled",
+      }, latestPending);
+    } else {
+      clearPendingCloudLaunchWithNotice(trackedWorkspaceId, {
+        kind: "launch_failed",
+        error: failure,
+      }, latestPending);
+    }
+  }
+  if (canceled) return { status: "none" };
+  return { status: "failed", error: failure };
+}
+
+export type PendingCloudMessagesReconciliation =
+  | { status: "none" }
+  | { status: "pending" }
+  | { status: "suppressed"; count: number; error: string }
+  | { status: "failed"; error: string }
+  | { status: "sent"; count: number };
+
+class PendingCloudMessageInvariantError extends Error {}
+
+const cloudMessageOutboxFlushes = new Map<
+  string,
+  Promise<PendingCloudMessagesReconciliation>
+>();
+
+/** Deliver recovery follow-ups from a durable, ordered, idempotent outbox. */
+export function reconcilePendingCloudMessages(
+  trackedWorkspaceId: string,
+  binding: TrackedConductorBinding
+): Promise<PendingCloudMessagesReconciliation> {
+  const existing = cloudMessageOutboxFlushes.get(trackedWorkspaceId);
+  // A waiter may have appended a distinct request while the owner was
+  // flushing. Re-run after the owner releases the lock so the waiter receives
+  // the durable outcome for its own outbox state, not a synthetic success.
+  if (existing) {
+    return existing.then(() =>
+      reconcilePendingCloudMessages(trackedWorkspaceId, binding)
+    );
+  }
+  const attempt = performPendingCloudMessageReconciliation(
+    trackedWorkspaceId,
+    binding
+  ).finally(() => {
+    if (cloudMessageOutboxFlushes.get(trackedWorkspaceId) === attempt) {
+      cloudMessageOutboxFlushes.delete(trackedWorkspaceId);
+    }
+  });
+  cloudMessageOutboxFlushes.set(trackedWorkspaceId, attempt);
+  return attempt;
+}
+
+async function performPendingCloudMessageReconciliation(
+  trackedWorkspaceId: string,
+  _bindingSnapshot: TrackedConductorBinding
+): Promise<PendingCloudMessagesReconciliation> {
+  const messages = getPendingCloudMessages(trackedWorkspaceId);
+  if (messages.length === 0) return { status: "none" };
+  const capturedScope = {
+    sessionId: messages[0].sessionId,
+    requestIds: messages.map((message) => message.requestId),
+  };
+  const binding = getTrackedWorkspaceById(trackedWorkspaceId);
+  const sessionId = binding?.conductorSessionId;
+  if (
+    !binding ||
+    binding.conductorBackendKind !== "cloud-api" ||
+    !binding.conductorWorkspaceId ||
+    !sessionId ||
+    messages.some((message) => message.sessionId !== sessionId)
+  ) {
+    clearPendingCloudMessagesWithNotice(trackedWorkspaceId, {
+      kind: "messages_failed",
+      error: "pending Cloud recovery messages no longer match their binding",
+    }, capturedScope);
+    return {
+      status: "failed",
+      error: "pending Cloud recovery messages no longer match their binding",
+    };
+  }
+  if (
+    binding.status === "stopped" ||
+    binding.status === "archived" ||
+    binding.status === "failed"
+  ) {
+    clearPendingCloudMessagesWithNotice(trackedWorkspaceId, {
+      kind: "messages_suppressed",
+      count: messages.length,
+      error: `workspace status is ${binding.status}`,
+    }, capturedScope);
+    return {
+      status: "suppressed",
+      count: messages.length,
+      error: `workspace status is ${binding.status}`,
+    };
+  }
+
+  let client;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    console.warn("[conductor-api] Could not flush Cloud recovery outbox:", error);
+    return { status: "pending" };
+  }
+  if (!client) return { status: "pending" };
+
+  let sentCount = 0;
+  try {
+    for (const pending of messages) {
+      let alreadyQueued = false;
+      try {
+        const existingMessage = await client.getMessage(pending.messageId);
+        if (existingMessage.sessionId !== sessionId) {
+          throw new PendingCloudMessageInvariantError(
+            "Pending Cloud recovery message belongs to a different session"
+          );
+        }
+        alreadyQueued = true;
+      } catch (error) {
+        const missing =
+          error instanceof ConductorApiError &&
+          error.status === 404 &&
+          !error.retryable;
+        if (
+          error instanceof ConductorApiError &&
+          error.message.includes("mismatched message identity")
+        ) {
+          throw new PendingCloudMessageInvariantError(error.message);
+        }
+        if (!missing) throw error;
+      }
+
+      if (!alreadyQueued) {
+        const status = await client.getSessionStatus(sessionId).catch((error) => {
+          if (
+            error instanceof ConductorApiError &&
+            error.message.includes("mismatched session identity")
+          ) {
+            throw new PendingCloudMessageInvariantError(error.message);
+          }
+          throw error;
+        });
+        if (status.workspaceId !== binding.conductorWorkspaceId) {
+          throw new PendingCloudMessageInvariantError(
+            "Pending Cloud recovery session belongs to a different workspace"
+          );
+        }
+        const gate = pendingCloudMessageCanSend(
+          trackedWorkspaceId,
+          pending.requestId,
+          binding.conductorWorkspaceId,
+          sessionId
+        );
+        if (gate === "suppressed") {
+          clearPendingCloudMessagesWithNotice(trackedWorkspaceId, {
+            kind: "messages_suppressed",
+            count: messages.length - sentCount,
+            error: "workspace was stopped while delivery was pending",
+          }, capturedScope);
+          return {
+            status: "suppressed",
+            count: messages.length - sentCount,
+            error: "workspace was stopped while delivery was pending",
+          };
+        }
+        if (gate === "mismatch") {
+          throw new PendingCloudMessageInvariantError(
+            "Pending Cloud recovery binding changed before delivery"
+          );
+        }
+        if (gate === "missing") {
+          const outcome = getPendingCloudMessageOutcome(
+            trackedWorkspaceId,
+            pending.requestId
+          );
+          if (outcome?.outcome === "suppressed") {
+            return {
+              status: "suppressed",
+              count: messages.length - sentCount,
+              error: outcome.error ?? "workspace became unavailable",
+            };
+          }
+          if (outcome?.outcome === "failed") {
+            return {
+              status: "failed",
+              error: outcome.error ?? "Cloud request delivery failed",
+            };
+          }
+          if (outcome?.outcome === "delivered") {
+            sentCount += 1;
+            continue;
+          }
+          return { status: "pending" };
+        }
+        const cycle = reserveCloudSessionCycle(
+          binding.conductorWorkspaceId,
+          sessionId
+        );
+        writeCloudSessionCycle(cycle, {
+          phase: "pending",
+          outboundMessageId: pending.messageId,
+        });
+        try {
+          await client.sendMessage({
+            sessionId,
+            message: pending.prompt.trim() || "(empty message)",
+            messageId: pending.messageId,
+          });
+          writeCloudSessionCycle(cycle, {
+            phase: "boundary",
+            outboundMessageId: pending.messageId,
+          });
+        } catch (error) {
+          restoreCloudSessionCycleAfterSendFailure(cycle);
+          throw error;
+        }
+      }
+      const completion = completePendingCloudMessageDelivery(
+        trackedWorkspaceId,
+        pending.requestId,
+        binding.conductorWorkspaceId,
+        sessionId,
+        {
+          delivered:
+            { kind: "messages_sent", count: 1 },
+          suppressed: {
+            kind: "messages_suppressed",
+            count: messages.length - sentCount,
+            error: "workspace was stopped while delivery was in flight",
+          },
+        }
+      );
+      if (completion === "suppressed") {
+        return {
+          status: "suppressed",
+          count: messages.length - sentCount,
+          error: "workspace was stopped while delivery was in flight",
+        };
+      }
+      if (completion === "mismatch") {
+        throw new ConductorApiError(
+          "Pending Cloud recovery binding changed during delivery"
+        );
+      }
+      if (completion === "missing") {
+        const outcome = getPendingCloudMessageOutcome(
+          trackedWorkspaceId,
+          pending.requestId
+        );
+        if (outcome?.outcome === "suppressed") {
+          return {
+            status: "suppressed",
+            count: messages.length - sentCount,
+            error: outcome.error ?? "workspace became unavailable",
+          };
+        }
+        if (outcome?.outcome === "failed") {
+          return {
+            status: "failed",
+            error: outcome.error ?? "Cloud request delivery failed",
+          };
+        }
+        if (outcome?.outcome !== "delivered") {
+          return { status: "pending" };
+        }
+      }
+      sentCount += 1;
+    }
+    return { status: "sent", count: sentCount };
+  } catch (error) {
+    console.warn("[conductor-api] Cloud recovery outbox is not ready:", error);
+    if (error instanceof PendingCloudMessageInvariantError) {
+      const message = error.message;
+      clearPendingCloudMessagesWithNotice(trackedWorkspaceId, {
+        kind: "messages_failed",
+        error: message,
+      }, capturedScope);
+      return { status: "failed", error: message };
+    }
+    // A malformed/lost POST receipt is not proof that the server rejected the
+    // stable message id. Keep this entry and every later request so the next
+    // cycle can resolve it with GET before considering another POST.
+    return { status: "pending" };
   }
 }
 
@@ -2464,7 +4041,13 @@ async function queueFirstCloudPrompt(
   client: ConductorApiClient,
   workspaceId: string,
   sessionId: string,
-  prompt: string
+  prompt: string | (() => string),
+  validateBeforeSend?: () => Promise<void>,
+  persistBeforeSend?: (
+    messageId: string,
+    prompt: string
+  ) => void | Promise<void>,
+  messageId = randomUUID()
 ): Promise<{ messageId: string }> {
   const createdStatus = await client.getSessionStatus(sessionId);
   if (createdStatus.workspaceId !== workspaceId) {
@@ -2472,7 +4055,9 @@ async function queueFirstCloudPrompt(
       "Conductor API created the session in a different workspace"
     );
   }
-  const messageId = randomUUID();
+  await validateBeforeSend?.();
+  const resolvedPrompt = typeof prompt === "function" ? prompt() : prompt;
+  await persistBeforeSend?.(messageId, resolvedPrompt);
   const pendingCycle = reserveCloudSessionCycle(workspaceId, sessionId);
   writeCloudSessionCycle(pendingCycle, {
     phase: "pending",
@@ -2481,7 +4066,7 @@ async function queueFirstCloudPrompt(
   try {
     const sent = await client.sendMessage({
       sessionId,
-      message: prompt.trim() || "(empty message)",
+      message: resolvedPrompt.trim() || "(empty message)",
       messageId,
     });
     // A new session has no older transcript backlog, and callers persist
@@ -2600,6 +4185,13 @@ export async function stopConductorAgent(
         getTrackedWorkspaceByName(workspaceName, { repoPath })
           ?.conductorSessionId ??
         workspace.sessionId;
+      // Record stop intent before either API read. Outbox delivery and polling
+      // can now suppress work even if cancellation is slow or temporarily
+      // unavailable; a later idle/error observation completes this cycle.
+      setMetaValue(
+        cloudSessionCycleKey(workspace.workspaceId, trackedSessionId),
+        encodeCloudSessionCycle({ phase: "canceling" })
+      );
       const status = await client.getSessionStatus(trackedSessionId);
       if (status.workspaceId !== workspace.workspaceId) {
         console.error(
@@ -2852,12 +4444,117 @@ export async function resolveRepoDefaultBranch(repoPath: string): Promise<string
   return "main";
 }
 
-async function resolveRepoRemoteUrl(repoPath: string): Promise<string | null> {
+export async function resolveRepoRemoteUrl(repoPath: string): Promise<string | null> {
   try {
-    const output = (await execAsync(
-      `git -C ${shellQuote(repoPath)} config --get remote.origin.url`
-    )).trim();
+    const output = (
+      await execFileAsync("git", ["config", "--get", "remote.origin.url"], repoPath)
+    ).trim();
     return output || null;
+  } catch {
+    return null;
+  }
+}
+
+export type CloudTakeoverBranchFailure =
+  | "workspace_has_uncommitted_changes"
+  | "commit_not_available_on_remote"
+  | "workspace_state_unavailable";
+
+export interface CloudTakeoverBranchResolution {
+  branch: string | null;
+  commit: string | null;
+  reason: CloudTakeoverBranchFailure | null;
+}
+
+/**
+ * Resolve a branch that gives Conductor Cloud the exact commit currently
+ * checked out locally. Automatic takeover is only safe when the worktree is
+ * clean and that commit is already visible on origin. A brand-new local
+ * workspace branch commonly has no remote branch yet, so the repository's
+ * default branch is accepted when it points at the same immutable commit.
+ */
+export async function resolveSafeCloudTakeoverBranch(
+  repoPath: string,
+  workspaceDir: string
+): Promise<CloudTakeoverBranchResolution> {
+  try {
+    const status = await execFileAsync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      workspaceDir
+    );
+    if (status.trim()) {
+      return {
+        branch: null,
+        commit: null,
+        reason: "workspace_has_uncommitted_changes",
+      };
+    }
+
+    const head = (
+      await execFileAsync("git", ["rev-parse", "--verify", "HEAD^{commit}"], workspaceDir)
+    ).trim();
+    if (!COMMIT_SHA_RE.test(head)) {
+      return {
+        branch: null,
+        commit: null,
+        reason: "workspace_state_unavailable",
+      };
+    }
+
+    const currentBranch = (
+      await execFileAsync("git", ["branch", "--show-current"], workspaceDir)
+    ).trim();
+    if (
+      currentBranch &&
+      (await resolveRemoteBranchCommit(workspaceDir, currentBranch)) === head
+    ) {
+      return { branch: currentBranch, commit: head, reason: null };
+    }
+
+    const defaultBranch = await resolveRepoDefaultBranch(repoPath);
+    if (
+      defaultBranch &&
+      defaultBranch !== currentBranch &&
+      (await resolveRemoteBranchCommit(workspaceDir, defaultBranch)) === head
+    ) {
+      return { branch: defaultBranch, commit: head, reason: null };
+    }
+
+    return {
+      branch: null,
+      commit: null,
+      reason: "commit_not_available_on_remote",
+    };
+  } catch {
+    return {
+      branch: null,
+      commit: null,
+      reason: "workspace_state_unavailable",
+    };
+  }
+}
+
+async function resolveRemoteBranchCommit(
+  cwd: string,
+  branch: string
+): Promise<string | null> {
+  try {
+    const output = await execFileAsync(
+      "git",
+      ["ls-remote", "--heads", "origin", `refs/heads/${branch}`],
+      cwd,
+      {
+        timeoutMs: 15_000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      }
+    );
+    const line = output
+      .split("\n")
+      .map((entry) => entry.trim())
+      .find(Boolean);
+    const commit = line?.split(/\s+/)[0] ?? "";
+    return COMMIT_SHA_RE.test(commit) ? commit : null;
   } catch {
     return null;
   }
@@ -2894,6 +4591,7 @@ export interface ConductorWorkspaceInfo {
  * intentionally match Workspace so callers can pass a tracked row directly.
  */
 export interface TrackedConductorBinding {
+  id?: string;
   conductorWorkspaceId: string | null;
   conductorSessionId: string | null;
   conductorBackendKind: "local" | "cloud-api" | null;
@@ -3674,7 +5372,11 @@ async function steerRemoteSession(
   wsInfo: ConductorWorkspaceInfo,
   target: SessionSendTarget,
   prompt: string,
-  attachmentSourcePaths: string[]
+  attachmentSourcePaths: string[],
+  allowWhileBusy = false,
+  validateBeforeSend?: () => boolean | Promise<boolean>,
+  completeAfterSend?: () => boolean | Promise<boolean>,
+  handleRevokedAfterSend?: () => void | Promise<void>
 ): Promise<SendSuccess | SendError> {
   let client;
   try {
@@ -3700,7 +5402,7 @@ async function steerRemoteSession(
     wsInfo.workspaceId,
     target.sessionId
   );
-  if (cloudCycleIsInFlight(existingCycle)) {
+  if (!allowWhileBusy && cloudCycleIsInFlight(existingCycle)) {
     return {
       error:
         `☁️ "${wsInfo.displayName}" still has queued or running work in that thread. ` +
@@ -3724,8 +5426,9 @@ async function steerRemoteSession(
       );
     }
     if (
-      status.status !== "idle" ||
-      (latest && conductorApiMessageRole(latest) === "user")
+      !allowWhileBusy &&
+      (status.status !== "idle" ||
+        (latest && conductorApiMessageRole(latest) === "user"))
     ) {
       restoreCloudSessionCycleAfterSendFailure(pendingCycle);
       return {
@@ -3744,11 +5447,27 @@ async function steerRemoteSession(
         ? { baselineRowid: Math.max(0, Math.trunc(latest.sessionIndex)) }
         : {}),
     });
+    if (validateBeforeSend && !(await validateBeforeSend())) {
+      restoreCloudSessionCycleAfterSendFailure(pendingCycle);
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" was stopped or archived before the message could be sent.`,
+        reason: "conductor_api_unavailable",
+      };
+    }
     const sent = await client.sendMessage({
       sessionId: target.sessionId,
       message: text,
       messageId,
     });
+    if (completeAfterSend && !(await completeAfterSend())) {
+      await handleRevokedAfterSend?.();
+      return {
+        error:
+          `☁️ "${wsInfo.displayName}" was stopped or archived while the message was being delivered. Cancellation has been re-confirmed.`,
+        reason: "conductor_api_unavailable",
+      };
+    }
     console.log(
       `[conductor-api] message ${sent.state} for ${wsInfo.displayName} (${target.sessionId})`
     );
@@ -4106,6 +5825,39 @@ export async function getSessionMessagesAfter(
   }
 }
 
+/** Return the newest local transcript rows in chronological order. */
+export function getLocalSessionMessagesTail(
+  sessionId: string,
+  limit = 50
+): SessionMessage[] {
+  const boundedLimit = Math.max(1, Math.min(200, Math.trunc(limit)));
+  try {
+    const db = new Database(CONDUCTOR_DB_PATH, { readonly: true });
+    const rows = db.prepare(
+      `SELECT id, rowid, role, content, created_at, sent_at
+       FROM (
+         SELECT id, rowid, role, content, created_at, sent_at
+         FROM session_messages
+         WHERE session_id = ?
+         ORDER BY rowid DESC
+         LIMIT ?
+       )
+       ORDER BY rowid ASC`
+    ).all(sessionId, boundedLimit) as any[];
+    db.close();
+    return rows.map((row) => ({
+      messageId: null,
+      rowid: Number(row.rowid),
+      role: row.role,
+      content: row.content,
+      createdAt: row.created_at,
+      sentAt: row.sent_at ?? null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 function mapConductorApiMessage(message: ConductorApiMessage): SessionMessage {
   const role = conductorApiMessageRole(message);
   return {
@@ -4221,13 +5973,23 @@ function execAsync(cmd: string): Promise<string> {
 function execFileAsync(
   command: string,
   args: string[],
-  cwd?: string
+  cwd?: string,
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(command, args, { cwd }, (err, stdout) => {
-      if (err) reject(err);
-      else resolve(stdout);
-    });
+    execFile(
+      command,
+      args,
+      {
+        cwd,
+        timeout: options.timeoutMs,
+        env: options.env,
+      },
+      (err, stdout) => {
+        if (err) reject(err);
+        else resolve(stdout);
+      }
+    );
   });
 }
 

@@ -35,7 +35,9 @@ function buildIsolatedEnv(
   source: NodeJS.ProcessEnv = OPERATOR_ENV
 ): NodeJS.ProcessEnv {
   const env = buildAgentEnvironment(source, context);
-  t.after(() => rmSync(env.HOME ?? "", { recursive: true, force: true }));
+  if ((env.HOME ?? "").includes("conductor-telegram-agents")) {
+    t.after(() => rmSync(env.HOME ?? "", { recursive: true, force: true }));
+  }
   return env;
 }
 
@@ -99,6 +101,8 @@ test("only full-access launches receive git and gh credentials", (t) => {
     workspaceDir: "/workspaces/oslo",
     repoPath: "/repos/app",
   });
+  assert.equal(legacy.HOME, "/Users/operator");
+  assert.equal(legacy.CLAUDE_CONFIG_DIR, undefined);
   assert.equal(legacy.GIT_CONFIG_GLOBAL, "/Users/operator/.gitconfig");
   assert.equal(legacy.GH_CONFIG_DIR, "/Users/operator/.config/gh");
 
@@ -110,11 +114,76 @@ test("only full-access launches receive git and gh credentials", (t) => {
       workspaceDir: "/workspaces/oslo",
       repoPath: "/repos/app",
     });
+    assert.notEqual(restricted.HOME, "/Users/operator");
+    assert.match(restricted.HOME ?? "", /conductor-telegram-agents/);
     assert.equal(restricted.GIT_CONFIG_GLOBAL, undefined);
     assert.equal(restricted.GH_CONFIG_DIR, undefined);
     assert.equal(restricted.GIT_SSH_COMMAND, undefined);
     assert.equal(restricted.SSH_AUTH_SOCK, undefined);
   }
+});
+
+test("an explicitly configured Claude directory is preserved", (t) => {
+  const env = buildIsolatedEnv(
+    t,
+    {
+      agentType: "claude",
+      accessMode: "legacy",
+      workspaceName: "oslo",
+      workspaceDir: "/workspaces/oslo",
+      repoPath: "/repos/app",
+    },
+    { ...OPERATOR_ENV, CLAUDE_CONFIG_DIR: "/Users/operator/custom-claude" }
+  );
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/Users/operator/custom-claude");
+});
+
+test("the exact legacy Claude environment preserves an installed CLI login", (t) => {
+  const claudeBin = path.join(
+    os.homedir(),
+    "Library/Application Support/com.conductor.app/bin/claude"
+  );
+  if (!existsSync(claudeBin)) {
+    t.skip("Conductor's bundled Claude CLI is not installed");
+    return;
+  }
+  // Returns null when the CLI itself could not answer — not installed, too
+  // slow under a loaded test run, or not emitting JSON. Only a parsed answer
+  // is evidence about the login, so everything else has to skip instead of
+  // failing a build for the machine it happened to run on.
+  const authStatus = (env: NodeJS.ProcessEnv): { loggedIn?: boolean } | null => {
+    try {
+      return JSON.parse(
+        execFileSync(claudeBin, ["auth", "status", "--json"], {
+          env,
+          encoding: "utf8",
+          stdio: "pipe",
+          input: "",
+          timeout: 60_000,
+        })
+      );
+    } catch {
+      return null;
+    }
+  };
+  if (authStatus(process.env)?.loggedIn !== true) {
+    t.skip("Claude is not logged in on this machine");
+    return;
+  }
+
+  const env = buildAgentEnvironment(process.env, {
+    agentType: "claude",
+    accessMode: "legacy",
+    workspaceName: "auth-probe",
+    workspaceDir: process.cwd(),
+    repoPath: process.cwd(),
+  });
+  const probed = authStatus(env);
+  if (!probed) {
+    t.skip("Claude's CLI could not report auth status for the built environment");
+    return;
+  }
+  assert.equal(probed.loggedIn, true);
 });
 
 test("Codex launches are sandboxed and never use the bypass flag", () => {
@@ -225,9 +294,10 @@ test("generated restricted arguments parse in Conductor's bundled Codex CLI", (t
   }
 });
 
-test("restricted Claude launches expose file tools without project MCP", () => {
+test("restricted Claude launches isolate customizations while legacy keeps repo tooling", () => {
   const readOnly = claudeAccessArgs("read-only");
   const writable = claudeAccessArgs("workspace-write");
+  const legacy = claudeAccessArgs("legacy");
 
   assert.equal(readOnly[readOnly.indexOf("--tools") + 1], "Read,Glob,Grep");
   assert.equal(
@@ -246,6 +316,16 @@ test("restricted Claude launches expose file tools without project MCP", () => {
     assert.equal(args.includes("--safe-mode"), true);
     assert.equal(args.includes("--no-chrome"), true);
   }
+  assert.equal(legacy[legacy.indexOf("--setting-sources") + 1], "");
+  assert.equal(legacy.includes("--strict-mcp-config"), true);
+  const mcpConfig = JSON.parse(legacy[legacy.indexOf("--mcp-config") + 1]);
+  assert.deepEqual(Object.keys(mcpConfig.mcpServers), ["conductor-telegram"]);
+  assert.equal(
+    mcpConfig.mcpServers["conductor-telegram"].command,
+    "conductor-telegram-mcp"
+  );
+  assert.equal(legacy.includes("--safe-mode"), false);
+  assert.equal(legacy.includes("--disable-slash-commands"), false);
 });
 
 test("generated restricted arguments parse in Conductor's bundled Claude CLI", (t) => {

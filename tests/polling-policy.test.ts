@@ -5,6 +5,7 @@ import {
   canCompletePolledWorkspace,
   cloudCycleIsInFlight,
   cloudSessionCycleKey,
+  chunkTelegramHtmlEntries,
   encodeCloudSessionCycle,
   mapWithConcurrency,
   parseCloudSessionCycle,
@@ -346,4 +347,40 @@ test("completed and failed cloud workspaces remain observable", () => {
     shouldPollTrackedWorkspace({ status: "archived", cloudOnly: true }),
     false
   );
+});
+
+test("an oversized recovery notice is truncated rather than dropped", () => {
+  const entries = [
+    { id: "small", html: "<pre>ok</pre>" },
+    { id: "huge", html: `<pre>${"x".repeat(9_000)}</pre>` },
+    { id: "after", html: "<pre>later</pre>" },
+  ];
+  const chunks = chunkTelegramHtmlEntries(entries);
+  const flat = chunks.flat();
+
+  // Every notice still has to be published; the outbox only clears the ones
+  // that were delivered, so silently dropping one would strand it forever.
+  assert.deepEqual(flat.map((entry) => entry.id), ["small", "huge", "after"]);
+  const huge = flat.find((entry) => entry.id === "huge");
+  assert.ok(huge!.html.length <= 3_500);
+  assert.ok(huge!.html.endsWith("</pre>"));
+  for (const chunk of chunks) {
+    assert.ok(chunk.map((entry) => entry.html).join("\n\n").length <= 3_500);
+  }
+});
+
+test("recovery notice backlogs are chunked below Telegram's text limit", () => {
+  const entries = Array.from({ length: 12 }, (_, index) => ({
+    id: `notice-${index}`,
+    html: `<pre>${"x".repeat(490)}</pre>`,
+  }));
+  const chunks = chunkTelegramHtmlEntries(entries);
+
+  assert.ok(chunks.length > 1);
+  assert.deepEqual(chunks.flat().map((entry) => entry.id), entries.map((entry) => entry.id));
+  for (const chunk of chunks) {
+    assert.ok(
+      chunk.map((entry) => entry.html).join("\n\n").length <= 3_500
+    );
+  }
 });

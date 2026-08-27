@@ -323,12 +323,18 @@ export class ConductorApiClient {
     pathFor: (offset: number) => string,
     schema: z.ZodType<{ data: T[]; offset: number; hasMore: boolean }>,
     noun: string,
-    options: { keep?: number; validate?: (data: T[]) => void } = {}
+    options: {
+      keep?: number;
+      validate?: (data: T[]) => void;
+      signal?: AbortSignal;
+    } = {}
   ): Promise<T[]> {
     const kept: T[] = [];
     let offset = 0;
     for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
-      const page = await this.request("GET", pathFor(offset), schema);
+      const page = await this.request("GET", pathFor(offset), schema, {
+        signal: options.signal,
+      });
       options.validate?.(page.data);
       kept.push(...page.data);
       if (options.keep !== undefined && kept.length > options.keep) {
@@ -510,11 +516,12 @@ export class ConductorApiClient {
     return result;
   }
 
-  listProjects(): Promise<ConductorApiProject[]> {
+  listProjects(options: { signal?: AbortSignal } = {}): Promise<ConductorApiProject[]> {
     return this.walkPages(
       (offset) => withQuery("/v0/projects", { limit: PAGE_SIZE, offset }),
       ProjectPageSchema,
-      "project"
+      "project",
+      { signal: options.signal }
     );
   }
 
@@ -592,14 +599,23 @@ export class ConductorApiClient {
     method: "GET" | "POST",
     apiPath: string,
     schema: z.ZodType<T>,
-    options: { body?: unknown; retrySafe?: boolean } = {}
+    options: {
+      body?: unknown;
+      retrySafe?: boolean;
+      signal?: AbortSignal;
+    } = {}
   ): Promise<T> {
     const retrySafe = method === "GET" || options.retrySafe === true;
     const attempts = retrySafe ? this.config.maxRetries + 1 : 1;
     let lastError: ConductorApiError | null = null;
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (options.signal?.aborted) {
+        throw new ConductorApiError("Conductor API request canceled");
+      }
       const controller = new AbortController();
+      const abortFromCaller = () => controller.abort();
+      options.signal?.addEventListener("abort", abortFromCaller, { once: true });
       const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
       try {
         const response = await this.fetcher(`${this.config.baseUrl}${apiPath}`, {
@@ -631,7 +647,9 @@ export class ConductorApiClient {
             throw error;
           }
           lastError = error;
-          await delay(retryDelayMs(response, attempt));
+          await delay(retryDelayMs(response, attempt), undefined, {
+            signal: options.signal,
+          });
           continue;
         }
 
@@ -648,7 +666,9 @@ export class ConductorApiClient {
         return parsed.data;
       } catch (error) {
         const normalized =
-          error instanceof ConductorApiError
+          options.signal?.aborted
+            ? new ConductorApiError("Conductor API request canceled")
+            : error instanceof ConductorApiError
             ? error
             : (error as Error)?.name === "AbortError"
               ? new ConductorApiError(
@@ -665,9 +685,12 @@ export class ConductorApiClient {
           throw normalized;
         }
         lastError = normalized;
-        await delay(retryDelayMs(null, attempt));
+        await delay(retryDelayMs(null, attempt), undefined, {
+          signal: options.signal,
+        });
       } finally {
         clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", abortFromCaller);
       }
     }
 

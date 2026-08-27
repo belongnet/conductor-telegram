@@ -1,3 +1,5 @@
+import { truncateHtml } from "./format.js";
+
 export interface PolledSessionStatus {
   status: string | null;
 }
@@ -192,6 +194,58 @@ export function shouldPollTrackedWorkspace(input: {
  * are retryable and so turn into a retry storm that never converges.
  */
 export const MAX_CONCURRENT_SESSION_REQUESTS = 6;
+
+/**
+ * Truncate to a hard ceiling. `truncateHtml` budgets for the text it keeps and
+ * then appends its ellipsis and any closing tags, so it overshoots the length
+ * it was given; re-cutting by the measured overshoot lands under the ceiling
+ * without having to guess how many tags were left open.
+ */
+function fitTelegramHtml(html: string, maxLength: number): string {
+  let budget = maxLength;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const candidate = truncateHtml(html, budget);
+    if (candidate.length <= maxLength) return candidate;
+    budget -= candidate.length - maxLength;
+  }
+  // A raw slice could land inside a tag or entity and be rejected outright,
+  // which would strand the notice this exists to get published.
+  return "<pre>(notice omitted: too large to display)</pre>";
+}
+
+/**
+ * Pack complete HTML fragments below Telegram's message-size ceiling.
+ *
+ * A single oversized fragment is truncated rather than rejected. These entries
+ * carry recovery notices that are only acknowledged once they are published, so
+ * throwing here would fail the same notice on every poll and leave the
+ * workspace permanently unpolled.
+ */
+export function chunkTelegramHtmlEntries<T extends { html: string }>(
+  entries: readonly T[],
+  maxLength = 3_500
+): T[][] {
+  const chunks: T[][] = [];
+  let current: T[] = [];
+  let currentLength = 0;
+  for (const original of entries) {
+    const entry =
+      original.html.length > maxLength
+        ? { ...original, html: fitTelegramHtml(original.html, maxLength) }
+        : original;
+    const nextLength =
+      currentLength + (current.length > 0 ? 2 : 0) + entry.html.length;
+    if (current.length > 0 && nextLength > maxLength) {
+      chunks.push(current);
+      current = [];
+      currentLength = 0;
+    }
+    current.push(entry);
+    currentLength += (current.length > 1 ? 2 : 0) + entry.html.length;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
 
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
