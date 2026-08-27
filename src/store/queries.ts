@@ -151,6 +151,26 @@ export function getAllWorkspaces(limit = 10): Workspace[] {
   return rows.map(mapWorkspaceRow);
 }
 
+/** Durable Cloud work must not be starved by the normal workspace list cap. */
+export function getWorkspacesWithPendingCloudWork(): Workspace[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT w.*
+       FROM workspaces w
+       JOIN meta m
+         ON m.key IN (
+           'pending-cloud-launch:' || w.id,
+           'pending-cloud-messages:' || w.id,
+           'pending-cloud-notices:' || w.id,
+           'pending-cloud-terminal:' || w.id
+         )
+       ORDER BY w.created_at ASC`
+    )
+    .all() as any[];
+  return rows.map(mapWorkspaceRow);
+}
+
 export function getAllWorkspacesForChat(chatId: string, limit = 50): Workspace[] {
   const db = getDb();
   const rows = db
@@ -179,11 +199,101 @@ export function updateWorkspaceStatus(
   db.prepare("UPDATE workspaces SET status = ? WHERE id = ?").run(status, id);
 }
 
+/** Fail only a newly starting row; existing/terminal workspaces keep state. */
+export function updateWorkspaceStatusUnlessTerminal(
+  id: string,
+  status: WorkspaceStatus
+): boolean {
+  const db = getDb();
+  const updated = db.prepare(
+    `UPDATE workspaces
+     SET status = ?
+     WHERE id = ?
+       AND archived_at IS NULL
+       AND status = 'starting'`
+  ).run(status, id);
+  return updated.changes === 1;
+}
+
 export function archiveWorkspace(id: string): void {
   const db = getDb();
-  db.prepare(
-    "UPDATE workspaces SET status = 'archived', archived_at = datetime('now') WHERE id = ?"
-  ).run(id);
+  db.transaction(() => {
+    const workspace = db.prepare(
+      `SELECT conductor_workspace_id,
+              conductor_session_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(id) as
+      | {
+          conductor_workspace_id: string | null;
+          conductor_session_id: string | null;
+          conductor_backend_kind: string | null;
+        }
+      | undefined;
+    db.prepare(
+      "UPDATE workspaces SET status = 'archived', archived_at = datetime('now') WHERE id = ?"
+    ).run(id);
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(id)) as { value?: string } | undefined
+    );
+    if (pending) {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(
+          JSON.stringify({ ...pending, phase: "cancel" }),
+          new Date().toISOString(),
+          pendingCloudLaunchKey(id)
+        );
+    }
+    // The terminal action belongs to the binding the user acted on. A stale
+    // detached saga cleans up its own resource separately.
+    const currentCloudBinding =
+      workspace?.conductor_backend_kind === "cloud-api" &&
+      workspace.conductor_workspace_id &&
+      workspace.conductor_session_id
+        ? {
+            workspaceId: workspace.conductor_workspace_id,
+            sessionId: workspace.conductor_session_id,
+          }
+        : null;
+    const archiveWorkspaceId =
+      currentCloudBinding?.workspaceId ?? pending?.workspaceId;
+    const archiveSessionId =
+      currentCloudBinding?.sessionId ?? pending?.sessionId;
+    if (
+      (pending || workspace?.conductor_backend_kind === "cloud-api") &&
+      archiveWorkspaceId &&
+      archiveSessionId
+    ) {
+      persistPendingCloudTerminalIntentInTransaction(db, id, {
+        action: "archive",
+        workspaceId: archiveWorkspaceId,
+        sessionId: archiveSessionId,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudMessagesKey(id)) as { value?: string } | undefined;
+    const outbox = decodePendingCloudMessages(outboxRow?.value ?? null);
+    recordPendingCloudMessageOutcomesInTransaction(
+      db,
+      id,
+      outbox,
+      "suppressed",
+      "workspace was archived"
+    );
+    if (outbox.length > 0) {
+      appendPendingCloudNoticeInTransaction(db, id, {
+        kind: "messages_suppressed",
+        count: outbox.length,
+        error: "workspace was archived",
+      });
+    }
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudMessagesKey(id));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(id));
+  })();
 }
 
 export function updateWorkspaceTelegramMessage(
@@ -226,18 +336,22 @@ export function updateWorkspaceConductorBinding(
   }
 ): void {
   const db = getDb();
-  db.prepare(
-    `UPDATE workspaces
-     SET conductor_workspace_id = ?,
-         conductor_session_id = ?,
-         conductor_backend_kind = ?
-     WHERE id = ?`
-  ).run(
-    input.workspaceId,
-    input.sessionId,
-    input.backendKind,
-    id
-  );
+  db.transaction(() => {
+    db.prepare(
+      `UPDATE workspaces
+       SET conductor_workspace_id = ?,
+           conductor_session_id = ?,
+           conductor_backend_kind = ?
+       WHERE id = ?`
+    ).run(
+      input.workspaceId,
+      input.sessionId,
+      input.backendKind,
+      id
+    );
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(id));
+  })();
 }
 
 export function updateWorkspaceThreadId(
@@ -496,6 +610,1871 @@ export function setMetaValue(key: string, value: string): void {
        value = excluded.value,
        updated_at = excluded.updated_at`
   ).run(key, value, now);
+}
+
+export type PendingCloudNoticeKind =
+  | "launch_queued"
+  | "launch_failed"
+  | "launch_canceled"
+  | "messages_sent"
+  | "messages_suppressed"
+  | "messages_failed"
+  | "stop_confirmed"
+  | "archive_confirmed"
+  | "stop_failed"
+  | "archive_failed";
+
+export interface PendingCloudNotice {
+  id: string;
+  kind: PendingCloudNoticeKind;
+  count?: number;
+  error?: string;
+  createdAt: string;
+}
+
+export interface PendingCloudNoticeInput {
+  kind: PendingCloudNoticeKind;
+  count?: number;
+  error?: string;
+}
+
+function pendingCloudNoticesKey(trackedWorkspaceId: string): string {
+  return `pending-cloud-notices:${trackedWorkspaceId}`;
+}
+
+function decodePendingCloudNotices(raw: string | null): PendingCloudNotice[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (notice): notice is PendingCloudNotice =>
+        typeof notice === "object" &&
+        notice !== null &&
+        typeof (notice as PendingCloudNotice).id === "string" &&
+        (notice as PendingCloudNotice).id.length > 0 &&
+        [
+          "launch_queued",
+          "launch_failed",
+          "launch_canceled",
+          "messages_sent",
+          "messages_suppressed",
+          "messages_failed",
+          "stop_confirmed",
+          "archive_confirmed",
+          "stop_failed",
+          "archive_failed",
+        ].includes((notice as PendingCloudNotice).kind) &&
+        typeof (notice as PendingCloudNotice).createdAt === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Upper bound on retained recovery notices per workspace. */
+const MAX_PENDING_CLOUD_NOTICES = 50;
+
+function appendPendingCloudNoticeInTransaction(
+  db: ReturnType<typeof getDb>,
+  trackedWorkspaceId: string,
+  input: PendingCloudNoticeInput
+): PendingCloudNotice {
+  const key = pendingCloudNoticesKey(trackedWorkspaceId);
+  const now = new Date().toISOString();
+  const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+    .get(key) as { value?: string } | undefined;
+  const notice: PendingCloudNotice = {
+    id: randomUUID(),
+    ...input,
+    createdAt: now,
+  };
+  const notices = decodePendingCloudNotices(row?.value ?? null);
+  // Notices only clear once Telegram accepts them, so a sustained delivery
+  // outage would otherwise grow one meta row without bound. Keep the newest:
+  // the oldest recovery notice is the least useful one to replay.
+  const retained = [...notices, notice].slice(-MAX_PENDING_CLOUD_NOTICES);
+  db.prepare(
+    `INSERT INTO meta (key, value, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  ).run(key, JSON.stringify(retained), now);
+  return notice;
+}
+
+export function getPendingCloudNotices(
+  trackedWorkspaceId: string
+): PendingCloudNotice[] {
+  return decodePendingCloudNotices(
+    getMetaValue(pendingCloudNoticesKey(trackedWorkspaceId))
+  );
+}
+
+export function enqueuePendingCloudNotice(
+  trackedWorkspaceId: string,
+  input: PendingCloudNoticeInput
+): PendingCloudNotice {
+  const db = getDb();
+  return db.transaction(() =>
+    appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, input)
+  )();
+}
+
+/** Acknowledge only the notice that was actually published. */
+export function acknowledgePendingCloudNotice(
+  trackedWorkspaceId: string,
+  noticeId: string
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const key = pendingCloudNoticesKey(trackedWorkspaceId);
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const notices = decodePendingCloudNotices(row?.value ?? null);
+    if (!notices.some((notice) => notice.id === noticeId)) return false;
+    const remaining = notices.filter((notice) => notice.id !== noticeId);
+    if (remaining.length === 0) {
+      db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    } else {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(JSON.stringify(remaining), new Date().toISOString(), key);
+    }
+    return true;
+  })();
+}
+
+export interface PendingCloudLaunch {
+  workspaceId: string;
+  sessionId: string;
+  prompt: string;
+  messageId: string;
+  /** Resource provisioned by this saga and safe to remove on rollback. */
+  cleanupTarget?: "workspace" | "session";
+  /** Preserve the existing Cloud workspace name when only a thread changes. */
+  conductorWorkspaceName?: string;
+  phase?: "provisioned" | "send" | "sent" | "cleanup" | "cancel";
+  previousBinding?: {
+    conductorWorkspaceName: string | null;
+    conductorWorkspaceId: string | null;
+    conductorSessionId: string | null;
+    conductorBackendKind: "local" | "cloud-api" | null;
+    status: WorkspaceStatus;
+  };
+}
+
+export type PendingCloudLaunchIdentity = Pick<
+  PendingCloudLaunch,
+  "workspaceId" | "sessionId" | "messageId"
+> & { phase?: PendingCloudLaunch["phase"] };
+
+function pendingCloudLaunchMatches(
+  pending: PendingCloudLaunch | null,
+  expected: PendingCloudLaunchIdentity
+): pending is PendingCloudLaunch {
+  return Boolean(
+    pending &&
+      pending.workspaceId === expected.workspaceId &&
+      pending.sessionId === expected.sessionId &&
+      pending.messageId === expected.messageId &&
+      (expected.phase === undefined || pending.phase === expected.phase)
+  );
+}
+
+export interface PendingCloudTerminalIntent {
+  action: "stop" | "archive";
+  workspaceId: string;
+  sessionId: string;
+  createdAt: string;
+  /** Cancel even if a status read has not observed the late accepted POST yet. */
+  forceCancel?: boolean;
+}
+
+function pendingCloudTerminalKey(trackedWorkspaceId: string): string {
+  return `pending-cloud-terminal:${trackedWorkspaceId}`;
+}
+
+interface CloudWorkLease {
+  token: string;
+  workspaceId: string;
+  createdAt: string;
+}
+
+function cloudWorkLeasesKey(trackedWorkspaceId: string): string {
+  return `cloud-work-leases:${trackedWorkspaceId}`;
+}
+
+/**
+ * How long a work lease may be held before another attempt may claim it.
+ *
+ * A lease is released in a `finally`, so only a crash between acquiring it and
+ * reaching that block can strand one — and nothing sweeps `cloud-work-leases`
+ * on boot. Without an expiry that workspace would refuse every later send with
+ * "retry after its pending Stop or Archive completes" when no such request
+ * exists, until the operator manually stopped it. The ceiling sits above the
+ * slowest legitimate hold: one API call is bounded at 120s and may retry 5
+ * times, so 15 minutes cannot expire a lease that is still doing real work.
+ */
+const CLOUD_WORK_LEASE_MAX_AGE_MS = 15 * 60_000;
+
+/** Drop leases old enough that only a dead process could still hold them. */
+function activeCloudWorkLeases(
+  leases: CloudWorkLease[],
+  now = Date.now()
+): CloudWorkLease[] {
+  return leases.filter((lease) => {
+    const startedAt = Date.parse(lease.createdAt);
+    // An unparsable timestamp cannot be shown to be current, so treat it as
+    // expired rather than letting it block the workspace forever.
+    return (
+      Number.isFinite(startedAt) &&
+      now - startedAt < CLOUD_WORK_LEASE_MAX_AGE_MS
+    );
+  });
+}
+
+function decodeCloudWorkLeases(raw: string | null | undefined): CloudWorkLease[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (lease): lease is CloudWorkLease =>
+        typeof lease === "object" &&
+        lease !== null &&
+        typeof (lease as CloudWorkLease).token === "string" &&
+        typeof (lease as CloudWorkLease).workspaceId === "string" &&
+        typeof (lease as CloudWorkLease).createdAt === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Reserve a send/new-thread attempt so a later stop can revoke it durably. */
+export function beginCloudWorkLease(
+  trackedWorkspaceId: string,
+  workspaceId: string
+): string | null {
+  const db = getDb();
+  return db.transaction(() => {
+    const workspace = db.prepare(
+      `SELECT status, archived_at, conductor_workspace_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status: string;
+          archived_at: string | null;
+          conductor_workspace_id: string | null;
+          conductor_backend_kind: string | null;
+        }
+      | undefined;
+    const terminalRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudTerminalKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const launchRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    if (
+      !workspace ||
+      workspace.archived_at ||
+      workspace.status === "archived" ||
+      workspace.conductor_backend_kind !== "cloud-api" ||
+      workspace.conductor_workspace_id !== workspaceId ||
+      decodePendingCloudTerminalIntent(terminalRow?.value) ||
+      decodePendingCloudLaunch(launchRow)
+    ) {
+      return null;
+    }
+    const key = cloudWorkLeasesKey(trackedWorkspaceId);
+    const existingRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const existingLeases = activeCloudWorkLeases(
+      decodeCloudWorkLeases(existingRow?.value)
+    );
+    const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    if (
+      existingLeases.length > 0 ||
+      decodePendingCloudMessages(outboxRow?.value ?? null).length > 0
+    ) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const lease: CloudWorkLease = {
+      token: randomUUID(),
+      workspaceId,
+      createdAt: now,
+    };
+    const leases = existingLeases;
+    db.prepare(
+      `INSERT INTO meta (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    ).run(key, JSON.stringify([...leases, lease]), now);
+    return lease.token;
+  })();
+}
+
+/** Final pre-POST gate: Stop/Archive clears every outstanding lease. */
+export function cloudWorkLeaseCanSend(
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  token: string
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const workspace = db.prepare(
+      `SELECT status, archived_at, conductor_workspace_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status: string;
+          archived_at: string | null;
+          conductor_workspace_id: string | null;
+          conductor_backend_kind: string | null;
+        }
+      | undefined;
+    const terminalRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudTerminalKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const leaseRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    return Boolean(
+      workspace &&
+        !workspace.archived_at &&
+        workspace.status !== "archived" &&
+        workspace.conductor_backend_kind === "cloud-api" &&
+        workspace.conductor_workspace_id === workspaceId &&
+        !decodePendingCloudTerminalIntent(terminalRow?.value) &&
+        activeCloudWorkLeases(decodeCloudWorkLeases(leaseRow?.value)).some(
+          (lease) => lease.token === token && lease.workspaceId === workspaceId
+        )
+    );
+  })();
+}
+
+export function clearCloudWorkLease(
+  trackedWorkspaceId: string,
+  token: string
+): void {
+  const db = getDb();
+  db.transaction(() => {
+    const key = cloudWorkLeasesKey(trackedWorkspaceId);
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const remaining = decodeCloudWorkLeases(row?.value).filter(
+      (lease) => lease.token !== token
+    );
+    if (remaining.length === 0) {
+      db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    } else {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(JSON.stringify(remaining), new Date().toISOString(), key);
+    }
+  })();
+}
+
+/** Commit a Cloud send only if no terminal action revoked its lease. */
+export function completeCloudWorkLease(
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  token: string
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const key = cloudWorkLeasesKey(trackedWorkspaceId);
+    const leaseRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const leases = activeCloudWorkLeases(
+      decodeCloudWorkLeases(leaseRow?.value)
+    );
+    if (
+      !leases.some(
+        (lease) => lease.token === token && lease.workspaceId === workspaceId
+      ) ||
+      !cloudWorkLeaseCanSend(trackedWorkspaceId, workspaceId, token)
+    ) {
+      return false;
+    }
+    const updated = db.prepare(
+      `UPDATE workspaces
+       SET status = 'running'
+       WHERE id = ?
+         AND conductor_backend_kind = 'cloud-api'
+         AND conductor_workspace_id = ?
+         AND archived_at IS NULL
+         AND status != 'archived'`
+    ).run(trackedWorkspaceId, workspaceId);
+    if (updated.changes !== 1) return false;
+    const remaining = leases.filter((lease) => lease.token !== token);
+    if (remaining.length === 0) {
+      db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    } else {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(JSON.stringify(remaining), new Date().toISOString(), key);
+    }
+    return true;
+  })();
+}
+
+/** Re-arm a stop after an in-flight POST may have landed behind cancellation. */
+export function ensurePendingCloudStopIntent(
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  sessionId: string
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const workspace = db.prepare(
+      `SELECT status, archived_at, conductor_workspace_id,
+              conductor_session_id, conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status: string;
+          archived_at: string | null;
+          conductor_workspace_id: string | null;
+          conductor_session_id: string | null;
+          conductor_backend_kind: string | null;
+        }
+      | undefined;
+    if (
+      !workspace ||
+      workspace.status !== "stopped" ||
+      workspace.archived_at ||
+      workspace.conductor_backend_kind !== "cloud-api" ||
+      workspace.conductor_workspace_id !== workspaceId ||
+      workspace.conductor_session_id !== sessionId
+    ) {
+      return false;
+    }
+    persistPendingCloudTerminalIntentInTransaction(
+      db,
+      trackedWorkspaceId,
+      {
+        action: "stop",
+        workspaceId,
+        sessionId,
+        createdAt: new Date().toISOString(),
+        forceCancel: true,
+      }
+    );
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(trackedWorkspaceId));
+    return true;
+  })();
+}
+
+function decodePendingCloudTerminalIntent(
+  raw: string | null | undefined
+): PendingCloudTerminalIntent | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PendingCloudTerminalIntent>;
+    if (
+      (parsed.action !== "stop" && parsed.action !== "archive") ||
+      typeof parsed.workspaceId !== "string" ||
+      !parsed.workspaceId ||
+      typeof parsed.sessionId !== "string" ||
+      !parsed.sessionId ||
+      typeof parsed.createdAt !== "string"
+    ) {
+      return null;
+    }
+    return parsed as PendingCloudTerminalIntent;
+  } catch {
+    return null;
+  }
+}
+
+function persistPendingCloudTerminalIntentInTransaction(
+  db: ReturnType<typeof getDb>,
+  trackedWorkspaceId: string,
+  intent: PendingCloudTerminalIntent
+): void {
+  const key = pendingCloudTerminalKey(trackedWorkspaceId);
+  const existingRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+    .get(key) as { value?: string } | undefined;
+  const existing = decodePendingCloudTerminalIntent(existingRow?.value);
+  // Archive is stronger than stop and must never be downgraded by a racing
+  // callback that captured older UI state.
+  const durable =
+    existing?.action === "archive" && intent.action === "stop"
+      ? existing
+      : intent;
+  db.prepare(
+    `INSERT INTO meta (key, value, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  ).run(key, JSON.stringify(durable), new Date().toISOString());
+}
+
+export function getPendingCloudTerminalIntent(
+  trackedWorkspaceId: string
+): PendingCloudTerminalIntent | null {
+  return decodePendingCloudTerminalIntent(
+    getMetaValue(pendingCloudTerminalKey(trackedWorkspaceId))
+  );
+}
+
+/** Clear only the exact terminal request whose remote effect was confirmed. */
+export function completePendingCloudTerminalIntent(
+  trackedWorkspaceId: string,
+  expected: PendingCloudTerminalIntent
+): PendingCloudNotice | null {
+  const db = getDb();
+  return db.transaction(() => {
+    const key = pendingCloudTerminalKey(trackedWorkspaceId);
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const current = decodePendingCloudTerminalIntent(row?.value);
+    if (
+      current?.action !== expected.action ||
+      current.workspaceId !== expected.workspaceId ||
+      current.sessionId !== expected.sessionId ||
+      current.createdAt !== expected.createdAt
+    ) {
+      return null;
+    }
+    const notice = appendPendingCloudNoticeInTransaction(
+      db,
+      trackedWorkspaceId,
+      {
+        kind:
+          expected.action === "archive"
+            ? "archive_confirmed"
+            : "stop_confirmed",
+      }
+    );
+    db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    return notice;
+  })();
+}
+
+/**
+ * How long a stop/archive intent may keep retrying before it gives up.
+ *
+ * Retryable failures (429s, 5xx, an unreachable API) should survive a long
+ * outage, but they must not gate the workspace forever: sends and new threads
+ * refuse to run while an intent is pending, so an intent that can never
+ * succeed silently retires the workspace.
+ */
+const PENDING_CLOUD_TERMINAL_MAX_AGE_MS = 60 * 60_000;
+
+/** True once a terminal intent has retried past the point of being useful. */
+export function pendingCloudTerminalIntentIsExhausted(
+  intent: PendingCloudTerminalIntent,
+  now = Date.now()
+): boolean {
+  const startedAt = Date.parse(intent.createdAt);
+  if (!Number.isFinite(startedAt)) return true;
+  return now - startedAt >= PENDING_CLOUD_TERMINAL_MAX_AGE_MS;
+}
+
+/**
+ * Retire a stop/archive intent that cannot succeed, leaving a notice behind.
+ *
+ * The launch saga has always been able to fail out; this one could only ever
+ * report "pending", so a deterministic error (a stored id the API rejects, a
+ * workspace-identity mismatch) blocked every later send with no way out.
+ */
+export function failPendingCloudTerminalIntent(
+  trackedWorkspaceId: string,
+  expected: PendingCloudTerminalIntent,
+  error: string
+): PendingCloudNotice | null {
+  const db = getDb();
+  return db.transaction(() => {
+    const key = pendingCloudTerminalKey(trackedWorkspaceId);
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const current = decodePendingCloudTerminalIntent(row?.value);
+    if (
+      current?.action !== expected.action ||
+      current.workspaceId !== expected.workspaceId ||
+      current.sessionId !== expected.sessionId ||
+      current.createdAt !== expected.createdAt
+    ) {
+      return null;
+    }
+    const notice = appendPendingCloudNoticeInTransaction(
+      db,
+      trackedWorkspaceId,
+      {
+        kind: expected.action === "archive" ? "archive_failed" : "stop_failed",
+        error,
+      }
+    );
+    db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    return notice;
+  })();
+}
+
+function pendingCloudLaunchKey(trackedWorkspaceId: string): string {
+  return `pending-cloud-launch:${trackedWorkspaceId}`;
+}
+
+interface FinalizedCloudLaunchReceipt {
+  workspaceId: string;
+  sessionId: string;
+  messageId: string;
+  finalizedAt: string;
+}
+
+function finalizedCloudLaunchReceiptKey(trackedWorkspaceId: string): string {
+  return `finalized-cloud-launch:${trackedWorkspaceId}`;
+}
+
+function decodeFinalizedCloudLaunchReceipt(
+  raw: string | null | undefined
+): FinalizedCloudLaunchReceipt | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<FinalizedCloudLaunchReceipt>;
+    if (
+      typeof parsed.workspaceId !== "string" ||
+      !parsed.workspaceId ||
+      typeof parsed.sessionId !== "string" ||
+      !parsed.sessionId ||
+      typeof parsed.messageId !== "string" ||
+      !parsed.messageId ||
+      typeof parsed.finalizedAt !== "string"
+    ) {
+      return null;
+    }
+    return parsed as FinalizedCloudLaunchReceipt;
+  } catch {
+    return null;
+  }
+}
+
+function finalizedCloudLaunchMatchesInTransaction(
+  db: ReturnType<typeof getDb>,
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  sessionId: string,
+  messageId: string
+): boolean {
+  const row = db.prepare(
+    `SELECT status,
+            conductor_workspace_id,
+            conductor_session_id,
+            conductor_backend_kind
+     FROM workspaces WHERE id = ?`
+  ).get(trackedWorkspaceId) as
+    | {
+        status?: string;
+        conductor_workspace_id?: string | null;
+        conductor_session_id?: string | null;
+        conductor_backend_kind?: string | null;
+      }
+    | undefined;
+  const receiptRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+    .get(finalizedCloudLaunchReceiptKey(trackedWorkspaceId)) as
+    | { value?: string }
+    | undefined;
+  const receipt = decodeFinalizedCloudLaunchReceipt(receiptRow?.value);
+  return (
+    (row?.status === "running" ||
+      row?.status === "done" ||
+      row?.status === "failed") &&
+    row.conductor_backend_kind === "cloud-api" &&
+    row.conductor_workspace_id === workspaceId &&
+    row.conductor_session_id === sessionId &&
+    receipt?.workspaceId === workspaceId &&
+    receipt.sessionId === sessionId &&
+    receipt.messageId === messageId
+  );
+}
+
+/** Prove that this exact first-message identity already committed durably. */
+export function isFinalizedCloudLaunch(input: {
+  trackedWorkspaceId: string;
+  workspaceId: string;
+  sessionId: string;
+  messageId: string;
+}): boolean {
+  const db = getDb();
+  return db.transaction(() =>
+    finalizedCloudLaunchMatchesInTransaction(
+      db,
+      input.trackedWorkspaceId,
+      input.workspaceId,
+      input.sessionId,
+      input.messageId
+    )
+  )();
+}
+
+/** Persist the Cloud identity and unsent/uncertain first prompt atomically. */
+export function persistPendingCloudLaunch(
+  trackedWorkspaceId: string,
+  pending: PendingCloudLaunch,
+  options: {
+    /** Proves a stopped/done/failed Cloud row is intentionally reopening. */
+    reopenLeaseToken?: string;
+    expectedPreviousSessionId?: string | null;
+  } = {}
+): boolean {
+  const db = getDb();
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const previous = db.prepare(
+      `SELECT conductor_workspace_name,
+              conductor_workspace_id,
+              conductor_session_id,
+              conductor_backend_kind,
+              status
+       FROM workspaces
+       WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          conductor_workspace_name: string | null;
+          conductor_workspace_id: string | null;
+          conductor_session_id: string | null;
+          conductor_backend_kind: "local" | "cloud-api" | null;
+          status: WorkspaceStatus;
+        }
+      | undefined;
+    if (!previous) {
+      throw new Error(
+        `Cannot persist pending Cloud launch for missing workspace ${trackedWorkspaceId}`
+      );
+    }
+    const existing = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    const terminalRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudTerminalKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const terminalIntent = decodePendingCloudTerminalIntent(
+      terminalRow?.value
+    );
+    const reopenLease = options.reopenLeaseToken
+      ? decodeCloudWorkLeases(
+          (
+            db.prepare("SELECT value FROM meta WHERE key = ?")
+              .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
+              | { value?: string }
+              | undefined
+          )?.value
+        ).some(
+          (lease) =>
+            lease.token === options.reopenLeaseToken &&
+            lease.workspaceId === pending.workspaceId
+        )
+      : false;
+    if (options.reopenLeaseToken) {
+      const expectedSession = options.expectedPreviousSessionId;
+      const bindingMatches =
+        previous.conductor_backend_kind === "cloud-api" &&
+        previous.conductor_workspace_id === pending.workspaceId &&
+        (expectedSession === undefined ||
+          previous.conductor_session_id === expectedSession);
+      const canceledDuringProvisioning = Boolean(
+        terminalIntent &&
+          terminalIntent.workspaceId === pending.workspaceId &&
+          bindingMatches
+      );
+      if (
+        existing ||
+        !bindingMatches ||
+        (!reopenLease && !canceledDuringProvisioning)
+      ) {
+        return false;
+      }
+    }
+    const terminalPhase = options.reopenLeaseToken
+      ? terminalIntent
+        ? "cancel"
+        : null
+      : previous.status === "stopped" || previous.status === "archived"
+        ? "cancel"
+        : previous.status === "failed" || previous.status === "done"
+          ? "cleanup"
+          : null;
+    const durablePending: PendingCloudLaunch = {
+      ...pending,
+      // A terminal status may have been written while Cloud provisioning was
+      // in flight. Preserve it atomically instead of resurrecting the launch.
+      phase: terminalPhase ?? pending.phase ?? "send",
+      previousBinding:
+        existing?.previousBinding ?? {
+          conductorWorkspaceName: previous.conductor_workspace_name,
+          conductorWorkspaceId: previous.conductor_workspace_id,
+          conductorSessionId: previous.conductor_session_id,
+          conductorBackendKind: previous.conductor_backend_kind,
+          status: previous.status,
+        },
+    };
+    const updated = db.prepare(
+      `UPDATE workspaces
+       SET conductor_workspace_name = ?,
+           conductor_workspace_id = ?,
+           conductor_session_id = ?,
+           conductor_backend_kind = 'cloud-api',
+           status = ?
+       WHERE id = ?`
+    ).run(
+      pending.conductorWorkspaceName ?? pending.workspaceId,
+      pending.workspaceId,
+      pending.sessionId,
+      durablePending.phase === "send" || durablePending.phase === "provisioned"
+        ? "starting"
+        : previous.status,
+      trackedWorkspaceId
+    );
+    if (updated.changes !== 1) {
+      throw new Error(
+        `Cannot persist pending Cloud launch for missing workspace ${trackedWorkspaceId}`
+      );
+    }
+    db.prepare(
+      `INSERT INTO meta (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    ).run(
+      pendingCloudLaunchKey(trackedWorkspaceId),
+      JSON.stringify(durablePending),
+      now
+    );
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(finalizedCloudLaunchReceiptKey(trackedWorkspaceId));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(trackedWorkspaceId));
+    if (durablePending.phase === "cancel") {
+      db.prepare("DELETE FROM meta WHERE key = ?")
+        .run(pendingCloudMessagesKey(trackedWorkspaceId));
+    }
+    return true;
+  })();
+}
+
+export function getPendingCloudLaunch(
+  trackedWorkspaceId: string
+): PendingCloudLaunch | null {
+  return decodePendingCloudLaunch(
+    getMetaValue(pendingCloudLaunchKey(trackedWorkspaceId))
+  );
+}
+
+function decodePendingCloudLaunch(
+  source: string | { value?: string } | null | undefined
+): PendingCloudLaunch | null {
+  const raw = typeof source === "string" ? source : source?.value;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PendingCloudLaunch>;
+    if (
+      typeof parsed.workspaceId !== "string" ||
+      !parsed.workspaceId ||
+      typeof parsed.sessionId !== "string" ||
+      !parsed.sessionId ||
+      typeof parsed.prompt !== "string" ||
+      typeof parsed.messageId !== "string" ||
+      !parsed.messageId
+    ) {
+      return null;
+    }
+    const phase =
+      parsed.phase === "provisioned" ||
+      parsed.phase === "sent" ||
+      parsed.phase === "cleanup" ||
+      parsed.phase === "cancel"
+        ? parsed.phase
+        : "send";
+    const cleanupTarget =
+      parsed.cleanupTarget === "session" ? "session" : "workspace";
+    return { ...parsed, phase, cleanupTarget } as PendingCloudLaunch;
+  } catch {
+    return null;
+  }
+}
+
+/** Restore the binding that existed before Cloud provisioning and clear the saga. */
+export function restorePendingCloudLaunchBinding(
+  trackedWorkspaceId: string,
+  statusOverride?: WorkspaceStatus,
+  notice?: PendingCloudNoticeInput,
+  expected?: PendingCloudLaunchIdentity
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    if (expected && !pendingCloudLaunchMatches(pending, expected)) {
+      return false;
+    }
+    const previous = pending?.previousBinding;
+    if (!previous) return false;
+    const restored = db.prepare(
+      `UPDATE workspaces
+       SET conductor_workspace_name = ?,
+           conductor_workspace_id = ?,
+           conductor_session_id = ?,
+           conductor_backend_kind = ?,
+           status = ?
+       WHERE id = ?`
+    ).run(
+      previous.conductorWorkspaceName,
+      previous.conductorWorkspaceId,
+      previous.conductorSessionId,
+      previous.conductorBackendKind,
+      statusOverride ?? previous.status,
+      trackedWorkspaceId
+    );
+    if (restored.changes !== 1) return false;
+    if (notice) {
+      appendPendingCloudNoticeInTransaction(
+        db,
+        trackedWorkspaceId,
+        notice
+      );
+    }
+    const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const outbox = decodePendingCloudMessages(outboxRow?.value ?? null);
+    const outboxOutcome =
+      statusOverride === "stopped" || statusOverride === "archived"
+        ? "suppressed"
+        : "failed";
+    recordPendingCloudMessageOutcomesInTransaction(
+      db,
+      trackedWorkspaceId,
+      outbox,
+      outboxOutcome,
+      notice?.error
+    );
+    if (outbox.length > 0) {
+      appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, {
+        kind:
+          outboxOutcome === "suppressed"
+            ? "messages_suppressed"
+            : "messages_failed",
+        count: outbox.length,
+        error:
+          notice?.error ??
+          (outboxOutcome === "suppressed"
+            ? "Cloud launch was canceled"
+            : "Cloud launch failed"),
+      });
+    }
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudLaunchKey(trackedWorkspaceId));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudMessagesKey(trackedWorkspaceId));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(trackedWorkspaceId));
+    return true;
+  })();
+}
+
+/** Final send gate, checked after durable persistence and before API delivery. */
+export function pendingCloudLaunchCanSend(
+  trackedWorkspaceId: string,
+  expected: PendingCloudLaunchIdentity
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(
+      `SELECT status,
+              conductor_workspace_id,
+              conductor_session_id
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status?: string;
+          conductor_workspace_id?: string | null;
+          conductor_session_id?: string | null;
+        }
+      | undefined;
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    // promotePendingCloudLaunchToSend only reaches the "send" phase once the
+    // row already points at this binding, so re-checking it here costs nothing
+    // on the happy path and refuses to POST an old prompt into an old session
+    // if anything rebound the row without clearing the saga.
+    return (
+      row?.status === "starting" &&
+      row.conductor_workspace_id === expected.workspaceId &&
+      row.conductor_session_id === expected.sessionId &&
+      pending?.phase === "send" &&
+      pendingCloudLaunchMatches(pending, expected)
+    );
+  })();
+}
+
+/** Promote only the exact freshly provisioned saga after validation succeeds. */
+export function promotePendingCloudLaunchToSend(
+  trackedWorkspaceId: string,
+  expected: PendingCloudLaunchIdentity,
+  prompt: string
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(
+      `SELECT status,
+              conductor_workspace_id,
+              conductor_session_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status?: string;
+          conductor_workspace_id?: string | null;
+          conductor_session_id?: string | null;
+          conductor_backend_kind?: string | null;
+        }
+      | undefined;
+    const pendingRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const pending = decodePendingCloudLaunch(pendingRow);
+    if (
+      row?.status !== "starting" ||
+      row.conductor_backend_kind !== "cloud-api" ||
+      row.conductor_workspace_id !== expected.workspaceId ||
+      row.conductor_session_id !== expected.sessionId ||
+      pending?.phase !== "provisioned" ||
+      !pendingCloudLaunchMatches(pending, expected)
+    ) {
+      return false;
+    }
+    db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+      .run(
+        JSON.stringify({ ...pending, prompt, phase: "send" }),
+        new Date().toISOString(),
+        pendingCloudLaunchKey(trackedWorkspaceId)
+      );
+    return true;
+  })();
+}
+
+/** Record the API receipt without losing crash-recovery evidence. */
+export function markPendingCloudLaunchSent(
+  trackedWorkspaceId: string,
+  messageId: string,
+  workspaceId: string,
+  sessionId: string
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const row = db.prepare(
+      `SELECT status,
+              conductor_workspace_id,
+              conductor_session_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status?: string;
+          conductor_workspace_id?: string | null;
+          conductor_session_id?: string | null;
+          conductor_backend_kind?: string | null;
+        }
+      | undefined;
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    if (!pending) {
+      // A restart poller may have finalized this exact launch while the
+      // foreground POST response was still in flight.
+      return finalizedCloudLaunchMatchesInTransaction(
+        db,
+        trackedWorkspaceId,
+        workspaceId,
+        sessionId,
+        messageId
+      );
+    }
+    // The binding columns were already read here but never compared, so a
+    // rebound row could mark an old prompt sent against a new session.
+    if (
+      row?.status !== "starting" ||
+      row.conductor_workspace_id !== workspaceId ||
+      row.conductor_session_id !== sessionId ||
+      pending?.phase !== "send" ||
+      pending.messageId !== messageId ||
+      pending.workspaceId !== workspaceId ||
+      pending.sessionId !== sessionId
+    ) {
+      return false;
+    }
+    db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+      .run(
+        JSON.stringify({ ...pending, phase: "sent" }),
+        new Date().toISOString(),
+        pendingCloudLaunchKey(trackedWorkspaceId)
+      );
+    return true;
+  })();
+}
+
+/** Atomically bind, anchor, and activate a first prompt with a durable receipt. */
+export function finalizePendingCloudLaunch(input: {
+  trackedWorkspaceId: string;
+  conductorWorkspaceName: string;
+  workspaceId: string;
+  sessionId: string;
+  messageId: string;
+  notice?: PendingCloudNoticeInput;
+}): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(input.trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    const row = db.prepare(
+      `SELECT status,
+              conductor_workspace_id,
+              conductor_session_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(input.trackedWorkspaceId) as
+      | {
+          status?: string;
+          conductor_workspace_id?: string | null;
+          conductor_session_id?: string | null;
+          conductor_backend_kind?: string | null;
+        }
+      | undefined;
+    if (!pending) {
+      return finalizedCloudLaunchMatchesInTransaction(
+        db,
+        input.trackedWorkspaceId,
+        input.workspaceId,
+        input.sessionId,
+        input.messageId
+      );
+    }
+    if (
+      row?.status !== "starting" ||
+      pending?.phase !== "sent" ||
+      pending.workspaceId !== input.workspaceId ||
+      pending.sessionId !== input.sessionId ||
+      pending.messageId !== input.messageId
+    ) {
+      return false;
+    }
+    const updated = db.prepare(
+      `UPDATE workspaces
+       SET conductor_workspace_name = ?,
+           conductor_workspace_id = ?,
+           conductor_session_id = ?,
+           conductor_backend_kind = 'cloud-api',
+           status = 'running',
+           last_forwarded_message_rowid = MAX(
+             COALESCE(last_forwarded_message_rowid, 0), 0
+           )
+       WHERE id = ? AND status = 'starting'`
+    ).run(
+      input.conductorWorkspaceName,
+      input.workspaceId,
+      input.sessionId,
+      input.trackedWorkspaceId
+    );
+    if (updated.changes !== 1) return false;
+    upsertThreadCursor({
+      workspaceId: input.trackedWorkspaceId,
+      sessionId: input.sessionId,
+      backendKind: "cloud-api",
+      lastForwardedRowid: 0,
+      lastMessageId: input.messageId,
+    });
+    if (input.notice) {
+      appendPendingCloudNoticeInTransaction(
+        db,
+        input.trackedWorkspaceId,
+        input.notice
+      );
+    }
+    const finalizedAt = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO meta (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    ).run(
+      finalizedCloudLaunchReceiptKey(input.trackedWorkspaceId),
+      JSON.stringify({
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId,
+        messageId: input.messageId,
+        finalizedAt,
+      } satisfies FinalizedCloudLaunchReceipt),
+      finalizedAt
+    );
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudLaunchKey(input.trackedWorkspaceId));
+    return true;
+  })();
+}
+
+function markPendingCloudLaunchPhase(
+  trackedWorkspaceId: string,
+  phase: "cleanup" | "cancel",
+  expected?: PendingCloudLaunchIdentity
+): boolean {
+  const db = getDb();
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    if (!pending) return false;
+    if (expected && !pendingCloudLaunchMatches(pending, expected)) {
+      return false;
+    }
+    // Cancellation is terminal for prompt delivery. A racing send/cleanup
+    // failure must never downgrade it and make reconciliation send again.
+    if (pending.phase === "cancel" && phase === "cleanup") return false;
+    // A durable API receipt must be finalized/reconciled, never converted
+    // back into destructive cleanup by a stale pre-receipt owner.
+    if (pending.phase === "sent" && phase === "cleanup") return false;
+    db.prepare(
+      `UPDATE meta SET value = ?, updated_at = ? WHERE key = ?`
+    ).run(
+      JSON.stringify({ ...pending, phase }),
+      now,
+      pendingCloudLaunchKey(trackedWorkspaceId)
+    );
+    if (phase === "cancel") {
+      db.prepare("UPDATE workspaces SET status = 'stopped' WHERE id = ?")
+        .run(trackedWorkspaceId);
+      db.prepare("DELETE FROM meta WHERE key = ?")
+        .run(pendingCloudMessagesKey(trackedWorkspaceId));
+    }
+    return true;
+  })();
+}
+
+export function markPendingCloudLaunchForCleanup(
+  trackedWorkspaceId: string,
+  expected?: PendingCloudLaunchIdentity
+): boolean {
+  return markPendingCloudLaunchPhase(trackedWorkspaceId, "cleanup", expected);
+}
+
+/** Persist stop intent before calling the remote cancellation endpoint. */
+export function markPendingCloudLaunchCanceled(
+  trackedWorkspaceId: string,
+  expected?: PendingCloudLaunchIdentity
+): boolean {
+  const db = getDb();
+  const now = new Date().toISOString();
+  return db.transaction(() => {
+    const workspace = db.prepare(
+      `SELECT status,
+              conductor_workspace_id,
+              conductor_session_id,
+              conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          status: WorkspaceStatus;
+          conductor_workspace_id: string | null;
+          conductor_session_id: string | null;
+          conductor_backend_kind: string | null;
+        }
+      | undefined;
+    const pending = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    if (expected && !pendingCloudLaunchMatches(pending, expected)) {
+      return false;
+    }
+    db.prepare(
+      `UPDATE workspaces
+       SET status = CASE WHEN status = 'archived' THEN status ELSE 'stopped' END
+       WHERE id = ?`
+    ).run(trackedWorkspaceId);
+    if (pending) {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(
+          JSON.stringify({ ...pending, phase: "cancel" }),
+          now,
+          pendingCloudLaunchKey(trackedWorkspaceId)
+        );
+    }
+    if (
+      workspace?.conductor_backend_kind === "cloud-api" &&
+      workspace.conductor_workspace_id &&
+      workspace.conductor_session_id
+    ) {
+      persistPendingCloudTerminalIntentInTransaction(
+        db,
+        trackedWorkspaceId,
+        {
+          action: workspace.status === "archived" ? "archive" : "stop",
+          workspaceId: workspace.conductor_workspace_id,
+          sessionId: workspace.conductor_session_id,
+          createdAt: now,
+        }
+      );
+    }
+    const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const outbox = decodePendingCloudMessages(outboxRow?.value ?? null);
+    recordPendingCloudMessageOutcomesInTransaction(
+      db,
+      trackedWorkspaceId,
+      outbox,
+      "suppressed",
+      "workspace was stopped"
+    );
+    if (outbox.length > 0) {
+      appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, {
+        kind: "messages_suppressed",
+        count: outbox.length,
+        error: "workspace was stopped",
+      });
+    }
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudMessagesKey(trackedWorkspaceId));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(trackedWorkspaceId));
+    return Boolean(
+      pending ||
+      (workspace?.conductor_backend_kind === "cloud-api" &&
+        workspace.conductor_workspace_id &&
+        workspace.conductor_session_id)
+    );
+  })();
+}
+
+export interface PendingCloudMessage {
+  requestId: string;
+  sessionId: string;
+  messageId: string;
+  prompt: string;
+  createdAt: string;
+}
+
+export interface PendingCloudMessageOutcome {
+  requestId: string;
+  outcome: "delivered" | "suppressed" | "failed";
+  error?: string;
+  recordedAt: string;
+}
+
+function pendingCloudMessagesKey(trackedWorkspaceId: string): string {
+  return `pending-cloud-messages:${trackedWorkspaceId}`;
+}
+
+function pendingCloudMessageOutcomesKey(trackedWorkspaceId: string): string {
+  return `pending-cloud-message-outcomes:${trackedWorkspaceId}`;
+}
+
+function decodePendingCloudMessages(raw: string | null): PendingCloudMessage[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is PendingCloudMessage =>
+        entry &&
+        typeof entry.requestId === "string" &&
+        Boolean(entry.requestId) &&
+        typeof entry.sessionId === "string" &&
+        Boolean(entry.sessionId) &&
+        typeof entry.messageId === "string" &&
+        Boolean(entry.messageId) &&
+        typeof entry.prompt === "string" &&
+        typeof entry.createdAt === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+function decodePendingCloudMessageOutcomes(
+  raw: string | null
+): PendingCloudMessageOutcome[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is PendingCloudMessageOutcome =>
+        typeof entry === "object" &&
+        entry !== null &&
+        typeof (entry as PendingCloudMessageOutcome).requestId === "string" &&
+        ["delivered", "suppressed", "failed"].includes(
+          (entry as PendingCloudMessageOutcome).outcome
+        ) &&
+        typeof (entry as PendingCloudMessageOutcome).recordedAt === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+function recordPendingCloudMessageOutcomesInTransaction(
+  db: ReturnType<typeof getDb>,
+  trackedWorkspaceId: string,
+  messages: PendingCloudMessage[],
+  outcome: PendingCloudMessageOutcome["outcome"],
+  error?: string
+): void {
+  if (messages.length === 0) return;
+  const key = pendingCloudMessageOutcomesKey(trackedWorkspaceId);
+  const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+    .get(key) as { value?: string } | undefined;
+  const replacedIds = new Set(messages.map((message) => message.requestId));
+  const retained = decodePendingCloudMessageOutcomes(
+    row?.value ?? null
+  ).filter((entry) => !replacedIds.has(entry.requestId));
+  const now = new Date().toISOString();
+  const recorded = messages.map((message) => ({
+    requestId: message.requestId,
+    outcome,
+    ...(error ? { error } : {}),
+    recordedAt: now,
+  }));
+  const bounded = [...retained, ...recorded].slice(-200);
+  db.prepare(
+    `INSERT INTO meta (key, value, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  ).run(key, JSON.stringify(bounded), now);
+}
+
+export function getPendingCloudMessageOutcome(
+  trackedWorkspaceId: string,
+  requestId: string
+): PendingCloudMessageOutcome | null {
+  return (
+    decodePendingCloudMessageOutcomes(
+      getMetaValue(pendingCloudMessageOutcomesKey(trackedWorkspaceId))
+    ).find((entry) => entry.requestId === requestId) ?? null
+  );
+}
+
+export function getPendingCloudMessages(
+  trackedWorkspaceId: string
+): PendingCloudMessage[] {
+  return decodePendingCloudMessages(
+    getMetaValue(pendingCloudMessagesKey(trackedWorkspaceId))
+  );
+}
+
+/** Append one recovery request before any Cloud network send. */
+export function enqueuePendingCloudMessage(
+  trackedWorkspaceId: string,
+  message: PendingCloudMessage
+): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    const binding = db.prepare(
+      `SELECT conductor_session_id, conductor_backend_kind, status
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          conductor_session_id: string | null;
+          conductor_backend_kind: string | null;
+          status: string;
+        }
+      | undefined;
+    if (
+      !binding ||
+      binding.conductor_backend_kind !== "cloud-api" ||
+      binding.conductor_session_id !== message.sessionId
+    ) {
+      throw new Error(
+        `Cannot queue Cloud recovery message for an unbound session (${trackedWorkspaceId})`
+      );
+    }
+    const launch = decodePendingCloudLaunch(
+      db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined
+    );
+    const workLeaseRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    if (
+      binding.status === "stopped" ||
+      binding.status === "archived" ||
+      binding.status === "failed" ||
+      (!launch && decodeCloudWorkLeases(workLeaseRow?.value).length > 0) ||
+      (launch &&
+        launch.phase !== "provisioned" &&
+        launch.phase !== "send" &&
+        launch.phase !== "sent")
+    ) {
+      throw new Error(
+        `Cannot queue Cloud recovery message while workspace is ${binding.status}`
+      );
+    }
+    const existingRaw = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const messages = decodePendingCloudMessages(existingRaw?.value ?? null);
+    if (messages.some((entry) => entry.requestId === message.requestId)) return;
+    if (messages.length >= 100) {
+      throw new Error("Cloud recovery outbox is full");
+    }
+    db.prepare(
+      `INSERT INTO meta (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    ).run(
+      pendingCloudMessagesKey(trackedWorkspaceId),
+      JSON.stringify([...messages, message]),
+      now
+    );
+  })();
+}
+
+export function clearPendingCloudMessages(trackedWorkspaceId: string): void {
+  getDb()
+    .prepare("DELETE FROM meta WHERE key = ?")
+    .run(pendingCloudMessagesKey(trackedWorkspaceId));
+}
+
+export type PendingCloudMessageGate =
+  | "send"
+  | "suppressed"
+  | "mismatch"
+  | "missing";
+
+function pendingCloudMessageGateInTransaction(
+  db: ReturnType<typeof getDb>,
+  trackedWorkspaceId: string,
+  requestId: string,
+  workspaceId: string,
+  sessionId: string
+): PendingCloudMessageGate {
+  const row = db.prepare(
+    `SELECT status, conductor_workspace_id, conductor_session_id,
+            conductor_backend_kind
+     FROM workspaces WHERE id = ?`
+  ).get(trackedWorkspaceId) as
+    | {
+        status: string;
+        conductor_workspace_id: string | null;
+        conductor_session_id: string | null;
+        conductor_backend_kind: string | null;
+      }
+    | undefined;
+  const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+    .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
+    | { value?: string }
+    | undefined;
+  const messages = decodePendingCloudMessages(outboxRow?.value ?? null);
+  const message = messages.find((entry) => entry.requestId === requestId);
+  if (!message) return "missing";
+  if (
+    !row ||
+    row.conductor_backend_kind !== "cloud-api" ||
+    row.conductor_workspace_id !== workspaceId ||
+    row.conductor_session_id !== sessionId ||
+    message.sessionId !== sessionId
+  ) {
+    return "mismatch";
+  }
+  const launch = decodePendingCloudLaunch(
+    db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined
+  );
+  if (
+    row.status === "stopped" ||
+    row.status === "archived" ||
+    row.status === "failed" ||
+    (launch && launch.phase !== "send")
+  ) {
+    return "suppressed";
+  }
+  return "send";
+}
+
+/** Current durable gate, checked immediately before each outbox POST. */
+export function pendingCloudMessageCanSend(
+  trackedWorkspaceId: string,
+  requestId: string,
+  workspaceId: string,
+  sessionId: string
+): PendingCloudMessageGate {
+  const db = getDb();
+  return db.transaction(() =>
+    pendingCloudMessageGateInTransaction(
+      db,
+      trackedWorkspaceId,
+      requestId,
+      workspaceId,
+      sessionId
+    )
+  )();
+}
+
+/** Remove a delivered entry only if no terminal intent raced its POST. */
+export function completePendingCloudMessageDelivery(
+  trackedWorkspaceId: string,
+  requestId: string,
+  workspaceId: string,
+  sessionId: string,
+  notices: {
+    delivered?: PendingCloudNoticeInput;
+    suppressed?: PendingCloudNoticeInput;
+  } = {}
+): PendingCloudMessageGate {
+  const db = getDb();
+  return db.transaction(() => {
+    const gate = pendingCloudMessageGateInTransaction(
+      db,
+      trackedWorkspaceId,
+      requestId,
+      workspaceId,
+      sessionId
+    );
+    if (gate === "missing") return gate;
+    if (gate === "mismatch") return gate;
+    const key = pendingCloudMessagesKey(trackedWorkspaceId);
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const messages = decodePendingCloudMessages(row?.value ?? null);
+    const delivered = messages.filter(
+      (entry) => entry.requestId === requestId
+    );
+    const remaining = messages.filter(
+      (entry) => entry.requestId !== requestId
+    );
+    if (gate === "suppressed") {
+      recordPendingCloudMessageOutcomesInTransaction(
+        db,
+        trackedWorkspaceId,
+        messages,
+        "suppressed",
+        notices.suppressed?.error
+      );
+      if (notices.suppressed) {
+        appendPendingCloudNoticeInTransaction(
+          db,
+          trackedWorkspaceId,
+          notices.suppressed
+        );
+      }
+      db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    } else if (remaining.length === 0) {
+      db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    } else {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(JSON.stringify(remaining), new Date().toISOString(), key);
+    }
+    if (gate === "send" && notices.delivered) {
+      appendPendingCloudNoticeInTransaction(
+        db,
+        trackedWorkspaceId,
+        notices.delivered
+      );
+    }
+    if (gate === "send") {
+      recordPendingCloudMessageOutcomesInTransaction(
+        db,
+        trackedWorkspaceId,
+        delivered,
+        "delivered"
+      );
+      db.prepare(
+        `UPDATE workspaces
+         SET status = 'running'
+         WHERE id = ?
+           AND status NOT IN ('stopped', 'archived', 'failed')`
+      ).run(trackedWorkspaceId);
+    }
+    return gate;
+  })();
+}
+
+/** Clear recovery messages and persist the reason in the same transaction. */
+export function clearPendingCloudMessagesWithNotice(
+  trackedWorkspaceId: string,
+  notice: PendingCloudNoticeInput,
+  expected?: {
+    sessionId: string;
+    requestIds: readonly string[];
+  }
+): number {
+  const db = getDb();
+  return db.transaction(() => {
+    const key = pendingCloudMessagesKey(trackedWorkspaceId);
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const allMessages = decodePendingCloudMessages(row?.value ?? null);
+    const expectedIds = expected ? new Set(expected.requestIds) : null;
+    const messages = expected
+      ? allMessages.filter(
+          (message) =>
+            message.sessionId === expected.sessionId &&
+            expectedIds!.has(message.requestId)
+        )
+      : allMessages;
+    const remaining = expected
+      ? allMessages.filter(
+          (message) =>
+            message.sessionId !== expected.sessionId ||
+            !expectedIds!.has(message.requestId)
+        )
+      : [];
+    const count = messages.length;
+    if (count === 0) return 0;
+    recordPendingCloudMessageOutcomesInTransaction(
+      db,
+      trackedWorkspaceId,
+      messages,
+      notice.kind === "messages_suppressed" ? "suppressed" : "failed",
+      notice.error
+    );
+    appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, {
+      ...notice,
+      count,
+    });
+    if (remaining.length === 0) {
+      db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    } else {
+      db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+        .run(JSON.stringify(remaining), new Date().toISOString(), key);
+    }
+    return count;
+  })();
+}
+
+export function clearPendingCloudLaunch(
+  trackedWorkspaceId: string,
+  expected?: PendingCloudLaunchIdentity
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    if (expected) {
+      const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined;
+      if (!pendingCloudLaunchMatches(decodePendingCloudLaunch(row), expected)) {
+        return false;
+      }
+    }
+    return (
+      db.prepare("DELETE FROM meta WHERE key = ?")
+        .run(pendingCloudLaunchKey(trackedWorkspaceId)).changes > 0
+    );
+  })();
+}
+
+/** Clear a terminal launch saga only after its user-visible notice is durable. */
+export function clearPendingCloudLaunchWithNotice(
+  trackedWorkspaceId: string,
+  notice: PendingCloudNoticeInput,
+  expected?: PendingCloudLaunchIdentity
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    if (expected) {
+      const pendingRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined;
+      if (
+        !pendingCloudLaunchMatches(
+          decodePendingCloudLaunch(pendingRow),
+          expected
+        )
+      ) {
+        return false;
+      }
+    }
+    appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, notice);
+    const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const outbox = decodePendingCloudMessages(outboxRow?.value ?? null);
+    const outboxOutcome =
+      notice.kind === "launch_canceled" ? "suppressed" : "failed";
+    recordPendingCloudMessageOutcomesInTransaction(
+      db,
+      trackedWorkspaceId,
+      outbox,
+      outboxOutcome,
+      notice.error
+    );
+    if (outbox.length > 0) {
+      appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, {
+        kind:
+          outboxOutcome === "suppressed"
+            ? "messages_suppressed"
+            : "messages_failed",
+        count: outbox.length,
+        error:
+          notice.error ??
+          (outboxOutcome === "suppressed"
+            ? "Cloud launch was canceled"
+            : "Cloud launch failed"),
+      });
+    }
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudLaunchKey(trackedWorkspaceId));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(pendingCloudMessagesKey(trackedWorkspaceId));
+    return true;
+  })();
 }
 
 // ── Repo Topics ────────────────────────────────────────────────
