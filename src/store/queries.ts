@@ -296,6 +296,18 @@ export function archiveWorkspace(id: string): void {
   })();
 }
 
+/**
+ * Retire a tracking row after Conductor reports it hidden or archived.
+ *
+ * This observer path must never manufacture a user-requested remote Archive;
+ * the remote state is the input to the local synchronization, not a command.
+ */
+export function archiveWorkspaceLocally(id: string): void {
+  getDb().prepare(
+    "UPDATE workspaces SET status = 'archived', archived_at = datetime('now') WHERE id = ?"
+  ).run(id);
+}
+
 export function updateWorkspaceTelegramMessage(
   id: string,
   messageId: string
@@ -622,7 +634,19 @@ export type PendingCloudNoticeKind =
   | "stop_confirmed"
   | "archive_confirmed"
   | "stop_failed"
-  | "archive_failed";
+  | "archive_failed"
+  | "topic_reconcile";
+
+/** Notices whose publication must complete before Cloud work may resume. */
+export function cloudNoticeFinalizesWorkspaceTopic(
+  kind: PendingCloudNoticeKind
+): boolean {
+  return (
+    kind === "stop_confirmed" ||
+    kind === "archive_confirmed" ||
+    kind === "launch_canceled"
+  );
+}
 
 export interface PendingCloudNotice {
   id: string;
@@ -664,6 +688,7 @@ function decodePendingCloudNotices(raw: string | null): PendingCloudNotice[] {
           "archive_confirmed",
           "stop_failed",
           "archive_failed",
+          "topic_reconcile",
         ].includes((notice as PendingCloudNotice).kind) &&
         typeof (notice as PendingCloudNotice).createdAt === "string"
     );
@@ -690,10 +715,25 @@ function appendPendingCloudNoticeInTransaction(
     createdAt: now,
   };
   const notices = decodePendingCloudNotices(row?.value ?? null);
+  const topicReconciliation =
+    input.kind === "topic_reconcile"
+      ? notice
+      : notices.find((pending) => pending.kind === "topic_reconcile");
+  const visibleNotices = [
+    ...notices.filter((pending) => pending.kind !== "topic_reconcile"),
+    ...(input.kind === "topic_reconcile" ? [] : [notice]),
+  ];
   // Notices only clear once Telegram accepts them, so a sustained delivery
-  // outage would otherwise grow one meta row without bound. Keep the newest:
-  // the oldest recovery notice is the least useful one to replay.
-  const retained = [...notices, notice].slice(-MAX_PENDING_CLOUD_NOTICES);
+  // outage would otherwise grow one meta row without bound. Preserve the
+  // invisible topic-repair owner and spend the remaining capacity on the
+  // newest user-visible notices; otherwise a notice flood could permanently
+  // strand the topic in the wrong open/closed state.
+  const visibleCapacity =
+    MAX_PENDING_CLOUD_NOTICES - (topicReconciliation ? 1 : 0);
+  const retained = [
+    ...(topicReconciliation ? [topicReconciliation] : []),
+    ...visibleNotices.slice(-visibleCapacity),
+  ];
   db.prepare(
     `INSERT INTO meta (key, value, updated_at)
      VALUES (?, ?, ?)
@@ -712,6 +752,15 @@ export function getPendingCloudNotices(
   );
 }
 
+/** True until Telegram has published and finalized a terminal topic notice. */
+export function hasPendingCloudTopicFinalizationNotice(
+  trackedWorkspaceId: string
+): boolean {
+  return getPendingCloudNotices(trackedWorkspaceId).some((notice) =>
+    cloudNoticeFinalizesWorkspaceTopic(notice.kind)
+  );
+}
+
 export function enqueuePendingCloudNotice(
   trackedWorkspaceId: string,
   input: PendingCloudNoticeInput
@@ -720,6 +769,15 @@ export function enqueuePendingCloudNotice(
   return db.transaction(() =>
     appendPendingCloudNoticeInTransaction(db, trackedWorkspaceId, input)
   )();
+}
+
+/** Queue one invisible, idempotent retry for the topic's durable state. */
+export function requestWorkspaceTopicReconciliation(
+  trackedWorkspaceId: string
+): PendingCloudNotice {
+  return enqueuePendingCloudNotice(trackedWorkspaceId, {
+    kind: "topic_reconcile",
+  });
 }
 
 /** Acknowledge only the notice that was actually published. */
@@ -786,6 +844,8 @@ export interface PendingCloudTerminalIntent {
   action: "stop" | "archive";
   workspaceId: string;
   sessionId: string;
+  /** Every Cloud session that a workspace Stop must fence. */
+  sessionIds?: string[];
   createdAt: string;
   /** Cancel even if a status read has not observed the late accepted POST yet. */
   forceCancel?: boolean;
@@ -798,11 +858,69 @@ function pendingCloudTerminalKey(trackedWorkspaceId: string): string {
 interface CloudWorkLease {
   token: string;
   workspaceId: string;
+  /** Exact session that may receive the leased POST (legacy rows omit this). */
+  sessionId?: string;
   createdAt: string;
 }
 
 function cloudWorkLeasesKey(trackedWorkspaceId: string): string {
   return `cloud-work-leases:${trackedWorkspaceId}`;
+}
+
+interface CloudSessionTarget {
+  workspaceId: string;
+  sessionId: string;
+}
+
+function cloudSessionTargetsKey(trackedWorkspaceId: string): string {
+  return `cloud-session-targets:${trackedWorkspaceId}`;
+}
+
+function decodeCloudSessionTargets(
+  raw: string | null | undefined
+): CloudSessionTarget[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (target): target is CloudSessionTarget =>
+        typeof target === "object" &&
+        target !== null &&
+        typeof (target as CloudSessionTarget).workspaceId === "string" &&
+        Boolean((target as CloudSessionTarget).workspaceId) &&
+        typeof (target as CloudSessionTarget).sessionId === "string" &&
+        Boolean((target as CloudSessionTarget).sessionId)
+    );
+  } catch {
+    return [];
+  }
+}
+
+function rememberCloudSessionTargetInTransaction(
+  db: ReturnType<typeof getDb>,
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  sessionId: string,
+  now: string
+): void {
+  const key = cloudSessionTargetsKey(trackedWorkspaceId);
+  const row = db.prepare("SELECT value FROM meta WHERE key = ?")
+    .get(key) as { value?: string } | undefined;
+  const targets = decodeCloudSessionTargets(row?.value).filter(
+    (target) =>
+      target.workspaceId !== workspaceId || target.sessionId !== sessionId
+  );
+  // One tracked workspace should never approach this, but keep corrupt or
+  // long-lived reply histories from growing a meta row without bound.
+  const retained = [...targets, { workspaceId, sessionId }].slice(-100);
+  db.prepare(
+    `INSERT INTO meta (key, value, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET
+       value = excluded.value,
+       updated_at = excluded.updated_at`
+  ).run(key, JSON.stringify(retained), now);
 }
 
 /**
@@ -852,10 +970,28 @@ function decodeCloudWorkLeases(raw: string | null | undefined): CloudWorkLease[]
   }
 }
 
-/** Reserve a send/new-thread attempt so a later stop can revoke it durably. */
-export function beginCloudWorkLease(
+/** True while a live sender may still finish a POST to this Cloud workspace. */
+export function hasActiveCloudWorkLease(
   trackedWorkspaceId: string,
   workspaceId: string
+): boolean {
+  const row = getDb().prepare("SELECT value FROM meta WHERE key = ?")
+    .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
+    | { value?: string }
+    | undefined;
+  return activeCloudWorkLeases(decodeCloudWorkLeases(row?.value)).some(
+    (lease) => lease.workspaceId === workspaceId
+  );
+}
+
+/** Reserve a send attempt so a later stop can revoke it durably. */
+export function beginCloudWorkLease(
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  options: {
+    allowPendingMessages?: boolean;
+    sessionId?: string | null;
+  } = {}
 ): string | null {
   const db = getDb();
   return db.transaction(() => {
@@ -879,6 +1015,10 @@ export function beginCloudWorkLease(
       .get(pendingCloudLaunchKey(trackedWorkspaceId)) as
       | { value?: string }
       | undefined;
+    const noticeRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudNoticesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
     if (
       !workspace ||
       workspace.archived_at ||
@@ -886,7 +1026,10 @@ export function beginCloudWorkLease(
       workspace.conductor_backend_kind !== "cloud-api" ||
       workspace.conductor_workspace_id !== workspaceId ||
       decodePendingCloudTerminalIntent(terminalRow?.value) ||
-      decodePendingCloudLaunch(launchRow)
+      decodePendingCloudLaunch(launchRow) ||
+      decodePendingCloudNotices(noticeRow?.value ?? null).some((notice) =>
+        cloudNoticeFinalizesWorkspaceTopic(notice.kind)
+      )
     ) {
       return null;
     }
@@ -902,7 +1045,8 @@ export function beginCloudWorkLease(
       | undefined;
     if (
       existingLeases.length > 0 ||
-      decodePendingCloudMessages(outboxRow?.value ?? null).length > 0
+      (!options.allowPendingMessages &&
+        decodePendingCloudMessages(outboxRow?.value ?? null).length > 0)
     ) {
       return null;
     }
@@ -910,6 +1054,9 @@ export function beginCloudWorkLease(
     const lease: CloudWorkLease = {
       token: randomUUID(),
       workspaceId,
+      ...(options.sessionId?.trim()
+        ? { sessionId: options.sessionId.trim() }
+        : {}),
       createdAt: now,
     };
     const leases = existingLeases;
@@ -920,11 +1067,20 @@ export function beginCloudWorkLease(
          value = excluded.value,
          updated_at = excluded.updated_at`
     ).run(key, JSON.stringify([...leases, lease]), now);
+    if (lease.sessionId) {
+      rememberCloudSessionTargetInTransaction(
+        db,
+        trackedWorkspaceId,
+        workspaceId,
+        lease.sessionId,
+        now
+      );
+    }
     return lease.token;
   })();
 }
 
-/** Final pre-POST gate: Stop/Archive clears every outstanding lease. */
+/** Final pre-POST gate: a terminal intent revokes every outstanding lease. */
 export function cloudWorkLeaseCanSend(
   trackedWorkspaceId: string,
   workspaceId: string,
@@ -948,6 +1104,10 @@ export function cloudWorkLeaseCanSend(
       .get(pendingCloudTerminalKey(trackedWorkspaceId)) as
       | { value?: string }
       | undefined;
+    const noticeRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudNoticesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
     const leaseRow = db.prepare("SELECT value FROM meta WHERE key = ?")
       .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
       | { value?: string }
@@ -959,10 +1119,93 @@ export function cloudWorkLeaseCanSend(
         workspace.conductor_backend_kind === "cloud-api" &&
         workspace.conductor_workspace_id === workspaceId &&
         !decodePendingCloudTerminalIntent(terminalRow?.value) &&
+        !decodePendingCloudNotices(noticeRow?.value ?? null).some((notice) =>
+          cloudNoticeFinalizesWorkspaceTopic(notice.kind)
+        ) &&
         activeCloudWorkLeases(decodeCloudWorkLeases(leaseRow?.value)).some(
           (lease) => lease.token === token && lease.workspaceId === workspaceId
         )
     );
+  })();
+}
+
+/** Renew an existing live lease at the final pre-POST boundary. */
+export function refreshCloudWorkLease(
+  trackedWorkspaceId: string,
+  workspaceId: string,
+  token: string,
+  sessionId?: string | null
+): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const workspace = db.prepare(
+      `SELECT archived_at, conductor_workspace_id, conductor_backend_kind
+       FROM workspaces WHERE id = ?`
+    ).get(trackedWorkspaceId) as
+      | {
+          archived_at: string | null;
+          conductor_workspace_id: string | null;
+          conductor_backend_kind: string | null;
+        }
+      | undefined;
+    const terminalRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudTerminalKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const noticeRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(pendingCloudNoticesKey(trackedWorkspaceId)) as
+      | { value?: string }
+      | undefined;
+    const key = cloudWorkLeasesKey(trackedWorkspaceId);
+    const leaseRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+      .get(key) as { value?: string } | undefined;
+    const leases = activeCloudWorkLeases(
+      decodeCloudWorkLeases(leaseRow?.value)
+    );
+    const verifiedSessionId = sessionId?.trim() || null;
+    const lease = leases.find(
+      (candidate) =>
+        candidate.token === token &&
+        candidate.workspaceId === workspaceId &&
+        (!verifiedSessionId ||
+          !candidate.sessionId ||
+          candidate.sessionId === verifiedSessionId)
+    );
+    if (
+      !workspace ||
+      workspace.archived_at ||
+      workspace.conductor_backend_kind !== "cloud-api" ||
+      workspace.conductor_workspace_id !== workspaceId ||
+      decodePendingCloudTerminalIntent(terminalRow?.value) ||
+      decodePendingCloudNotices(noticeRow?.value ?? null).some((notice) =>
+        cloudNoticeFinalizesWorkspaceTopic(notice.kind)
+      ) ||
+      !lease
+    ) {
+      return false;
+    }
+    const now = new Date().toISOString();
+    const refreshed = leases.map((candidate) =>
+      candidate.token === token
+        ? {
+            ...candidate,
+            ...(verifiedSessionId ? { sessionId: verifiedSessionId } : {}),
+            createdAt: now,
+          }
+        : candidate
+    );
+    db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+      .run(JSON.stringify(refreshed), now, key);
+    if (verifiedSessionId) {
+      rememberCloudSessionTargetInTransaction(
+        db,
+        trackedWorkspaceId,
+        workspaceId,
+        verifiedSessionId,
+        now
+      );
+    }
+    return true;
   })();
 }
 
@@ -1056,18 +1299,19 @@ export function ensurePendingCloudStopIntent(
       workspace.status !== "stopped" ||
       workspace.archived_at ||
       workspace.conductor_backend_kind !== "cloud-api" ||
-      workspace.conductor_workspace_id !== workspaceId ||
-      workspace.conductor_session_id !== sessionId
+      workspace.conductor_workspace_id !== workspaceId
     ) {
       return false;
     }
+    const primarySessionId = workspace.conductor_session_id || sessionId;
     persistPendingCloudTerminalIntentInTransaction(
       db,
       trackedWorkspaceId,
       {
         action: "stop",
         workspaceId,
-        sessionId,
+        sessionId: primarySessionId,
+        sessionIds: uniqueCloudSessionIds(primarySessionId, [sessionId]),
         createdAt: new Date().toISOString(),
         forceCancel: true,
       }
@@ -1094,10 +1338,42 @@ function decodePendingCloudTerminalIntent(
     ) {
       return null;
     }
-    return parsed as PendingCloudTerminalIntent;
+    const sessionIds = uniqueCloudSessionIds(
+      parsed.sessionId,
+      Array.isArray(parsed.sessionIds)
+        ? parsed.sessionIds.filter(
+            (sessionId): sessionId is string =>
+              typeof sessionId === "string" && Boolean(sessionId.trim())
+          )
+        : []
+    );
+    return {
+      ...(parsed as PendingCloudTerminalIntent),
+      sessionIds,
+    };
   } catch {
     return null;
   }
+}
+
+function uniqueCloudSessionIds(
+  primarySessionId: string,
+  sessionIds: readonly string[] = []
+): string[] {
+  return [
+    ...new Set(
+      [primarySessionId, ...sessionIds]
+        .map((sessionId) => sessionId.trim())
+        .filter(Boolean)
+    ),
+  ];
+}
+
+/** Backward-compatible target list for durable Stop reconciliation. */
+export function pendingCloudTerminalSessionIds(
+  intent: PendingCloudTerminalIntent
+): string[] {
+  return uniqueCloudSessionIds(intent.sessionId, intent.sessionIds);
 }
 
 function persistPendingCloudTerminalIntentInTransaction(
@@ -1111,10 +1387,27 @@ function persistPendingCloudTerminalIntentInTransaction(
   const existing = decodePendingCloudTerminalIntent(existingRow?.value);
   // Archive is stronger than stop and must never be downgraded by a racing
   // callback that captured older UI state.
-  const durable =
-    existing?.action === "archive" && intent.action === "stop"
-      ? existing
-      : intent;
+  let durable = intent;
+  if (existing?.action === "archive" && intent.action === "stop") {
+    durable = existing;
+  } else if (
+    existing?.action === intent.action &&
+    existing.workspaceId === intent.workspaceId
+  ) {
+    // A repeated Stop or a late sender may discover another affected thread.
+    // Preserve the union, plus sticky evidence that an unconditional final
+    // cancel is required after every in-flight POST settles.
+    durable = {
+      ...intent,
+      sessionIds: uniqueCloudSessionIds(intent.sessionId, [
+        ...pendingCloudTerminalSessionIds(existing),
+        ...pendingCloudTerminalSessionIds(intent),
+      ]),
+      ...(existing.forceCancel || intent.forceCancel
+        ? { forceCancel: true }
+        : {}),
+    };
+  }
   db.prepare(
     `INSERT INTO meta (key, value, updated_at)
      VALUES (?, ?, ?)
@@ -1162,6 +1455,10 @@ export function completePendingCloudTerminalIntent(
       }
     );
     db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(trackedWorkspaceId));
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudSessionTargetsKey(trackedWorkspaceId));
     return notice;
   })();
 }
@@ -1221,6 +1518,8 @@ export function failPendingCloudTerminalIntent(
       }
     );
     db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+    db.prepare("DELETE FROM meta WHERE key = ?")
+      .run(cloudWorkLeasesKey(trackedWorkspaceId));
     return notice;
   })();
 }
@@ -1941,27 +2240,59 @@ export function markPendingCloudLaunchCanceled(
           pendingCloudLaunchKey(trackedWorkspaceId)
         );
     }
-    if (
-      workspace?.conductor_backend_kind === "cloud-api" &&
-      workspace.conductor_workspace_id &&
-      workspace.conductor_session_id
-    ) {
-      persistPendingCloudTerminalIntentInTransaction(
-        db,
-        trackedWorkspaceId,
-        {
-          action: workspace.status === "archived" ? "archive" : "stop",
-          workspaceId: workspace.conductor_workspace_id,
-          sessionId: workspace.conductor_session_id,
-          createdAt: now,
-        }
-      );
-    }
     const outboxRow = db.prepare("SELECT value FROM meta WHERE key = ?")
       .get(pendingCloudMessagesKey(trackedWorkspaceId)) as
       | { value?: string }
       | undefined;
     const outbox = decodePendingCloudMessages(outboxRow?.value ?? null);
+    if (
+      workspace?.conductor_backend_kind === "cloud-api" &&
+      workspace.conductor_workspace_id &&
+      workspace.conductor_session_id
+    ) {
+      const action = workspace.status === "archived" ? "archive" : "stop";
+      const workLeaseRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined;
+      const unresolvedLeases = activeCloudWorkLeases(
+        decodeCloudWorkLeases(workLeaseRow?.value)
+      ).filter(
+        (lease) => lease.workspaceId === workspace.conductor_workspace_id
+      );
+      const targetRow = db.prepare("SELECT value FROM meta WHERE key = ?")
+        .get(cloudSessionTargetsKey(trackedWorkspaceId)) as
+        | { value?: string }
+        | undefined;
+      const rememberedSessionIds = decodeCloudSessionTargets(
+        targetRow?.value
+      )
+        .filter(
+          (target) =>
+            target.workspaceId === workspace.conductor_workspace_id
+        )
+        .map((target) => target.sessionId);
+      persistPendingCloudTerminalIntentInTransaction(
+        db,
+        trackedWorkspaceId,
+        {
+          action,
+          workspaceId: workspace.conductor_workspace_id,
+          sessionId: workspace.conductor_session_id,
+          sessionIds: uniqueCloudSessionIds(workspace.conductor_session_id, [
+            ...rememberedSessionIds,
+            ...unresolvedLeases.flatMap((lease) =>
+              lease.sessionId ? [lease.sessionId] : []
+            ),
+          ]),
+          createdAt: now,
+          // Session status can still read idle immediately after the API has
+          // accepted queued work. Every operator Stop therefore performs an
+          // idempotent cancel, even without a currently active sender lease.
+          ...(action === "stop" ? { forceCancel: true } : {}),
+        }
+      );
+    }
     recordPendingCloudMessageOutcomesInTransaction(
       db,
       trackedWorkspaceId,
@@ -1978,8 +2309,6 @@ export function markPendingCloudLaunchCanceled(
     }
     db.prepare("DELETE FROM meta WHERE key = ?")
       .run(pendingCloudMessagesKey(trackedWorkspaceId));
-    db.prepare("DELETE FROM meta WHERE key = ?")
-      .run(cloudWorkLeasesKey(trackedWorkspaceId));
     return Boolean(
       pending ||
       (workspace?.conductor_backend_kind === "cloud-api" &&
@@ -2144,11 +2473,22 @@ export function enqueuePendingCloudMessage(
       .get(cloudWorkLeasesKey(trackedWorkspaceId)) as
       | { value?: string }
       | undefined;
+    const decodedLeases = decodeCloudWorkLeases(workLeaseRow?.value);
+    const liveLeases = activeCloudWorkLeases(decodedLeases);
+    if (liveLeases.length !== decodedLeases.length) {
+      const key = cloudWorkLeasesKey(trackedWorkspaceId);
+      if (liveLeases.length === 0) {
+        db.prepare("DELETE FROM meta WHERE key = ?").run(key);
+      } else {
+        db.prepare("UPDATE meta SET value = ?, updated_at = ? WHERE key = ?")
+          .run(JSON.stringify(liveLeases), now, key);
+      }
+    }
     if (
       binding.status === "stopped" ||
       binding.status === "archived" ||
       binding.status === "failed" ||
-      (!launch && decodeCloudWorkLeases(workLeaseRow?.value).length > 0) ||
+      (!launch && liveLeases.length > 0) ||
       (launch &&
         launch.phase !== "provisioned" &&
         launch.phase !== "send" &&

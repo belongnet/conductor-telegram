@@ -697,6 +697,109 @@ test("claude auth preflight fails before any customized prompt process starts", 
   }
 });
 
+test("pending Claude auth preflight is visible, duplicate-fenced, and Stop-cancelable", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-auth-pending-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const authGate = path.join(dir, "release-auth");
+    const promptStarted = path.join(dir, "prompt-started");
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh
+if [ "$1" = "auth" ]; then
+  while [ ! -f "${authGate}" ]; do sleep 0.01; done
+  printf '{"loggedIn":true}\\n'
+  exit 0
+fi
+touch "${promptStarted}"
+exit 0
+`
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import Database from "better-sqlite3";
+        import { writeFileSync, existsSync } from "node:fs";
+        import { sendToSession, stopAgent } from "./src/bot/launcher.ts";
+        const first = await sendToSession("local-ws", "first", [], { repoPath: "/tmp/repo" });
+        const statusDb = new Database(process.env.CONDUCTOR_DB_PATH);
+        const pendingStatus = statusDb.prepare("SELECT status FROM sessions WHERE id = ?").get("conductor-session-1").status;
+        statusDb.close();
+        const duplicate = await sendToSession("local-ws", "second", [], { repoPath: "/tmp/repo" });
+        const stopped = stopAgent("local-ws", "/tmp/repo");
+        const stoppedDb = new Database(process.env.CONDUCTOR_DB_PATH);
+        const stoppedStatus = stoppedDb.prepare("SELECT status FROM sessions WHERE id = ?").get("conductor-session-1").status;
+        stoppedDb.close();
+        writeFileSync(${JSON.stringify(authGate)}, "release");
+        const agentResult = "ok" in first ? await first.done : first;
+        const finalDb = new Database(process.env.CONDUCTOR_DB_PATH);
+        const finalStatus = finalDb.prepare("SELECT status FROM sessions WHERE id = ?").get("conductor-session-1").status;
+        finalDb.close();
+        console.log(JSON.stringify({
+          firstOk: "ok" in first,
+          pendingStatus,
+          duplicate,
+          stopped,
+          stoppedStatus,
+          agentResult,
+          finalStatus,
+          promptStarted: existsSync(${JSON.stringify(promptStarted)}),
+        }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as {
+      firstOk: boolean;
+      pendingStatus: string;
+      duplicate: { error?: string; ok?: boolean };
+      stopped: boolean;
+      stoppedStatus: string;
+      agentResult: { isError?: boolean; hadMeaningfulActivity?: boolean };
+      finalStatus: string;
+      promptStarted: boolean;
+    };
+
+    assert.equal(result.firstOk, true);
+    assert.equal(result.pendingStatus, "working");
+    assert.match(result.duplicate.error ?? "", /still starting/i);
+    assert.equal(result.duplicate.ok, undefined);
+    assert.equal(result.stopped, true);
+    assert.equal(result.stoppedStatus, "idle");
+    assert.equal(result.agentResult.isError, false);
+    assert.equal(result.agentResult.hadMeaningfulActivity, false);
+    assert.equal(result.finalStatus, "idle");
+    assert.equal(result.promptStarted, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("claude spawn classifies the attached weekly-limit banner before activity", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-weekly-limit-"));
   try {

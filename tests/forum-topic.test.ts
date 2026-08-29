@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   buildRepoTopicName,
   buildTopicName,
+  finalizeWorkspaceTopic,
+  finalizeWorkspaceTopicForCloudNotices,
   syncWorkspaceTopic,
 } from "../src/bot/forum.js";
 import type { Workspace, WorkspaceStatus } from "../src/types/index.js";
@@ -47,6 +49,164 @@ test("terminal workspace topics use the folder icon", async () => {
     edits.map((edit) => edit.icon_custom_emoji_id),
     ["folder-icon", "folder-icon", "folder-icon"]
   );
+});
+
+test("terminal workspace topic finalization syncs and closes the topic", async () => {
+  const actions: string[] = [];
+  const telegram = {
+    getForumTopicIconStickers: async () => [
+      { emoji: "📁", custom_emoji_id: "folder-icon" },
+    ],
+    editForumTopic: async () => {
+      actions.push("sync");
+    },
+    closeForumTopic: async () => {
+      actions.push("close");
+    },
+  };
+
+  await finalizeWorkspaceTopic(
+    telegram as any,
+    sampleWorkspace("stopped")
+  );
+
+  assert.deepEqual(actions, ["sync", "close"]);
+});
+
+test("terminal workspace topic finalization still closes after a sync error", async () => {
+  let closed = false;
+  const telegram = {
+    getForumTopicIconStickers: async () => [
+      { emoji: "📁", custom_emoji_id: "folder-icon" },
+    ],
+    editForumTopic: async () => {
+      throw new Error("topic sync unavailable");
+    },
+    closeForumTopic: async () => {
+      closed = true;
+    },
+  };
+
+  await assert.rejects(
+    finalizeWorkspaceTopic(
+      telegram as any,
+      sampleWorkspace("archived")
+    ),
+    /topic sync unavailable/
+  );
+  assert.equal(closed, true);
+});
+
+test("durable terminal notices finalize topics before they can be acknowledged", async () => {
+  const actions: string[] = [];
+  const telegram = {
+    getForumTopicIconStickers: async () => [
+      { emoji: "📁", custom_emoji_id: "folder-icon" },
+    ],
+    editForumTopic: async () => {
+      actions.push("sync");
+    },
+    closeForumTopic: async () => {
+      actions.push("close");
+    },
+  };
+
+  await finalizeWorkspaceTopicForCloudNotices(
+    telegram as any,
+    sampleWorkspace("stopped"),
+    ["messages_sent"]
+  );
+  assert.deepEqual(actions, []);
+
+  await finalizeWorkspaceTopicForCloudNotices(
+    telegram as any,
+    sampleWorkspace("stopped"),
+    ["launch_canceled"]
+  );
+  assert.deepEqual(actions, ["sync", "close"]);
+});
+
+test("durable terminal finalization surfaces retryable Telegram failures", async () => {
+  const workspace = sampleWorkspace("stopped");
+  const telegram = {
+    getForumTopicIconStickers: async () => [
+      { emoji: "📁", custom_emoji_id: "folder-icon" },
+    ],
+    editForumTopic: async () => undefined,
+    closeForumTopic: async () => {
+      throw new Error("Telegram unavailable");
+    },
+  };
+  await assert.rejects(
+    finalizeWorkspaceTopicForCloudNotices(
+      telegram as any,
+      workspace,
+      ["stop_confirmed"]
+    ),
+    /Telegram unavailable/
+  );
+
+  telegram.closeForumTopic = async () => {
+    throw new Error("Bad Request: TOPIC_CLOSED");
+  };
+  await finalizeWorkspaceTopicForCloudNotices(
+    telegram as any,
+    workspace,
+    ["archive_confirmed"]
+  );
+});
+
+test("durable terminal finalization leaves the topic open after a sync failure", async () => {
+  let closeCalls = 0;
+  const telegram = {
+    getForumTopicIconStickers: async () => [
+      { emoji: "📁", custom_emoji_id: "folder-icon" },
+    ],
+    editForumTopic: async () => {
+      throw new Error("topic sync unavailable");
+    },
+    closeForumTopic: async () => {
+      closeCalls += 1;
+    },
+  };
+
+  await assert.rejects(
+    finalizeWorkspaceTopicForCloudNotices(
+      telegram as any,
+      sampleWorkspace("stopped"),
+      ["stop_confirmed"]
+    ),
+    /topic sync unavailable/
+  );
+  assert.equal(closeCalls, 0);
+});
+
+test("durable terminal finalization never recreates a deleted topic", async () => {
+  let closeCalls = 0;
+  let createCalls = 0;
+  const telegram = {
+    getForumTopicIconStickers: async () => [
+      { emoji: "📁", custom_emoji_id: "folder-icon" },
+    ],
+    editForumTopic: async () => {
+      throw new Error("Bad Request: message_thread_not_found");
+    },
+    closeForumTopic: async () => {
+      closeCalls += 1;
+    },
+    createForumTopic: async () => {
+      createCalls += 1;
+      return { message_thread_id: 999 };
+    },
+  };
+
+  await finalizeWorkspaceTopicForCloudNotices(
+    telegram as any,
+    sampleWorkspace("stopped"),
+    ["stop_confirmed"]
+  );
+  assert.equal(createCalls, 0);
+  assert.equal(closeCalls, 0);
 });
 
 test("topic names clamp to Telegram's 128-character limit", () => {

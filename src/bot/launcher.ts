@@ -1,7 +1,6 @@
 import {
   exec,
   execFile,
-  execFileSync,
   spawn,
   type ChildProcess,
 } from "node:child_process";
@@ -26,7 +25,6 @@ import {
   clearPendingCloudLaunch,
   clearPendingCloudLaunchWithNotice,
   clearCloudWorkLease,
-  clearPendingCloudMessages,
   clearPendingCloudMessagesWithNotice,
   completeCloudWorkLease,
   finalizePendingCloudLaunch,
@@ -37,8 +35,11 @@ import {
   getPendingCloudMessageOutcome,
   getPendingCloudLaunch,
   getPendingCloudTerminalIntent,
+  hasActiveCloudWorkLease,
+  hasPendingCloudTopicFinalizationNotice,
   failPendingCloudTerminalIntent,
   pendingCloudTerminalIntentIsExhausted,
+  pendingCloudTerminalSessionIds,
   getMetaValue,
   ensurePendingCloudStopIntent,
   isFinalizedCloudLaunch,
@@ -49,6 +50,7 @@ import {
   pendingCloudLaunchCanSend,
   persistPendingCloudLaunch,
   promotePendingCloudLaunchToSend,
+  refreshCloudWorkLease,
   restorePendingCloudLaunchBinding,
   getWorkspace as getTrackedWorkspaceById,
   getWorkspaceByName as getTrackedWorkspaceByName,
@@ -125,6 +127,11 @@ const CITY_NAMES = [
 
 // Track running agents by workspace name
 const runningAgents = new Map<string, ChildProcess>();
+interface PendingAgentStart {
+  canceled: boolean;
+  conductorSessionId: string;
+}
+const pendingAgentStarts = new Map<string, Set<PendingAgentStart>>();
 const lastAssistantSdkMessageIds = new Map<string, string>();
 // Track seen tool_use IDs to avoid duplicate question forwarding
 const seenToolUseIds = new Set<string>();
@@ -133,6 +140,12 @@ const pendingStdinDecisions = new Map<number, string>();
 
 function workspaceAgentKey(repoPath: string, workspaceName: string): string {
   return `${repoPath}::${workspaceName}`;
+}
+
+function hasPendingAgentStart(repoPath: string, workspaceName: string): boolean {
+  return Boolean(
+    pendingAgentStarts.get(workspaceAgentKey(repoPath, workspaceName))?.size
+  );
 }
 
 // ── Agent result interface ──────────────────────────────────
@@ -962,17 +975,77 @@ function spawnClaudeAgent(
     workspaceDir,
     repoPath,
   });
-  if (accessMode === "legacy") {
-    const authFailure = runClaudeAuthenticationPreflight(
-      CLAUDE_BIN,
+  const start = () =>
+    spawnClaudeProcess({
+      conductorSessionId,
+      repoPath,
       workspaceDir,
-      agentEnv
-    );
-    if (authFailure) {
-      cleanupAgentRuntimeHome(agentEnv);
-      return { child: null, done: Promise.resolve(authFailure) };
-    }
+      model,
+      workspaceName,
+      args,
+      agentEnv,
+    });
+  if (accessMode !== "legacy") return start();
+
+  const key = workspaceAgentKey(repoPath, workspaceName);
+  if (pendingAgentStarts.get(key)?.size) {
+    throw new Error(`Agent start is already in progress for ${workspaceName}`);
   }
+  const pending: PendingAgentStart = { canceled: false, conductorSessionId };
+  const starts = pendingAgentStarts.get(key) ?? new Set<PendingAgentStart>();
+  starts.add(pending);
+  pendingAgentStarts.set(key, starts);
+  // Make the asynchronous preflight visible to pollers immediately. A Stop
+  // can still cancel the pending token before any child process is created.
+  updateSessionStatus(conductorSessionId, "working");
+  const done = (async (): Promise<AgentResult> => {
+    try {
+      const authFailure = await runClaudeAuthenticationPreflight(
+        CLAUDE_BIN,
+        workspaceDir,
+        agentEnv
+      );
+      if (pending.canceled) {
+        updateSessionStatus(conductorSessionId, "idle");
+        cleanupAgentRuntimeHome(agentEnv);
+        return {
+          isError: false,
+          exitCode: null,
+          hadMeaningfulActivity: false,
+        };
+      }
+      if (authFailure) {
+        updateSessionStatus(conductorSessionId, "idle");
+        cleanupAgentRuntimeHome(agentEnv);
+        return authFailure;
+      }
+      return await start().done;
+    } finally {
+      starts.delete(pending);
+      if (starts.size === 0) pendingAgentStarts.delete(key);
+    }
+  })();
+  return { child: null, done };
+}
+
+function spawnClaudeProcess(input: {
+  conductorSessionId: string;
+  repoPath: string;
+  workspaceDir: string;
+  model: string;
+  workspaceName: string;
+  args: string[];
+  agentEnv: NodeJS.ProcessEnv;
+}): { child: ChildProcess; done: Promise<AgentResult> } {
+  const {
+    conductorSessionId,
+    repoPath,
+    workspaceDir,
+    model,
+    workspaceName,
+    args,
+    agentEnv,
+  } = input;
   const child = spawn(CLAUDE_BIN, args, {
     cwd: workspaceDir,
     stdio: ["pipe", "pipe", "pipe"],
@@ -1081,31 +1154,38 @@ function spawnClaudeAgent(
   return { child, done };
 }
 
-function runClaudeAuthenticationPreflight(
+/** @internal exported for event-loop responsiveness regression coverage. */
+export async function runClaudeAuthenticationPreflight(
   executable: string,
   cwd: string,
   env: NodeJS.ProcessEnv
-): AgentResult | null {
-  let stdout = "";
-  let stderr = "";
-  let exitCode = 0;
-  try {
-    stdout = execFileSync(executable, ["auth", "status", "--json"], {
-      cwd,
-      env,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 10_000,
-    });
-  } catch (error: any) {
-    stdout = Buffer.isBuffer(error?.stdout)
-      ? error.stdout.toString()
-      : String(error?.stdout ?? "");
-    stderr = Buffer.isBuffer(error?.stderr)
-      ? error.stderr.toString()
-      : String(error?.stderr ?? error?.message ?? "");
-    exitCode = typeof error?.status === "number" ? error.status : 1;
-  }
+): Promise<AgentResult | null> {
+  const result = await new Promise<{
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+  }>((resolve) => {
+    execFile(
+      executable,
+      ["auth", "status", "--json"],
+      {
+        cwd,
+        env,
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+      (error, stdout, stderr) => {
+        const errorCode = (error as { code?: unknown } | null)?.code;
+        resolve({
+          stdout: String(stdout ?? ""),
+          stderr: String(stderr ?? error?.message ?? ""),
+          exitCode:
+            typeof errorCode === "number" ? errorCode : error ? 1 : 0,
+        });
+      }
+    );
+  });
+  const { stdout, stderr, exitCode } = result;
 
   let loggedIn: boolean | null = null;
   try {
@@ -2295,6 +2375,16 @@ export async function sendToSession(
     allowCloudSteeringWhileBusy?: boolean;
   } = {}
 ): Promise<SendSuccess | SendError> {
+  if (
+    options.binding?.id &&
+    hasPendingCloudTopicFinalizationNotice(options.binding.id)
+  ) {
+    return {
+      error:
+        `The final Cloud status for "${workspaceName}" is still being published. ` +
+        "Retry after its Telegram topic finishes closing.",
+    };
+  }
   const wsInfo = resolveConductorWorkspaceInfo(
     workspaceName,
     options.repoPath ?? null,
@@ -2314,14 +2404,24 @@ export async function sendToSession(
   }
 
   const remote = isRemoteConductorWorkspace(wsInfo);
-  const trackedWorkspace = remote
-    ? options.binding?.id
-      ? options.binding
-      : getTrackedWorkspaceByName(workspaceName, {
+  const trackedWorkspace = options.binding?.id
+    ? options.binding
+    : remote
+      ? getTrackedWorkspaceByName(workspaceName, {
           repoPath: options.repoPath ?? wsInfo.repoPath ?? undefined,
         })
-    : null;
+      : null;
   const trackedWorkspaceId = trackedWorkspace?.id;
+  if (
+    trackedWorkspaceId &&
+    hasPendingCloudTopicFinalizationNotice(trackedWorkspaceId)
+  ) {
+    return {
+      error:
+        `The final Cloud status for "${wsInfo.displayName}" is still being published. ` +
+        "Retry after its Telegram topic finishes closing.",
+    };
+  }
   if (remote && trackedWorkspaceId) {
     const terminalIntent = getPendingCloudTerminalIntent(trackedWorkspaceId);
     if (terminalIntent?.action === "archive") {
@@ -2421,6 +2521,12 @@ export async function sendToSession(
         options.allowCloudSteeringWhileBusy === true,
         leaseToken && trackedWorkspaceId
           ? () =>
+              refreshCloudWorkLease(
+                trackedWorkspaceId,
+                wsInfo.workspaceId,
+                leaseToken,
+                target.sessionId
+              ) &&
               cloudWorkLeaseCanSend(
                 trackedWorkspaceId,
                 wsInfo.workspaceId,
@@ -2467,6 +2573,12 @@ export async function sendToSession(
   if (!workspaceDir) {
     return { error: `Workspace "${wsInfo.displayName}" has no local directory on this Mac.` };
   }
+  const localWorkspaceName = wsInfo.directoryName || workspaceName;
+  if (hasPendingAgentStart(repoPath, localWorkspaceName)) {
+    return {
+      error: `Workspace "${wsInfo.displayName}" is still starting its previous agent run. Retry when startup completes.`,
+    };
+  }
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
     attachmentSourcePaths
@@ -2489,7 +2601,7 @@ export async function sendToSession(
     fullPrompt,
     normalizeModelForCli(target.model ?? resolveAgentModel(target.agentType, "prompt")),
     target.agentType,
-    wsInfo.directoryName || workspaceName,
+    localWorkspaceName,
     {
       agentSessionId: target.agentSessionId,
       isFollowUp: true,
@@ -2522,6 +2634,16 @@ export async function launchWorkspaceSession(
     backendKind: "local" | "cloud-api";
   } | SendError
 > {
+  if (
+    options.binding?.id &&
+    hasPendingCloudTopicFinalizationNotice(options.binding.id)
+  ) {
+    return {
+      error:
+        `The final Cloud status for "${workspaceName}" is still being published. ` +
+        "Retry the new thread after its Telegram topic finishes closing.",
+    };
+  }
   const wsInfo = resolveConductorWorkspaceInfo(
     workspaceName,
     options.repoPath ?? null,
@@ -2541,14 +2663,24 @@ export async function launchWorkspaceSession(
   }
 
   const remote = isRemoteConductorWorkspace(wsInfo);
-  const trackedWorkspace = remote
-    ? options.binding?.id
-      ? options.binding
-      : getTrackedWorkspaceByName(workspaceName, {
+  const trackedWorkspace = options.binding?.id
+    ? options.binding
+    : remote
+      ? getTrackedWorkspaceByName(workspaceName, {
           repoPath: options.repoPath ?? wsInfo.repoPath ?? undefined,
         })
-    : null;
+      : null;
   const trackedWorkspaceId = trackedWorkspace?.id;
+  if (
+    trackedWorkspaceId &&
+    hasPendingCloudTopicFinalizationNotice(trackedWorkspaceId)
+  ) {
+    return {
+      error:
+        `The final Cloud status for "${wsInfo.displayName}" is still being published. ` +
+        "Retry the new thread after its Telegram topic finishes closing.",
+    };
+  }
   if (remote && trackedWorkspaceId) {
     const terminalIntent = getPendingCloudTerminalIntent(trackedWorkspaceId);
     if (terminalIntent?.action === "archive") {
@@ -2791,6 +2923,11 @@ export async function launchWorkspaceSession(
   if (!workspaceDir) {
     return { error: `Workspace "${wsInfo.displayName}" has no local directory on this Mac.` };
   }
+  if (hasPendingAgentStart(repoPath, workspaceName)) {
+    return {
+      error: `Workspace "${wsInfo.displayName}" is still starting its previous agent run. Retry when startup completes.`,
+    };
+  }
   const stagedAttachmentPaths = stageAttachmentPaths(
     workspaceDir,
     options.attachmentSourcePaths ?? []
@@ -3021,13 +3158,22 @@ export async function launchCloudWorkspace(input: {
       input.promptProvider ?? input.prompt,
       requestedBranch && input.expectedRemoteCommit
         ? async () => {
-            const remoteCommit = await resolveRemoteBranchCommit(
+            const failure = await revalidateCloudTakeoverBranch(
               input.expectedRemoteCommit!.cwd,
-              requestedBranch
+              requestedBranch,
+              input.expectedRemoteCommit!.commit
             );
-            if (remoteCommit !== input.expectedRemoteCommit!.commit) {
+            if (failure) {
+              const detail =
+                failure === "workspace_has_uncommitted_changes"
+                  ? "the local worktree became dirty"
+                  : failure === "workspace_changed_after_verification"
+                    ? "local HEAD changed"
+                    : failure === "commit_not_available_on_remote"
+                      ? `Origin branch ${requestedBranch} moved`
+                      : "the local workspace state became unreadable";
               throw new ConductorApiError(
-                `Origin branch ${requestedBranch} moved after local state verification; refusing to send the prompt to an unverified checkout`
+                `${detail} after local state verification; refusing to send the prompt to an unverified checkout`
               );
             }
           }
@@ -3320,32 +3466,58 @@ async function performPendingCloudTerminalReconciliation(
   }
   if (!client) return { status: "pending", action: intent.action };
 
+  const hasUnresolvedSend =
+    intent.action === "stop" &&
+    hasActiveCloudWorkLease(trackedWorkspaceId, intent.workspaceId);
+  const targetSessionIds = pendingCloudTerminalSessionIds(intent);
+
   try {
     if (intent.action === "archive") {
       await client.archiveWorkspace(intent.workspaceId);
     } else {
-      setMetaValue(
-        cloudSessionCycleKey(intent.workspaceId, intent.sessionId),
-        encodeCloudSessionCycle({ phase: "canceling" })
-      );
-      const status = await client.getSessionStatus(intent.sessionId);
-      if (status.workspaceId !== intent.workspaceId) {
-        throw new ConductorApiError(
-          `Refusing to cancel session ${intent.sessionId}: workspace identity mismatch`
+      for (const sessionId of targetSessionIds) {
+        setMetaValue(
+          cloudSessionCycleKey(intent.workspaceId, sessionId),
+          encodeCloudSessionCycle({ phase: "canceling" })
         );
-      }
-      if (status.status !== "idle" || intent.forceCancel) {
-        const canceled = await client.cancelSession(intent.sessionId);
-        if (canceled.workspaceId !== intent.workspaceId) {
-          throw new ConductorApiError(
-            `Canceled session ${intent.sessionId} belongs to a different workspace`
-          );
+        try {
+          const status = await client.getSessionStatus(sessionId);
+          if (status.workspaceId !== intent.workspaceId) {
+            throw new ConductorApiError(
+              `Refusing to cancel session ${sessionId}: workspace identity mismatch`
+            );
+          }
+          if (
+            status.status !== "idle" ||
+            intent.forceCancel ||
+            hasUnresolvedSend
+          ) {
+            const canceled = await client.cancelSession(sessionId);
+            if (canceled.workspaceId !== intent.workspaceId) {
+              throw new ConductorApiError(
+                `Canceled session ${sessionId} belongs to a different workspace`
+              );
+            }
+          }
+        } catch (error) {
+          if (!(error instanceof ConductorApiError && error.status === 404)) {
+            throw error;
+          }
         }
       }
-      setMetaValue(
-        cloudSessionCycleKey(intent.workspaceId, intent.sessionId),
-        encodeCloudSessionCycle({ phase: "complete" })
-      );
+      if (hasUnresolvedSend) {
+        // These cancels only fence work already visible to the API. Keep the
+        // durable intent and every canceling cycle until all racing POSTs have
+        // returned (or their crash leases expire), then cancel every affected
+        // session once more.
+        return { status: "pending", action: intent.action };
+      }
+      for (const sessionId of targetSessionIds) {
+        setMetaValue(
+          cloudSessionCycleKey(intent.workspaceId, sessionId),
+          encodeCloudSessionCycle({ phase: "complete" })
+        );
+      }
     }
   } catch (error) {
     if (!(error instanceof ConductorApiError && error.status === 404)) {
@@ -3360,7 +3532,7 @@ async function performPendingCloudTerminalReconciliation(
           ? error.retryable
           : true;
       const exhausted = pendingCloudTerminalIntentIsExhausted(intent);
-      if (retryable && !exhausted) {
+      if (hasUnresolvedSend || (retryable && !exhausted)) {
         console.warn(
           `[conductor-api] Cloud ${intent.action} intent is not confirmed yet:`,
           error
@@ -3938,27 +4110,79 @@ async function performPendingCloudMessageReconciliation(
           }
           return { status: "pending" };
         }
-        const cycle = reserveCloudSessionCycle(
+        const leaseToken = beginCloudWorkLease(
+          trackedWorkspaceId,
           binding.conductorWorkspaceId,
-          sessionId
-        );
-        writeCloudSessionCycle(cycle, {
-          phase: "pending",
-          outboundMessageId: pending.messageId,
-        });
-        try {
-          await client.sendMessage({
+          {
+            allowPendingMessages: true,
             sessionId,
-            message: pending.prompt.trim() || "(empty message)",
-            messageId: pending.messageId,
-          });
+          }
+        );
+        if (!leaseToken) {
+          const outcome = getPendingCloudMessageOutcome(
+            trackedWorkspaceId,
+            pending.requestId
+          );
+          if (outcome?.outcome === "suppressed") {
+            return {
+              status: "suppressed",
+              count: messages.length - sentCount,
+              error: outcome.error ?? "workspace became unavailable",
+            };
+          }
+          if (outcome?.outcome === "failed") {
+            return {
+              status: "failed",
+              error: outcome.error ?? "Cloud request delivery failed",
+            };
+          }
+          return { status: "pending" };
+        }
+        try {
+          if (
+            !cloudWorkLeaseCanSend(
+              trackedWorkspaceId,
+              binding.conductorWorkspaceId,
+              leaseToken
+            )
+          ) {
+            const outcome = getPendingCloudMessageOutcome(
+              trackedWorkspaceId,
+              pending.requestId
+            );
+            if (outcome?.outcome === "suppressed") {
+              return {
+                status: "suppressed",
+                count: messages.length - sentCount,
+                error: outcome.error ?? "workspace became unavailable",
+              };
+            }
+            return { status: "pending" };
+          }
+          const cycle = reserveCloudSessionCycle(
+            binding.conductorWorkspaceId,
+            sessionId
+          );
           writeCloudSessionCycle(cycle, {
-            phase: "boundary",
+            phase: "pending",
             outboundMessageId: pending.messageId,
           });
-        } catch (error) {
-          restoreCloudSessionCycleAfterSendFailure(cycle);
-          throw error;
+          try {
+            await client.sendMessage({
+              sessionId,
+              message: pending.prompt.trim() || "(empty message)",
+              messageId: pending.messageId,
+            });
+            writeCloudSessionCycle(cycle, {
+              phase: "boundary",
+              outboundMessageId: pending.messageId,
+            });
+          } catch (error) {
+            restoreCloudSessionCycleAfterSendFailure(cycle);
+            throw error;
+          }
+        } finally {
+          clearCloudWorkLease(trackedWorkspaceId, leaseToken);
         }
       }
       const completion = completePendingCloudMessageDelivery(
@@ -4055,9 +4279,11 @@ async function queueFirstCloudPrompt(
       "Conductor API created the session in a different workspace"
     );
   }
-  await validateBeforeSend?.();
   const resolvedPrompt = typeof prompt === "function" ? prompt() : prompt;
   await persistBeforeSend?.(messageId, resolvedPrompt);
+  // Validation is deliberately last: persistence callbacks may be async, and
+  // takeover safety must be rechecked after every await before the POST.
+  await validateBeforeSend?.();
   const pendingCycle = reserveCloudSessionCycle(workspaceId, sessionId);
   writeCloudSessionCycle(pendingCycle, {
     phase: "pending",
@@ -4087,8 +4313,15 @@ async function queueFirstCloudPrompt(
  */
 export function stopAgent(workspaceName: string, repoPath: string): boolean {
   const key = workspaceAgentKey(repoPath, workspaceName);
+  const pending = pendingAgentStarts.get(key);
+  if (pending) {
+    for (const start of pending) {
+      start.canceled = true;
+      updateSessionStatus(start.conductorSessionId, "idle");
+    }
+  }
   const child = runningAgents.get(key);
-  if (!child) return false;
+  if (!child) return Boolean(pending?.size);
 
   child.kill("SIGTERM");
   // Give it 5s for graceful shutdown, then force kill
@@ -4460,6 +4693,10 @@ export type CloudTakeoverBranchFailure =
   | "commit_not_available_on_remote"
   | "workspace_state_unavailable";
 
+export type CloudTakeoverRevalidationFailure =
+  | CloudTakeoverBranchFailure
+  | "workspace_changed_after_verification";
+
 export interface CloudTakeoverBranchResolution {
   branch: string | null;
   commit: string | null;
@@ -4532,6 +4769,47 @@ export async function resolveSafeCloudTakeoverBranch(
       commit: null,
       reason: "workspace_state_unavailable",
     };
+  }
+}
+
+/** Re-check every mutable takeover invariant at the final pre-send boundary. */
+export async function revalidateCloudTakeoverBranch(
+  workspaceDir: string,
+  branch: string,
+  expectedCommit: string
+): Promise<CloudTakeoverRevalidationFailure | null> {
+  try {
+    if (!COMMIT_SHA_RE.test(expectedCommit)) {
+      return "workspace_state_unavailable";
+    }
+    if (
+      (await resolveRemoteBranchCommit(workspaceDir, branch)) !== expectedCommit
+    ) {
+      return "commit_not_available_on_remote";
+    }
+
+    // One final git snapshot checks HEAD and every tracked/untracked path
+    // after the network call. No await remains between this result and the
+    // caller's synchronous cycle reservation + POST dispatch.
+    const snapshot = await execFileAsync(
+      "git",
+      ["status", "--porcelain=v2", "--branch", "--untracked-files=all"],
+      workspaceDir
+    );
+    const lines = snapshot.split("\n").map((line) => line.trim()).filter(Boolean);
+    const oid = lines
+      .find((line) => line.startsWith("# branch.oid "))
+      ?.slice("# branch.oid ".length)
+      .trim();
+    if (!oid || !COMMIT_SHA_RE.test(oid)) {
+      return "workspace_state_unavailable";
+    }
+    if (oid !== expectedCommit) return "workspace_changed_after_verification";
+    return lines.some((line) => !line.startsWith("#"))
+      ? "workspace_has_uncommitted_changes"
+      : null;
+  } catch {
+    return "workspace_state_unavailable";
   }
 }
 

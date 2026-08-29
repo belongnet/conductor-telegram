@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -20,6 +20,8 @@ import {
   codexEventHasMeaningfulActivity,
   resolveRepoRemoteUrl,
   resolveSafeCloudTakeoverBranch,
+  revalidateCloudTakeoverBranch,
+  runClaudeAuthenticationPreflight,
 } from "../src/bot/launcher.js";
 import type { ConductorApiProject } from "../src/integrations/conductor-api.js";
 
@@ -453,6 +455,10 @@ test("cloud takeover only uses a clean commit available on the remote", async ()
       await resolveSafeCloudTakeoverBranch(repoDir, workspaceDir),
       { branch: "main", commit: baseCommit, reason: null }
     );
+    assert.equal(
+      await revalidateCloudTakeoverBranch(workspaceDir, "main", baseCommit),
+      null
+    );
 
     const dirtyPath = path.join(workspaceDir, "dirty.txt");
     writeFileSync(dirtyPath, "not uploaded\n");
@@ -464,6 +470,10 @@ test("cloud takeover only uses a clean commit available on the remote", async ()
         reason: "workspace_has_uncommitted_changes",
       }
     );
+    assert.equal(
+      await revalidateCloudTakeoverBranch(workspaceDir, "main", baseCommit),
+      "workspace_has_uncommitted_changes"
+    );
     rmSync(dirtyPath);
 
     writeFileSync(path.join(workspaceDir, "committed.txt"), "local only\n");
@@ -472,6 +482,10 @@ test("cloud takeover only uses a clean commit available on the remote", async ()
     assert.deepEqual(
       await resolveSafeCloudTakeoverBranch(repoDir, workspaceDir),
       { branch: null, commit: null, reason: "commit_not_available_on_remote" }
+    );
+    assert.equal(
+      await revalidateCloudTakeoverBranch(workspaceDir, "main", baseCommit),
+      "workspace_changed_after_verification"
     );
 
     git(["push", "-u", "origin", "local-task"], workspaceDir);
@@ -492,6 +506,33 @@ test("cloud takeover fails closed when repository state cannot be read", async (
     commit: null,
     reason: "workspace_state_unavailable",
   });
+});
+
+test("Claude authentication preflight does not block the Node event loop", async () => {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "ct-auth-preflight-"));
+  const executable = path.join(tempDir, "slow-auth");
+  try {
+    writeFileSync(
+      executable,
+      '#!/bin/sh\nsleep 0.2\nprintf \'{"loggedIn":true}\'\n'
+    );
+    chmodSync(executable, 0o755);
+    let immediateRan = false;
+    const probe = runClaudeAuthenticationPreflight(
+      executable,
+      tempDir,
+      process.env
+    );
+    setImmediate(() => {
+      immediateRan = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(immediateRan, true);
+    assert.equal(await probe, null);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("only http(s) deep links become Telegram anchors", () => {

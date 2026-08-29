@@ -38,8 +38,9 @@ import {
   type SessionMessage,
 } from "./launcher.js";
 import {
-  archiveWorkspace,
+  archiveWorkspaceLocally,
   acknowledgePendingCloudNotice,
+  cloudNoticeFinalizesWorkspaceTopic,
   deleteThreadCursorsNotIn,
   getAllThreadedWorkspaces,
   getAllWorkspaces,
@@ -87,6 +88,8 @@ import {
   createWorkspaceTopic,
   deleteWorkspaceTopic,
   ensureWorkspaceTopic,
+  finalizeWorkspaceTopicForCloudNotices,
+  reconcilePendingWorkspaceTopicState,
   renameWorkspaceTopics,
   syncWorkspaceTopic,
 } from "./forum.js";
@@ -107,7 +110,9 @@ import {
   cloudSessionCycleKey,
   encodeCloudSessionCycle,
   chunkTelegramHtmlEntries,
+  publishCloudNoticeChunks,
   parseCloudSessionCycle,
+  shouldReconcilePendingCloudWork,
   shouldPollTrackedWorkspace,
   type CloudSessionCycle,
 } from "./polling-policy.js";
@@ -473,13 +478,12 @@ async function pollConductorWorkspaces(cloudOnly: boolean): Promise<void> {
   }
 }
 
-async function pollConductorWorkspace(
-  ws: Workspace,
-  cloudOnly: boolean
-): Promise<void> {
+async function reconcilePendingCloudWorkForWorkspace(
+  ws: Workspace
+): Promise<boolean> {
   await publishPendingCloudNotices(ws);
   const terminalIntent = await reconcilePendingCloudTerminalIntent(ws.id);
-  if (terminalIntent.status === "pending") return;
+  if (terminalIntent.status === "pending") return true;
   if (terminalIntent.status === "failed") {
     pollerLog.error(
       `pending cloud ${terminalIntent.action} failed for ${ws.id}: ${terminalIntent.error}`
@@ -491,20 +495,15 @@ async function pollConductorWorkspace(
         forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
       );
     }
-    return;
+    return true;
   }
   if (terminalIntent.status === "completed") {
     Object.assign(ws, getWorkspace(ws.id) ?? ws);
     await publishPendingCloudNotices(ws);
-    if (ws.telegramThreadId) {
-      await syncWorkspaceTopic(bot.telegram, ws).catch((error) =>
-        forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
-      );
-    }
-    return;
+    return true;
   }
   const pendingLaunch = await reconcilePendingCloudLaunch(ws.id, ws);
-  if (pendingLaunch.status === "pending") return;
+  if (pendingLaunch.status === "pending") return true;
   if (pendingLaunch.status === "failed") {
     pollerLog.error(
       `pending cloud launch failed for ${ws.id}: ${pendingLaunch.error}`
@@ -516,7 +515,7 @@ async function pollConductorWorkspace(
         forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
       );
     }
-    return;
+    return true;
   }
   if (pendingLaunch.status === "queued") {
     Object.assign(ws, getWorkspace(ws.id) ?? ws);
@@ -532,7 +531,7 @@ async function pollConductorWorkspace(
   if (pendingMessages.status === "suppressed") {
     Object.assign(ws, getWorkspace(ws.id) ?? ws);
     await publishPendingCloudNotices(ws);
-    return;
+    return true;
   }
   if (pendingMessages.status === "failed") {
     Object.assign(ws, getWorkspace(ws.id) ?? ws);
@@ -542,11 +541,25 @@ async function pollConductorWorkspace(
         forumLog.error(`topic sync error ${ws.telegramThreadId}:`, error)
       );
     }
-    return;
+    return true;
   }
   if (pendingMessages.status === "sent") {
     Object.assign(ws, getWorkspace(ws.id) ?? ws);
     await publishPendingCloudNotices(ws);
+  }
+
+  return false;
+}
+
+async function pollConductorWorkspace(
+  ws: Workspace,
+  cloudOnly: boolean
+): Promise<void> {
+  if (
+    shouldReconcilePendingCloudWork(cloudOnly) &&
+    (await reconcilePendingCloudWorkForWorkspace(ws))
+  ) {
+    return;
   }
 
   if (!ws.conductorWorkspaceName) {
@@ -914,6 +927,8 @@ function formatPendingCloudNotice(notice: PendingCloudNotice): {
         html: `🔴 The saved Cloud archive request could not be confirmed and was given up on: <pre>${esc(trunc(notice.error ?? "unknown archive error", 500))}</pre> Check the workspace in Conductor Cloud.`,
         includeStopButton: false,
       };
+    case "topic_reconcile":
+      return { html: "", includeStopButton: false };
   }
 }
 
@@ -934,7 +949,15 @@ async function publishPendingCloudNotices(ws: Workspace): Promise<void> {
 async function performPendingCloudNoticePublication(
   ws: Workspace
 ): Promise<void> {
-  const notices = getPendingCloudNotices(ws.id);
+  const allNotices = getPendingCloudNotices(ws.id);
+  if (allNotices.length === 0) return;
+  const notices = allNotices.filter(
+    (notice) => notice.kind !== "topic_reconcile"
+  );
+  // An uncertain topic state is repaired open before any user-visible notice.
+  // Terminal rows remain in deferred-close mode until publication/finalization
+  // retires their durable notice, then the post-publication pass closes them.
+  await reconcilePendingWorkspaceTopicState(bot.telegram, ws.id);
   if (notices.length === 0) return;
   const grouped: Array<{ notice: PendingCloudNotice; noticeIds: string[] }> = [];
   for (const notice of notices) {
@@ -953,25 +976,32 @@ async function performPendingCloudNoticePublication(
   Object.assign(ws, getWorkspace(ws.id) ?? ws);
   const entries = grouped.map(({ notice, noticeIds }) => ({
     ...formatPendingCloudNotice(notice),
+    noticeKind: notice.kind,
     noticeIds,
   }));
   const chunks = chunkTelegramHtmlEntries(entries);
-  for (const [index, chunk] of chunks.entries()) {
-    const includeStopButton =
-      chunk.some((entry) => entry.includeStopButton) &&
-      ws.status !== "stopped" &&
-      ws.status !== "archived" &&
-      ws.status !== "failed";
-    const published = await publishCloudReconciliationStatus(
-      ws,
-      chunk.map((entry) => entry.html).join("\n\n"),
-      includeStopButton,
-      index > 0
-    );
-    if (!published) return;
-    for (const noticeId of chunk.flatMap((entry) => entry.noticeIds)) {
-      acknowledgePendingCloudNotice(ws.id, noticeId);
-    }
+  const published = await publishCloudNoticeChunks(chunks, {
+    publish: (chunk, index) => {
+      const includeStopButton =
+        chunk.some((entry) => entry.includeStopButton) &&
+        ws.status !== "stopped" &&
+        ws.status !== "archived" &&
+        ws.status !== "failed";
+      return publishCloudReconciliationStatus(
+        ws,
+        chunk.map((entry) => entry.html).join("\n\n"),
+        includeStopButton,
+        index > 0
+      );
+    },
+    isTerminal: cloudNoticeFinalizesWorkspaceTopic,
+    finalize: (kinds) =>
+      finalizeWorkspaceTopicForCloudNotices(bot.telegram, ws, kinds),
+    acknowledge: (noticeId) =>
+      acknowledgePendingCloudNotice(ws.id, noticeId),
+  });
+  if (published) {
+    await reconcilePendingWorkspaceTopicState(bot.telegram, ws.id);
   }
 }
 
@@ -1188,7 +1218,7 @@ function buildFinishedMessage(
 }
 
 function syncHiddenConductorWorkspace(ws: Workspace): void {
-  archiveWorkspace(ws.id);
+  archiveWorkspaceLocally(ws.id);
   const name = ws.conductorWorkspaceName ?? ws.name;
   pollerLog.info(`archived hidden Conductor workspace ${name} locally`);
   if (ws.telegramThreadId) {

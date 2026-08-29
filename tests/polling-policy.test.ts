@@ -9,6 +9,8 @@ import {
   encodeCloudSessionCycle,
   mapWithConcurrency,
   parseCloudSessionCycle,
+  publishCloudNoticeChunks,
+  shouldReconcilePendingCloudWork,
   shouldPollTrackedWorkspace,
   CLOUD_CYCLE_PENDING_TTL_MS,
 } from "../src/bot/polling-policy.js";
@@ -349,6 +351,11 @@ test("completed and failed cloud workspaces remain observable", () => {
   );
 });
 
+test("only the Cloud poller performs pending Cloud recovery", () => {
+  assert.equal(shouldReconcilePendingCloudWork(false), false);
+  assert.equal(shouldReconcilePendingCloudWork(true), true);
+});
+
 test("an oversized recovery notice is truncated rather than dropped", () => {
   const entries = [
     { id: "small", html: "<pre>ok</pre>" },
@@ -383,4 +390,104 @@ test("recovery notice backlogs are chunked below Telegram's text limit", () => {
       chunk.map((entry) => entry.html).join("\n\n").length <= 3_500
     );
   }
+});
+
+test("terminal recovery notices close only after every backlog chunk publishes", async () => {
+  const actions: string[] = [];
+  type NoticeEntry = {
+    noticeKind: "launch_canceled" | "messages_suppressed";
+    noticeIds: readonly string[];
+  };
+  const chunks: readonly (readonly NoticeEntry[])[] = [
+    [
+      {
+        noticeKind: "launch_canceled",
+        noticeIds: ["terminal"],
+      },
+    ],
+    [
+      {
+        noticeKind: "messages_suppressed",
+        noticeIds: ["suppressed"],
+      },
+    ],
+  ];
+
+  assert.equal(
+    await publishCloudNoticeChunks(chunks, {
+      publish: async (_chunk, index) => {
+        actions.push(`publish:${index}`);
+        return true;
+      },
+      isTerminal: (kind) => kind === "launch_canceled",
+      finalize: async () => {
+        actions.push("close");
+      },
+      acknowledge: (noticeId) => {
+        actions.push(`ack:${noticeId}`);
+      },
+    }),
+    true
+  );
+  assert.deepEqual(actions, [
+    "publish:0",
+    "publish:1",
+    "ack:suppressed",
+    "close",
+    "ack:terminal",
+  ]);
+});
+
+test("terminal recovery notices remain durable when later publication or finalization fails", async () => {
+  type NoticeEntry = {
+    noticeKind: "stop_confirmed" | "messages_sent";
+    noticeIds: readonly string[];
+  };
+  const chunks: readonly (readonly NoticeEntry[])[] = [
+    [
+      { noticeKind: "stop_confirmed", noticeIds: ["terminal"] },
+      { noticeKind: "messages_sent", noticeIds: ["sent"] },
+    ],
+    [{ noticeKind: "messages_sent", noticeIds: ["later"] }],
+  ];
+  const publishFailureActions: string[] = [];
+
+  assert.equal(
+    await publishCloudNoticeChunks(chunks, {
+      publish: async (_chunk, index) => {
+        publishFailureActions.push(`publish:${index}`);
+        return index === 0;
+      },
+      isTerminal: (kind) => kind === "stop_confirmed",
+      finalize: async () => {
+        publishFailureActions.push("close");
+      },
+      acknowledge: (noticeId) => {
+        publishFailureActions.push(`ack:${noticeId}`);
+      },
+    }),
+    false
+  );
+  assert.deepEqual(publishFailureActions, [
+    "publish:0",
+    "ack:sent",
+    "publish:1",
+  ]);
+
+  const finalizationFailureActions: string[] = [];
+  await assert.rejects(
+    publishCloudNoticeChunks(chunks.slice(0, 1), {
+      publish: async () => true,
+      isTerminal: (kind) => kind === "stop_confirmed",
+      finalize: async () => {
+        finalizationFailureActions.push("close");
+        throw new Error("topic close unavailable");
+      },
+      acknowledge: (noticeId) => {
+        finalizationFailureActions.push(`ack:${noticeId}`);
+      },
+    }),
+    /topic close unavailable/
+  );
+  assert.deepEqual(finalizationFailureActions, ["ack:sent", "close"]);
 });

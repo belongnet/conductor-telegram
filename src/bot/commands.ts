@@ -64,6 +64,9 @@ import {
   getRepoTopicByThreadId,
   getPendingDecisionsForChat,
   getPendingCloudNotices,
+  getPendingCloudLaunch,
+  hasPendingCloudTopicFinalizationNotice,
+  requestWorkspaceTopicReconciliation,
   getPendingCloudMessages,
   getPendingCloudMessageOutcome,
   getPendingCloudTerminalIntent,
@@ -78,6 +81,7 @@ import {
   createWorkspaceTopic,
   createRepoTopic,
   closeWorkspaceTopic,
+  reconcilePendingWorkspaceTopicState,
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
@@ -701,6 +705,58 @@ function commitSessionLaunchResult(
   };
 }
 
+function workspaceTopicNeedsResume(workspace: Workspace): boolean {
+  return Boolean(
+    workspace.telegramThreadId &&
+      (workspace.status === "done" ||
+        workspace.status === "stopped" ||
+        workspace.status === "failed")
+  );
+}
+
+async function reopenWorkspaceTopicBeforeActivity(
+  ctx: Context,
+  workspace: Workspace,
+  needed: boolean
+): Promise<void> {
+  if (!needed || !workspace.telegramThreadId) return;
+  await reopenWorkspaceTopic(
+    ctx.telegram,
+    workspace.telegramChatId,
+    workspace.telegramThreadId
+  );
+}
+
+/**
+ * Reopen again after a successful resume. A durable terminal publisher may
+ * have closed and acknowledged its notice between the handler's first reopen
+ * and the launcher's atomic activity gate.
+ */
+async function restoreWorkspaceTopicAfterActivity(
+  ctx: Context,
+  workspace: Workspace,
+  needed: boolean
+): Promise<void> {
+  if (!needed || !workspace.telegramThreadId) return;
+  requestWorkspaceTopicReconciliation(workspace.id);
+  try {
+    const status = await reconcilePendingWorkspaceTopicState(
+      ctx.telegram,
+      workspace.id
+    );
+    if (status === "pending") {
+      console.log(
+        `[forum] topic state changed repeatedly for ${workspace.id}; queued a retry`
+      );
+    }
+  } catch (error) {
+    console.error(
+      `[forum] topic reconciliation queued for ${workspace.telegramThreadId}:`,
+      error
+    );
+  }
+}
+
 function persistProvisionedCloudLaunch(
   workspace: Workspace,
   pending: PendingCloudLaunch
@@ -1141,15 +1197,7 @@ async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
       result.reason === "cloud_launch_canceled" ||
       result.reason === "cloud_launch_cancel_pending"
     ) {
-      const noticeIds =
-        result.reason === "cloud_launch_canceled"
-          ? newCloudNoticeIds(
-              workspace.id,
-              noticeIdsBeforeLaunch,
-              new Set(["launch_canceled"])
-            )
-          : [];
-      const published = await publishTrackedWorkspaceStatus(
+      await publishTrackedWorkspaceStatus(
         ctx,
         workspace,
         msg,
@@ -1158,9 +1206,9 @@ async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
           : "⏹ Cloud launch canceled before its prompt was sent.",
         false
       );
-      if (published && result.reason === "cloud_launch_canceled") {
-        acknowledgeCloudNoticeIds(workspace.id, noticeIds);
-      }
+      // The poller owns publication of every durable terminal notice (plus
+      // any following suppression notice), then closes and acknowledges once
+      // the complete backlog is visible.
       return { workspace, launched: null };
     }
     if (result.reason === "cloud_launch_cleanup_pending") {
@@ -2271,15 +2319,12 @@ export async function handleStop(ctx: Context): Promise<void> {
     : null;
   // Persist stop intent before the remote call so a crash or slow poll cannot
   // enqueue a durable-but-unsent first prompt after the user canceled it.
+  const hadPendingLaunch = Boolean(getPendingCloudLaunch(workspace.id));
   const pendingCancellation = markPendingCloudLaunchCanceled(workspace.id);
   const terminalIntent = getPendingCloudTerminalIntent(workspace.id);
   const terminalResult = terminalIntent
     ? await reconcilePendingCloudTerminalIntent(workspace.id)
     : null;
-  const terminalNoticeId =
-    terminalResult?.status === "completed"
-      ? terminalResult.noticeId
-      : null;
   const terminalFailure =
     terminalResult?.status === "failed" ? terminalResult : null;
   const killed = terminalResult
@@ -2298,18 +2343,22 @@ export async function handleStop(ctx: Context): Promise<void> {
     !killed
   ) {
     if (terminalFailure) {
-      if (terminalFailure.noticeId) {
-        acknowledgePendingCloudNotice(workspace.id, terminalFailure.noticeId);
-      }
       await ctx.reply(
         `🔴 The saved Cloud stop request for <b>${escHtml(wsName)}</b> could not be confirmed and was given up on: <pre>${escHtml(truncate(terminalFailure.error, 500))}</pre> Check the workspace in Conductor Cloud before sending more work.`,
         { parse_mode: "HTML" }
       );
+      if (terminalFailure.noticeId) {
+        acknowledgePendingCloudNotice(workspace.id, terminalFailure.noticeId);
+      }
       return;
     }
     if (pendingCancellation) {
       await ctx.reply(
-        `⏹ Stop intent for ☁️ <b>${escHtml(wsName)}</b> is saved, but Conductor has not confirmed cancellation yet. The bot will retry and will not send the pending prompt.`,
+        `⏹ Stop intent for ☁️ <b>${escHtml(wsName)}</b> is saved, but Conductor has not confirmed cancellation yet. The bot will retry and ${
+          hadPendingLaunch
+            ? "will not send the pending prompt"
+            : "will keep new Cloud work blocked"
+        }.`,
         { parse_mode: "HTML" }
       );
       return;
@@ -2322,21 +2371,19 @@ export async function handleStop(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceStatus(workspace.id, "stopped");
-  if (workspace.telegramThreadId) {
+  const deferTopicFinalization =
+    hadPendingLaunch ||
+    hasPendingCloudTopicFinalizationNotice(workspace.id);
+  if (workspace.telegramThreadId && !deferTopicFinalization) {
     try {
       await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "stopped" });
     } catch (err) {
       console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err);
     }
-    await closeWorkspaceTopic(
-      ctx.telegram,
-      workspace.telegramChatId,
-      workspace.telegramThreadId
-    );
   }
   await ctx.reply(
     `⏹ <b>${escHtml(wsName)}</b> stopped.${
-      pendingCancellation
+      hadPendingLaunch
         ? "\n<i>The provisioned Cloud workspace will be archived and the previous binding restored in the background.</i>"
         : killed
           ? ""
@@ -2347,8 +2394,12 @@ export async function handleStop(ctx: Context): Promise<void> {
       ...styledButtons([btn("Archive", `archive:${workspace.id}`)]),
     }
   );
-  if (terminalNoticeId) {
-    acknowledgePendingCloudNotice(workspace.id, terminalNoticeId);
+  if (workspace.telegramThreadId && !deferTopicFinalization) {
+    await closeWorkspaceTopic(
+      ctx.telegram,
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
   }
 }
 
@@ -3546,6 +3597,12 @@ async function startThreadForTarget(
     });
     return;
   }
+  const topicNeedsResume = workspaceTopicNeedsResume(trackedWorkspace);
+  await reopenWorkspaceTopicBeforeActivity(
+    ctx,
+    trackedWorkspace,
+    topicNeedsResume
+  );
   const threadOpts = trackedWorkspace.telegramThreadId
     ? { message_thread_id: trackedWorkspace.telegramThreadId }
     : {};
@@ -3587,6 +3644,11 @@ async function startThreadForTarget(
     );
     return;
   }
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    durableWorkspace,
+    topicNeedsResume
+  );
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
     progress.message_id,
@@ -3644,6 +3706,12 @@ async function handleReview(ctx: Context): Promise<void> {
     });
     return;
   }
+  const topicNeedsResume = workspaceTopicNeedsResume(trackedWorkspace);
+  await reopenWorkspaceTopicBeforeActivity(
+    ctx,
+    trackedWorkspace,
+    topicNeedsResume
+  );
   const progress = await ctx.reply(
     `Starting review for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(reviewPrompt, 200))}</i>`,
     { parse_mode: "HTML" }
@@ -3685,6 +3753,12 @@ async function handleReview(ctx: Context): Promise<void> {
     );
     return;
   }
+
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    durableWorkspace,
+    topicNeedsResume
+  );
 
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
@@ -4136,16 +4210,23 @@ async function handleThreadCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Reply with the first prompt");
 }
 
-async function handleStopCallback(ctx: Context): Promise<void> {
+export async function handleStopCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
   const workspaceId = match?.[1];
   if (!workspaceId) return;
 
   const workspace = getWorkspace(workspaceId);
+  const hadPendingLaunch = workspace
+    ? Boolean(getPendingCloudLaunch(workspace.id))
+    : false;
   const pendingCancellation = workspace
     ? markPendingCloudLaunchCanceled(workspace.id)
     : false;
-  let terminalNoticeId: string | null = null;
+  let deferTopicFinalization = Boolean(
+    workspace &&
+      (hadPendingLaunch ||
+        hasPendingCloudTopicFinalizationNotice(workspace.id))
+  );
   if (workspace?.conductorWorkspaceName) {
     const info = getWorkspaceSessionInfo(
       workspace.conductorWorkspaceName,
@@ -4156,10 +4237,9 @@ async function handleStopCallback(ctx: Context): Promise<void> {
     const terminalResult = terminalIntent
       ? await reconcilePendingCloudTerminalIntent(workspace.id)
       : null;
-    terminalNoticeId =
-      terminalResult?.status === "completed"
-        ? terminalResult.noticeId
-        : null;
+    deferTopicFinalization =
+      hadPendingLaunch ||
+      hasPendingCloudTopicFinalizationNotice(workspace.id);
     const stopped = terminalResult
       ? terminalResult.status === "completed" || terminalResult.status === "none"
       : await stopConductorAgent(
@@ -4173,9 +4253,6 @@ async function handleStopCallback(ctx: Context): Promise<void> {
       !stopped
     ) {
       if (terminalResult?.status === "failed") {
-        if (terminalResult.noticeId) {
-          acknowledgePendingCloudNotice(workspace.id, terminalResult.noticeId);
-        }
         await ctx.answerCbQuery(
           "Cloud stop gave up; check the workspace in Conductor Cloud"
         );
@@ -4191,7 +4268,7 @@ async function handleStopCallback(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
-  if (workspace?.telegramThreadId) {
+  if (workspace?.telegramThreadId && !deferTopicFinalization) {
     try {
       await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "stopped" });
     } catch (err) {
@@ -4209,16 +4286,13 @@ async function handleStopCallback(ctx: Context): Promise<void> {
       styledButtons([btn("Archive", `archive:${workspaceId}`)]).reply_markup
     )
     .catch(() => undefined);
-  if (terminalNoticeId) {
-    acknowledgePendingCloudNotice(workspaceId, terminalNoticeId);
-  }
 }
 
 async function handleOpenCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Open workspace in Conductor UI");
 }
 
-async function handleArchiveCallback(ctx: Context): Promise<void> {
+export async function handleArchiveCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
   const workspaceId = match?.[1];
   if (!workspaceId) return;
@@ -4231,7 +4305,8 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
   // Persist terminal intent before any remote await so launch/outbox
   // reconciliation cannot send another prompt after the Archive click.
   archiveWorkspace(workspaceId);
-  let terminalNoticeId: string | null = null;
+  let deferTopicFinalization =
+    hasPendingCloudTopicFinalizationNotice(workspace.id);
   if (workspace.conductorWorkspaceName) {
     const info = getWorkspaceSessionInfo(
       workspace.conductorWorkspaceName,
@@ -4242,10 +4317,8 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
     const terminalResult = terminalIntent
       ? await reconcilePendingCloudTerminalIntent(workspace.id)
       : null;
-    terminalNoticeId =
-      terminalResult?.status === "completed"
-        ? terminalResult.noticeId
-        : null;
+    deferTopicFinalization =
+      hasPendingCloudTopicFinalizationNotice(workspace.id);
     const archived = terminalResult
       ? terminalResult.status === "completed" || terminalResult.status === "none"
       : await archiveConductorWorkspace(
@@ -4258,9 +4331,6 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
       !archived
     ) {
       if (terminalResult?.status === "failed") {
-        if (terminalResult.noticeId) {
-          acknowledgePendingCloudNotice(workspace.id, terminalResult.noticeId);
-        }
         await ctx.answerCbQuery(
           "Cloud archive gave up; check the workspace in Conductor Cloud"
         );
@@ -4273,7 +4343,7 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
     }
   }
 
-  if (workspace.telegramThreadId) {
+  if (workspace.telegramThreadId && !deferTopicFinalization) {
     try {
       await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "archived" });
     } catch (err) {
@@ -4288,9 +4358,6 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
 
   await ctx.answerCbQuery("Workspace archived");
   await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
-  if (terminalNoticeId) {
-    acknowledgePendingCloudNotice(workspaceId, terminalNoticeId);
-  }
 }
 
 async function handleDecisionCallback(ctx: Context): Promise<void> {
@@ -4360,6 +4427,12 @@ async function handlePrCallback(ctx: Context): Promise<void> {
       await ctx.reply("Workspace is not linked to a Conductor session.");
       return;
     }
+    const topicNeedsResume = workspaceTopicNeedsResume(workspace);
+    await reopenWorkspaceTopicBeforeActivity(
+      ctx,
+      workspace,
+      topicNeedsResume
+    );
     const prompt = buildFixPrPrompt(record);
     const result = await sendToSession(
       workspace.conductorWorkspaceName,
@@ -4376,6 +4449,11 @@ async function handlePrCallback(ctx: Context): Promise<void> {
       updateWorkspaceStatus(workspace.id, "running");
       durable.status = "running";
     }
+    await restoreWorkspaceTopicAfterActivity(
+      ctx,
+      durable,
+      topicNeedsResume
+    );
     await sendPrStatusCard(ctx, durable);
     return;
   }
@@ -4525,21 +4603,12 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   }
   const conductorName = workspace.conductorWorkspaceName;
   const actionLabel = action === "review" ? "Review" : "PR generation";
+  const topicNeedsResume = workspaceTopicNeedsResume(workspace);
 
   await ctx.answerCbQuery(`Starting ${actionLabel}...`);
   await ctx.editMessageReplyMarkup(undefined);
 
-  // Reopen forum topic if needed
-  if (
-    workspace.telegramThreadId &&
-    (workspace.status === "done" || workspace.status === "stopped" || workspace.status === "failed")
-  ) {
-    await reopenWorkspaceTopic(
-      ctx.telegram,
-      workspace.telegramChatId,
-      workspace.telegramThreadId
-    );
-  }
+  await reopenWorkspaceTopicBeforeActivity(ctx, workspace, topicNeedsResume);
 
   const prompt = action === "review"
     ? buildReviewPrompt("")
@@ -4606,6 +4675,12 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     return;
   }
 
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    durableWorkspace,
+    topicNeedsResume
+  );
+
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
     progress.message_id,
@@ -4666,7 +4741,7 @@ function inferWorkspaceFromReply(reply: any, chatId: string): Workspace | undefi
   return getWorkspaceByName(workspaceName, { chatId });
 }
 
-async function sendMessageToWorkspace(
+export async function sendMessageToWorkspace(
   ctx: Context,
   workspace: Workspace,
   message: string,
@@ -4675,18 +4750,9 @@ async function sendMessageToWorkspace(
 ): Promise<void> {
   const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
   const messagePreview = previewOutgoingText(message, attachmentSourcePaths);
+  const topicNeedsResume = workspaceTopicNeedsResume(workspace);
 
-  // Reopen forum topic if the workspace was stopped/done/failed
-  if (
-    workspace.telegramThreadId &&
-    (workspace.status === "done" || workspace.status === "stopped" || workspace.status === "failed")
-  ) {
-    await reopenWorkspaceTopic(
-      ctx.telegram,
-      workspace.telegramChatId,
-      workspace.telegramThreadId
-    );
-  }
+  await reopenWorkspaceTopicBeforeActivity(ctx, workspace, topicNeedsResume);
 
   await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(messagePreview, 200))}</i>`, {
     parse_mode: "HTML",
@@ -4709,7 +4775,12 @@ async function sendMessageToWorkspace(
     updateWorkspaceStatus(workspace.id, "running");
     workspace.status = "running";
   }
-  if (workspace.telegramThreadId) {
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    workspace,
+    topicNeedsResume
+  );
+  if (workspace.telegramThreadId && !topicNeedsResume) {
     syncWorkspaceTopic(ctx.telegram, workspace).catch((err) =>
       console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
     );
@@ -5099,15 +5170,7 @@ async function performLocalCloudRecovery(
         launched.reason === "cloud_launch_canceled" ||
         launched.reason === "cloud_launch_cancel_pending"
       ) {
-        const noticeIds =
-          launched.reason === "cloud_launch_canceled"
-            ? newCloudNoticeIds(
-                current.id,
-                noticeIdsBeforeLaunch,
-                new Set(["launch_canceled"])
-              )
-            : [];
-        const published = await publishTrackedWorkspaceStatus(
+        await publishTrackedWorkspaceStatus(
           ctx,
           current,
           progress,
@@ -5116,9 +5179,8 @@ async function performLocalCloudRecovery(
             : `⏹ Cloud takeover for <b>${escHtml(conductorName)}</b> was canceled before its prompt was sent.`,
           false
         );
-        if (published && launched.reason === "cloud_launch_canceled") {
-          acknowledgeCloudNoticeIds(current.id, noticeIds);
-        }
+        // Leave terminal and suppression notices together for the poller's
+        // publish-all → close → acknowledge sequence.
         return {
           handled: true,
           recovered: false,

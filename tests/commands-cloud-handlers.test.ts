@@ -21,15 +21,22 @@ process.env.TELEGRAM_DEFAULT_AGENT_TYPE = "";
 
 import {
   handleCloud,
+  handleArchiveCallback,
   handleFleet,
   handleProjects,
   handleRename,
   handleRenameThread,
   handleStop,
+  handleStopCallback,
   observeAgentCompletion,
   recoverLocalAgentFailure,
+  sendMessageToWorkspace,
   startWorkspaceForRepo,
 } from "../src/bot/commands.js";
+import {
+  finalizeWorkspaceTopicForCloudNotices,
+  reconcilePendingWorkspaceTopicState,
+} from "../src/bot/forum.js";
 import {
   launchCloudWorkspace,
   launchWorkspaceSession,
@@ -42,6 +49,7 @@ import { closeDb, getDb } from "../src/store/db.js";
 import {
   acknowledgePendingCloudNotice,
   archiveWorkspace,
+  archiveWorkspaceLocally,
   clearPendingCloudLaunch,
   clearPendingCloudMessages,
   enqueuePendingCloudNotice,
@@ -55,10 +63,12 @@ import {
   getPendingCloudTerminalIntent,
   getWorkspacesWithPendingCloudWork,
   beginCloudWorkLease,
+  clearCloudWorkLease,
   markPendingCloudLaunchCanceled,
   markPendingCloudLaunchSent,
   markPendingCloudLaunchForCleanup,
   persistPendingCloudLaunch,
+  requestWorkspaceTopicReconciliation,
   updateWorkspaceConductorBinding,
   updateWorkspaceConductorName,
   updateWorkspaceThreadId,
@@ -881,6 +891,178 @@ test("an ordinary Cloud stop survives an API outage and retries after restart", 
   );
 });
 
+test("a Cloud stop stays durable until a racing send settles", async () => {
+  const tracked = trackLocalWorkspace(
+    "durable-racing-stop-city",
+    path.join(TEMP_DIR, "durable-racing-stop-repo"),
+    "Do not let a late POST outlive Stop"
+  );
+  updateWorkspaceConductorName(tracked.id, "durable-racing-stop-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-durable-racing-stop",
+    sessionId: "session-durable-racing-stop",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  const leaseToken = beginCloudWorkLease(
+    tracked.id,
+    "workspace-durable-racing-stop"
+  );
+  assert.ok(leaseToken);
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.equal(getPendingCloudTerminalIntent(tracked.id)?.forceCancel, true);
+
+  const calls = stubFetch({
+    "GET /v0/sessions/session-durable-racing-stop/status": () =>
+      json({
+        workspaceId: "workspace-durable-racing-stop",
+        sessionId: "session-durable-racing-stop",
+        status: "idle",
+        updatedAt: "2026-08-28T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-durable-racing-stop/cancel": () =>
+      json({
+        workspaceId: "workspace-durable-racing-stop",
+        sessionId: "session-durable-racing-stop",
+        status: "idle",
+        canceledQueuedMessages: 1,
+      }),
+  });
+
+  assert.deepEqual(await reconcilePendingCloudTerminalIntent(tracked.id), {
+    status: "pending",
+    action: "stop",
+  });
+  assert.ok(
+    getPendingCloudTerminalIntent(tracked.id),
+    "an idle status cannot clear Stop while the POST outcome is unresolved"
+  );
+  assert.equal(
+    calls.filter(
+      (call) =>
+        call === "POST /v0/sessions/session-durable-racing-stop/cancel"
+    ).length,
+    1
+  );
+
+  clearCloudWorkLease(tracked.id, leaseToken);
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.equal(
+    getPendingCloudTerminalIntent(tracked.id)?.forceCancel,
+    true,
+    "a repeated Stop must not weaken the final-cancel requirement"
+  );
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "completed"
+  );
+  assert.equal(getPendingCloudTerminalIntent(tracked.id), null);
+  assert.equal(
+    calls.filter(
+      (call) =>
+        call === "POST /v0/sessions/session-durable-racing-stop/cancel"
+    ).length,
+    2,
+    "the settled sender must be fenced by one final unconditional cancel"
+  );
+});
+
+test("a terminal API error cannot retire Stop while a racing send is unresolved", async () => {
+  const tracked = trackLocalWorkspace(
+    "error-racing-stop-city",
+    path.join(TEMP_DIR, "error-racing-stop-repo"),
+    "Keep Stop until the sender settles"
+  );
+  updateWorkspaceConductorName(tracked.id, "error-racing-stop-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-error-racing-stop",
+    sessionId: "session-error-racing-stop",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  const leaseToken = beginCloudWorkLease(
+    tracked.id,
+    "workspace-error-racing-stop"
+  );
+  assert.ok(leaseToken);
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  stubFetch({
+    "GET /v0/sessions/session-error-racing-stop/status": () =>
+      json({ userMessage: "unknown session" }, 400),
+  });
+
+  assert.deepEqual(await reconcilePendingCloudTerminalIntent(tracked.id), {
+    status: "pending",
+    action: "stop",
+  });
+  assert.ok(getPendingCloudTerminalIntent(tracked.id));
+
+  clearCloudWorkLease(tracked.id, leaseToken);
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "failed"
+  );
+  assert.equal(getPendingCloudTerminalIntent(tracked.id), null);
+});
+
+test("a Stop performs its final cancel after a crashed sender lease expires", async () => {
+  const tracked = trackLocalWorkspace(
+    "expired-racing-stop-city",
+    path.join(TEMP_DIR, "expired-racing-stop-repo"),
+    "Finish Stop after the crashed sender expires"
+  );
+  updateWorkspaceConductorName(tracked.id, "expired-racing-stop-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-expired-racing-stop",
+    sessionId: "session-expired-racing-stop",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  assert.ok(
+    beginCloudWorkLease(tracked.id, "workspace-expired-racing-stop")
+  );
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  const leaseKey = `cloud-work-leases:${tracked.id}`;
+  const leaseRow = getDb().prepare("SELECT value FROM meta WHERE key = ?")
+    .get(leaseKey) as { value: string };
+  const leases = JSON.parse(leaseRow.value) as Array<{ createdAt: string }>;
+  leases[0].createdAt = new Date(Date.now() - 30 * 60_000).toISOString();
+  getDb().prepare("UPDATE meta SET value = ? WHERE key = ?")
+    .run(JSON.stringify(leases), leaseKey);
+
+  const calls = stubFetch({
+    "GET /v0/sessions/session-expired-racing-stop/status": () =>
+      json({
+        workspaceId: "workspace-expired-racing-stop",
+        sessionId: "session-expired-racing-stop",
+        status: "idle",
+        updatedAt: "2026-08-28T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-expired-racing-stop/cancel": () =>
+      json({
+        workspaceId: "workspace-expired-racing-stop",
+        sessionId: "session-expired-racing-stop",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+  });
+
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "completed"
+  );
+  assert.ok(
+    calls.includes("POST /v0/sessions/session-expired-racing-stop/cancel")
+  );
+  assert.equal(
+    getDb().prepare("SELECT value FROM meta WHERE key = ?").get(leaseKey),
+    undefined
+  );
+});
+
 test("an ordinary Cloud archive survives an API outage and retries after restart", async () => {
   const tracked = trackLocalWorkspace(
     "durable-archive-city",
@@ -1351,6 +1533,87 @@ test("stop wins while durable outbox delivery is waiting on the API", async () =
   assert.equal(getWorkspace(tracked.id)?.status, "stopped");
 });
 
+test("stop stays durable while a recovery outbox POST is in flight", async () => {
+  const tracked = trackLocalWorkspace(
+    "stop-outbox-post-city",
+    path.join(TEMP_DIR, "stop-outbox-post-repo"),
+    "Initial work"
+  );
+  updateWorkspaceConductorName(tracked.id, "stop-outbox-post-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-stop-outbox-post",
+    sessionId: "session-stop-outbox-post",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+  enqueuePendingCloudMessage(tracked.id, {
+    requestId: "request-stop-outbox-post",
+    sessionId: "session-stop-outbox-post",
+    messageId: "message-stop-outbox-post",
+    prompt: "Never run after Stop",
+    createdAt: "2026-08-29T00:00:00.000Z",
+  });
+
+  let announcePost!: () => void;
+  const postStarted = new Promise<void>((resolve) => {
+    announcePost = resolve;
+  });
+  let releasePost!: () => void;
+  const postGate = new Promise<void>((resolve) => {
+    releasePost = resolve;
+  });
+  const calls = stubFetch({
+    "GET /v0/messages/message-stop-outbox-post": () =>
+      json({ userMessage: "not found" }, 404),
+    "GET /v0/sessions/session-stop-outbox-post/status": () =>
+      json({
+        workspaceId: "workspace-stop-outbox-post",
+        sessionId: "session-stop-outbox-post",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-stop-outbox-post/messages": async (init) => {
+      announcePost();
+      await postGate;
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+    "POST /v0/sessions/session-stop-outbox-post/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-outbox-post",
+        sessionId: "session-stop-outbox-post",
+        status: "idle",
+        canceledQueuedMessages: 1,
+      }),
+  });
+
+  const delivery = reconcilePendingCloudMessages(
+    tracked.id,
+    getWorkspace(tracked.id)!
+  );
+  await postStarted;
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.deepEqual(await reconcilePendingCloudTerminalIntent(tracked.id), {
+    status: "pending",
+    action: "stop",
+  });
+
+  releasePost();
+  assert.equal((await delivery).status, "suppressed");
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "completed"
+  );
+  assert.equal(getPendingCloudTerminalIntent(tracked.id), null);
+  assert.equal(
+    calls.filter(
+      (call) => call === "POST /v0/sessions/session-stop-outbox-post/cancel"
+    ).length,
+    2,
+    "the outbox sender must be fenced once while active and once after settling"
+  );
+});
+
 test("stop revokes an ordinary Cloud steer while remote preflight is waiting", async () => {
   const tracked = trackLocalWorkspace(
     "stop-steer-city",
@@ -1416,6 +1679,149 @@ test("stop revokes an ordinary Cloud steer while remote preflight is waiting", a
     "the revoked lease must suppress the final message POST"
   );
   assert.equal(getWorkspace(tracked.id)?.status, "stopped");
+});
+
+test("a rejected foreign reply target cannot poison a later Cloud Stop", async () => {
+  const tracked = trackLocalWorkspace(
+    "foreign-reply-city",
+    path.join(TEMP_DIR, "foreign-reply-repo"),
+    "Reject a stale reply target"
+  );
+  updateWorkspaceConductorName(tracked.id, "foreign-reply-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-foreign-reply",
+    sessionId: "session-foreign-reply-default",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  const calls = stubFetch({
+    "GET /v0/sessions/session-foreign-reply-stale": () =>
+      json({
+        id: "session-foreign-reply-stale",
+        deepLink:
+          "conductor://workspace/workspace-someone-else/session/session-foreign-reply-stale",
+        name: "Stale foreign reply",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-foreign-reply-stale/status": () =>
+      json({
+        workspaceId: "workspace-someone-else",
+        sessionId: "session-foreign-reply-stale",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-foreign-reply-default/status": () =>
+      json({
+        workspaceId: "workspace-foreign-reply",
+        sessionId: "session-foreign-reply-default",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-foreign-reply-default/cancel": () =>
+      json({
+        workspaceId: "workspace-foreign-reply",
+        sessionId: "session-foreign-reply-default",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+  });
+  const binding = getWorkspace(tracked.id)!;
+  const result = await sendToSession(
+    "foreign-reply-cloud-city",
+    "Do not send this stale reply",
+    [],
+    {
+      repoPath: binding.repoPath,
+      binding,
+      sessionId: "session-foreign-reply-stale",
+    }
+  );
+  assert.ok("error" in result);
+
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.deepEqual(getPendingCloudTerminalIntent(tracked.id)?.sessionIds, [
+    "session-foreign-reply-default",
+  ]);
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "completed"
+  );
+  assert.ok(
+    !calls.includes("POST /v0/sessions/session-foreign-reply-stale/cancel")
+  );
+});
+
+test("an expired ordinary steer lease cannot be revived at the final POST gate", async () => {
+  const tracked = trackLocalWorkspace(
+    "expired-steer-city",
+    path.join(TEMP_DIR, "expired-steer-repo"),
+    "Initial work"
+  );
+  updateWorkspaceConductorName(tracked.id, "expired-steer-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-expired-steer",
+    sessionId: "session-expired-steer",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  let announceSessionRead!: () => void;
+  const sessionReadStarted = new Promise<void>((resolve) => {
+    announceSessionRead = resolve;
+  });
+  let releaseSessionRead!: () => void;
+  const sessionReadGate = new Promise<void>((resolve) => {
+    releaseSessionRead = resolve;
+  });
+  const calls = stubFetch({
+    "GET /v0/sessions/session-expired-steer": async () => {
+      announceSessionRead();
+      await sessionReadGate;
+      return json({
+        id: "session-expired-steer",
+        deepLink:
+          "conductor://workspace/workspace-expired-steer/session/session-expired-steer",
+        name: "Expired steer",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      });
+    },
+    "GET /v0/sessions/session-expired-steer/status": () =>
+      json({
+        workspaceId: "workspace-expired-steer",
+        sessionId: "session-expired-steer",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-expired-steer/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+  });
+  const binding = getWorkspace(tracked.id)!;
+  const sending = sendToSession(
+    "expired-steer-cloud-city",
+    "Do not revive an expired operation",
+    [],
+    { repoPath: binding.repoPath, binding }
+  );
+
+  await sessionReadStarted;
+  const leaseRow = getDb()
+    .prepare("SELECT value FROM meta WHERE key = ?")
+    .get(`cloud-work-leases:${tracked.id}`) as { value: string };
+  const leases = JSON.parse(leaseRow.value);
+  leases[0].createdAt = new Date(Date.now() - 30 * 60_000).toISOString();
+  getDb()
+    .prepare("UPDATE meta SET value = ? WHERE key = ?")
+    .run(JSON.stringify(leases), `cloud-work-leases:${tracked.id}`);
+  releaseSessionRead();
+  const result = await sending;
+
+  assert.ok("error" in result);
+  assert.ok(!calls.includes("POST /v0/sessions/session-expired-steer/messages"));
 });
 
 test("stop revokes a new Cloud thread before its first prompt POST", async () => {
@@ -1577,6 +1983,220 @@ test("stop is re-confirmed when an ordinary Cloud steer POST was already accepte
     "a possibly accepted late message requires a fresh cancellation"
   );
   assert.equal(getWorkspace(tracked.id)?.status, "stopped");
+});
+
+test("stop fences a racing POST in a non-default Cloud thread", async () => {
+  const tracked = trackLocalWorkspace(
+    "stop-reply-thread-city",
+    path.join(TEMP_DIR, "stop-reply-thread-repo"),
+    "Initial work"
+  );
+  updateWorkspaceConductorName(tracked.id, "stop-reply-thread-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-stop-reply-thread",
+    sessionId: "session-stop-reply-default",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  let announcePost!: () => void;
+  const postStarted = new Promise<void>((resolve) => {
+    announcePost = resolve;
+  });
+  let releasePost!: () => void;
+  const postGate = new Promise<void>((resolve) => {
+    releasePost = resolve;
+  });
+  const calls = stubFetch({
+    "GET /v0/sessions/session-stop-reply-other": () =>
+      json({
+        id: "session-stop-reply-other",
+        deepLink:
+          "conductor://workspace/workspace-stop-reply-thread/session/session-stop-reply-other",
+        name: "Older reply thread",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-stop-reply-default/status": () =>
+      json({
+        workspaceId: "workspace-stop-reply-thread",
+        sessionId: "session-stop-reply-default",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-stop-reply-other/status": () =>
+      json({
+        workspaceId: "workspace-stop-reply-thread",
+        sessionId: "session-stop-reply-other",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-stop-reply-other/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+    "POST /v0/sessions/session-stop-reply-other/messages": async (init) => {
+      announcePost();
+      await postGate;
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+    "POST /v0/sessions/session-stop-reply-default/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-reply-thread",
+        sessionId: "session-stop-reply-default",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+    "POST /v0/sessions/session-stop-reply-other/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-reply-thread",
+        sessionId: "session-stop-reply-other",
+        status: "idle",
+        canceledQueuedMessages: 1,
+      }),
+  });
+  const binding = getWorkspace(tracked.id)!;
+  const sending = sendToSession(
+    "stop-reply-thread-cloud-city",
+    "Reply in the older thread",
+    [],
+    {
+      repoPath: binding.repoPath,
+      binding,
+      sessionId: "session-stop-reply-other",
+    }
+  );
+
+  await postStarted;
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.deepEqual(
+    getPendingCloudTerminalIntent(tracked.id)?.sessionIds,
+    ["session-stop-reply-default", "session-stop-reply-other"]
+  );
+  assert.deepEqual(await reconcilePendingCloudTerminalIntent(tracked.id), {
+    status: "pending",
+    action: "stop",
+  });
+
+  releasePost();
+  const result = await sending;
+
+  assert.ok("error" in result);
+  assert.equal(getPendingCloudTerminalIntent(tracked.id), null);
+  for (const sessionId of [
+    "session-stop-reply-default",
+    "session-stop-reply-other",
+  ]) {
+    assert.equal(
+      calls.filter(
+        (call) => call === `POST /v0/sessions/${sessionId}/cancel`
+      ).length,
+      2,
+      `Stop must cancel ${sessionId} before and after the racing POST settles`
+    );
+  }
+});
+
+test("a later Stop cancels completed sends in non-default Cloud threads", async () => {
+  const tracked = trackLocalWorkspace(
+    "stop-completed-reply-city",
+    path.join(TEMP_DIR, "stop-completed-reply-repo"),
+    "Initial work"
+  );
+  updateWorkspaceConductorName(
+    tracked.id,
+    "stop-completed-reply-cloud-city"
+  );
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-stop-completed-reply",
+    sessionId: "session-stop-completed-default",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+
+  const calls = stubFetch({
+    "GET /v0/sessions/session-stop-completed-other": () =>
+      json({
+        id: "session-stop-completed-other",
+        deepLink:
+          "conductor://workspace/workspace-stop-completed-reply/session/session-stop-completed-other",
+        name: "Older reply thread",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-stop-completed-default/status": () =>
+      json({
+        workspaceId: "workspace-stop-completed-reply",
+        sessionId: "session-stop-completed-default",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-stop-completed-other/status": () =>
+      json({
+        workspaceId: "workspace-stop-completed-reply",
+        sessionId: "session-stop-completed-other",
+        // The accepted request may not be reflected in status immediately.
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-stop-completed-other/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+    "POST /v0/sessions/session-stop-completed-other/messages": (init) => {
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+    "POST /v0/sessions/session-stop-completed-default/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-completed-reply",
+        sessionId: "session-stop-completed-default",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+    "POST /v0/sessions/session-stop-completed-other/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-completed-reply",
+        sessionId: "session-stop-completed-other",
+        status: "idle",
+        canceledQueuedMessages: 1,
+      }),
+  });
+  const binding = getWorkspace(tracked.id)!;
+  const result = await sendToSession(
+    "stop-completed-reply-cloud-city",
+    "Keep working in the older thread",
+    [],
+    {
+      repoPath: binding.repoPath,
+      binding,
+      sessionId: "session-stop-completed-other",
+    }
+  );
+  assert.ok("ok" in result);
+
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.deepEqual(
+    getPendingCloudTerminalIntent(tracked.id)?.sessionIds,
+    ["session-stop-completed-default", "session-stop-completed-other"]
+  );
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "completed"
+  );
+  assert.equal(
+    calls.filter(
+      (call) =>
+        call === "POST /v0/sessions/session-stop-completed-other/cancel"
+    ).length,
+    1
+  );
+  assert.equal(
+    calls.filter(
+      (call) =>
+        call === "POST /v0/sessions/session-stop-completed-default/cancel"
+    ).length,
+    1
+  );
 });
 
 test("stop rolls back a new Cloud thread whose first POST was already accepted", async () => {
@@ -2507,6 +3127,84 @@ test("auth recovery aborts before sending when the remote branch moves during pr
   assert.equal(getWorkspace(tracked.id)?.conductorBackendKind, "local");
 });
 
+test("auth recovery aborts when the local worktree becomes dirty during provisioning", async () => {
+  const { repoDir, remoteDir } = createPushedRepo(
+    "dirty-during-provisioning"
+  );
+  const tracked = trackLocalWorkspace(
+    "dirty-local-city",
+    repoDir,
+    "Never replay over new local work"
+  );
+  let dirtied = false;
+  const calls = stubFetch({
+    "GET /v0/projects": () =>
+      json({
+        data: [
+          {
+            id: "proj-dirty",
+            name: "dirty-during-provisioning",
+            gitRemote: remoteDir,
+          },
+        ],
+        offset: 0,
+        hasMore: false,
+      }),
+    "POST /v0/workspaces": () =>
+      json(
+        {
+          workspaceId: "workspace-dirty",
+          sessionId: "session-dirty",
+          deepLink: "https://conductor.build/w/workspace-dirty",
+        },
+        201
+      ),
+    "GET /v0/sessions/session-dirty/status": () => {
+      if (!dirtied) {
+        dirtied = true;
+        writeFileSync(
+          path.join(repoDir, "arrived-during-provisioning.txt"),
+          "local-only work\n"
+        );
+      }
+      return json({
+        workspaceId: "workspace-dirty",
+        sessionId: "session-dirty",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      });
+    },
+    "POST /v0/workspaces/workspace-dirty/archive": () =>
+      json({ workspaceId: "workspace-dirty", status: "archived" }),
+  });
+
+  const outcome = await recoverLocalAgentFailure(
+    fakeCtx("dirty worktree takeover").ctx,
+    tracked,
+    "dirty-local-city",
+    {
+      isError: true,
+      exitCode: 1,
+      resultText: "Not logged in · Please run /login",
+      hadMeaningfulActivity: false,
+      authenticationFailure: true,
+    },
+    {
+      prompt: "Never replay over new local work",
+      repoName: "dirty-during-provisioning",
+      repoPath: repoDir,
+      workspaceDir: repoDir,
+    }
+  );
+
+  assert.equal(outcome.handled, true);
+  assert.equal(outcome.recovered, false);
+  assert.match(outcome.reason ?? "", /local worktree became dirty/);
+  assert.ok(!calls.includes("POST /v0/sessions/session-dirty/messages"));
+  assert.ok(calls.includes("POST /v0/workspaces/workspace-dirty/archive"));
+  assert.equal(getWorkspace(tracked.id)?.conductorBackendKind, "local");
+});
+
 test("overlapping auth failures forward every distinct prompt through one takeover", async () => {
   const { repoDir, remoteDir } = createPushedRepo("overlap-takeover");
   const tracked = trackLocalWorkspace(
@@ -3111,6 +3809,841 @@ test("a Cloud stop that can never succeed gives up instead of gating forever", a
   );
 });
 
+test("a failed Stop notice remains durable when Telegram publication fails", async () => {
+  const tracked = trackLocalWorkspace(
+    "unpublished-stop-failure-city",
+    path.join(TEMP_DIR, "unpublished-stop-failure-repo"),
+    "Keep the failure notice"
+  );
+  updateWorkspaceConductorName(
+    tracked.id,
+    "unpublished-stop-failure-cloud-city"
+  );
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-unpublished-stop-failure",
+    sessionId: "session-unpublished-stop-failure",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+  stubFetch({
+    "GET /v0/sessions/session-unpublished-stop-failure/status": () =>
+      json({ userMessage: "unknown session" }, 400),
+  });
+  const chat = fakeCtx(`/stop ${tracked.id}`);
+  chat.ctx.reply = async () => {
+    throw new Error("Telegram unavailable");
+  };
+
+  await assert.rejects(handleStop(chat.ctx), /Telegram unavailable/);
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "stop_failed"
+    )
+  );
+});
+
+test("a confirmed direct Stop notice remains durable for poller finalization", async () => {
+  const tracked = trackLocalWorkspace(
+    "unfinalized-stop-city",
+    path.join(TEMP_DIR, "unfinalized-stop-repo"),
+    "Keep the confirmation notice"
+  );
+  updateWorkspaceConductorName(tracked.id, "unfinalized-stop-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-unfinalized-stop",
+    sessionId: "session-unfinalized-stop",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 777);
+  updateWorkspaceStatus(tracked.id, "running");
+  stubFetch({
+    "GET /v0/sessions/session-unfinalized-stop/status": () =>
+      json({
+        workspaceId: "workspace-unfinalized-stop",
+        sessionId: "session-unfinalized-stop",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-unfinalized-stop/cancel": () =>
+      json({
+        workspaceId: "workspace-unfinalized-stop",
+        sessionId: "session-unfinalized-stop",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+  });
+  const chat = fakeCtx(`/stop ${tracked.id}`, { threadId: 777 });
+  chat.ctx.telegram.getForumTopicIconStickers = async () => [];
+  chat.ctx.telegram.editForumTopic = async () => undefined;
+  let closeCalls = 0;
+  chat.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+  };
+
+  await handleStop(chat.ctx);
+  assert.equal(closeCalls, 0);
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "stop_confirmed"
+    )
+  );
+});
+
+test("topic repair keeps a stopped topic open until its pending Stop notice publishes", async () => {
+  const tracked = trackLocalWorkspace(
+    "pending-stop-topic-repair-city",
+    path.join(TEMP_DIR, "pending-stop-topic-repair-repo"),
+    "Publish Stop before closing"
+  );
+  updateWorkspaceConductorName(tracked.id, "pending-stop-topic-repair-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-pending-stop-topic-repair",
+    sessionId: "session-pending-stop-topic-repair",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 785);
+  updateWorkspaceStatus(tracked.id, "running");
+  requestWorkspaceTopicReconciliation(tracked.id);
+
+  let releaseCancel!: () => void;
+  const cancelReleased = new Promise<void>((resolve) => {
+    releaseCancel = resolve;
+  });
+  let signalCancelStarted!: () => void;
+  const cancelStarted = new Promise<void>((resolve) => {
+    signalCancelStarted = resolve;
+  });
+  stubFetch({
+    "GET /v0/sessions/session-pending-stop-topic-repair/status": () =>
+      json({
+        workspaceId: "workspace-pending-stop-topic-repair",
+        sessionId: "session-pending-stop-topic-repair",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-pending-stop-topic-repair/cancel": async () => {
+      signalCancelStarted();
+      await cancelReleased;
+      return json({
+        workspaceId: "workspace-pending-stop-topic-repair",
+        sessionId: "session-pending-stop-topic-repair",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      });
+    },
+  });
+  const chat = fakeCtx(`/stop ${tracked.id}`, { threadId: 785 });
+  let reopenCalls = 0;
+  let closeCalls = 0;
+  let topicOpen = true;
+  chat.ctx.telegram.reopenForumTopic = async () => {
+    reopenCalls += 1;
+    topicOpen = true;
+  };
+  chat.ctx.telegram.editForumTopic = async () => true;
+  chat.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+    topicOpen = false;
+  };
+
+  const stopping = handleStop(chat.ctx);
+  await cancelStarted;
+  assert.equal(getWorkspace(tracked.id)?.status, "stopped");
+  assert.equal(
+    await reconcilePendingWorkspaceTopicState(chat.ctx.telegram, tracked.id),
+    "pending"
+  );
+  assert.equal(reopenCalls, 1);
+  assert.equal(closeCalls, 0, "the in-flight Stop must not close before confirmation");
+  assert.equal(topicOpen, true);
+
+  releaseCancel();
+  await stopping;
+  const terminalNotices = getPendingCloudNotices(tracked.id).filter(
+    (notice) => notice.kind === "stop_confirmed"
+  );
+  assert.equal(terminalNotices.length, 1);
+  await finalizeWorkspaceTopicForCloudNotices(
+    chat.ctx.telegram,
+    getWorkspace(tracked.id)!,
+    terminalNotices.map((notice) => notice.kind)
+  );
+  for (const notice of terminalNotices) {
+    acknowledgePendingCloudNotice(tracked.id, notice.id);
+  }
+  assert.equal(topicOpen, false);
+
+  assert.equal(
+    await reconcilePendingWorkspaceTopicState(chat.ctx.telegram, tracked.id),
+    "completed"
+  );
+  assert.equal(closeCalls, 2, "the durable repair closes idempotently after publication");
+  assert.equal(topicOpen, false);
+});
+
+test("Cloud Stop callback leaves the topic open until its durable notice publishes", async () => {
+  const tracked = trackLocalWorkspace(
+    "callback-stop-city",
+    path.join(TEMP_DIR, "callback-stop-repo"),
+    "Stop from a button"
+  );
+  updateWorkspaceConductorName(tracked.id, "callback-stop-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-callback-stop",
+    sessionId: "session-callback-stop",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 778);
+  updateWorkspaceStatus(tracked.id, "running");
+  stubFetch({
+    "GET /v0/sessions/session-callback-stop/status": () =>
+      json({
+        workspaceId: "workspace-callback-stop",
+        sessionId: "session-callback-stop",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-callback-stop/cancel": () =>
+      json({
+        workspaceId: "workspace-callback-stop",
+        sessionId: "session-callback-stop",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+  });
+  const chat = fakeCtx("callback stop", { threadId: 778 });
+  const answers: string[] = [];
+  let closeCalls = 0;
+  chat.ctx.match = [`stop:${tracked.id}`, tracked.id];
+  chat.ctx.answerCbQuery = async (text: string) => {
+    answers.push(text);
+  };
+  chat.ctx.editMessageReplyMarkup = async () => undefined;
+  chat.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+  };
+
+  await handleStopCallback(chat.ctx);
+
+  assert.deepEqual(answers, ["Agent stopped"]);
+  assert.equal(closeCalls, 0);
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "stop_confirmed"
+    )
+  );
+});
+
+test("a repeated direct Stop leaves an older callback notice for the poller", async () => {
+  const tracked = trackLocalWorkspace(
+    "repeated-stop-notice-city",
+    path.join(TEMP_DIR, "repeated-stop-notice-repo"),
+    "Do not strand the first Stop confirmation"
+  );
+  updateWorkspaceConductorName(tracked.id, "repeated-stop-notice-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-repeated-stop-notice",
+    sessionId: "session-repeated-stop-notice",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 781);
+  updateWorkspaceStatus(tracked.id, "running");
+  stubFetch({
+    "GET /v0/sessions/session-repeated-stop-notice/status": () =>
+      json({
+        workspaceId: "workspace-repeated-stop-notice",
+        sessionId: "session-repeated-stop-notice",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-repeated-stop-notice/cancel": () =>
+      json({
+        workspaceId: "workspace-repeated-stop-notice",
+        sessionId: "session-repeated-stop-notice",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+  });
+
+  const callback = fakeCtx("callback stop", { threadId: 781 });
+  callback.ctx.match = [`stop:${tracked.id}`, tracked.id];
+  callback.ctx.answerCbQuery = async () => undefined;
+  callback.ctx.editMessageReplyMarkup = async () => undefined;
+  callback.ctx.telegram.closeForumTopic = async () => {
+    assert.fail("the callback must defer topic finalization");
+  };
+  await handleStopCallback(callback.ctx);
+  assert.equal(
+    getPendingCloudNotices(tracked.id).filter(
+      (notice) => notice.kind === "stop_confirmed"
+    ).length,
+    1
+  );
+
+  const direct = fakeCtx(`/stop ${tracked.id}`, { threadId: 781 });
+  let closeCalls = 0;
+  direct.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+  };
+  await handleStop(direct.ctx);
+
+  assert.equal(closeCalls, 0);
+  assert.equal(
+    getPendingCloudNotices(tracked.id).filter(
+      (notice) => notice.kind === "stop_confirmed"
+    ).length,
+    2,
+    "both confirmations remain open and durable for one ordered publication"
+  );
+});
+
+test("Stop during a pending Cloud launch defers close until cleanup notices exist", async () => {
+  const tracked = trackLocalWorkspace(
+    "stop-pending-topic-city",
+    path.join(TEMP_DIR, "stop-pending-topic-repo"),
+    "Never close before launch cleanup is reported"
+  );
+  updateWorkspaceThreadId(tracked.id, 782);
+  persistPendingCloudLaunch(tracked.id, {
+    workspaceId: "workspace-stop-pending-topic",
+    sessionId: "session-stop-pending-topic",
+    prompt: "Never send this prompt",
+    messageId: "message-stop-pending-topic",
+  });
+  stubFetch({
+    "GET /v0/sessions/session-stop-pending-topic/status": () =>
+      json({
+        workspaceId: "workspace-stop-pending-topic",
+        sessionId: "session-stop-pending-topic",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-stop-pending-topic/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-pending-topic",
+        sessionId: "session-stop-pending-topic",
+        status: "idle",
+        canceledQueuedMessages: 0,
+      }),
+  });
+  const chat = fakeCtx(`/stop ${tracked.id}`, { threadId: 782 });
+  let closeCalls = 0;
+  chat.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+  };
+
+  await handleStop(chat.ctx);
+
+  assert.equal(closeCalls, 0);
+  assert.equal(getPendingCloudLaunch(tracked.id)?.phase, "cancel");
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "stop_confirmed"
+    )
+  );
+
+  stubFetch({
+    "POST /v0/workspaces/workspace-stop-pending-topic/archive": () =>
+      json({
+        workspaceId: "workspace-stop-pending-topic",
+        status: "archived",
+      }),
+  });
+  assert.deepEqual(
+    await reconcilePendingCloudLaunch(tracked.id, getWorkspace(tracked.id)!),
+    { status: "none" }
+  );
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "launch_canceled"
+    )
+  );
+});
+
+test("Cloud Archive callback leaves the topic open until its durable notice publishes", async () => {
+  const tracked = trackLocalWorkspace(
+    "callback-archive-city",
+    path.join(TEMP_DIR, "callback-archive-repo"),
+    "Archive from a button"
+  );
+  updateWorkspaceConductorName(tracked.id, "callback-archive-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-callback-archive",
+    sessionId: "session-callback-archive",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 779);
+  updateWorkspaceStatus(tracked.id, "running");
+  stubFetch({
+    "POST /v0/workspaces/workspace-callback-archive/archive": () =>
+      json({
+        workspaceId: "workspace-callback-archive",
+        status: "archived",
+      }),
+  });
+  const chat = fakeCtx("callback archive", { threadId: 779 });
+  const answers: string[] = [];
+  let closeCalls = 0;
+  chat.ctx.match = [`archive:${tracked.id}`, tracked.id];
+  chat.ctx.answerCbQuery = async (text: string) => {
+    answers.push(text);
+  };
+  chat.ctx.editMessageReplyMarkup = async () => undefined;
+  chat.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+  };
+
+  await handleArchiveCallback(chat.ctx);
+
+  assert.deepEqual(answers, ["Workspace archived"]);
+  assert.equal(closeCalls, 0);
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "archive_confirmed"
+    )
+  );
+});
+
+test("terminal topic notices gate local and Cloud activity until publication", async () => {
+  const restoredLocal = trackLocalWorkspace(
+    "notice-gated-local-city",
+    path.join(TEMP_DIR, "notice-gated-local-repo"),
+    "Do not resume before launch cancellation is visible"
+  );
+  enqueuePendingCloudNotice(restoredLocal.id, { kind: "launch_canceled" });
+  const localBinding = getWorkspace(restoredLocal.id)!;
+
+  for (const blocked of [
+    await sendToSession(localBinding.name, "Too early", [], {
+      repoPath: localBinding.repoPath,
+      binding: localBinding,
+    }),
+    await launchWorkspaceSession(localBinding.name, "Also too early", {
+      repoPath: localBinding.repoPath,
+      binding: localBinding,
+    }),
+  ]) {
+    assert.ok("error" in blocked);
+    assert.match(
+      "error" in blocked ? blocked.error : "",
+      /final Cloud status.*still being published/i
+    );
+  }
+
+  const tracked = trackLocalWorkspace(
+    "notice-gated-cloud-city",
+    path.join(TEMP_DIR, "notice-gated-cloud-repo"),
+    "Resume only after topic finalization"
+  );
+  updateWorkspaceConductorName(tracked.id, "notice-gated-cloud-workspace");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-notice-gate",
+    sessionId: "session-notice-gate",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "stopped");
+  const terminalNotice = enqueuePendingCloudNotice(tracked.id, {
+    kind: "stop_confirmed",
+  });
+  const calls = stubFetch({
+    "GET /v0/sessions/session-notice-gate": () =>
+      json({
+        id: "session-notice-gate",
+        deepLink:
+          "conductor://workspace/workspace-notice-gate/session/session-notice-gate",
+        name: "Notice gate",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-notice-gate/status": () =>
+      json({
+        workspaceId: "workspace-notice-gate",
+        sessionId: "session-notice-gate",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-notice-gate/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+    "POST /v0/sessions/session-notice-gate/messages": (init) => {
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+  });
+  const binding = getWorkspace(tracked.id)!;
+
+  const blockedSend = await sendToSession(
+    "notice-gated-cloud-workspace",
+    "Still too early",
+    [],
+    { repoPath: binding.repoPath, binding }
+  );
+  const blockedThread = await launchWorkspaceSession(
+    "notice-gated-cloud-workspace",
+    "New thread too early",
+    { repoPath: binding.repoPath, binding }
+  );
+  assert.ok("error" in blockedSend);
+  assert.ok("error" in blockedThread);
+  assert.equal(
+    calls.length,
+    0,
+    "no Cloud API activity may precede topic finalization"
+  );
+
+  assert.equal(
+    acknowledgePendingCloudNotice(tracked.id, terminalNotice.id),
+    true
+  );
+  const resumed = await sendToSession(
+    "notice-gated-cloud-workspace",
+    "Resume after publication",
+    [],
+    { repoPath: binding.repoPath, binding }
+  );
+  assert.ok("ok" in resumed);
+  assert.ok(calls.includes("POST /v0/sessions/session-notice-gate/messages"));
+});
+
+test("a successful resumed send reopens after a racing terminal finalizer", async () => {
+  const tracked = trackLocalWorkspace(
+    "resume-topic-race-city",
+    path.join(TEMP_DIR, "resume-topic-race-repo"),
+    "Keep the resumed topic open"
+  );
+  updateWorkspaceConductorName(tracked.id, "resume-topic-race-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-resume-topic-race",
+    sessionId: "session-resume-topic-race",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 780);
+  updateWorkspaceStatus(tracked.id, "stopped");
+  const terminalNotice = enqueuePendingCloudNotice(tracked.id, {
+    kind: "stop_confirmed",
+  });
+  const calls = stubFetch({
+    "GET /v0/sessions/session-resume-topic-race": () =>
+      json({
+        id: "session-resume-topic-race",
+        deepLink:
+          "conductor://workspace/workspace-resume-topic-race/session/session-resume-topic-race",
+        name: "Resume race",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-resume-topic-race/status": () =>
+      json({
+        workspaceId: "workspace-resume-topic-race",
+        sessionId: "session-resume-topic-race",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-resume-topic-race/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+    "POST /v0/sessions/session-resume-topic-race/messages": (init) => {
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+  });
+  const chat = fakeCtx("resume", { threadId: 780 });
+  let reopenCalls = 0;
+  let topicOpen = false;
+  chat.ctx.telegram.reopenForumTopic = async () => {
+    reopenCalls += 1;
+    topicOpen = true;
+    if (reopenCalls === 1) {
+      // Model a finalizer that closes + acknowledges after the handler's
+      // optimistic reopen but before the launcher's activity gate.
+      topicOpen = false;
+      acknowledgePendingCloudNotice(tracked.id, terminalNotice.id);
+    }
+  };
+  chat.ctx.telegram.editForumTopic = async () => {
+    assert.equal(topicOpen, true, "topic styling must happen after the final reopen");
+    return true;
+  };
+
+  await sendMessageToWorkspace(
+    chat.ctx,
+    getWorkspace(tracked.id)!,
+    "Resume safely"
+  );
+
+  assert.equal(reopenCalls, 2, "resume reopens both before and after the send");
+  assert.equal(topicOpen, true);
+  assert.ok(
+    calls.includes("POST /v0/sessions/session-resume-topic-race/messages")
+  );
+  assert.equal(getWorkspace(tracked.id)?.status, "running");
+});
+
+test("a terminal finalizer that wins during the post-send reopen leaves the topic closed", async () => {
+  const tracked = trackLocalWorkspace(
+    "post-resume-reopen-race-city",
+    path.join(TEMP_DIR, "post-resume-reopen-race-repo"),
+    "Keep a stopped topic closed"
+  );
+  updateWorkspaceConductorName(tracked.id, "post-resume-reopen-race-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-post-resume-reopen-race",
+    sessionId: "session-post-resume-reopen-race",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 783);
+  updateWorkspaceStatus(tracked.id, "stopped");
+  const calls = stubFetch({
+    "GET /v0/sessions/session-post-resume-reopen-race": () =>
+      json({
+        id: "session-post-resume-reopen-race",
+        deepLink:
+          "conductor://workspace/workspace-post-resume-reopen-race/session/session-post-resume-reopen-race",
+        name: "Post-resume reopen race",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-post-resume-reopen-race/status": () =>
+      json({
+        workspaceId: "workspace-post-resume-reopen-race",
+        sessionId: "session-post-resume-reopen-race",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-post-resume-reopen-race/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+    "POST /v0/sessions/session-post-resume-reopen-race/messages": (init) => {
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+    "POST /v0/sessions/session-post-resume-reopen-race/cancel": () =>
+      json({
+        workspaceId: "workspace-post-resume-reopen-race",
+        sessionId: "session-post-resume-reopen-race",
+        status: "idle",
+        canceledQueuedMessages: 1,
+      }),
+  });
+  const chat = fakeCtx("resume", { threadId: 783 });
+  let reopenCalls = 0;
+  let closeCalls = 0;
+  let topicOpen = false;
+  let releaseDelayedReopen!: () => void;
+  const delayedReopen = new Promise<void>((resolve) => {
+    releaseDelayedReopen = resolve;
+  });
+  let signalDelayedReopen!: () => void;
+  const delayedReopenStarted = new Promise<void>((resolve) => {
+    signalDelayedReopen = resolve;
+  });
+  chat.ctx.telegram.reopenForumTopic = async () => {
+    reopenCalls += 1;
+    if (reopenCalls === 2) {
+      signalDelayedReopen();
+      await delayedReopen;
+    }
+    topicOpen = true;
+  };
+  chat.ctx.telegram.editForumTopic = async () => true;
+  chat.ctx.telegram.closeForumTopic = async () => {
+    closeCalls += 1;
+    if (closeCalls === 2) {
+      throw new Error("Telegram close temporarily unavailable");
+    }
+    topicOpen = false;
+  };
+
+  const resumedSend = sendMessageToWorkspace(
+    chat.ctx,
+    getWorkspace(tracked.id)!,
+    "Resume, unless Stop wins"
+  );
+  await delayedReopenStarted;
+
+  const stop = fakeCtx(`/stop ${tracked.id}`, { threadId: 783 });
+  stop.ctx.telegram = chat.ctx.telegram;
+  await handleStop(stop.ctx);
+  const terminalNotices = getPendingCloudNotices(tracked.id).filter(
+    (notice) => notice.kind === "stop_confirmed"
+  );
+  assert.equal(terminalNotices.length, 1);
+  await finalizeWorkspaceTopicForCloudNotices(
+    chat.ctx.telegram,
+    getWorkspace(tracked.id)!,
+    terminalNotices.map((notice) => notice.kind)
+  );
+  for (const notice of terminalNotices) {
+    assert.equal(acknowledgePendingCloudNotice(tracked.id, notice.id), true);
+  }
+  assert.equal(topicOpen, false, "terminal publication closes the topic");
+
+  releaseDelayedReopen();
+  await resumedSend;
+
+  assert.equal(reopenCalls, 2);
+  assert.equal(closeCalls, 2, "the stale reopen attempts a compensating close");
+  assert.equal(topicOpen, true, "the transient close failure is observable");
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "topic_reconcile"
+    ),
+    "a durable marker survives the failed compensation"
+  );
+
+  assert.equal(
+    await reconcilePendingWorkspaceTopicState(chat.ctx.telegram, tracked.id),
+    "completed"
+  );
+  assert.equal(closeCalls, 3, "the poller retry closes the topic");
+  assert.equal(topicOpen, false);
+  assert.equal(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "topic_reconcile"
+    ),
+    false
+  );
+  assert.equal(getWorkspace(tracked.id)?.status, "stopped");
+  assert.ok(
+    calls.includes("POST /v0/sessions/session-post-resume-reopen-race/messages")
+  );
+  assert.ok(
+    calls.includes("POST /v0/sessions/session-post-resume-reopen-race/cancel")
+  );
+});
+
+test("a failed post-send reopen remains durable until a retry succeeds", async () => {
+  const tracked = trackLocalWorkspace(
+    "resume-retry-city",
+    path.join(TEMP_DIR, "resume-retry-repo"),
+    "Retry the topic reopen"
+  );
+  updateWorkspaceConductorName(tracked.id, "resume-retry-cloud-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-resume-retry",
+    sessionId: "session-resume-retry",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceThreadId(tracked.id, 784);
+  updateWorkspaceStatus(tracked.id, "stopped");
+  stubFetch({
+    "GET /v0/sessions/session-resume-retry": () =>
+      json({
+        id: "session-resume-retry",
+        deepLink:
+          "conductor://workspace/workspace-resume-retry/session/session-resume-retry",
+        name: "Resume retry",
+        model: "gpt-5.5",
+        resolvedModel: "gpt-5.5",
+        archivedAt: null,
+      }),
+    "GET /v0/sessions/session-resume-retry/status": () =>
+      json({
+        workspaceId: "workspace-resume-retry",
+        sessionId: "session-resume-retry",
+        status: "idle",
+        updatedAt: "2026-08-30T00:00:00.000Z",
+      }),
+    "GET /v0/sessions/session-resume-retry/messages": () =>
+      json({ data: [], offset: 0, hasMore: false }),
+    "POST /v0/sessions/session-resume-retry/messages": (init) => {
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "queued" }, 201);
+    },
+  });
+  const chat = fakeCtx("resume", { threadId: 784 });
+  let reopenCalls = 0;
+  let topicOpen = false;
+  chat.ctx.telegram.reopenForumTopic = async () => {
+    reopenCalls += 1;
+    if (reopenCalls <= 2) {
+      throw new Error("Telegram reopen temporarily unavailable");
+    }
+    topicOpen = true;
+  };
+  chat.ctx.telegram.editForumTopic = async () => true;
+
+  await sendMessageToWorkspace(
+    chat.ctx,
+    getWorkspace(tracked.id)!,
+    "Resume with durable topic repair"
+  );
+
+  assert.equal(reopenCalls, 2);
+  assert.equal(topicOpen, false);
+  assert.equal(getWorkspace(tracked.id)?.status, "running");
+  assert.ok(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "topic_reconcile"
+    )
+  );
+
+  assert.equal(
+    await reconcilePendingWorkspaceTopicState(chat.ctx.telegram, tracked.id),
+    "completed"
+  );
+  assert.equal(reopenCalls, 3);
+  assert.equal(topicOpen, true);
+  assert.equal(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "topic_reconcile"
+    ),
+    false
+  );
+});
+
+test("concurrent topic repairs serialize and retire only the newest marker", async () => {
+  const tracked = trackLocalWorkspace(
+    "serialized-topic-repair-city",
+    path.join(TEMP_DIR, "serialized-topic-repair-repo"),
+    "Serialize topic repair"
+  );
+  updateWorkspaceConductorName(tracked.id, "serialized-topic-repair-cloud-city");
+  updateWorkspaceThreadId(tracked.id, 786);
+  updateWorkspaceStatus(tracked.id, "running");
+  requestWorkspaceTopicReconciliation(tracked.id);
+
+  let releaseFirst!: () => void;
+  const firstReleased = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let signalFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    signalFirstStarted = resolve;
+  });
+  let reopenCalls = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const telegram = fakeCtx("repair", { threadId: 786 }).ctx.telegram;
+  telegram.reopenForumTopic = async () => {
+    reopenCalls += 1;
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    if (reopenCalls === 1) {
+      signalFirstStarted();
+      await firstReleased;
+    }
+    inFlight -= 1;
+  };
+  telegram.editForumTopic = async () => true;
+
+  const first = reconcilePendingWorkspaceTopicState(telegram, tracked.id);
+  await firstStarted;
+  requestWorkspaceTopicReconciliation(tracked.id);
+  const second = reconcilePendingWorkspaceTopicState(telegram, tracked.id);
+  releaseFirst();
+
+  assert.deepEqual(await Promise.all([first, second]), ["completed", "none"]);
+  assert.equal(reopenCalls, 2, "the superseding marker receives a fresh state pass");
+  assert.equal(maxInFlight, 1, "Telegram topic mutations are serialized per workspace");
+  assert.equal(
+    getPendingCloudNotices(tracked.id).some(
+      (notice) => notice.kind === "topic_reconcile"
+    ),
+    false
+  );
+});
+
 test("a workspace-identity mismatch retires the stop rather than self-trapping", async () => {
   const tracked = trackLocalWorkspace(
     "mismatch-stop-city",
@@ -3188,6 +4721,15 @@ test("a work lease orphaned by a crash expires instead of retiring the workspace
 
   // One older than any legitimate hold must not block the workspace forever.
   writeLease(30 * 60_000);
+  enqueuePendingCloudMessage(tracked.id, {
+    requestId: "request-after-orphan-lease",
+    sessionId: "session-orphan-lease",
+    messageId: "message-after-orphan-lease",
+    prompt: "Recover after the crashed sender",
+    createdAt: new Date().toISOString(),
+  });
+  assert.equal(getPendingCloudMessages(tracked.id).length, 1);
+  clearPendingCloudMessages(tracked.id);
   assert.ok(beginCloudWorkLease(tracked.id, "workspace-orphan-lease"));
 });
 
@@ -3210,6 +4752,35 @@ test("recovery notices stay bounded when Telegram never accepts them", () => {
   // The newest are the ones worth replaying, so the oldest are dropped.
   assert.match(notices.at(-1)?.error ?? "", /failure 59/);
   assert.match(notices[0]?.error ?? "", /failure 10/);
+});
+
+test("a topic-repair marker survives a bounded recovery-notice flood", () => {
+  const tracked = trackLocalWorkspace(
+    "topic-repair-flood-city",
+    path.join(TEMP_DIR, "topic-repair-flood-repo"),
+    "A topic repair must outlive visible recovery notices"
+  );
+  const repair = requestWorkspaceTopicReconciliation(tracked.id);
+  for (let index = 0; index < 60; index += 1) {
+    enqueuePendingCloudNotice(tracked.id, {
+      kind: "messages_failed",
+      count: 1,
+      error: `failure ${index}`,
+    });
+  }
+  const notices = getPendingCloudNotices(tracked.id);
+  const visibleNotices = notices.filter(
+    (notice) => notice.kind !== "topic_reconcile"
+  );
+
+  assert.equal(notices.length, 50);
+  assert.equal(
+    notices.find((notice) => notice.kind === "topic_reconcile")?.id,
+    repair.id
+  );
+  assert.equal(visibleNotices.length, 49);
+  assert.match(visibleNotices[0]?.error ?? "", /failure 11/);
+  assert.match(visibleNotices.at(-1)?.error ?? "", /failure 59/);
 });
 
 test("a rebound workspace row cannot mark an older launch prompt sent", () => {
@@ -3279,6 +4850,101 @@ test("a rebound workspace row cannot mark an older launch prompt sent", () => {
       "message-rebound",
       "workspace-rebound",
       "session-rebound-old"
+    ),
+    false
+  );
+});
+
+test("stop force-cancels an outbox POST whose acceptance receipt was malformed", async () => {
+  const tracked = trackLocalWorkspace(
+    "stop-uncertain-outbox-city",
+    path.join(TEMP_DIR, "stop-uncertain-outbox-repo"),
+    "Fence an ambiguously accepted request"
+  );
+  updateWorkspaceConductorName(
+    tracked.id,
+    "stop-uncertain-outbox-cloud-city"
+  );
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-stop-uncertain-outbox",
+    sessionId: "session-stop-uncertain-outbox",
+    backendKind: "cloud-api",
+  });
+  updateWorkspaceStatus(tracked.id, "running");
+  enqueuePendingCloudMessage(tracked.id, {
+    requestId: "request-stop-uncertain-outbox",
+    sessionId: "session-stop-uncertain-outbox",
+    messageId: "message-stop-uncertain-outbox",
+    prompt: "The server may already have accepted this",
+    createdAt: "2026-08-29T00:00:00.000Z",
+  });
+
+  const calls = stubFetch({
+    "GET /v0/messages/message-stop-uncertain-outbox": () =>
+      json({ userMessage: "not found" }, 404),
+    "POST /v0/sessions/session-stop-uncertain-outbox/messages": (init) => {
+      const body = JSON.parse(String(init.body));
+      return json({ messageId: body.messageId, state: "unknown" }, 201);
+    },
+    "GET /v0/sessions/session-stop-uncertain-outbox/status": () =>
+      json({
+        workspaceId: "workspace-stop-uncertain-outbox",
+        sessionId: "session-stop-uncertain-outbox",
+        status: "idle",
+        updatedAt: "2026-08-29T00:00:00.000Z",
+      }),
+    "POST /v0/sessions/session-stop-uncertain-outbox/cancel": () =>
+      json({
+        workspaceId: "workspace-stop-uncertain-outbox",
+        sessionId: "session-stop-uncertain-outbox",
+        status: "idle",
+        canceledQueuedMessages: 1,
+      }),
+  });
+
+  assert.equal(
+    (
+      await reconcilePendingCloudMessages(
+        tracked.id,
+        getWorkspace(tracked.id)!
+      )
+    ).status,
+    "pending"
+  );
+  assert.equal(getPendingCloudMessages(tracked.id).length, 1);
+  assert.equal(markPendingCloudLaunchCanceled(tracked.id), true);
+  assert.equal(getPendingCloudTerminalIntent(tracked.id)?.forceCancel, true);
+  assert.equal(
+    (await reconcilePendingCloudTerminalIntent(tracked.id)).status,
+    "completed"
+  );
+  assert.ok(
+    calls.includes(
+      "POST /v0/sessions/session-stop-uncertain-outbox/cancel"
+    )
+  );
+});
+
+test("local visibility retirement never manufactures a remote archive intent", () => {
+  const tracked = trackLocalWorkspace(
+    "hidden-cloud-city",
+    path.join(TEMP_DIR, "hidden-cloud-repo"),
+    "Observe an externally hidden Cloud session"
+  );
+  updateWorkspaceConductorName(tracked.id, "hidden-cloud-remote-city");
+  updateWorkspaceConductorBinding(tracked.id, {
+    workspaceId: "workspace-hidden-cloud",
+    sessionId: "session-hidden-cloud",
+    backendKind: "cloud-api",
+  });
+
+  archiveWorkspaceLocally(tracked.id);
+
+  assert.equal(getWorkspace(tracked.id)?.status, "archived");
+  assert.equal(getPendingCloudTerminalIntent(tracked.id), null);
+  assert.equal(
+    getWorkspacesWithPendingCloudWork().some(
+      (workspace) => workspace.id === tracked.id
     ),
     false
   );

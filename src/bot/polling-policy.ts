@@ -186,6 +186,11 @@ export function shouldPollTrackedWorkspace(input: {
   return input.status !== "archived";
 }
 
+/** Keep Cloud recovery API calls off the five-second local polling loop. */
+export function shouldReconcilePendingCloudWork(cloudOnly: boolean): boolean {
+  return cloudOnly;
+}
+
 /**
  * Caps the per-tick request fan-out at the beta Conductor API.
  *
@@ -245,6 +250,51 @@ export function chunkTelegramHtmlEntries<T extends { html: string }>(
   }
   if (current.length > 0) chunks.push(current);
   return chunks;
+}
+
+/**
+ * Publish a durable notice backlog without closing its topic mid-stream.
+ *
+ * Terminal notices stay unacknowledged until every chunk has reached Telegram
+ * and topic finalization succeeds. Nonterminal notices can be retired as each
+ * chunk lands, so a later retry does not duplicate the whole backlog.
+ */
+export async function publishCloudNoticeChunks<
+  K,
+  T extends { noticeKind: K; noticeIds: readonly string[] },
+>(
+  chunks: readonly (readonly T[])[],
+  options: {
+    publish: (chunk: readonly T[], index: number) => Promise<boolean>;
+    isTerminal: (kind: K) => boolean;
+    finalize: (kinds: readonly K[]) => Promise<void>;
+    acknowledge: (noticeId: string) => void;
+  }
+): Promise<boolean> {
+  const terminalKinds: K[] = [];
+  const terminalNoticeIds: string[] = [];
+
+  for (const [index, chunk] of chunks.entries()) {
+    if (!(await options.publish(chunk, index))) return false;
+    for (const entry of chunk) {
+      if (options.isTerminal(entry.noticeKind)) {
+        terminalKinds.push(entry.noticeKind);
+        terminalNoticeIds.push(...entry.noticeIds);
+      } else {
+        for (const noticeId of entry.noticeIds) {
+          options.acknowledge(noticeId);
+        }
+      }
+    }
+  }
+
+  if (terminalKinds.length > 0) {
+    await options.finalize(terminalKinds);
+    for (const noticeId of terminalNoticeIds) {
+      options.acknowledge(noticeId);
+    }
+  }
+  return true;
 }
 
 export async function mapWithConcurrency<T, R>(
