@@ -44,6 +44,7 @@ src/
 │   ├── index.ts       # Bot init, polling loops, message forwarding
 │   ├── commands.ts    # All command and callback handlers
 │   ├── launcher.ts    # Agent spawning and session management
+│   ├── polling-policy.ts  # Cloud recovery scheduling and notice publication
 │   ├── middleware.ts  # Authentication guard
 │   ├── format.ts      # Markdown→HTML, styled buttons, escaping
 │   ├── forum.ts       # Forum topic lifecycle
@@ -233,6 +234,8 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `decisions` | Questions posed to the operator with answers |
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
 | `thread_cursors` | Per-Conductor-session forwarding cursors for thread fan-out |
+| `bot_heartbeat` | Process liveness, boot count, and last exit details |
+| `meta` | Durable Cloud launches, ordered messages, stop/archive intents, work leases, and recovery notices |
 | `pr_records` | GitHub PR/check/merge state verified by repo + branch |
 | `merge_intents` | Expiring requester-bound confirmations for an exact PR head SHA |
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
