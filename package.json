@@ -24,7 +24,7 @@
   "dependencies": {
     "@clack/prompts": "^0.10.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^12.11.1",
     "telegraf": "^4.16.3",
     "zod": "^3.24.2"
   },
