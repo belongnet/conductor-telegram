@@ -140,6 +140,8 @@ const IdentitySchema = z.object({
   apiKey: z.object({ id: IdSchema }).optional(),
 });
 
+export type ConductorApiAgent = "claude" | "codex" | "cursor";
+
 export type ConductorApiMessage = z.infer<typeof ApiMessageSchema>;
 export type ConductorApiSession = z.infer<typeof SessionSchema>;
 export type ConductorApiWorkspace = z.infer<typeof WorkspaceSchema>;
@@ -435,7 +437,7 @@ export class ConductorApiClient {
   createSession(input: {
     workspaceId: string;
     name?: string;
-    agent: "claude" | "codex";
+    agent: ConductorApiAgent;
     model?: string;
     effort?: string;
     fastMode?: boolean;
@@ -455,7 +457,7 @@ export class ConductorApiClient {
         branch?: string;
         name?: string;
         sessionName?: string;
-        agent?: "claude" | "codex";
+        agent?: ConductorApiAgent;
         model?: string;
         effort?: string;
         env?: Record<string, string>;
@@ -465,7 +467,7 @@ export class ConductorApiClient {
         branch?: string;
         name?: string;
         sessionName?: string;
-        agent?: "claude" | "codex";
+        agent?: ConductorApiAgent;
         model?: string;
         effort?: string;
         env?: Record<string, string>;
@@ -544,6 +546,31 @@ export class ConductorApiClient {
         }),
       WorkspacePageSchema,
       "workspace"
+    );
+  }
+
+  /**
+   * Org-wide workspace listing. `mine` and `name` are forwarded as query
+   * filters when the API supports them; callers still filter by name prefix.
+   */
+  listWorkspaces(
+    options: {
+      mine?: boolean;
+      name?: string;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<ConductorApiWorkspace[]> {
+    return this.walkPages(
+      (offset) =>
+        withQuery("/v0/workspaces", {
+          limit: PAGE_SIZE,
+          offset,
+          mine: options.mine === true ? "true" : undefined,
+          name: options.name?.trim() || undefined,
+        }),
+      WorkspacePageSchema,
+      "workspace",
+      { signal: options.signal }
     );
   }
 

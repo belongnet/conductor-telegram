@@ -13,6 +13,7 @@ import {
   getLogger,
 } from "./supervisor.js";
 import { initHeartbeat } from "../store/queries.js";
+import { startLanesScheduler } from "../lanes/scheduler.js";
 import {
   runStartupMaintenance,
   startMaintenanceTimer,
@@ -446,6 +447,7 @@ function isDeletedThreadError(err: any): boolean {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let cloudPollTimer: ReturnType<typeof setInterval> | null = null;
+let lanesSchedulerStop: (() => void) | null = null;
 
 function startSessionPoller(): void {
   pollTimer = supervisedInterval(
@@ -1545,6 +1547,7 @@ async function main(): Promise<void> {
   installCrashHandlers(() => {
     heartbeat.stop();
     maintenance.stop();
+    lanesSchedulerStop?.();
     if (pollTimer) clearInterval(pollTimer);
     if (cloudPollTimer) clearInterval(cloudPollTimer);
     if (eventPollTimer) clearInterval(eventPollTimer);
@@ -1576,6 +1579,14 @@ async function main(): Promise<void> {
 
   startSessionPoller();
   startEventPoller();
+  const lanes = startLanesScheduler({
+    notify: async (text) => {
+      const ownerChatId = getOwnerChatId();
+      if (!ownerChatId || ownerChatId === "0") return;
+      await bot.telegram.sendMessage(ownerChatId, text);
+    },
+  });
+  lanesSchedulerStop = lanes.stop;
   lifecycleLog.info(
     `connected · polling every ${POLL_INTERVAL_MS / 1000}s · v${BOT_VERSION ?? "?"} · pid ${process.pid} · boot #${bootCount}`
   );

@@ -3459,3 +3459,112 @@ export function recordExitReason(reason: string): void {
     "UPDATE bot_heartbeat SET last_exit_reason = ? WHERE id = 1"
   ).run(reason);
 }
+
+// ── Lanes scheduler ──────────────────────────────────────────
+
+const LANES_PAUSED_KEY = "lanes_paused";
+const LANES_LAST_TICK_KEY = "lanes_last_tick_at";
+
+export type LaneActionKind =
+  | "create"
+  | "nudge"
+  | "create_failed"
+  | "nudge_failed"
+  | "create_refused";
+
+export interface LaneActionRecord {
+  id: number;
+  laneId: string;
+  provider: string;
+  action: LaneActionKind;
+  detail: string | null;
+  createdAt: string;
+}
+
+export function isLanesPaused(): boolean {
+  return getMetaValue(LANES_PAUSED_KEY) === "1";
+}
+
+export function setLanesPaused(paused: boolean): void {
+  setMetaValue(LANES_PAUSED_KEY, paused ? "1" : "0");
+}
+
+export function getLanesLastTickAt(): string | null {
+  return getMetaValue(LANES_LAST_TICK_KEY);
+}
+
+export function setLanesLastTickAt(iso: string): void {
+  setMetaValue(LANES_LAST_TICK_KEY, iso);
+}
+
+export function recordLaneAction(input: {
+  laneId: string;
+  provider: string;
+  action: LaneActionKind;
+  detail?: string | null;
+}): LaneActionRecord {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      `INSERT INTO lane_actions (lane_id, provider, action, detail, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .run(input.laneId, input.provider, input.action, input.detail ?? null, now);
+  return {
+    id: Number(result.lastInsertRowid),
+    laneId: input.laneId,
+    provider: input.provider,
+    action: input.action,
+    detail: input.detail ?? null,
+    createdAt: now,
+  };
+}
+
+export function getLatestLaneAction(laneId: string): LaneActionRecord | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT * FROM lane_actions WHERE lane_id = ? ORDER BY id DESC LIMIT 1`
+    )
+    .get(laneId) as
+    | {
+        id: number;
+        lane_id: string;
+        provider: string;
+        action: LaneActionKind;
+        detail: string | null;
+        created_at: string;
+      }
+    | undefined;
+  return row ? mapLaneActionRow(row) : null;
+}
+
+export function getLatestLaneActions(
+  laneIds: readonly string[]
+): Map<string, LaneActionRecord> {
+  const result = new Map<string, LaneActionRecord>();
+  for (const laneId of laneIds) {
+    const action = getLatestLaneAction(laneId);
+    if (action) result.set(laneId, action);
+  }
+  return result;
+}
+
+function mapLaneActionRow(row: {
+  id: number;
+  lane_id: string;
+  provider: string;
+  action: LaneActionKind;
+  detail: string | null;
+  created_at: string;
+}): LaneActionRecord {
+  return {
+    id: row.id,
+    laneId: row.lane_id,
+    provider: row.provider,
+    action: row.action,
+    detail: row.detail,
+    createdAt: row.created_at,
+  };
+}

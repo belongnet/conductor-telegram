@@ -1,0 +1,309 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  decideLaneActions,
+  deriveLaneRuntimeState,
+  laneWorkspaceName,
+  parseLaneWorkspaceName,
+  type LaneSnapshot,
+  type ProviderLimits,
+} from "../src/lanes/decide.js";
+
+const NOW = new Date("2026-09-01T12:00:00.000Z");
+const OLD_USER = "2026-09-01T06:00:00.000Z"; // 6h ago
+const RECENT_USER = "2026-09-01T11:30:00.000Z"; // 30m ago
+
+const PROVIDERS: ProviderLimits[] = [
+  { name: "primary", gapHours: 4.5, maxActive: 1 },
+  { name: "secondary", gapHours: 4.5, maxActive: 1 },
+];
+
+function lane(overrides: Partial<LaneSnapshot> & Pick<LaneSnapshot, "id">): LaneSnapshot {
+  return {
+    provider: "primary",
+    assignedProvider: "primary",
+    state: "not_created",
+    lastUserMessageAt: null,
+    after: [],
+    ...overrides,
+  };
+}
+
+test("busy provider takes no action while at maxActive", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "working",
+        lastUserMessageAt: OLD_USER,
+      }),
+      lane({
+        id: "L2",
+        state: "paused",
+        lastUserMessageAt: OLD_USER,
+      }),
+      lane({
+        id: "L3",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+
+  assert.deepEqual(
+    actions.filter((action) => action.provider === "primary"),
+    []
+  );
+});
+
+test("paused lane is not nudged until gapHours have passed", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "paused",
+        lastUserMessageAt: RECENT_USER,
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, []);
+});
+
+test("a lane whose dependency is not done is neither created nor nudged", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "initializing",
+        lastUserMessageAt: null,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+        after: ["L1"],
+      }),
+      lane({
+        id: "L3",
+        provider: "any",
+        assignedProvider: null,
+        state: "paused",
+        lastUserMessageAt: OLD_USER,
+        after: ["L1"],
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, []);
+});
+
+test("an initializing lane is never nudged", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "initializing",
+        lastUserMessageAt: null,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L2", provider: "primary" },
+  ]);
+});
+
+test("a done lane is not nudged and does not occupy a provider slot", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "done",
+        lastUserMessageAt: OLD_USER,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L2", provider: "primary" },
+  ]);
+});
+
+test("any-provider lanes are created by the first provider with a free slot", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        provider: "any",
+        assignedProvider: null,
+        state: "not_created",
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L1", provider: "primary" },
+  ]);
+});
+
+test("failed create moves on to the next eligible lane", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    failedLaneIds: new Set(["L1"]),
+    lanes: [
+      lane({
+        id: "L1",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L2", provider: "primary" },
+  ]);
+});
+
+test("global pause suppresses every action", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: true,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "paused",
+        lastUserMessageAt: OLD_USER,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
+test("nudge is preferred over create when both are eligible", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "paused",
+        lastUserMessageAt: OLD_USER,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, [
+    { type: "nudge", laneId: "L1", provider: "primary" },
+  ]);
+});
+
+test("deriveLaneRuntimeState: working, done, initializing, paused, not created", () => {
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: false,
+      sessionStatus: null,
+      messages: [],
+    }).state,
+    "not_created"
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [],
+    }).state,
+    "initializing"
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "working",
+      messages: [
+        {
+          type: "user",
+          content: "go",
+          receivedAt: OLD_USER,
+        },
+      ],
+    }).state,
+    "working"
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "user", content: "go", receivedAt: OLD_USER },
+        {
+          type: "assistant",
+          content: "Opened https://github.com/example-org/example-repo/pull/12",
+          receivedAt: NOW.toISOString(),
+        },
+      ],
+    }).state,
+    "done"
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "user", content: "go", receivedAt: OLD_USER },
+        { type: "assistant", content: "still working", receivedAt: NOW.toISOString() },
+      ],
+    }).state,
+    "paused"
+  );
+});
+
+test("workspace names encode lane id and provider", () => {
+  const name = laneWorkspaceName("L1", "primary", "Example task");
+  assert.equal(name, "[lane:L1:primary] Example task");
+  assert.deepEqual(parseLaneWorkspaceName(name), {
+    laneId: "L1",
+    provider: "primary",
+  });
+});

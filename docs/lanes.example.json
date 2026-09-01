@@ -1,0 +1,44 @@
+{
+  "intervalMinutes": 30,
+  "providers": {
+    "primary": {
+      "agent": "claude",
+      "model": "claude-example-model",
+      "effort": "high",
+      "gapHours": 4.5,
+      "maxActive": 1
+    },
+    "secondary": {
+      "agent": "codex",
+      "model": "codex-example-model",
+      "effort": "high",
+      "gapHours": 4.5,
+      "maxActive": 1
+    },
+    "cursor": {
+      "agent": "cursor",
+      "model": "cursor-example-model",
+      "effort": "high",
+      "gapHours": 4.5,
+      "maxActive": 1
+    }
+  },
+  "lanes": [
+    {
+      "id": "L1",
+      "title": "Example first lane",
+      "provider": "primary",
+      "repoUrl": "https://github.com/example-org/example-repo",
+      "prompt": "prompts/l1.md",
+      "after": []
+    },
+    {
+      "id": "L2",
+      "title": "Example second lane",
+      "provider": "any",
+      "repoUrl": "https://github.com/example-org/example-repo",
+      "prompt": "prompts/l2.md",
+      "after": ["L1"]
+    }
+  ]
+}

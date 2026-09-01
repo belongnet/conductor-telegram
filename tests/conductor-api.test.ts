@@ -448,6 +448,71 @@ test("sql queries post the query and parse the row envelope", async () => {
   assert.equal(result.rows[0].workspace_name, "api-fix");
 });
 
+test("org workspace listing forwards mine and name filters", async () => {
+  const urls: string[] = [];
+  const fetcher = (async (url: string | URL | Request) => {
+    urls.push(String(url));
+    return new Response(
+      JSON.stringify({
+        data: [
+          {
+            id: "workspace-1",
+            name: "[lane:L1:primary] Example first lane",
+            createdAt: "2026-09-01T00:00:00.000Z",
+            deepLink: "https://conductor.build/workspace-1",
+          },
+        ],
+        offset: 0,
+        hasMore: false,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const workspaces = await client.listWorkspaces({
+    mine: true,
+    name: "[lane:L1:",
+  });
+
+  assert.equal(workspaces[0]?.id, "workspace-1");
+  assert.equal(new URL(urls[0]).pathname, "/v0/workspaces");
+  assert.equal(new URL(urls[0]).searchParams.get("mine"), "true");
+  assert.equal(new URL(urls[0]).searchParams.get("name"), "[lane:L1:");
+});
+
+test("workspace create accepts the cursor agent", async () => {
+  const bodies: unknown[] = [];
+  const fetcher = (async (_url: string | URL | Request, init: RequestInit = {}) => {
+    bodies.push(init.body ? JSON.parse(String(init.body)) : null);
+    return new Response(
+      JSON.stringify({
+        workspaceId: "workspace-1",
+        sessionId: "session-1",
+        deepLink: "https://conductor.build/workspace-1",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  await client.createWorkspace({
+    repositoryUrl: "https://github.com/example-org/example-repo",
+    name: "[lane:L1:cursor] Example first lane",
+    agent: "cursor",
+    model: "cursor-example-model",
+    effort: "high",
+  });
+
+  assert.deepEqual(bodies[0], {
+    repositoryUrl: "https://github.com/example-org/example-repo",
+    name: "[lane:L1:cursor] Example first lane",
+    agent: "cursor",
+    model: "cursor-example-model",
+    effort: "high",
+  });
+});
+
 test("project workspace listing paginates against the project path", async () => {
   const urls: string[] = [];
   const workspace = (id: string, name: string) => ({

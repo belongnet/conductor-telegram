@@ -75,8 +75,15 @@ import {
   persistPendingCloudLaunch,
   touchRepoTopic,
   upsertRepoTopic,
+  isLanesPaused,
+  setLanesPaused,
   type PendingCloudLaunch,
 } from "../store/queries.js";
+import {
+  collectLaneStatuses,
+  runLanesTick,
+  type LaneStatusRow,
+} from "../lanes/scheduler.js";
 import {
   createWorkspaceTopic,
   createRepoTopic,
@@ -366,6 +373,7 @@ const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "cloud", description: "Start a ☁️ cloud workspace via the Conductor API" },
   { command: "projects", description: "List ☁️ cloud projects and workspaces" },
   { command: "fleet", description: "☁️ cloud activity report (last 24h)" },
+  { command: "lanes", description: "Config-driven lane scheduler status" },
   { command: "rename", description: "Rename a ☁️ cloud workspace" },
   { command: "renamethread", description: "Rename a ☁️ cloud thread" },
   { command: "review", description: "Start a review session for a workspace" },
@@ -808,6 +816,7 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.command("cloud", handleCloud);
   bot.command("projects", handleProjects);
   bot.command("fleet", handleFleet);
+  bot.command("lanes", handleLanes);
   bot.command("rename", handleRename);
   bot.command("renamethread", handleRenameThread);
   bot.command("workspaces", handleWorkspaces);
@@ -2129,6 +2138,92 @@ export async function handleFleet(ctx: Context): Promise<void> {
   await ctx.reply(
     truncateHtml(
       `☁️ <b>Cloud activity — last ${hours}h</b>\n${entries.length} workspace(s), ${result.rowCount} active thread(s)\n\n${lines.join("\n")}${overflow}${truncatedNote}`,
+      TELEGRAM_MAX_TEXT
+    ),
+    { parse_mode: "HTML" }
+  );
+}
+
+// ── /lanes ──────────────────────────────────────────────────
+
+function formatLaneStatusTable(statuses: LaneStatusRow[], paused: boolean): string {
+  if (statuses.length === 0) {
+    return "No lanes in the current config.";
+  }
+  const lines = statuses.map((row) => {
+    const provider = row.assignedProvider
+      ? `${row.provider === "any" ? "any/" : ""}${row.assignedProvider}`
+      : row.provider;
+    const last = row.lastAction
+      ? `${row.lastAction.action} ${formatRelativeTime(row.lastAction.createdAt)}`
+      : "—";
+    return `<code>${escHtml(row.id)}</code> · ${escHtml(provider)} · ${escHtml(row.state)} · ${escHtml(last)}`;
+  });
+  const pauseNote = paused ? "\n\nPaused. /lanes resume to continue." : "";
+  return `<b>Lanes</b>\n\n${lines.join("\n")}${pauseNote}`;
+}
+
+/** @internal exported for lanes command unit tests; not part of the public bot API. */
+export async function handleLanes(ctx: Context): Promise<void> {
+  const text = (ctx.message as any)?.text ?? "";
+  const arg = stripCommandPrefix(text, "lanes").toLowerCase();
+
+  if (arg && !["run", "pause", "resume"].includes(arg)) {
+    await ctx.reply(
+      "Usage: /lanes — status\n/lanes run — tick now\n/lanes pause — stop scheduling\n/lanes resume — continue scheduling"
+    );
+    return;
+  }
+
+  if (arg === "pause") {
+    setLanesPaused(true);
+    await ctx.reply("Lanes scheduler paused.");
+    return;
+  }
+  if (arg === "resume") {
+    setLanesPaused(false);
+    await ctx.reply("Lanes scheduler resumed.");
+    return;
+  }
+
+  if (arg === "run") {
+    const result = await runLanesTick({
+      notify: async (notice) => {
+        await ctx.reply(notice);
+      },
+      force: true,
+    });
+    if (result.skipped && result.reason) {
+      await ctx.reply(result.reason);
+      if (result.statuses.length > 0) {
+        await ctx.reply(
+          truncateHtml(
+            formatLaneStatusTable(result.statuses, isLanesPaused()),
+            TELEGRAM_MAX_TEXT
+          ),
+          { parse_mode: "HTML" }
+        );
+      }
+      return;
+    }
+    await ctx.reply(
+      truncateHtml(
+        formatLaneStatusTable(result.statuses, isLanesPaused()),
+        TELEGRAM_MAX_TEXT
+      ),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  const collected = await collectLaneStatuses();
+  if (collected.reason && collected.statuses.length === 0) {
+    await ctx.reply(collected.reason);
+    return;
+  }
+  await ctx.reply(
+    truncateHtml(
+      formatLaneStatusTable(collected.statuses, collected.paused),
       TELEGRAM_MAX_TEXT
     ),
     { parse_mode: "HTML" }
@@ -4012,6 +4107,7 @@ Commands:
 /cloud &lt;project&gt; &lt;prompt&gt; — Start a ☁️ cloud workspace (no Mac needed)
 /projects [name] — List ☁️ cloud projects, or one project's workspaces
 /fleet [hours] — ☁️ org-wide cloud activity report
+/lanes — Lane scheduler status; /lanes run, pause, resume
 /rename &lt;name&gt; — Rename the current ☁️ cloud workspace
 /renamethread &lt;name&gt; — Rename the current ☁️ cloud thread
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent
