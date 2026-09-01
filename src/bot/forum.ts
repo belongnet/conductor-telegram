@@ -1,9 +1,17 @@
 import path from "node:path";
 import type { Telegram } from "telegraf";
 import {
+  acknowledgePendingCloudNotice,
   getLatestEventByType,
+  getPendingCloudLaunch,
+  getPendingCloudNotices,
+  getPendingCloudTerminalIntent,
   getPendingDecision,
+  getWorkspace,
+  requestWorkspaceTopicReconciliation,
   updateWorkspaceThreadId,
+  cloudNoticeFinalizesWorkspaceTopic,
+  type PendingCloudNoticeKind,
 } from "../store/queries.js";
 import type {
   ArtifactPayload,
@@ -281,20 +289,7 @@ export async function syncWorkspaceTopic(
   workspace: Workspace
 ): Promise<void> {
   if (!workspace.telegramThreadId) return;
-
-  const extra: { name?: string; icon_custom_emoji_id?: string } = {};
-  if (workspace.conductorWorkspaceName) {
-    extra.name = buildTopicName(
-      path.basename(workspace.repoPath),
-      workspace.conductorWorkspaceName
-    );
-  }
-
-  const iconId = await getTopicIconId(telegram, getWorkspaceTopicState(workspace));
-  if (iconId) {
-    extra.icon_custom_emoji_id = iconId;
-  }
-
+  const extra = await workspaceTopicEdit(telegram, workspace);
   if (!extra.name && !extra.icon_custom_emoji_id) return;
   try {
     await telegram.editForumTopic(
@@ -312,6 +307,25 @@ export async function syncWorkspaceTopic(
       throw err;
     }
   }
+}
+
+async function workspaceTopicEdit(
+  telegram: Telegram,
+  workspace: Workspace
+): Promise<{ name?: string; icon_custom_emoji_id?: string }> {
+  const extra: { name?: string; icon_custom_emoji_id?: string } = {};
+  if (workspace.conductorWorkspaceName) {
+    extra.name = buildTopicName(
+      path.basename(workspace.repoPath),
+      workspace.conductorWorkspaceName
+    );
+  }
+
+  const iconId = await getTopicIconId(telegram, getWorkspaceTopicState(workspace));
+  if (iconId) {
+    extra.icon_custom_emoji_id = iconId;
+  }
+  return extra;
 }
 
 /**
@@ -363,6 +377,59 @@ export async function closeWorkspaceTopic(
   }
 }
 
+/** Apply the terminal topic state, then collapse the forum topic. */
+export async function finalizeWorkspaceTopic(
+  telegram: Telegram,
+  workspace: Workspace
+): Promise<void> {
+  try {
+    await syncWorkspaceTopic(telegram, workspace);
+  } finally {
+    if (workspace.telegramThreadId) {
+      await closeWorkspaceTopic(
+        telegram,
+        workspace.telegramChatId,
+        workspace.telegramThreadId
+      );
+    }
+  }
+}
+
+/** Idempotently apply terminal topic state before recovery notices are acked. */
+export async function finalizeWorkspaceTopicForCloudNotices(
+  telegram: Telegram,
+  workspace: Workspace,
+  kinds: readonly PendingCloudNoticeKind[]
+): Promise<void> {
+  if (!kinds.some(cloudNoticeFinalizesWorkspaceTopic)) return;
+  if (!workspace.telegramThreadId) return;
+  try {
+    const extra = await workspaceTopicEdit(telegram, workspace);
+    if (extra.name || extra.icon_custom_emoji_id) {
+      await telegram.editForumTopic(
+        workspace.telegramChatId,
+        workspace.telegramThreadId,
+        extra
+      );
+    }
+  } catch (error) {
+    // A deleted terminal topic is already beyond "closed". Crucially, do not
+    // recreate it: that would create a new open topic after recovery.
+    if (isTopicAlreadyTerminalError(error)) return;
+    // Keep the topic open when its terminal styling cannot be applied. The
+    // durable notice can then publish and retry the whole finalization later.
+    throw error;
+  }
+  try {
+    await telegram.closeForumTopic(
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  } catch (error) {
+    if (!isTopicAlreadyTerminalError(error)) throw error;
+  }
+}
+
 /**
  * Reopen a previously closed forum topic (e.g. when /send resumes a stopped workspace).
  */
@@ -378,6 +445,176 @@ export async function reopenWorkspaceTopic(
   }
 }
 
+type DurableWorkspaceTopicState = "open" | "deferred_close" | "closed";
+
+function durableWorkspaceTopicState(
+  workspace: Workspace
+): DurableWorkspaceTopicState {
+  if (
+    !workspace.archivedAt &&
+    (workspace.status === "starting" || workspace.status === "running")
+  ) {
+    return "open";
+  }
+  const publicationPending = getPendingCloudNotices(workspace.id).some(
+    (notice) => notice.kind !== "topic_reconcile"
+  );
+  if (
+    publicationPending ||
+    getPendingCloudTerminalIntent(workspace.id) ||
+    getPendingCloudLaunch(workspace.id)
+  ) {
+    return "deferred_close";
+  }
+  return "closed";
+}
+
+function workspaceTopicStateSignature(workspace: Workspace): string {
+  return JSON.stringify([
+    durableWorkspaceTopicState(workspace),
+    workspace.status,
+    workspace.telegramChatId,
+    workspace.telegramThreadId,
+    workspace.conductorWorkspaceName,
+    workspace.repoPath,
+  ]);
+}
+
+function isTopicAlreadyOpenError(err: unknown): boolean {
+  const msg = String((err as { message?: unknown })?.message ?? "").toLowerCase();
+  return (
+    msg.includes("topic_not_modified") ||
+    msg.includes("topic is not closed") ||
+    msg.includes("topic already open") ||
+    msg.includes("topic is already open")
+  );
+}
+
+async function applyDurableWorkspaceTopicState(
+  telegram: Telegram,
+  workspace: Workspace
+): Promise<void> {
+  if (!workspace.telegramThreadId) return;
+  if (durableWorkspaceTopicState(workspace) === "closed") {
+    await finalizeWorkspaceTopicForCloudNotices(telegram, workspace, [
+      "stop_confirmed",
+    ]);
+    return;
+  }
+
+  try {
+    await telegram.reopenForumTopic(
+      workspace.telegramChatId,
+      workspace.telegramThreadId
+    );
+  } catch (error) {
+    if (isTopicDeletedError(error)) {
+      const recreated = await ensureWorkspaceTopic(telegram, workspace);
+      if (!recreated) throw error;
+    } else if (!isTopicAlreadyOpenError(error)) {
+      throw error;
+    }
+  }
+  await syncWorkspaceTopic(telegram, workspace);
+}
+
+export type WorkspaceTopicReconciliationStatus =
+  | "none"
+  | "completed"
+  | "pending";
+
+const pendingWorkspaceTopicReconciliations = new Map<
+  string,
+  Promise<WorkspaceTopicReconciliationStatus>
+>();
+
+/**
+ * Retry an invisible topic-state marker against fresh durable workspace state.
+ * A bounded loop compensates when Stop/Archive or a new resume wins during a
+ * Telegram request; continued churn leaves the marker for the next poll.
+ */
+async function performPendingWorkspaceTopicReconciliation(
+  telegram: Telegram,
+  trackedWorkspaceId: string
+): Promise<WorkspaceTopicReconciliationStatus> {
+  let marker = getPendingCloudNotices(trackedWorkspaceId).find(
+    (notice) => notice.kind === "topic_reconcile"
+  );
+  if (!marker) return "none";
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const workspace = getWorkspace(trackedWorkspaceId);
+    if (!workspace || !workspace.telegramThreadId) {
+      return acknowledgePendingCloudNotice(trackedWorkspaceId, marker.id)
+        ? "completed"
+        : "pending";
+    }
+    const before = workspaceTopicStateSignature(workspace);
+    await applyDurableWorkspaceTopicState(telegram, workspace);
+
+    const latestMarker = getPendingCloudNotices(trackedWorkspaceId).find(
+      (notice) => notice.kind === "topic_reconcile"
+    );
+    const latest = getWorkspace(trackedWorkspaceId);
+    if (!latestMarker) {
+      if (
+        latest &&
+        latest.telegramThreadId &&
+        workspaceTopicStateSignature(latest) !== before
+      ) {
+        marker = requestWorkspaceTopicReconciliation(trackedWorkspaceId);
+        continue;
+      }
+      return "completed";
+    }
+    if (latestMarker.id !== marker.id) {
+      marker = latestMarker;
+      continue;
+    }
+    if (
+      latest &&
+      latest.telegramThreadId &&
+      workspaceTopicStateSignature(latest) === before
+    ) {
+      if (durableWorkspaceTopicState(latest) === "deferred_close") {
+        return "pending";
+      }
+      return acknowledgePendingCloudNotice(trackedWorkspaceId, marker.id)
+        ? "completed"
+        : "pending";
+    }
+  }
+  return "pending";
+}
+
+export function reconcilePendingWorkspaceTopicState(
+  telegram: Telegram,
+  trackedWorkspaceId: string
+): Promise<WorkspaceTopicReconciliationStatus> {
+  const previous = pendingWorkspaceTopicReconciliations.get(trackedWorkspaceId);
+  const afterPrevious = previous
+    ? previous.then(
+        () => undefined,
+        () => undefined
+      )
+    : Promise.resolve();
+  const reconciliation = afterPrevious.then(() =>
+    performPendingWorkspaceTopicReconciliation(telegram, trackedWorkspaceId)
+  );
+  pendingWorkspaceTopicReconciliations.set(
+    trackedWorkspaceId,
+    reconciliation
+  );
+  return reconciliation.finally(() => {
+    if (
+      pendingWorkspaceTopicReconciliations.get(trackedWorkspaceId) ===
+      reconciliation
+    ) {
+      pendingWorkspaceTopicReconciliations.delete(trackedWorkspaceId);
+    }
+  });
+}
+
 function isTopicDeletedError(err: any): boolean {
   const msg = String(err?.message ?? "").toLowerCase();
   return (
@@ -386,6 +623,12 @@ function isTopicDeletedError(err: any): boolean {
     msg.includes("thread not found") ||
     (msg.includes("bad request") && msg.includes("thread"))
   );
+}
+
+function isTopicAlreadyTerminalError(err: unknown): boolean {
+  if (isTopicDeletedError(err)) return true;
+  const msg = String((err as { message?: unknown })?.message ?? "").toLowerCase();
+  return msg.includes("topic_closed") || msg.includes("topic is closed");
 }
 
 /**

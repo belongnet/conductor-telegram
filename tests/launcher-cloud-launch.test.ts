@@ -148,3 +148,71 @@ const SEND_RESPONSE = (json, body) =>
   assert.ok(!calls.includes("POST /v0/sessions/session-1/messages"));
   assert.ok(calls.includes("POST /v0/workspaces/workspace-1/archive"));
 });
+
+test("local recovery reads the newest transcript tail in chronological order", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-local-tail-"));
+  const conductorDb = path.join(dir, "conductor.db");
+  const script = `
+import Database from "better-sqlite3";
+import { getLocalSessionMessagesTail } from "./src/bot/launcher.ts";
+
+const db = new Database(process.env.CONDUCTOR_DB_PATH);
+db.exec(\`
+  CREATE TABLE session_messages (
+    id TEXT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+  )
+\`);
+const insert = db.prepare(
+  "INSERT INTO session_messages (id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)"
+);
+for (let index = 1; index <= 60; index += 1) {
+  insert.run(
+    "message-" + index,
+    "session-tail",
+    index % 2 === 0 ? "assistant" : "user",
+    "entry-" + index,
+    new Date(Date.UTC(2026, 6, 31, 0, 0, index)).toISOString()
+  );
+}
+db.close();
+const messages = getLocalSessionMessagesTail("session-tail", 50);
+console.log(JSON.stringify(messages.map((message) => ({
+  rowid: message.rowid,
+  content: message.content,
+}))));
+`;
+  try {
+    const output = execFileSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", script],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CONDUCTOR_DB_PATH: conductorDb,
+          CONDUCTOR_SETTINGS_PATH: path.join(dir, "no-settings.toml"),
+          DB_PATH: path.join(dir, "bot.db"),
+        },
+      }
+    );
+    const tail = JSON.parse(output.trim()) as Array<{
+      rowid: number;
+      content: string;
+    }>;
+    assert.equal(tail.length, 50);
+    assert.deepEqual(tail[0], { rowid: 11, content: "entry-11" });
+    assert.deepEqual(tail.at(-1), { rowid: 60, content: "entry-60" });
+    assert.deepEqual(
+      tail.map((message) => message.rowid),
+      Array.from({ length: 50 }, (_, index) => index + 11)
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

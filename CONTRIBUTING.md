@@ -21,7 +21,7 @@ The project has three entry points:
 - `src/bot/` — Telegram bot (commands, middleware, formatting)
 - `src/mcp/` — MCP server (report_status, report_artifact, request_human)
 
-Run `npm run dev` to start the CLI in development mode. You'll need a `BOT_TOKEN` from [@BotFather](https://t.me/BotFather) and a running [Conductor](https://conductor.build) instance.
+Run `npm run dev` to start the CLI in development mode. You'll need a `BOT_TOKEN` from [@BotFather](https://t.me/BotFather). Local workspace flows use a [Conductor](https://conductor.build) installation; Cloud-only flows can instead use a configured `CONDUCTOR_API_KEY` while the desktop app is closed or absent.
 
 ## Branching
 

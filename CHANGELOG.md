@@ -4,6 +4,32 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-30
+
+### Added
+- Telegram work now survives losing your local Conductor login. When a prompt fails because the CLI login disappeared, the bot can hand that same workspace to Conductor Cloud and keep going. It rechecks the clean worktree, local commit, and remote branch immediately before delivery, and only takes over before the agent has done any work, so dirty files, unpushed commits, and half-finished prompts are never silently replayed.
+- Stop and Archive now stick. A stop you press during a Cloud API outage is saved and retried after a restart instead of being lost, and the bot tells you when it has been confirmed.
+- Recovered work reports itself. After a restart the bot says what it replayed, what it suppressed, and what could not be delivered, so a recovery is never silent.
+
+### Changed
+- `/run`, repo-topic messages, and AI-routed new tasks go to Conductor Cloud by default when `CONDUCTOR_API_KEY` is set and exactly one Cloud project matches your repository's `origin`. SSH and HTTPS remotes count as the same repository. Anything ambiguous falls back to a local workspace and the bot says why. Automatic routing never guesses from a project name or a remote's basename.
+- A crash mid-launch no longer loses your first prompt. The Cloud binding and prompt are written down before they are sent, and overlapping follow-ups queue in order with stable message identities, so a retry after a crash cannot deliver the same prompt twice.
+- Read-only `/review` runs stay local until the Cloud API can enforce the same permission policy.
+- Legacy Claude login checks now run asynchronously, keeping Telegram and pollers responsive while a launch starts; duplicate starts and Stop are fenced until the check settles.
+
+### Fixed
+- A workspace could go permanently silent after a crash. A send that died mid-flight left a lock nobody released, and every later Cloud message was refused with a message telling you to wait for a Stop that was not running. Stale locks now expire.
+- A stop or archive that could never succeed retried forever and blocked all further work in that workspace. It now gives up, says why, and lets you keep working.
+- A single oversized recovery notice could stall one workspace's updates indefinitely. Long notices are trimmed and delivered instead.
+- Recovery notices could grow without limit while Telegram was unreachable.
+- An older queued prompt can no longer be delivered into a newer thread if a workspace is rebound mid-flight.
+- Stop now remains durable across every affected Cloud thread while a message request is in flight or has an uncertain acceptance receipt. The bot keeps canceling until senders settle or their crash leases expire, then performs a final cancellation so a late accepted prompt cannot run after Stop was confirmed.
+- A slow or unavailable Cloud API no longer stalls the five-second local workspace poller. Cloud recovery runs only on the independent Cloud polling loop.
+- Stop, Archive, and canceled-launch confirmations recovered after a restart now close their Telegram forum topics only after the complete status backlog is published; transient Telegram failures remain durable for retry.
+- Resuming a terminal workspace now repairs its forum topic durably. A racing Stop or Archive cannot leave the topic reopened, and temporary Telegram failures are retried without losing the final open/closed state.
+- Hiding a Cloud thread in Conductor now retires only its local Telegram tracking row instead of accidentally archiving the entire remote workspace.
+- Node 24 installs and test runs no longer crash while SQLite handles are being released; the bundled SQLite driver now uses its Node 24-compatible release line.
+
 ## [0.6.3] - 2026-08-19
 
 ### Fixed

@@ -6,15 +6,22 @@ import {
   CLOUD_OBSERVE_ONLY_HINT,
   formatAttachmentReference,
   getConductorWorkspaceSessions,
+  getLocalSessionMessagesTail,
   getMaxSessionMessageCursor,
+  getSessionMessagesAfter,
   getWorkspaceDir,
   getWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
+  isKnownCliAuthenticationFailure,
   isRemoteConductorWorkspace,
   launchCloudWorkspace,
+  reconcilePendingCloudMessages,
+  reconcilePendingCloudTerminalIntent,
   type CloudWorkspaceLaunchResult,
   launchWorkspace,
   launchWorkspaceSession,
+  resolveRepoRemoteUrl,
+  resolveSafeCloudTakeoverBranch,
   sendToSession,
   stageAttachmentPaths,
   setConductorActiveSession,
@@ -24,6 +31,7 @@ import {
 } from "./launcher.js";
 import {
   archiveWorkspace,
+  acknowledgePendingCloudNotice,
   createWorkspace,
   getActiveWorkspaces,
   getAllWorkspaces,
@@ -33,6 +41,7 @@ import {
   getWorkspaceByThreadId,
   getDecision,
   updateWorkspaceStatus,
+  updateWorkspaceStatusUnlessTerminal,
   updateWorkspaceTelegramMessage,
   updateWorkspaceConductorName,
   updateWorkspaceConductorBinding,
@@ -46,20 +55,33 @@ import {
   updateThreadCursor,
   getPrRecordsForWorkspaces,
   consumeMergeIntent,
+  clearPendingCloudLaunch,
   createMergeIntent,
   getMergeIntent,
   deleteRepoTopic,
+  enqueuePendingCloudMessage,
   getRepoTopic,
   getRepoTopicByThreadId,
   getPendingDecisionsForChat,
+  getPendingCloudNotices,
+  getPendingCloudLaunch,
+  hasPendingCloudTopicFinalizationNotice,
+  requestWorkspaceTopicReconciliation,
+  getPendingCloudMessages,
+  getPendingCloudMessageOutcome,
+  getPendingCloudTerminalIntent,
   recordRouteAttempt,
+  markPendingCloudLaunchCanceled,
+  persistPendingCloudLaunch,
   touchRepoTopic,
   upsertRepoTopic,
+  type PendingCloudLaunch,
 } from "../store/queries.js";
 import {
   createWorkspaceTopic,
   createRepoTopic,
   closeWorkspaceTopic,
+  reconcilePendingWorkspaceTopicState,
   reopenWorkspaceTopic,
   syncWorkspaceTopic,
 } from "./forum.js";
@@ -340,7 +362,7 @@ const WELL_KNOWN_SKILLS: WellKnownSkill[] = [
 
 const TELEGRAM_COMMANDS: TelegramCommandDefinition[] = [
   { command: "setup", description: "Check setup and apply this chat" },
-  { command: "run", description: "Start a new workspace run" },
+  { command: "run", description: "Start a Cloud-first workspace run" },
   { command: "cloud", description: "Start a ☁️ cloud workspace via the Conductor API" },
   { command: "projects", description: "List ☁️ cloud projects and workspaces" },
   { command: "fleet", description: "☁️ cloud activity report (last 24h)" },
@@ -641,6 +663,111 @@ function persistConductorLaunchBinding(
     launch.initialCursorMessageId,
     launch.backendKind
   );
+}
+
+function commitSessionLaunchResult(
+  trackedWorkspace: Workspace,
+  conductorName: string,
+  launch: {
+    workspaceId: string;
+    sessionId: string;
+    backendKind: "local" | "cloud-api";
+    initialCursorRowid: number;
+    initialCursorMessageId: string | null;
+  }
+): Workspace | null {
+  if (launch.backendKind === "cloud-api") {
+    // The durable launch saga owns Cloud binding/cursor/status finalization.
+    // Re-read it and never overwrite a Stop/Archive that won after return.
+    const durable = getWorkspace(trackedWorkspace.id);
+    if (
+      !durable ||
+      durable.status === "stopped" ||
+      durable.status === "archived" ||
+      durable.conductorBackendKind !== "cloud-api" ||
+      durable.conductorWorkspaceId !== launch.workspaceId ||
+      durable.conductorSessionId !== launch.sessionId
+    ) {
+      return null;
+    }
+    return durable;
+  }
+  updateWorkspaceConductorName(trackedWorkspace.id, conductorName);
+  persistConductorLaunchBinding(trackedWorkspace.id, launch);
+  updateWorkspaceStatus(trackedWorkspace.id, "running");
+  return getWorkspace(trackedWorkspace.id) ?? {
+    ...trackedWorkspace,
+    conductorWorkspaceName: conductorName,
+    conductorWorkspaceId: launch.workspaceId,
+    conductorSessionId: launch.sessionId,
+    conductorBackendKind: launch.backendKind,
+    status: "running",
+  };
+}
+
+function workspaceTopicNeedsResume(workspace: Workspace): boolean {
+  return Boolean(
+    workspace.telegramThreadId &&
+      (workspace.status === "done" ||
+        workspace.status === "stopped" ||
+        workspace.status === "failed")
+  );
+}
+
+async function reopenWorkspaceTopicBeforeActivity(
+  ctx: Context,
+  workspace: Workspace,
+  needed: boolean
+): Promise<void> {
+  if (!needed || !workspace.telegramThreadId) return;
+  await reopenWorkspaceTopic(
+    ctx.telegram,
+    workspace.telegramChatId,
+    workspace.telegramThreadId
+  );
+}
+
+/**
+ * Reopen again after a successful resume. A durable terminal publisher may
+ * have closed and acknowledged its notice between the handler's first reopen
+ * and the launcher's atomic activity gate.
+ */
+async function restoreWorkspaceTopicAfterActivity(
+  ctx: Context,
+  workspace: Workspace,
+  needed: boolean
+): Promise<void> {
+  if (!needed || !workspace.telegramThreadId) return;
+  requestWorkspaceTopicReconciliation(workspace.id);
+  try {
+    const status = await reconcilePendingWorkspaceTopicState(
+      ctx.telegram,
+      workspace.id
+    );
+    if (status === "pending") {
+      console.log(
+        `[forum] topic state changed repeatedly for ${workspace.id}; queued a retry`
+      );
+    }
+  } catch (error) {
+    console.error(
+      `[forum] topic reconciliation queued for ${workspace.telegramThreadId}:`,
+      error
+    );
+  }
+}
+
+function persistProvisionedCloudLaunch(
+  workspace: Workspace,
+  pending: PendingCloudLaunch
+): string {
+  persistPendingCloudLaunch(workspace.id, pending);
+  workspace.conductorWorkspaceName = pending.workspaceId;
+  workspace.conductorWorkspaceId = pending.workspaceId;
+  workspace.conductorSessionId = pending.sessionId;
+  workspace.conductorBackendKind = "cloud-api";
+  workspace.status = "starting";
+  return workspace.id;
 }
 
 async function sendPromptToTarget(
@@ -1014,13 +1141,15 @@ async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
     startingHtml: string;
     failedHtml: (error: string) => string;
     successHtml: (launched: S) => string;
-    launch: (workspace: Workspace) => Promise<S | { error: string }>;
+    launch: (
+      workspace: Workspace
+    ) => Promise<S | { error: string; reason?: string }>;
   }
 ): Promise<{ workspace: Workspace; launched: S | null }> {
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
 
-  const workspace = createWorkspace({
+  let workspace = createWorkspace({
     name: input.recordName,
     prompt: input.prompt,
     repoPath: input.repoPath,
@@ -1060,25 +1189,87 @@ async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
   });
   updateWorkspaceTelegramMessage(workspace.id, msg.message_id.toString());
 
+  const noticeIdsBeforeLaunch = snapshotCloudNoticeIds(workspace.id);
   const result = await input.launch(workspace);
 
   if ("error" in result) {
+    if (
+      result.reason === "cloud_launch_canceled" ||
+      result.reason === "cloud_launch_cancel_pending"
+    ) {
+      await publishTrackedWorkspaceStatus(
+        ctx,
+        workspace,
+        msg,
+        result.reason === "cloud_launch_cancel_pending"
+          ? "⏹ Cloud launch cancellation is saved and will keep retrying. The pending prompt will not be sent."
+          : "⏹ Cloud launch canceled before its prompt was sent.",
+        false
+      );
+      // The poller owns publication of every durable terminal notice (plus
+      // any following suppression notice), then closes and acknowledges once
+      // the complete backlog is visible.
+      return { workspace, launched: null };
+    }
+    if (result.reason === "cloud_launch_cleanup_pending") {
+      await publishTrackedWorkspaceStatus(
+        ctx,
+        workspace,
+        msg,
+        `⚠️ The Cloud workspace was created, but prompt delivery could not be confirmed and cleanup is still pending. The bot will keep retrying cleanup safely. Do not retry this launch yet.\n\n<pre>${escHtml(truncate(result.error, 500))}</pre>`,
+        false
+      );
+      return { workspace, launched: null };
+    }
+    clearPendingCloudLaunch(workspace.id);
     updateWorkspaceStatus(workspace.id, "failed");
-    await ctx.telegram.editMessageText(
-      chatId,
-      msg.message_id,
-      undefined,
-      input.failedHtml(result.error),
-      { parse_mode: "HTML" }
+    const noticeIds = newCloudNoticeIds(
+      workspace.id,
+      noticeIdsBeforeLaunch,
+      new Set(["launch_failed"])
     );
+    const published = await publishTrackedWorkspaceStatus(
+      ctx,
+      workspace,
+      msg,
+      input.failedHtml(result.error),
+      false
+    );
+    if (published) {
+      acknowledgeCloudNoticeIds(workspace.id, noticeIds);
+    }
     return { workspace, launched: null };
   }
 
-  updateWorkspaceConductorName(workspace.id, result.workspaceName);
-  persistConductorLaunchBinding(workspace.id, result);
-  updateWorkspaceStatus(workspace.id, "running");
-  workspace.conductorWorkspaceName = result.workspaceName;
-  workspace.status = "running";
+  if (result.backendKind === "cloud-api") {
+    // Cloud launch finalization already committed binding + cursor + running
+    // status atomically. Never overwrite a stop that arrived after it.
+    const durable = getWorkspace(workspace.id);
+    if (
+      !durable ||
+      durable.status === "stopped" ||
+      durable.status === "archived" ||
+      durable.conductorBackendKind !== "cloud-api" ||
+      durable.conductorWorkspaceId !== result.workspaceId ||
+      durable.conductorSessionId !== result.sessionId
+    ) {
+      await publishTrackedWorkspaceStatus(
+        ctx,
+        durable ?? workspace,
+        msg,
+        "⏹ Cloud launch finished provisioning, but a stop or binding change won before success could be reported.",
+        false
+      );
+      return { workspace: durable ?? workspace, launched: null };
+    }
+    workspace = durable;
+  } else {
+    updateWorkspaceConductorName(workspace.id, result.workspaceName);
+    persistConductorLaunchBinding(workspace.id, result);
+    updateWorkspaceStatus(workspace.id, "running");
+    workspace.conductorWorkspaceName = result.workspaceName;
+    workspace.status = "running";
+  }
 
   if (threadId) {
     try {
@@ -1088,21 +1279,30 @@ async function startTrackedWorkspace<S extends TrackedLaunchBinding>(
     }
   }
 
-  await ctx.telegram.editMessageText(
-    chatId,
-    msg.message_id,
-    undefined,
+  const noticeIds =
+    result.backendKind === "cloud-api"
+      ? newCloudNoticeIds(
+          workspace.id,
+          noticeIdsBeforeLaunch,
+          new Set(["launch_queued"])
+        )
+      : [];
+  const published = await publishTrackedWorkspaceStatus(
+    ctx,
+    workspace,
+    msg,
     input.successHtml(result),
-    {
-      parse_mode: "HTML",
-      ...styledKeyboard([[btn("Stop", `stop:${workspace.id}`)]]),
-    }
+    true
   );
+  if (published && result.backendKind === "cloud-api") {
+    acknowledgeCloudNoticeIds(workspace.id, noticeIds);
+  }
 
   return { workspace, launched: result };
 }
 
-async function startWorkspaceForRepo(
+/** @internal exported for cloud-first launch integration tests. */
+export async function startWorkspaceForRepo(
   ctx: Context,
   target: RepoLaunchTarget,
   prompt: string,
@@ -1110,6 +1310,16 @@ async function startWorkspaceForRepo(
 ): Promise<void> {
   const { repoName, repoPath } = target;
   const promptPreview = previewOutgoingText(prompt, attachmentSourcePaths);
+  const backend = await resolveDefaultRepoLaunchBackend(
+    target,
+    attachmentSourcePaths.length
+  );
+  if (backend.kind === "cloud") {
+    await startCloudWorkspaceForRepo(ctx, target, backend.project, prompt);
+    return;
+  }
+
+  const fallbackNote = localLaunchFallbackNote(backend.reason);
   type RepoLaunchSuccess = Exclude<
     Awaited<ReturnType<typeof launchWorkspace>>,
     { error: string }
@@ -1119,11 +1329,11 @@ async function startWorkspaceForRepo(
     recordName: `${repoName}-${Date.now()}`,
     repoPath,
     prompt,
-    startingHtml: `Starting workspace for <b>${escHtml(repoName)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    startingHtml: `Starting local workspace for <b>${escHtml(repoName)}</b>...\n<i>${escHtml(fallbackNote)}</i>\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
     failedHtml: (error) =>
-      `Failed to start workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(error)}`,
+      `Failed to start local workspace for <b>${escHtml(repoName)}</b>:\n${escHtml(error)}`,
     successHtml: (result) =>
-      `🟢 <b>${escHtml(result.workspaceName)}</b> running for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
+      `🟢 <b>${escHtml(result.workspaceName)}</b> running locally for <b>${escHtml(repoName)}</b>\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>`,
     launch: (workspace) =>
       launchWorkspace(
         repoPath,
@@ -1136,8 +1346,73 @@ async function startWorkspaceForRepo(
   });
 
   if (launched) {
-    observeAgentCompletion(ctx, workspace, launched.workspaceName, launched.done);
+    void observeAgentCompletion(
+      ctx,
+      workspace,
+      launched.workspaceName,
+      launched.done,
+      attachmentSourcePaths.length === 0
+        ? {
+            cloudRecovery: {
+              prompt,
+              repoName,
+              repoPath,
+              workspaceDir:
+                getWorkspaceDir(launched.workspaceName, repoPath) ?? undefined,
+            },
+          }
+        : undefined
+    );
   }
+}
+
+async function startCloudWorkspaceForRepo(
+  ctx: Context,
+  target: RepoLaunchTarget,
+  project: ConductorApiProject,
+  prompt: string
+): Promise<void> {
+  await startTrackedCloudWorkspace(ctx, {
+    displayName: target.repoName,
+    // Keep the local repo path for deterministic Telegram repo routing. The
+    // durable backend binding, not this display/routing field, selects Cloud.
+    repoPath: target.repoPath,
+    projectId: project.id,
+    prompt,
+    locationPreposition: "for",
+  });
+}
+
+async function startTrackedCloudWorkspace(
+  ctx: Context,
+  input: {
+    displayName: string;
+    repoPath: string;
+    projectId: string;
+    prompt: string;
+    locationPreposition: "for" | "in";
+  }
+): Promise<void> {
+  const promptPreview = previewOutgoingText(input.prompt, []);
+  const location = `${input.locationPreposition} <b>${escHtml(input.displayName)}</b>`;
+  await startTrackedWorkspace<CloudWorkspaceLaunchResult>(ctx, {
+    displayName: input.displayName,
+    recordName: `${input.displayName}-${Date.now()}`,
+    repoPath: input.repoPath,
+    prompt: input.prompt,
+    startingHtml: `Starting ☁️ cloud workspace ${location}...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
+    failedHtml: (error) =>
+      `Failed to start ☁️ cloud workspace ${location}:\n${escHtml(error)}`,
+    successHtml: (result) =>
+      `🟢 ☁️ <b>${escHtml(result.workspaceName)}</b> running ${location} (${escHtml(result.model)})\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>\n\n${formatConductorDeepLink(result.deepLink)}`,
+    launch: (workspace) =>
+      launchCloudWorkspace({
+        projectId: input.projectId,
+        prompt: input.prompt,
+        persistBeforePrompt: (pending) =>
+          persistProvisionedCloudLaunch(workspace, pending),
+      }),
+  });
 }
 
 async function startWorkspaceFromRepoTopic(
@@ -1207,6 +1482,167 @@ function sortCloudProjects(
   projects: ConductorApiProject[]
 ): ConductorApiProject[] {
   return [...projects].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+type LocalLaunchFallbackReason =
+  | "telegram_attachments"
+  | "cloud_api_unconfigured"
+  | "cloud_configuration_invalid"
+  | "cloud_project_lookup_failed"
+  | "cloud_project_not_found";
+
+type DefaultRepoLaunchBackend =
+  | { kind: "cloud"; project: ConductorApiProject }
+  | { kind: "local"; reason: LocalLaunchFallbackReason };
+
+const DEFAULT_REPO_CLOUD_LOOKUP_TIMEOUT_MS = 5_000;
+
+async function resolveDefaultRepoLaunchBackend(
+  target: RepoLaunchTarget,
+  attachmentCount: number
+): Promise<DefaultRepoLaunchBackend> {
+  // The public Cloud API cannot upload Telegram files yet. Keep the existing
+  // local bridge instead of silently dropping user attachments.
+  if (attachmentCount > 0) {
+    return { kind: "local", reason: "telegram_attachments" };
+  }
+
+  let client: ConductorApiClient | null;
+  try {
+    client = createConductorApiClientFromEnv();
+  } catch (error) {
+    console.error(
+      "[conductor-api] Cloud-first launch configuration is invalid:",
+      error
+    );
+    return { kind: "local", reason: "cloud_configuration_invalid" };
+  }
+  if (!client) {
+    return { kind: "local", reason: "cloud_api_unconfigured" };
+  }
+
+  let projects: ConductorApiProject[];
+  const lookupController = new AbortController();
+  const lookupTimeout = setTimeout(
+    () => lookupController.abort(),
+    DEFAULT_REPO_CLOUD_LOOKUP_TIMEOUT_MS
+  );
+  try {
+    projects = await client.listProjects({ signal: lookupController.signal });
+  } catch (error) {
+    console.error("[conductor-api] Cloud-first project lookup failed:", error);
+    return { kind: "local", reason: "cloud_project_lookup_failed" };
+  } finally {
+    clearTimeout(lookupTimeout);
+  }
+
+  const remoteUrl = await resolveRepoRemoteUrl(target.repoPath);
+  const project = resolveCloudProjectForRepo(
+    projects,
+    target.repoName,
+    remoteUrl
+  );
+  return project
+    ? { kind: "cloud", project }
+    : { kind: "local", reason: "cloud_project_not_found" };
+}
+
+function localLaunchFallbackNote(reason: LocalLaunchFallbackReason): string {
+  switch (reason) {
+    case "telegram_attachments":
+      return "Using the local file bridge because Cloud cannot receive Telegram attachments yet.";
+    case "cloud_api_unconfigured":
+      return "Using the local agent because the Conductor Cloud API is not configured.";
+    case "cloud_configuration_invalid":
+      return "Using the local agent because the Conductor Cloud configuration is invalid.";
+    case "cloud_project_lookup_failed":
+      return "Using the local agent because Cloud project lookup failed.";
+    case "cloud_project_not_found":
+      return "Using the local agent because no Cloud project matches this repository.";
+  }
+}
+
+function cloudRecoveryUnavailableReason(
+  reason: LocalLaunchFallbackReason
+): string {
+  switch (reason) {
+    case "telegram_attachments":
+      return "the failed request included Telegram attachments that Cloud cannot receive yet";
+    case "cloud_api_unconfigured":
+      return "the Conductor Cloud API is not configured";
+    case "cloud_configuration_invalid":
+      return "the Conductor Cloud configuration is invalid";
+    case "cloud_project_lookup_failed":
+      return "Cloud project lookup failed";
+    case "cloud_project_not_found":
+      return "no Cloud project matches this repository";
+  }
+}
+
+function normalizeGitRemote(remote: string | null | undefined): string | null {
+  const value = remote?.trim();
+  if (!value) return null;
+
+  const normalizePath = (input: string, lowercase: boolean): string => {
+    const normalized = input
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .replace(/\/+$/, "")
+      .replace(/\.git$/i, "");
+    return lowercase ? normalized.toLowerCase() : normalized;
+  };
+  const hostAndPath = (host: string, remotePath: string): string => {
+    const normalizedHost = host.toLowerCase();
+    const hostWithoutPort = normalizedHost.replace(/:\d+$/, "");
+    // GitHub repository paths are case-insensitive. Unknown/self-hosted Git
+    // servers may be case-sensitive, so preserve their path identity.
+    const lowercasePath = hostWithoutPort === "github.com";
+    return `${normalizedHost}/${normalizePath(remotePath, lowercasePath)}`;
+  };
+
+  if (!value.includes("://")) {
+    const scp = value.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+    if (scp) {
+      return hostAndPath(scp[1], scp[2]);
+    }
+    return normalizePath(value, false);
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol === "file:") {
+      return normalizePath(decodeURIComponent(parsed.pathname), false);
+    }
+    return hostAndPath(parsed.host, decodeURIComponent(parsed.pathname));
+  } catch {
+    return normalizePath(value, false);
+  }
+}
+
+/**
+ * Match a local repository to exactly one Cloud project using only its origin
+ * identity across SSH/HTTPS URL dialects. Automatic routing never guesses by
+ * a display name or basename; explicit /cloud remains the name-based picker.
+ *
+ * @internal exported for cloud-first launch tests.
+ */
+export function resolveCloudProjectForRepo(
+  projects: ConductorApiProject[],
+  _repoName: string,
+  remoteUrl: string | null
+): ConductorApiProject | null {
+  const normalizedRemote = normalizeGitRemote(remoteUrl);
+  if (normalizedRemote) {
+    const remoteMatches = projects.filter(
+      (project) => normalizeGitRemote(project.gitRemote) === normalizedRemote
+    );
+    if (remoteMatches.length === 1) return remoteMatches[0];
+    // A usable origin is authoritative. Falling through to a same-name
+    // project here could send the prompt to a different repository.
+    return null;
+  }
+
+  return null;
 }
 
 /** @internal exported for cloud command unit tests; not part of the public bot API. */
@@ -1463,18 +1899,12 @@ async function startCloudWorkspaceForProject(
   project: ConductorApiProject,
   prompt: string
 ): Promise<void> {
-  const promptPreview = previewOutgoingText(prompt, []);
-  await startTrackedWorkspace<CloudWorkspaceLaunchResult>(ctx, {
+  await startTrackedCloudWorkspace(ctx, {
     displayName: project.name,
-    recordName: `${project.name}-${Date.now()}`,
     repoPath: cloudRepoSentinel(project.name),
+    projectId: project.id,
     prompt,
-    startingHtml: `Starting ☁️ cloud workspace in <b>${escHtml(project.name)}</b>...\n\n<i>Prompt: ${escHtml(truncate(promptPreview, 200))}</i>`,
-    failedHtml: (error) =>
-      `Failed to start ☁️ cloud workspace in <b>${escHtml(project.name)}</b>:\n${escHtml(error)}`,
-    successHtml: (result) =>
-      `🟢 ☁️ <b>${escHtml(result.workspaceName)}</b> running in <b>${escHtml(project.name)}</b> (${escHtml(result.model)})\n\n<i>${escHtml(truncate(promptPreview, 200))}</i>\n\n${formatConductorDeepLink(result.deepLink)}`,
-    launch: () => launchCloudWorkspace({ projectId: project.id, prompt }),
+    locationPreposition: "in",
   });
 }
 
@@ -1847,7 +2277,8 @@ async function handleDecisions(ctx: Context): Promise<void> {
 
 // ── /stop <workspace> ───────────────────────────────────────
 
-async function handleStop(ctx: Context): Promise<void> {
+/** @internal exported for pending-launch cancellation integration tests. */
+export async function handleStop(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
   const idOrName = text.replace(/^\/stop\s*/, "").trim();
   const chatId = ctx.chat?.id?.toString();
@@ -1886,19 +2317,52 @@ async function handleStop(ctx: Context): Promise<void> {
         workspace
       )
     : null;
-  const killed = workspace.conductorWorkspaceName
-    ? await stopConductorAgent(
-        workspace.conductorWorkspaceName,
-        workspace.repoPath,
-        workspace.conductorSessionId,
-        workspace
-      )
-    : false;
+  // Persist stop intent before the remote call so a crash or slow poll cannot
+  // enqueue a durable-but-unsent first prompt after the user canceled it.
+  const hadPendingLaunch = Boolean(getPendingCloudLaunch(workspace.id));
+  const pendingCancellation = markPendingCloudLaunchCanceled(workspace.id);
+  const terminalIntent = getPendingCloudTerminalIntent(workspace.id);
+  const terminalResult = terminalIntent
+    ? await reconcilePendingCloudTerminalIntent(workspace.id)
+    : null;
+  const terminalFailure =
+    terminalResult?.status === "failed" ? terminalResult : null;
+  const killed = terminalResult
+    ? terminalResult.status === "completed" || terminalResult.status === "none"
+    : workspace.conductorWorkspaceName
+      ? await stopConductorAgent(
+          workspace.conductorWorkspaceName,
+          workspace.repoPath,
+          workspace.conductorSessionId,
+          workspace
+        )
+      : false;
   if (
-    conductorInfo &&
-    isRemoteConductorWorkspace(conductorInfo) &&
+    (terminalIntent ||
+      (conductorInfo && isRemoteConductorWorkspace(conductorInfo))) &&
     !killed
   ) {
+    if (terminalFailure) {
+      await ctx.reply(
+        `🔴 The saved Cloud stop request for <b>${escHtml(wsName)}</b> could not be confirmed and was given up on: <pre>${escHtml(truncate(terminalFailure.error, 500))}</pre> Check the workspace in Conductor Cloud before sending more work.`,
+        { parse_mode: "HTML" }
+      );
+      if (terminalFailure.noticeId) {
+        acknowledgePendingCloudNotice(workspace.id, terminalFailure.noticeId);
+      }
+      return;
+    }
+    if (pendingCancellation) {
+      await ctx.reply(
+        `⏹ Stop intent for ☁️ <b>${escHtml(wsName)}</b> is saved, but Conductor has not confirmed cancellation yet. The bot will retry and ${
+          hadPendingLaunch
+            ? "will not send the pending prompt"
+            : "will keep new Cloud work blocked"
+        }.`,
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
     await ctx.reply(
       `Could not stop ☁️ <b>${escHtml(wsName)}</b> through the Conductor API.`,
       { parse_mode: "HTML" }
@@ -1907,25 +2371,36 @@ async function handleStop(ctx: Context): Promise<void> {
   }
 
   updateWorkspaceStatus(workspace.id, "stopped");
-  if (workspace.telegramThreadId) {
+  const deferTopicFinalization =
+    hadPendingLaunch ||
+    hasPendingCloudTopicFinalizationNotice(workspace.id);
+  if (workspace.telegramThreadId && !deferTopicFinalization) {
     try {
       await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "stopped" });
     } catch (err) {
       console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err);
     }
+  }
+  await ctx.reply(
+    `⏹ <b>${escHtml(wsName)}</b> stopped.${
+      hadPendingLaunch
+        ? "\n<i>The provisioned Cloud workspace will be archived and the previous binding restored in the background.</i>"
+        : killed
+          ? ""
+          : "\n<i>Agent process was not running.</i>"
+    }`,
+    {
+      parse_mode: "HTML",
+      ...styledButtons([btn("Archive", `archive:${workspace.id}`)]),
+    }
+  );
+  if (workspace.telegramThreadId && !deferTopicFinalization) {
     await closeWorkspaceTopic(
       ctx.telegram,
       workspace.telegramChatId,
       workspace.telegramThreadId
     );
   }
-  await ctx.reply(
-    `⏹ <b>${escHtml(wsName)}</b> stopped.${killed ? "" : "\n<i>Agent process was not running.</i>"}`,
-    {
-      parse_mode: "HTML",
-      ...styledButtons([btn("Archive", `archive:${workspace.id}`)]),
-    }
-  );
 }
 
 // ── /repos ──────────────────────────────────────────────────
@@ -3122,6 +3597,12 @@ async function startThreadForTarget(
     });
     return;
   }
+  const topicNeedsResume = workspaceTopicNeedsResume(trackedWorkspace);
+  await reopenWorkspaceTopicBeforeActivity(
+    ctx,
+    trackedWorkspace,
+    topicNeedsResume
+  );
   const threadOpts = trackedWorkspace.telegramThreadId
     ? { message_thread_id: trackedWorkspace.telegramThreadId }
     : {};
@@ -3148,9 +3629,26 @@ async function startThreadForTarget(
     return;
   }
 
-  updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
-  persistConductorLaunchBinding(trackedWorkspace.id, result);
-  updateWorkspaceStatus(trackedWorkspace.id, "running");
+  const durableWorkspace = commitSessionLaunchResult(
+    trackedWorkspace,
+    target.conductorName,
+    result
+  );
+  if (!durableWorkspace) {
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `⏹ The new Cloud thread was stopped or rebound before success could be reported for <b>${escHtml(target.conductorName)}</b>.`,
+      { parse_mode: "HTML", ...threadOpts }
+    );
+    return;
+  }
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    durableWorkspace,
+    topicNeedsResume
+  );
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
     progress.message_id,
@@ -3159,7 +3657,7 @@ async function startThreadForTarget(
     { parse_mode: "HTML", ...threadOpts }
   );
 
-  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
+  observeAgentCompletion(ctx, durableWorkspace, target.conductorName, result.done);
 }
 
 // ── /review <workspace> [instructions] ──────────────────────
@@ -3208,6 +3706,12 @@ async function handleReview(ctx: Context): Promise<void> {
     });
     return;
   }
+  const topicNeedsResume = workspaceTopicNeedsResume(trackedWorkspace);
+  await reopenWorkspaceTopicBeforeActivity(
+    ctx,
+    trackedWorkspace,
+    topicNeedsResume
+  );
   const progress = await ctx.reply(
     `Starting review for <b>${escHtml(target.conductorName)}</b>...\n\n<i>${escHtml(truncate(reviewPrompt, 200))}</i>`,
     { parse_mode: "HTML" }
@@ -3223,7 +3727,7 @@ async function handleReview(ctx: Context): Promise<void> {
   });
 
   if ("error" in result) {
-    updateWorkspaceStatus(trackedWorkspace.id, "failed");
+    updateWorkspaceStatusUnlessTerminal(trackedWorkspace.id, "failed");
     await ctx.telegram.editMessageText(
       ctx.chat!.id,
       progress.message_id,
@@ -3234,9 +3738,27 @@ async function handleReview(ctx: Context): Promise<void> {
     return;
   }
 
-  updateWorkspaceConductorName(trackedWorkspace.id, target.conductorName);
-  persistConductorLaunchBinding(trackedWorkspace.id, result);
-  updateWorkspaceStatus(trackedWorkspace.id, "running");
+  const durableWorkspace = commitSessionLaunchResult(
+    trackedWorkspace,
+    target.conductorName,
+    result
+  );
+  if (!durableWorkspace) {
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `⏹ The Cloud review thread was stopped or rebound before success could be reported for <b>${escHtml(target.conductorName)}</b>.`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    durableWorkspace,
+    topicNeedsResume
+  );
 
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
@@ -3246,7 +3768,7 @@ async function handleReview(ctx: Context): Promise<void> {
     { parse_mode: "HTML" }
   );
 
-  observeAgentCompletion(ctx, trackedWorkspace, target.conductorName, result.done);
+  observeAgentCompletion(ctx, durableWorkspace, target.conductorName, result.done);
 }
 
 // ── /skills <workspace> ─────────────────────────────────────
@@ -3485,8 +4007,8 @@ async function handleHelp(ctx: Context): Promise<void> {
 
 Commands:
 /setup — Check setup and apply this chat
-/run &lt;repo&gt; &lt;prompt&gt; — Start a new workspace
-/run &lt;number&gt; &lt;prompt&gt; — Start using repo number
+/run &lt;repo&gt; &lt;prompt&gt; — Start Cloud-first (local fallback)
+/run &lt;number&gt; &lt;prompt&gt; — Start Cloud-first by repo number
 /cloud &lt;project&gt; &lt;prompt&gt; — Start a ☁️ cloud workspace (no Mac needed)
 /projects [name] — List ☁️ cloud projects, or one project's workspaces
 /fleet [hours] — ☁️ org-wide cloud activity report
@@ -3688,32 +4210,65 @@ async function handleThreadCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Reply with the first prompt");
 }
 
-async function handleStopCallback(ctx: Context): Promise<void> {
+export async function handleStopCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
   const workspaceId = match?.[1];
   if (!workspaceId) return;
 
   const workspace = getWorkspace(workspaceId);
+  const hadPendingLaunch = workspace
+    ? Boolean(getPendingCloudLaunch(workspace.id))
+    : false;
+  const pendingCancellation = workspace
+    ? markPendingCloudLaunchCanceled(workspace.id)
+    : false;
+  let deferTopicFinalization = Boolean(
+    workspace &&
+      (hadPendingLaunch ||
+        hasPendingCloudTopicFinalizationNotice(workspace.id))
+  );
   if (workspace?.conductorWorkspaceName) {
     const info = getWorkspaceSessionInfo(
       workspace.conductorWorkspaceName,
       workspace.repoPath,
       workspace
     );
-    const stopped = await stopConductorAgent(
-      workspace.conductorWorkspaceName,
-      workspace.repoPath,
-      workspace.conductorSessionId,
-      workspace
-    );
-    if (info && isRemoteConductorWorkspace(info) && !stopped) {
-      await ctx.answerCbQuery("Conductor API could not stop this cloud session");
+    const terminalIntent = getPendingCloudTerminalIntent(workspace.id);
+    const terminalResult = terminalIntent
+      ? await reconcilePendingCloudTerminalIntent(workspace.id)
+      : null;
+    deferTopicFinalization =
+      hadPendingLaunch ||
+      hasPendingCloudTopicFinalizationNotice(workspace.id);
+    const stopped = terminalResult
+      ? terminalResult.status === "completed" || terminalResult.status === "none"
+      : await stopConductorAgent(
+          workspace.conductorWorkspaceName,
+          workspace.repoPath,
+          workspace.conductorSessionId,
+          workspace
+        );
+    if (
+      (terminalIntent || (info && isRemoteConductorWorkspace(info))) &&
+      !stopped
+    ) {
+      if (terminalResult?.status === "failed") {
+        await ctx.answerCbQuery(
+          "Cloud stop gave up; check the workspace in Conductor Cloud"
+        );
+        return;
+      }
+      await ctx.answerCbQuery(
+        pendingCancellation
+          ? "Stop saved; Cloud cancellation will retry"
+          : "Conductor API could not stop this cloud session"
+      );
       return;
     }
   }
 
   updateWorkspaceStatus(workspaceId, "stopped");
-  if (workspace?.telegramThreadId) {
+  if (workspace?.telegramThreadId && !deferTopicFinalization) {
     try {
       await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "stopped" });
     } catch (err) {
@@ -3737,7 +4292,7 @@ async function handleOpenCallback(ctx: Context): Promise<void> {
   await ctx.answerCbQuery("Open workspace in Conductor UI");
 }
 
-async function handleArchiveCallback(ctx: Context): Promise<void> {
+export async function handleArchiveCallback(ctx: Context): Promise<void> {
   const match = (ctx as any).match;
   const workspaceId = match?.[1];
   if (!workspaceId) return;
@@ -3747,25 +4302,48 @@ async function handleArchiveCallback(ctx: Context): Promise<void> {
     await ctx.answerCbQuery("Workspace not found");
     return;
   }
+  // Persist terminal intent before any remote await so launch/outbox
+  // reconciliation cannot send another prompt after the Archive click.
+  archiveWorkspace(workspaceId);
+  let deferTopicFinalization =
+    hasPendingCloudTopicFinalizationNotice(workspace.id);
   if (workspace.conductorWorkspaceName) {
     const info = getWorkspaceSessionInfo(
       workspace.conductorWorkspaceName,
       workspace.repoPath,
       workspace
     );
-    const archived = await archiveConductorWorkspace(
-      workspace.conductorWorkspaceName,
-      workspace.repoPath,
-      workspace
-    );
-    if (info && isRemoteConductorWorkspace(info) && !archived) {
-      await ctx.answerCbQuery("Conductor API could not archive this cloud workspace");
+    const terminalIntent = getPendingCloudTerminalIntent(workspace.id);
+    const terminalResult = terminalIntent
+      ? await reconcilePendingCloudTerminalIntent(workspace.id)
+      : null;
+    deferTopicFinalization =
+      hasPendingCloudTopicFinalizationNotice(workspace.id);
+    const archived = terminalResult
+      ? terminalResult.status === "completed" || terminalResult.status === "none"
+      : await archiveConductorWorkspace(
+          workspace.conductorWorkspaceName,
+          workspace.repoPath,
+          workspace
+        );
+    if (
+      (terminalIntent || (info && isRemoteConductorWorkspace(info))) &&
+      !archived
+    ) {
+      if (terminalResult?.status === "failed") {
+        await ctx.answerCbQuery(
+          "Cloud archive gave up; check the workspace in Conductor Cloud"
+        );
+        return;
+      }
+      await ctx.answerCbQuery(
+        "Cloud archive is not confirmed; local prompt delivery remains blocked"
+      );
       return;
     }
   }
-  archiveWorkspace(workspaceId);
 
-  if (workspace.telegramThreadId) {
+  if (workspace.telegramThreadId && !deferTopicFinalization) {
     try {
       await syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "archived" });
     } catch (err) {
@@ -3849,6 +4427,12 @@ async function handlePrCallback(ctx: Context): Promise<void> {
       await ctx.reply("Workspace is not linked to a Conductor session.");
       return;
     }
+    const topicNeedsResume = workspaceTopicNeedsResume(workspace);
+    await reopenWorkspaceTopicBeforeActivity(
+      ctx,
+      workspace,
+      topicNeedsResume
+    );
     const prompt = buildFixPrPrompt(record);
     const result = await sendToSession(
       workspace.conductorWorkspaceName,
@@ -3860,8 +4444,17 @@ async function handlePrCallback(ctx: Context): Promise<void> {
       await ctx.reply(`Failed: ${escHtml(result.error)}`, { parse_mode: "HTML" });
       return;
     }
-    updateWorkspaceStatus(workspace.id, "running");
-    await sendPrStatusCard(ctx, { ...workspace, status: "running" });
+    const durable = getWorkspace(workspace.id) ?? workspace;
+    if (workspace.conductorBackendKind !== "cloud-api") {
+      updateWorkspaceStatus(workspace.id, "running");
+      durable.status = "running";
+    }
+    await restoreWorkspaceTopicAfterActivity(
+      ctx,
+      durable,
+      topicNeedsResume
+    );
+    await sendPrStatusCard(ctx, durable);
     return;
   }
 
@@ -4010,21 +4603,12 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   }
   const conductorName = workspace.conductorWorkspaceName;
   const actionLabel = action === "review" ? "Review" : "PR generation";
+  const topicNeedsResume = workspaceTopicNeedsResume(workspace);
 
   await ctx.answerCbQuery(`Starting ${actionLabel}...`);
   await ctx.editMessageReplyMarkup(undefined);
 
-  // Reopen forum topic if needed
-  if (
-    workspace.telegramThreadId &&
-    (workspace.status === "done" || workspace.status === "stopped" || workspace.status === "failed")
-  ) {
-    await reopenWorkspaceTopic(
-      ctx.telegram,
-      workspace.telegramChatId,
-      workspace.telegramThreadId
-    );
-  }
+  await reopenWorkspaceTopicBeforeActivity(ctx, workspace, topicNeedsResume);
 
   const prompt = action === "review"
     ? buildReviewPrompt("")
@@ -4064,7 +4648,7 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
   });
 
   if ("error" in result) {
-    updateWorkspaceStatus(trackedWorkspace.id, "failed");
+    updateWorkspaceStatusUnlessTerminal(trackedWorkspace.id, "failed");
     await ctx.telegram.editMessageText(
       ctx.chat!.id,
       progress.message_id,
@@ -4075,9 +4659,27 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     return;
   }
 
-  updateWorkspaceConductorName(trackedWorkspace.id, conductorName);
-  persistConductorLaunchBinding(trackedWorkspace.id, result);
-  updateWorkspaceStatus(trackedWorkspace.id, "running");
+  const durableWorkspace = commitSessionLaunchResult(
+    trackedWorkspace,
+    conductorName,
+    result
+  );
+  if (!durableWorkspace) {
+    await ctx.telegram.editMessageText(
+      ctx.chat!.id,
+      progress.message_id,
+      undefined,
+      `⏹ The Cloud ${actionLabel.toLowerCase()} thread was stopped or rebound before success could be reported for <b>${escHtml(conductorName)}</b>.`,
+      { parse_mode: "HTML", ...threadOpts }
+    );
+    return;
+  }
+
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    durableWorkspace,
+    topicNeedsResume
+  );
 
   await ctx.telegram.editMessageText(
     ctx.chat!.id,
@@ -4087,10 +4689,10 @@ async function handlePostDoneCallback(ctx: Context): Promise<void> {
     { parse_mode: "HTML" }
   );
 
-  observeAgentCompletion(ctx, trackedWorkspace, conductorName, result.done);
+  observeAgentCompletion(ctx, durableWorkspace, conductorName, result.done);
 
   if (action === "pr") {
-    await sendPrStatusCard(ctx, { ...workspace, status: "running" });
+    await sendPrStatusCard(ctx, durableWorkspace);
   }
 }
 
@@ -4139,7 +4741,7 @@ function inferWorkspaceFromReply(reply: any, chatId: string): Workspace | undefi
   return getWorkspaceByName(workspaceName, { chatId });
 }
 
-async function sendMessageToWorkspace(
+export async function sendMessageToWorkspace(
   ctx: Context,
   workspace: Workspace,
   message: string,
@@ -4148,18 +4750,9 @@ async function sendMessageToWorkspace(
 ): Promise<void> {
   const conductorName = workspace.conductorWorkspaceName ?? workspace.name;
   const messagePreview = previewOutgoingText(message, attachmentSourcePaths);
+  const topicNeedsResume = workspaceTopicNeedsResume(workspace);
 
-  // Reopen forum topic if the workspace was stopped/done/failed
-  if (
-    workspace.telegramThreadId &&
-    (workspace.status === "done" || workspace.status === "stopped" || workspace.status === "failed")
-  ) {
-    await reopenWorkspaceTopic(
-      ctx.telegram,
-      workspace.telegramChatId,
-      workspace.telegramThreadId
-    );
-  }
+  await reopenWorkspaceTopicBeforeActivity(ctx, workspace, topicNeedsResume);
 
   await ctx.reply(`Sending message to <b>${escHtml(conductorName)}</b>...\n\n<i>${escHtml(truncate(messagePreview, 200))}</i>`, {
     parse_mode: "HTML",
@@ -4176,9 +4769,18 @@ async function sendMessageToWorkspace(
     return;
   }
 
-  updateWorkspaceStatus(workspace.id, "running");
-  workspace.status = "running";
-  if (workspace.telegramThreadId) {
+  if (workspace.conductorBackendKind === "cloud-api") {
+    workspace = getWorkspace(workspace.id) ?? workspace;
+  } else {
+    updateWorkspaceStatus(workspace.id, "running");
+    workspace.status = "running";
+  }
+  await restoreWorkspaceTopicAfterActivity(
+    ctx,
+    workspace,
+    topicNeedsResume
+  );
+  if (workspace.telegramThreadId && !topicNeedsResume) {
     syncWorkspaceTopic(ctx.telegram, workspace).catch((err) =>
       console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
     );
@@ -4193,51 +4795,902 @@ async function sendMessageToWorkspace(
     await ctx.reply(result.warning);
   }
 
-  observeAgentCompletion(ctx, workspace, conductorName, result.done);
+  const cloudRecovery =
+    attachmentSourcePaths.length === 0 &&
+    workspace.conductorBackendKind !== "cloud-api"
+      ? {
+          prompt: await buildCloudRecoveryPromptFromLocalSession(
+            workspace,
+            message,
+            options.sessionId ?? workspace.conductorSessionId
+          ),
+          repoName: path.basename(workspace.repoPath),
+          repoPath: workspace.repoPath,
+          workspaceDir:
+            getWorkspaceDir(conductorName, workspace.repoPath) ?? undefined,
+        }
+      : undefined;
+
+  void observeAgentCompletion(
+    ctx,
+    workspace,
+    conductorName,
+    result.done,
+    cloudRecovery ? { cloudRecovery } : undefined
+  );
+}
+
+export interface LocalCloudRecoveryRequest {
+  prompt: string;
+  repoName: string;
+  repoPath: string;
+  /** Tests and callers that already know the worktree can avoid a DB lookup. */
+  workspaceDir?: string;
+}
+
+export interface LocalCloudRecoveryOutcome {
+  handled: boolean;
+  recovered: boolean;
+  reason: string | null;
+}
+
+interface AgentCompletionOptions {
+  cloudRecovery?: LocalCloudRecoveryRequest;
+}
+
+interface CloudRecoveryPrompt {
+  requestId: string;
+  prompt: string;
+}
+
+interface CloudTakeoverInFlight {
+  requests: CloudRecoveryPrompt[];
+  includedRequestIds: Set<string>;
+  durablyQueuedRequestIds: Set<string>;
+  persisted: Promise<PendingCloudLaunch | null>;
+  settlePersistence: (pending: PendingCloudLaunch | null) => void;
+  promise: Promise<LocalCloudRecoveryOutcome>;
+}
+
+const cloudTakeoversInFlight = new Map<string, CloudTakeoverInFlight>();
+
+/** @internal exported for auth-failure regression tests. */
+export function isLocalAgentAuthenticationFailure(
+  result: AgentResult
+): boolean {
+  return result.isError && isKnownCliAuthenticationFailure(result);
+}
+
+async function publishTrackedWorkspaceStatus(
+  ctx: Context,
+  workspace: Workspace,
+  progress: { message_id: number } | null,
+  html: string,
+  includeStopButton: boolean
+): Promise<boolean> {
+  const threadOpts = workspace.telegramThreadId
+    ? { message_thread_id: workspace.telegramThreadId }
+    : {};
+  const keyboardOpts = includeStopButton
+    ? styledKeyboard([[btn("Stop", `stop:${workspace.id}`)]])
+    : {};
+
+  if (progress) {
+    const edited = await ctx.telegram
+      .editMessageText(
+        workspace.telegramChatId,
+        progress.message_id,
+        undefined,
+        html,
+        { parse_mode: "HTML", ...keyboardOpts }
+      )
+      .then(() => true)
+      .catch((error: unknown) => {
+        console.error("[workspace-status] Could not edit status:", error);
+        return false;
+      });
+    if (edited) {
+      updateWorkspaceTelegramMessage(workspace.id, String(progress.message_id));
+      return true;
+    }
+  }
+
+  const replacement = await ctx.telegram
+    .sendMessage(workspace.telegramChatId, html, {
+      parse_mode: "HTML",
+      ...threadOpts,
+      ...keyboardOpts,
+    })
+    .catch((error: unknown) => {
+      console.error("[workspace-status] Could not post status:", error);
+      return null;
+    });
+  if (replacement) {
+    updateWorkspaceTelegramMessage(workspace.id, String(replacement.message_id));
+    return true;
+  }
+  return false;
+}
+
+function snapshotCloudNoticeIds(workspaceId: string): ReadonlySet<string> {
+  return new Set(
+    getPendingCloudNotices(workspaceId).map((notice) => notice.id)
+  );
+}
+
+function newCloudNoticeIds(
+  workspaceId: string,
+  previousIds: ReadonlySet<string>,
+  kinds: ReadonlySet<string>
+): string[] {
+  return getPendingCloudNotices(workspaceId)
+    .filter(
+      (notice) => !previousIds.has(notice.id) && kinds.has(notice.kind)
+    )
+    .map((notice) => notice.id);
+}
+
+function acknowledgeCloudNoticeIds(
+  workspaceId: string,
+  noticeIds: readonly string[]
+): void {
+  for (const noticeId of noticeIds) {
+    acknowledgePendingCloudNotice(workspaceId, noticeId);
+  }
 }
 
 /**
- * Watch a spawned agent run and surface hard failures in Telegram. Without
- * this, a run that dies before producing output looks like a clean
- * "finished" with nothing to show.
+ * Move a failed local prompt to Cloud only when its clean commit is available
+ * on the selected origin branch. The public API cannot attest the provisioned
+ * checkout SHA, so the handoff includes the expected SHA and requires a HEAD
+ * check before side effects.
+ *
+ * @internal exported for Cloud recovery integration tests.
  */
-function observeAgentCompletion(
+export async function recoverLocalAgentFailure(
   ctx: Context,
   workspace: Workspace,
   conductorName: string,
-  done: Promise<AgentResult>
-): void {
-  done
-    .then(async (agentResult) => {
-      if (!agentResult.isError) return;
+  agentResult: AgentResult,
+  recovery: LocalCloudRecoveryRequest
+): Promise<LocalCloudRecoveryOutcome> {
+  if (!isLocalAgentAuthenticationFailure(agentResult)) {
+    return { handled: false, recovered: false, reason: null };
+  }
+  if (agentResult.authenticationFailure !== true) {
+    return {
+      handled: false,
+      recovered: false,
+      reason:
+        "the local launcher could not confirm that authentication failed before execution began",
+    };
+  }
+  if (
+    agentResult.hadMeaningfulActivity !== false ||
+    (agentResult.numTurns ?? 0) > 1
+  ) {
+    return {
+      handled: false,
+      recovered: false,
+      reason:
+        "the local agent produced output or tool activity before authentication failed, so replaying the request could duplicate side effects",
+    };
+  }
 
-      updateWorkspaceStatus(workspace.id, "failed");
-      if (workspace.telegramThreadId) {
-        syncWorkspaceTopic(ctx.telegram, { ...workspace, status: "failed" }).catch((err) =>
-          console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+  const request: CloudRecoveryPrompt = {
+    requestId: randomUUID(),
+    prompt: recovery.prompt,
+  };
+  const inFlight = cloudTakeoversInFlight.get(workspace.id);
+  if (inFlight) {
+    inFlight.requests.push(request);
+    const pending = await inFlight.persisted;
+    let durablyQueued = false;
+    if (pending && !inFlight.includedRequestIds.has(request.requestId)) {
+      try {
+        enqueueCloudRecoveryPrompt(workspace.id, pending.sessionId, request);
+        inFlight.durablyQueuedRequestIds.add(request.requestId);
+        durablyQueued = true;
+      } catch (error) {
+        console.error("[cloud-takeover] Could not persist late recovery prompt:", error);
+      }
+    }
+    const outcome = await inFlight.promise;
+    const includedInFirstPrompt = inFlight.includedRequestIds.has(
+      request.requestId
+    );
+    if (!outcome.recovered || includedInFirstPrompt) {
+      if (!outcome.recovered && !includedInFirstPrompt) {
+        await publishTrackedWorkspaceStatus(
+          ctx,
+          getWorkspace(workspace.id) ?? workspace,
+          null,
+          "⚠️ Another local request arrived during a failed or canceled Cloud takeover and was not replayed. Resend it after the reported cleanup finishes.",
+          false
         );
       }
+      return outcome;
+    }
 
-      const exitNote =
-        typeof agentResult.exitCode === "number" ? ` (exit ${agentResult.exitCode})` : "";
-      let text = `🔴 <b>${escHtml(conductorName)}</b> agent run failed${exitNote}.`;
-      const detail = agentResult.stderrTail?.trim();
-      if (detail) {
-        text += `\n<pre>${escHtml(truncate(detail, 600))}</pre>`;
+    const rebound = getWorkspace(workspace.id) ?? workspace;
+    return forwardLateRecoveryPromptToCloud(
+      ctx,
+      rebound,
+      request,
+      durablyQueued
+    );
+  }
+
+  const current = getWorkspace(workspace.id) ?? workspace;
+  if (current.conductorBackendKind === "cloud-api") {
+    return forwardLateRecoveryPromptToCloud(ctx, current, request, false);
+  }
+
+  const workspaceDir =
+    recovery.workspaceDir ?? getWorkspaceDir(conductorName, recovery.repoPath);
+  if (!workspaceDir) {
+    return {
+      handled: false,
+      recovered: false,
+      reason: "the local worktree could not be resolved",
+    };
+  }
+
+  let persistenceSettled = false;
+  let resolvePersistence!: (pending: PendingCloudLaunch | null) => void;
+  const persisted = new Promise<PendingCloudLaunch | null>((resolve) => {
+    resolvePersistence = resolve;
+  });
+  const takeover = {
+    requests: [request],
+    includedRequestIds: new Set<string>(),
+    durablyQueuedRequestIds: new Set<string>(),
+    persisted,
+    settlePersistence: (pending: PendingCloudLaunch | null) => {
+      if (persistenceSettled) return;
+      persistenceSettled = true;
+      resolvePersistence(pending);
+    },
+    promise: null as unknown as Promise<LocalCloudRecoveryOutcome>,
+  } satisfies CloudTakeoverInFlight;
+  takeover.promise = performLocalCloudRecovery(
+    ctx,
+    current,
+    conductorName,
+    recovery,
+    workspaceDir,
+    takeover
+  ).finally(() => takeover.settlePersistence(null));
+  cloudTakeoversInFlight.set(workspace.id, takeover);
+  try {
+    return await takeover.promise;
+  } finally {
+    if (cloudTakeoversInFlight.get(workspace.id) === takeover) {
+      cloudTakeoversInFlight.delete(workspace.id);
+    }
+  }
+}
+
+async function performLocalCloudRecovery(
+  ctx: Context,
+  current: Workspace,
+  conductorName: string,
+  recovery: LocalCloudRecoveryRequest,
+  workspaceDir: string,
+  takeover: CloudTakeoverInFlight
+): Promise<LocalCloudRecoveryOutcome> {
+  try {
+    // Linked worktrees may override origin through extensions.worktreeConfig.
+    // Keep branch/SHA verification and Cloud project identity anchored to the
+    // exact same worktree so a divergent repository-root origin cannot route
+    // the recovered prompt into the wrong Cloud project.
+    const branch = await resolveSafeCloudTakeoverBranch(
+      workspaceDir,
+      workspaceDir
+    );
+    if (!branch.branch || !branch.commit) {
+      return {
+        handled: false,
+        recovered: false,
+        reason: describeCloudTakeoverBranchFailure(branch.reason),
+      };
+    }
+
+    const backend = await resolveDefaultRepoLaunchBackend(
+      {
+        repoName: recovery.repoName,
+        repoPath: workspaceDir,
+      },
+      0
+    );
+    if (backend.kind !== "cloud") {
+      return {
+        handled: false,
+        recovered: false,
+        reason: cloudRecoveryUnavailableReason(backend.reason),
+      };
+    }
+    const latestBeforeProvisioning = getWorkspace(current.id);
+    if (
+      latestBeforeProvisioning?.status === "stopped" ||
+      latestBeforeProvisioning?.status === "archived"
+    ) {
+      return {
+        handled: true,
+        recovered: false,
+        reason: "Cloud takeover was canceled before provisioning",
+      };
+    }
+
+    const threadOpts = current.telegramThreadId
+      ? { message_thread_id: current.telegramThreadId }
+      : {};
+    const progress = await ctx.telegram
+      .sendMessage(
+        current.telegramChatId,
+        `⚠️ Local agent authentication failed for <b>${escHtml(conductorName)}</b>. Switching to Conductor Cloud from <code>${escHtml(branch.branch)}</code>...`,
+        { parse_mode: "HTML", ...threadOpts }
+      )
+      .catch((error: unknown) => {
+        console.error("[cloud-takeover] Could not post progress:", error);
+        return null;
+      });
+
+    const noticeIdsBeforeLaunch = snapshotCloudNoticeIds(current.id);
+    const launched = await launchCloudWorkspace({
+      projectId: backend.project.id,
+      prompt: recovery.prompt,
+      promptProvider: () => {
+        const includedRequests = takeover.requests.filter(
+          (request) =>
+            !takeover.durablyQueuedRequestIds.has(request.requestId)
+        );
+        takeover.includedRequestIds = new Set(
+          includedRequests.map((request) => request.requestId)
+        );
+        return [
+          combineCloudRecoveryPrompts(includedRequests),
+          "",
+          `Expected remote state: ${branch.branch} at ${branch.commit}. The public Cloud API does not expose checkout SHA, so verify HEAD before any side effect.`,
+        ].join("\n");
+      },
+      branch: branch.branch,
+      expectedRemoteCommit: {
+        cwd: workspaceDir,
+        commit: branch.commit,
+      },
+      persistBeforePrompt: (pending) => {
+        const trackedWorkspaceId = persistProvisionedCloudLaunch(current, pending);
+        takeover.settlePersistence(pending);
+        return trackedWorkspaceId;
+      },
+    });
+    if ("error" in launched) {
+      if (
+        launched.reason === "cloud_launch_canceled" ||
+        launched.reason === "cloud_launch_cancel_pending"
+      ) {
+        await publishTrackedWorkspaceStatus(
+          ctx,
+          current,
+          progress,
+          launched.reason === "cloud_launch_cancel_pending"
+            ? `⏹ Cloud takeover cancellation for <b>${escHtml(conductorName)}</b> is saved and will keep retrying. The pending prompt will not be sent.`
+            : `⏹ Cloud takeover for <b>${escHtml(conductorName)}</b> was canceled before its prompt was sent.`,
+          false
+        );
+        // Leave terminal and suppression notices together for the poller's
+        // publish-all → close → acknowledge sequence.
+        return {
+          handled: true,
+          recovered: false,
+          reason: "Cloud takeover was canceled",
+        };
       }
-      if (workspace.telegramThreadId) {
-        await ctx.telegram.sendMessage(workspace.telegramChatId, text, {
-          parse_mode: "HTML",
-          message_thread_id: workspace.telegramThreadId,
-        });
-      } else {
-        await ctx.reply(text, { parse_mode: "HTML" });
+      if (launched.reason === "cloud_launch_cleanup_pending") {
+        const pendingHtml =
+          `⚠️ Cloud takeover for <b>${escHtml(conductorName)}</b> could not confirm prompt delivery, and cleanup is still pending. The bot will keep retrying cleanup; do not resend this request yet.`;
+        await publishTrackedWorkspaceStatus(
+          ctx,
+          current,
+          progress,
+          pendingHtml,
+          false
+        );
+        return {
+          handled: true,
+          recovered: false,
+          reason: "Cloud cleanup is still pending",
+        };
       }
-    })
-    .catch((err) => console.error("[send] agent completion watch error:", err));
+      clearPendingCloudLaunch(current.id);
+      updateWorkspaceStatus(current.id, "failed");
+      const failedHtml =
+        `🔴 Local authentication failed, and Cloud takeover for <b>${escHtml(conductorName)}</b> also failed:\n` +
+        escHtml(launched.error);
+      const noticeIds = newCloudNoticeIds(
+        current.id,
+        noticeIdsBeforeLaunch,
+        new Set(["launch_failed"])
+      );
+      const published = await publishTrackedWorkspaceStatus(
+        ctx,
+        current,
+        progress,
+        failedHtml,
+        false
+      );
+      if (published) {
+        acknowledgeCloudNoticeIds(current.id, noticeIds);
+      }
+      return { handled: true, recovered: false, reason: launched.error };
+    }
+
+    // launchCloudWorkspace finalized the Cloud binding, cursor, and running
+    // state atomically. Re-read it so a concurrent stop is never resurrected
+    // by redundant post-launch writes.
+    const durable = getWorkspace(current.id);
+    if (
+      !durable ||
+      durable.status === "stopped" ||
+      durable.status === "archived" ||
+      durable.conductorBackendKind !== "cloud-api" ||
+      durable.conductorWorkspaceId !== launched.workspaceId ||
+      durable.conductorSessionId !== launched.sessionId
+    ) {
+      await publishTrackedWorkspaceStatus(
+        ctx,
+        durable ?? current,
+        progress,
+        `⏹ Cloud takeover for <b>${escHtml(conductorName)}</b> was stopped or rebound before success could be reported.`,
+        false
+      );
+      return {
+        handled: true,
+        recovered: false,
+        reason: "Cloud takeover was stopped during finalization",
+      };
+    }
+    Object.assign(current, durable);
+    if (current.telegramThreadId) {
+      await syncWorkspaceTopic(ctx.telegram, current).catch((error: unknown) =>
+        console.error(
+          `[forum] topic sync error ${current.telegramThreadId}:`,
+          error
+        )
+      );
+    }
+
+    const successHtml =
+      `🟢 ☁️ <b>${escHtml(launched.workspaceName)}</b> took over after local authentication failed.\n` +
+      `Expected remote state: <code>${escHtml(branch.branch)} @ ${escHtml(branch.commit.slice(0, 12))}</code> (verify HEAD before side effects)\n\n` +
+      formatConductorDeepLink(launched.deepLink);
+    const noticeIds = newCloudNoticeIds(
+      current.id,
+      noticeIdsBeforeLaunch,
+      new Set(["launch_queued"])
+    );
+    const published = await publishTrackedWorkspaceStatus(
+      ctx,
+      current,
+      progress,
+      successHtml,
+      true
+    );
+    if (published) {
+      acknowledgeCloudNoticeIds(current.id, noticeIds);
+    }
+    return { handled: true, recovered: true, reason: null };
+  } catch (error) {
+    console.error("[cloud-takeover] Unexpected recovery failure:", error);
+    return {
+      handled: false,
+      recovered: false,
+      reason: "an unexpected Cloud recovery error occurred",
+    };
+  }
+}
+
+function combineCloudRecoveryPrompts(requests: CloudRecoveryPrompt[]): string {
+  const prompts = requests
+    .map((request) => request.prompt.trim())
+    .filter(Boolean);
+  if (prompts.length <= 1) return prompts[0] ?? "";
+
+  return [
+    prompts[0],
+    "",
+    "Additional Telegram requests that also failed locally during takeover:",
+    ...prompts.slice(1).map((prompt, index) =>
+      [`Request ${index + 2}:`, prompt].join("\n")
+    ),
+  ].join("\n\n");
+}
+
+function enqueueCloudRecoveryPrompt(
+  trackedWorkspaceId: string,
+  sessionId: string,
+  request: CloudRecoveryPrompt
+): void {
+  enqueuePendingCloudMessage(trackedWorkspaceId, {
+    requestId: request.requestId,
+    sessionId,
+    messageId: randomUUID(),
+    prompt: request.prompt,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+async function forwardLateRecoveryPromptToCloud(
+  ctx: Context,
+  workspace: Workspace,
+  request: CloudRecoveryPrompt,
+  alreadyQueued: boolean
+): Promise<LocalCloudRecoveryOutcome> {
+  const conductorName = workspace.conductorWorkspaceName;
+  const sessionId = workspace.conductorSessionId;
+  if (!conductorName || !sessionId) {
+    return {
+      handled: true,
+      recovered: false,
+      reason: "the Cloud workspace binding is incomplete",
+    };
+  }
+
+  try {
+    if (!alreadyQueued) {
+      enqueueCloudRecoveryPrompt(workspace.id, sessionId, request);
+    }
+  } catch (error) {
+    const reason = `the recovery outbox could not be persisted: ${(error as Error).message}`;
+    await publishTrackedWorkspaceStatus(
+      ctx,
+      workspace,
+      null,
+      `⚠️ ☁️ <b>${escHtml(conductorName)}</b> took over, but another local request could not be saved safely. Please resend it.`,
+      true
+    );
+    return { handled: true, recovered: false, reason };
+  }
+
+  const noticeIdsBeforeDelivery = snapshotCloudNoticeIds(workspace.id);
+  const delivery = await reconcilePendingCloudMessages(workspace.id, workspace);
+  if (delivery.status === "sent" || delivery.status === "none") {
+    const durable = getWorkspace(workspace.id);
+    const exactOutcome = getPendingCloudMessageOutcome(
+      workspace.id,
+      request.requestId
+    );
+    if (
+      exactOutcome?.outcome !== "delivered" ||
+      !durable ||
+      durable.status === "stopped" ||
+      durable.status === "archived" ||
+      durable.status === "failed"
+    ) {
+      const failedNoticeIds = newCloudNoticeIds(
+        workspace.id,
+        noticeIdsBeforeDelivery,
+        new Set(["messages_suppressed", "messages_failed"])
+      );
+      const published = await publishTrackedWorkspaceStatus(
+        ctx,
+        durable ?? workspace,
+        null,
+        exactOutcome?.outcome === "suppressed"
+          ? `⏹ ☁️ The recovered request for <b>${escHtml(conductorName)}</b> was suppressed because the workspace was stopped or archived before delivery completed.`
+          : `⚠️ ☁️ The recovered request for <b>${escHtml(conductorName)}</b> was not durably confirmed as delivered. Please resend only after checking the Cloud workspace.`,
+        false
+      );
+      if (published) {
+        acknowledgeCloudNoticeIds(workspace.id, failedNoticeIds);
+      }
+      return {
+        handled: true,
+        recovered: false,
+        reason:
+          exactOutcome?.error ??
+          "the Cloud request was not durably acknowledged as delivered",
+      };
+    }
+    const deliveredNoticeIds = newCloudNoticeIds(
+      workspace.id,
+      noticeIdsBeforeDelivery,
+      new Set(["messages_sent"])
+    );
+    const published = await publishTrackedWorkspaceStatus(
+      ctx,
+      durable,
+      null,
+      `🟢 ☁️ The local authentication failure happened after Cloud had already taken over. The pending request was queued in <b>${escHtml(conductorName)}</b>.`,
+      true
+    );
+    if (published) {
+      acknowledgeCloudNoticeIds(workspace.id, deliveredNoticeIds);
+    }
+    return { handled: true, recovered: true, reason: null };
+  }
+
+  if (delivery.status === "pending") {
+    const exactOutcome = getPendingCloudMessageOutcome(
+      workspace.id,
+      request.requestId
+    );
+    const stillPending = getPendingCloudMessages(workspace.id).some(
+      (pending) => pending.requestId === request.requestId
+    );
+    if (exactOutcome?.outcome === "delivered") {
+      const noticeIds = newCloudNoticeIds(
+        workspace.id,
+        noticeIdsBeforeDelivery,
+        new Set(["messages_sent"])
+      );
+      const published = await publishTrackedWorkspaceStatus(
+        ctx,
+        getWorkspace(workspace.id) ?? workspace,
+        null,
+        `🟢 ☁️ The pending request was queued in <b>${escHtml(conductorName)}</b>.`,
+        true
+      );
+      if (published) acknowledgeCloudNoticeIds(workspace.id, noticeIds);
+      return { handled: true, recovered: true, reason: null };
+    }
+    if (exactOutcome?.outcome === "suppressed" ||
+        exactOutcome?.outcome === "failed" ||
+        !stillPending) {
+      const noticeIds = newCloudNoticeIds(
+        workspace.id,
+        noticeIdsBeforeDelivery,
+        new Set(["messages_suppressed", "messages_failed"])
+      );
+      const published = await publishTrackedWorkspaceStatus(
+        ctx,
+        getWorkspace(workspace.id) ?? workspace,
+        null,
+        exactOutcome?.outcome === "suppressed"
+          ? `⏹ ☁️ The recovered request for <b>${escHtml(conductorName)}</b> was suppressed before delivery.`
+          : `⚠️ ☁️ The recovered request for <b>${escHtml(conductorName)}</b> is no longer queued and was not confirmed delivered. Please inspect Cloud before resending.`,
+        false
+      );
+      if (published) acknowledgeCloudNoticeIds(workspace.id, noticeIds);
+      return {
+        handled: true,
+        recovered: false,
+        reason:
+          exactOutcome?.error ??
+          "the Cloud request is no longer queued and was not confirmed delivered",
+      };
+    }
+    await publishTrackedWorkspaceStatus(
+      ctx,
+      workspace,
+      null,
+      `🟡 ☁️ The pending request is saved durably for <b>${escHtml(conductorName)}</b> and will be delivered with the same message identity when the API is available.`,
+      true
+    );
+    return { handled: true, recovered: true, reason: "delivery is pending" };
+  }
+
+  if (delivery.status === "suppressed") {
+    const reason = `the request was not delivered because ${delivery.error}`;
+    const noticeIds = newCloudNoticeIds(
+      workspace.id,
+      noticeIdsBeforeDelivery,
+      new Set(["messages_suppressed"])
+    );
+    const published = await publishTrackedWorkspaceStatus(
+      ctx,
+      workspace,
+      null,
+      `⏹ ☁️ The recovered request for <b>${escHtml(conductorName)}</b> was suppressed because the workspace was stopped or became unavailable. Resend only after intentionally reopening it.`,
+      false
+    );
+    if (published) {
+      acknowledgeCloudNoticeIds(workspace.id, noticeIds);
+    }
+    return { handled: true, recovered: false, reason };
+  }
+
+  const reason = delivery.error;
+  const noticeIds = newCloudNoticeIds(
+    workspace.id,
+    noticeIdsBeforeDelivery,
+    new Set(["messages_failed"])
+  );
+  const published = await publishTrackedWorkspaceStatus(
+    ctx,
+    workspace,
+    null,
+    `⚠️ ☁️ <b>${escHtml(conductorName)}</b> took over, but another local request could not be replayed because ${escHtml(reason)}. Please resend that request after the current Cloud run finishes.`,
+    true
+  );
+  if (published) {
+    acknowledgeCloudNoticeIds(workspace.id, noticeIds);
+  }
+  return { handled: true, recovered: false, reason };
+}
+
+function describeCloudTakeoverBranchFailure(
+  reason: Awaited<ReturnType<typeof resolveSafeCloudTakeoverBranch>>["reason"]
+): string {
+  switch (reason) {
+    case "workspace_has_uncommitted_changes":
+      return "the local worktree has changes that are not available in Cloud";
+    case "commit_not_available_on_remote":
+      return "the checked-out commit has not been pushed to origin";
+    default:
+      return "the local repository state could not be verified safely";
+  }
+}
+
+/**
+ * Watch a spawned agent run and surface hard failures in Telegram. Local
+ * authentication failures first attempt a commit-gated Cloud takeover when
+ * the caller supplied an eligible recovery plan.
+ */
+export async function observeAgentCompletion(
+  ctx: Context,
+  workspace: Workspace,
+  conductorName: string,
+  done: Promise<AgentResult>,
+  options: AgentCompletionOptions = {}
+): Promise<void> {
+  try {
+    const agentResult = await done;
+    if (!agentResult.isError) return;
+
+    let recovery: LocalCloudRecoveryOutcome | null = null;
+    if (options.cloudRecovery) {
+      recovery = await recoverLocalAgentFailure(
+        ctx,
+        workspace,
+        conductorName,
+        agentResult,
+        options.cloudRecovery
+      );
+      if (recovery.handled) return;
+    }
+
+    updateWorkspaceStatus(workspace.id, "failed");
+    if (workspace.telegramThreadId) {
+      await syncWorkspaceTopic(ctx.telegram, {
+        ...workspace,
+        status: "failed",
+      }).catch((err) =>
+        console.error(`[forum] topic sync error ${workspace.telegramThreadId}:`, err)
+      );
+    }
+
+    const exitNote =
+      typeof agentResult.exitCode === "number"
+        ? ` (exit ${agentResult.exitCode})`
+        : "";
+    let text = `🔴 <b>${escHtml(conductorName)}</b> agent run failed${exitNote}.`;
+    const detail =
+      agentResult.stderrTail?.trim() || agentResult.resultText?.trim();
+    if (detail) {
+      text += `\n<pre>${escHtml(truncate(detail, 600))}</pre>`;
+    }
+    if (isLocalAgentAuthenticationFailure(agentResult)) {
+      const reason = recovery?.reason
+        ? ` Automatic Cloud takeover was skipped because ${recovery.reason}.`
+        : " Automatic Cloud takeover was not eligible for this run.";
+      text += `\n\n☁️${escHtml(reason)}`;
+    }
+    if (workspace.telegramThreadId) {
+      await ctx.telegram.sendMessage(workspace.telegramChatId, text, {
+        parse_mode: "HTML",
+        message_thread_id: workspace.telegramThreadId,
+      });
+    } else {
+      await ctx.reply(text, { parse_mode: "HTML" });
+    }
+  } catch (err) {
+    console.error("[send] agent completion watch error:", err);
+  }
 }
 
 // ── Helpers ─────────────────────────────────────────────────
+
+/** @internal exported for Cloud handoff prompt tests. */
+export function buildCloudRecoveryPrompt(
+  originalPrompt: string,
+  latestPrompt: string,
+  localConversation = ""
+): string {
+  const original = originalPrompt.trim();
+  const latest = latestPrompt.trim();
+  const conversation = localConversation.trim();
+  if ((!original || original === latest) && !conversation) return latest;
+
+  const sections = [
+    "Continue this workspace in Conductor Cloud after the local agent lost authentication.",
+    "The requested pushed branch was used for provisioning. Verify HEAD against the expected SHA in the handoff before acting.",
+  ];
+  if (original) {
+    sections.push("", "Original workspace task:", original);
+  }
+  if (conversation) {
+    sections.push(
+      "",
+      "Relevant local conversation before the failed request:",
+      conversation
+    );
+  }
+  if (latest) {
+    sections.push("", "Latest request that did not complete:", latest);
+  }
+  return sections.join("\n");
+}
+
+async function buildCloudRecoveryPromptFromLocalSession(
+  workspace: Workspace,
+  latestPrompt: string,
+  sessionId: string | null
+): Promise<string> {
+  if (!sessionId) {
+    return buildCloudRecoveryPrompt(workspace.prompt, latestPrompt);
+  }
+  const messages = getLocalSessionMessagesTail(sessionId, 50);
+  return buildCloudRecoveryPrompt(
+    workspace.prompt,
+    latestPrompt,
+    formatRecoveryConversation(messages, workspace.prompt, latestPrompt)
+  );
+}
+
+/** @internal exported for recovery-tail budget tests. */
+export function formatRecoveryConversation(
+  messages: Awaited<ReturnType<typeof getSessionMessagesAfter>>,
+  originalPrompt: string,
+  latestPrompt: string
+): string {
+  const entries: string[] = [];
+
+  for (const message of messages) {
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const content = recoveryMessageText(message.content, message.role).trim();
+    if (!content) {
+      continue;
+    }
+    entries.push(
+      `${message.role === "user" ? "User" : "Assistant"}: ${content.slice(0, 1_500)}`
+    );
+  }
+
+  const selected = entries.slice(-12);
+  let remaining = 9_000;
+  const newestFirst: string[] = [];
+  for (const entry of [...selected].reverse()) {
+    if (remaining <= 0) break;
+    const value = entry.slice(0, remaining);
+    newestFirst.push(value);
+    remaining -= value.length;
+  }
+  return newestFirst.reverse().join("\n\n");
+}
+
+function recoveryMessageText(content: string, role: string): string {
+  if (role === "user") return content;
+  try {
+    const parsed = JSON.parse(content);
+    if (parsed?.type === "result" && typeof parsed.result === "string") {
+      return parsed.result;
+    }
+    const messageContent = parsed?.message?.content;
+    if (typeof messageContent === "string") return messageContent;
+    if (Array.isArray(messageContent)) {
+      return messageContent
+        .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+        .map((part: any) => part.text.trim())
+        .filter(Boolean)
+        .join("\n\n");
+    }
+    return "";
+  } catch {
+    return content;
+  }
+}
 
 function previewOutgoingText(prompt: string, attachmentSourcePaths: string[]): string {
   const trimmedPrompt = prompt.trim();

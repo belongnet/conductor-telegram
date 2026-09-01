@@ -1,7 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
@@ -528,7 +536,7 @@ test("claude follow-ups resume the stored claude_session_id, not the Conductor s
 
     const argsOut = path.join(dir, "claude-args.txt");
     const fakeClaude = path.join(dir, "fake-claude.sh");
-    writeFileSync(fakeClaude, `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsOut}"\nexit 0\n`);
+    writeFileSync(fakeClaude, `#!/bin/sh\nif [ "$1" = "auth" ]; then\n  printf '{"loggedIn":true}\\n'\n  exit 0\nfi\nprintf '%s\\n' "$@" > "${argsOut}"\nexit 0\n`);
     chmodSync(fakeClaude, 0o755);
 
     const result = runLauncherEval(
@@ -590,7 +598,7 @@ test("failed claude runs surface an error result with stderr detail", () => {
     const fakeClaude = path.join(dir, "fake-claude.sh");
     writeFileSync(
       fakeClaude,
-      `#!/bin/sh\necho "No conversation found with session ID: claude-real-1" >&2\nexit 1\n`
+      `#!/bin/sh\nif [ "$1" = "auth" ]; then\n  printf '{"loggedIn":true}\\n'\n  exit 0\nfi\necho "No conversation found with session ID: claude-real-1" >&2\nexit 1\n`
     );
     chmodSync(fakeClaude, 0o755);
 
@@ -616,6 +624,321 @@ test("failed claude runs surface an error result with stderr detail", () => {
     assert.equal(result.isError, true);
     assert.equal(result.exitCode, 1);
     assert.match(result.stderrTail ?? "", /No conversation found/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("claude auth preflight fails before any customized prompt process starts", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-auth-preflight-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+    writeFileSync(
+      path.join(workspaceDir, "CLAUDE.md"),
+      "This repo instruction must remain available to authenticated launches.\n"
+    );
+
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const promptStarted = path.join(dir, "prompt-started");
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh\nif [ "$1" = "auth" ]; then\n  printf '{"loggedIn":false}\\n'\n  exit 1\nfi\ntouch "${promptStarted}"\nexit 1\n`
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        const sendResult = await sendToSession("local-ws", "do not start", [], { repoPath: "/tmp/repo" });
+        if (!("ok" in sendResult)) {
+          console.log(JSON.stringify(sendResult));
+          process.exit(0);
+        }
+        console.log(JSON.stringify(await sendResult.done));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as {
+      isError: boolean;
+      authenticationFailure?: boolean;
+      hadMeaningfulActivity?: boolean;
+    };
+
+    assert.equal(result.isError, true);
+    assert.equal(result.authenticationFailure, true);
+    assert.equal(result.hadMeaningfulActivity, false);
+    assert.equal(existsSync(promptStarted), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pending Claude auth preflight is visible, duplicate-fenced, and Stop-cancelable", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-auth-pending-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const authGate = path.join(dir, "release-auth");
+    const promptStarted = path.join(dir, "prompt-started");
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh
+if [ "$1" = "auth" ]; then
+  while [ ! -f "${authGate}" ]; do sleep 0.01; done
+  printf '{"loggedIn":true}\\n'
+  exit 0
+fi
+touch "${promptStarted}"
+exit 0
+`
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import Database from "better-sqlite3";
+        import { writeFileSync, existsSync } from "node:fs";
+        import { sendToSession, stopAgent } from "./src/bot/launcher.ts";
+        const first = await sendToSession("local-ws", "first", [], { repoPath: "/tmp/repo" });
+        const statusDb = new Database(process.env.CONDUCTOR_DB_PATH);
+        const pendingStatus = statusDb.prepare("SELECT status FROM sessions WHERE id = ?").get("conductor-session-1").status;
+        statusDb.close();
+        const duplicate = await sendToSession("local-ws", "second", [], { repoPath: "/tmp/repo" });
+        const stopped = stopAgent("local-ws", "/tmp/repo");
+        const stoppedDb = new Database(process.env.CONDUCTOR_DB_PATH);
+        const stoppedStatus = stoppedDb.prepare("SELECT status FROM sessions WHERE id = ?").get("conductor-session-1").status;
+        stoppedDb.close();
+        writeFileSync(${JSON.stringify(authGate)}, "release");
+        const agentResult = "ok" in first ? await first.done : first;
+        const finalDb = new Database(process.env.CONDUCTOR_DB_PATH);
+        const finalStatus = finalDb.prepare("SELECT status FROM sessions WHERE id = ?").get("conductor-session-1").status;
+        finalDb.close();
+        console.log(JSON.stringify({
+          firstOk: "ok" in first,
+          pendingStatus,
+          duplicate,
+          stopped,
+          stoppedStatus,
+          agentResult,
+          finalStatus,
+          promptStarted: existsSync(${JSON.stringify(promptStarted)}),
+        }));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as {
+      firstOk: boolean;
+      pendingStatus: string;
+      duplicate: { error?: string; ok?: boolean };
+      stopped: boolean;
+      stoppedStatus: string;
+      agentResult: { isError?: boolean; hadMeaningfulActivity?: boolean };
+      finalStatus: string;
+      promptStarted: boolean;
+    };
+
+    assert.equal(result.firstOk, true);
+    assert.equal(result.pendingStatus, "working");
+    assert.match(result.duplicate.error ?? "", /still starting/i);
+    assert.equal(result.duplicate.ok, undefined);
+    assert.equal(result.stopped, true);
+    assert.equal(result.stoppedStatus, "idle");
+    assert.equal(result.agentResult.isError, false);
+    assert.equal(result.agentResult.hadMeaningfulActivity, false);
+    assert.equal(result.finalStatus, "idle");
+    assert.equal(result.promptStarted, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("claude spawn classifies the attached weekly-limit banner before activity", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-weekly-limit-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+
+    const argsLog = path.join(dir, "args.log");
+    const hookMarker = path.join(dir, "hook-ran");
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh
+if [ "$1" = "auth" ]; then
+  printf '{"loggedIn":true}\\n'
+  exit 0
+fi
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--setting-sources" ]; then
+    printf 'setting=%s\\n' "$argument" >> "${argsLog}"
+    if [ -n "$argument" ]; then touch "${hookMarker}"; fi
+  fi
+  if [ "$argument" = "--strict-mcp-config" ]; then printf 'strict-mcp\\n' >> "${argsLog}"; fi
+  if [ "$argument" = "--safe-mode" ]; then printf 'safe-mode\\n' >> "${argsLog}"; fi
+  previous="$argument"
+done
+printf '%s\\n' '{"type":"result","is_error":true,"result":"You'"'"'ve hit your weekly limit · resets Aug 28 at 7am (America/New_York)","num_turns":0}'
+exit 1
+`
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        const sent = await sendToSession("local-ws", "do not replay twice", [], { repoPath: "/tmp/repo" });
+        console.log(JSON.stringify("ok" in sent ? await sent.done : sent));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as {
+      isError: boolean;
+      resultText?: string;
+      authenticationFailure?: boolean;
+      hadMeaningfulActivity?: boolean;
+    };
+
+    assert.equal(result.isError, true);
+    assert.equal(result.authenticationFailure, true);
+    assert.equal(result.hadMeaningfulActivity, false);
+    assert.match(result.resultText ?? "", /weekly limit/);
+    const args = readFileSync(argsLog, "utf8");
+    assert.match(args, /setting=\n/);
+    assert.match(args, /strict-mcp/);
+    assert.doesNotMatch(args, /safe-mode/);
+    assert.equal(existsSync(hookMarker), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable Claude auth preflight falls through to the controlled launch", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-claude-auth-unsupported-"));
+  try {
+    const dbPath = path.join(dir, "conductor.db");
+    const workspaceRoot = path.join(dir, "workspaces");
+    const workspaceDir = path.join(workspaceRoot, "repo", "local-ws");
+    mkdirSync(workspaceDir, { recursive: true });
+    const db = createConductorDb(dbPath);
+    db.prepare(
+      `INSERT INTO repos (id, root_path, name, default_branch)
+       VALUES ('repo-1', '/tmp/repo', 'repo', 'main')`
+    ).run();
+    db.prepare(
+      `INSERT INTO sessions (id, status, claude_session_id, updated_at, workspace_id, is_hidden, model, agent_type)
+       VALUES ('conductor-session-1', 'idle', 'claude-real-1', datetime('now'), 'ws-1', 0, 'opus', 'claude')`
+    ).run();
+    db.prepare(
+      `INSERT INTO workspaces
+        (id, repository_id, directory_name, active_session_id, updated_at, state, derived_status, pinned_at, initialization_parent_branch, intended_target_branch)
+       VALUES
+        ('ws-1', 'repo-1', 'local-ws', 'conductor-session-1', '2026-05-19 00:00:00', 'ready', 'in-progress', NULL, 'main', 'main')`
+    ).run();
+    db.close();
+    const promptStarted = path.join(dir, "prompt-started");
+    const fakeClaude = path.join(dir, "fake-claude.sh");
+    writeFileSync(
+      fakeClaude,
+      `#!/bin/sh
+if [ "$1" = "auth" ]; then
+  echo 'unknown command: auth' >&2
+  exit 2
+fi
+touch "${promptStarted}"
+printf '%s\\n' '{"type":"result","is_error":false,"result":"completed","num_turns":0}'
+exit 0
+`
+    );
+    chmodSync(fakeClaude, 0o755);
+
+    const result = runLauncherEval(
+      `
+        import { sendToSession } from "./src/bot/launcher.ts";
+        const sent = await sendToSession("local-ws", "continue", [], { repoPath: "/tmp/repo" });
+        console.log(JSON.stringify("ok" in sent ? await sent.done : sent));
+      `,
+      {
+        CONDUCTOR_DB_PATH: dbPath,
+        CONDUCTOR_WORKSPACES_DIR: workspaceRoot,
+        CLAUDE_BIN: fakeClaude,
+        DB_PATH: path.join(dir, "bot.db"),
+      }
+    ) as { isError: boolean; authenticationFailure?: boolean };
+
+    assert.equal(existsSync(promptStarted), true);
+    assert.equal(result.isError, false);
+    assert.notEqual(result.authenticationFailure, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

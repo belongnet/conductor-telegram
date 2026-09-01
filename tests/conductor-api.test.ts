@@ -170,6 +170,32 @@ test("read requests retry transient failures", async () => {
   assert.equal(calls, 2);
 });
 
+test("caller cancellation interrupts retry backoff", async () => {
+  let calls = 0;
+  const fetcher = (async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ userMessage: "slow down" }), {
+      status: 429,
+      headers: {
+        "content-type": "application/json",
+        "retry-after": "5",
+      },
+    });
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config({ maxRetries: 1 }), fetcher);
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const listing = client.listProjects({ signal: controller.signal });
+  setTimeout(() => controller.abort(), 20);
+
+  await assert.rejects(listing, /request canceled/);
+  assert.equal(calls, 1, "an aborted backoff must not start another request");
+  assert.ok(
+    Date.now() - startedAt < 1_000,
+    "cancellation must not wait for Retry-After"
+  );
+});
+
 test("incremental transcript polling returns one bounded page", async () => {
   const urls: string[] = [];
   const fetcher = (async (url: string | URL | Request) => {
@@ -298,6 +324,35 @@ test("project listing paginates and preserves order", async () => {
   );
   assert.equal(urls.length, 2);
   assert.match(urls[0], /\/v0\/projects\?limit=100&offset=0$/);
+});
+
+test("project listing honors a caller cancellation across pagination", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const fetcher = (async (
+    _url: string | URL | Request,
+    init: RequestInit = {}
+  ) => {
+    calls += 1;
+    return new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener(
+        "abort",
+        () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        },
+        { once: true }
+      );
+    });
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const pending = client.listProjects({ signal: controller.signal });
+  controller.abort();
+
+  await assert.rejects(pending, /request canceled/);
+  assert.equal(calls, 1);
 });
 
 test("project and message reads reject mismatched identities", async () => {
