@@ -166,7 +166,7 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_lane_actions_lane_created
     ON lane_actions(lane_id, created_at DESC);
-`
+`;
 
 let _db: Database.Database | null = null;
 

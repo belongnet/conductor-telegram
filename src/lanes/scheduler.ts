@@ -11,6 +11,7 @@ import {
 import { createLogger } from "../bot/logger.js";
 import { supervisedInterval } from "../bot/supervisor.js";
 import {
+  countLaneActions,
   getLanesLastTickAt,
   getLatestLaneActions,
   isLanesPaused,
@@ -39,6 +40,17 @@ import {
 
 const log = createLogger("lanes");
 const DUE_CHECK_MS = 60_000;
+const INVALID_CONFIG_LOG_MS = 30 * 60_000;
+
+export class LaneWorkspaceIndexError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "LaneWorkspaceIndexError";
+    if (options?.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
 
 export type LaneStatusRow = {
   id: string;
@@ -59,6 +71,7 @@ export type LanesTickResult = {
 export type LanesNotify = (text: string) => Promise<void>;
 
 let tickInFlight = false;
+let lastInvalidConfigLog = { message: "", at: 0 };
 
 export function startLanesScheduler(options: {
   notify: LanesNotify;
@@ -117,7 +130,7 @@ async function runLanesTickUnlocked(options: {
       error instanceof LanesConfigError
         ? error.message
         : describeError(error);
-    log.error(message);
+    logInvalidConfig(message);
     return {
       skipped: true,
       reason: message,
@@ -138,7 +151,6 @@ async function runLanesTickUnlocked(options: {
   if (!options.force) {
     const lastTick = getLanesLastTickAt();
     if (!lastTick) {
-      // Start the interval clock on first boot without launching work.
       setLanesLastTickAt(new Date().toISOString());
       return {
         skipped: true,
@@ -172,7 +184,16 @@ async function runLanesTickUnlocked(options: {
     return { skipped: true, reason: message, actions: [], statuses: [] };
   }
 
-  const snapshots = await resolveLaneSnapshots(client, config);
+  let workspaces: ConductorApiWorkspace[];
+  try {
+    workspaces = await loadWorkspaceIndex(client, config);
+  } catch (error) {
+    const message = `Lanes tick skipped: ${describeError(error)}`;
+    log.error(message);
+    return { skipped: true, reason: message, actions: [], statuses: [] };
+  }
+
+  const snapshots = await resolveLaneSnapshots(client, config, workspaces);
   const lastActions = getLatestLaneActions(config.lanes.map((lane) => lane.id));
   const statuses = statusRows(config, snapshots, lastActions);
 
@@ -198,6 +219,7 @@ async function runLanesTickUnlocked(options: {
     name,
     gapHours: config.providers[name].gapHours,
     maxActive: config.providers[name].maxActive,
+    maxNudges: config.providers[name].maxNudges,
   }));
 
   const failedLaneIds = new Set<string>();
@@ -221,7 +243,13 @@ async function runLanesTickUnlocked(options: {
       continue;
     }
 
-    const outcome = await executeLaneAction(client, config, lane, action);
+    const outcome = await executeLaneAction(
+      client,
+      config,
+      lane,
+      action,
+      workspaces
+    );
     if (outcome.ok) {
       succeededProviders.add(action.provider);
       executed.push(action);
@@ -294,7 +322,8 @@ export async function collectLaneStatuses(): Promise<{
   }
 
   try {
-    const snapshots = await resolveLaneSnapshots(client, config);
+    const workspaces = await loadWorkspaceIndex(client, config);
+    const snapshots = await resolveLaneSnapshots(client, config, workspaces);
     const lastActions = getLatestLaneActions(config.lanes.map((lane) => lane.id));
     return {
       config,
@@ -318,69 +347,87 @@ type ExecuteOutcome = {
   assignedProvider?: string;
 };
 
-async function executeLaneAction(
+/** @internal exported for scheduler unit tests. */
+export async function executeLaneAction(
   client: ConductorApiClient,
   config: LanesConfig,
   lane: LaneConfig,
-  action: LaneAction
+  action: LaneAction,
+  workspaces: ConductorApiWorkspace[]
 ): Promise<ExecuteOutcome> {
   if (action.type === "nudge") {
+    return sendLaneMessage({
+      client,
+      config,
+      lane,
+      action,
+      workspaces,
+      message: LANE_NUDGE_MESSAGE,
+      successKind: "nudge",
+      failureKind: "nudge_failed",
+      successNotice: `nudged ${lane.id} (${action.provider})`,
+    });
+  }
+
+  if (action.type === "prompt") {
     try {
-      const sessionId = await resolveLaneSessionId(client, config, lane);
-      if (!sessionId) {
-        const notice = `nudge ${lane.id}: no session found`;
-        log.warn(notice);
-        recordLaneAction({
-          laneId: lane.id,
-          provider: action.provider,
-          action: "nudge_failed",
-          detail: notice,
-        });
-        return { ok: false, notice };
-      }
-      await client.sendMessage({
-        sessionId,
-        message: LANE_NUDGE_MESSAGE,
-        messageId: randomUUID(),
+      const prompt = readLanePrompt(config, lane);
+      return await sendLaneMessage({
+        client,
+        config,
+        lane,
+        action,
+        workspaces,
+        message: prompt,
+        successKind: "prompt",
+        failureKind: "prompt_failed",
+        successNotice: `prompted ${lane.id} (${action.provider})`,
       });
-      recordLaneAction({
-        laneId: lane.id,
-        provider: action.provider,
-        action: "nudge",
-        detail: sessionId,
-      });
-      return { ok: true, notice: `nudged ${lane.id} (${action.provider})` };
     } catch (error) {
-      const notice = `nudge ${lane.id} failed: ${describeError(error)}`;
+      const notice = `prompt ${lane.id} failed: ${describeError(error)}`;
       log.error(notice);
       recordLaneAction({
         laneId: lane.id,
         provider: action.provider,
-        action: "nudge_failed",
+        action: "prompt_failed",
         detail: describeError(error),
       });
       return { ok: false, notice };
     }
   }
 
+  let existing: ConductorApiWorkspace | null;
   try {
-    const existing = await findLaneWorkspace(client, config, lane);
-    if (existing) {
-      const notice = `create ${lane.id} refused: workspace already exists`;
-      log.warn(notice);
-      recordLaneAction({
-        laneId: lane.id,
-        provider: action.provider,
-        action: "create_refused",
-        detail: existing.id,
-      });
-      return { ok: false, notice };
-    }
+    existing = await findLaneWorkspace(client, config, lane, workspaces);
+  } catch (error) {
+    const notice = `create ${lane.id} skipped: ${describeError(error)}`;
+    log.error(notice);
+    recordLaneAction({
+      laneId: lane.id,
+      provider: action.provider,
+      action: "create_failed",
+      detail: describeError(error),
+    });
+    return { ok: false, notice };
+  }
 
-    const prompt = readLanePrompt(config, lane);
-    const provider = config.providers[action.provider];
-    const name = laneWorkspaceName(lane.id, action.provider, lane.title);
-    const created = lane.projectId
+  if (existing) {
+    const notice = `create ${lane.id} refused: workspace already exists`;
+    log.warn(notice);
+    recordLaneAction({
+      laneId: lane.id,
+      provider: action.provider,
+      action: "create_refused",
+      detail: existing.id,
+    });
+    return { ok: false, notice };
+  }
+
+  const provider = config.providers[action.provider];
+  const name = laneWorkspaceName(lane.id, action.provider, lane.title);
+  let created: { workspaceId: string; sessionId: string };
+  try {
+    created = lane.projectId
       ? await client.createWorkspace({
           projectId: lane.projectId,
           name,
@@ -395,22 +442,6 @@ async function executeLaneAction(
           model: provider.model,
           effort: provider.effort,
         });
-    await client.sendMessage({
-      sessionId: created.sessionId,
-      message: prompt,
-      messageId: randomUUID(),
-    });
-    recordLaneAction({
-      laneId: lane.id,
-      provider: action.provider,
-      action: "create",
-      detail: created.workspaceId,
-    });
-    return {
-      ok: true,
-      notice: `created ${lane.id} (${action.provider})`,
-      assignedProvider: action.provider,
-    };
   } catch (error) {
     const notice = `create ${lane.id} failed: ${describeError(error)}`;
     log.error(notice);
@@ -418,6 +449,99 @@ async function executeLaneAction(
       laneId: lane.id,
       provider: action.provider,
       action: "create_failed",
+      detail: describeError(error),
+    });
+    return { ok: false, notice };
+  }
+
+  try {
+    const prompt = readLanePrompt(config, lane);
+    await client.sendMessage({
+      sessionId: created.sessionId,
+      message: prompt,
+      messageId: randomUUID(),
+    });
+  } catch (error) {
+    const notice = `create ${lane.id} workspace ${created.workspaceId} needs its first prompt: ${describeError(error)}`;
+    log.error(notice);
+    recordLaneAction({
+      laneId: lane.id,
+      provider: action.provider,
+      action: "create_failed",
+      detail: `${created.workspaceId}: ${describeError(error)}`,
+    });
+    return {
+      ok: false,
+      notice,
+      assignedProvider: action.provider,
+    };
+  }
+
+  recordLaneAction({
+    laneId: lane.id,
+    provider: action.provider,
+    action: "create",
+    detail: created.workspaceId,
+  });
+  return {
+    ok: true,
+    notice: `created ${lane.id} (${action.provider})`,
+    assignedProvider: action.provider,
+  };
+}
+
+async function sendLaneMessage(input: {
+  client: ConductorApiClient;
+  config: LanesConfig;
+  lane: LaneConfig;
+  action: LaneAction;
+  workspaces: ConductorApiWorkspace[];
+  message: string;
+  successKind: "nudge" | "prompt";
+  failureKind: "nudge_failed" | "prompt_failed";
+  successNotice: string;
+}): Promise<ExecuteOutcome> {
+  try {
+    const sessionId = await resolveLaneSessionId(
+      input.client,
+      input.config,
+      input.lane,
+      input.workspaces
+    );
+    if (!sessionId) {
+      const notice = `${input.successKind} ${input.lane.id}: no session found`;
+      log.warn(notice);
+      recordLaneAction({
+        laneId: input.lane.id,
+        provider: input.action.provider,
+        action: input.failureKind,
+        detail: notice,
+      });
+      return { ok: false, notice };
+    }
+    await input.client.sendMessage({
+      sessionId,
+      message: input.message,
+      messageId: randomUUID(),
+    });
+    recordLaneAction({
+      laneId: input.lane.id,
+      provider: input.action.provider,
+      action: input.successKind,
+      detail: sessionId,
+    });
+    return {
+      ok: true,
+      notice: input.successNotice,
+      assignedProvider: input.action.provider,
+    };
+  } catch (error) {
+    const notice = `${input.successKind} ${input.lane.id} failed: ${describeError(error)}`;
+    log.error(notice);
+    recordLaneAction({
+      laneId: input.lane.id,
+      provider: input.action.provider,
+      action: input.failureKind,
       detail: describeError(error),
     });
     return { ok: false, notice };
@@ -443,37 +567,40 @@ function applyLocalSnapshotUpdate(
 ): void {
   const snapshot = snapshots.find((entry) => entry.id === action.laneId);
   if (!snapshot || !outcome.ok) return;
-  if (action.type === "create") {
-    snapshot.state = "initializing";
-    snapshot.assignedProvider = outcome.assignedProvider ?? action.provider;
-    snapshot.lastUserMessageAt = new Date().toISOString();
-    // After the prompt is sent there is a user message, so the lane is
-    // no longer initializing — treat it as paused until the next poll.
-    snapshot.state = "paused";
-  } else {
+  snapshot.assignedProvider = outcome.assignedProvider ?? action.provider;
+  snapshot.lastUserMessageAt = new Date().toISOString();
+  if (action.type === "nudge") {
     snapshot.state = "working";
-    snapshot.lastUserMessageAt = new Date().toISOString();
+    snapshot.nudgeCount += 1;
+  } else {
+    snapshot.state = "paused";
   }
 }
 
 async function resolveLaneSnapshots(
   client: ConductorApiClient,
-  config: LanesConfig
+  config: LanesConfig,
+  workspaces: ConductorApiWorkspace[]
 ): Promise<LaneSnapshot[]> {
-  const workspaces = await loadWorkspaceIndex(client, config);
+  const lastActions = getLatestLaneActions(config.lanes.map((lane) => lane.id));
   const snapshots: LaneSnapshot[] = [];
   for (const lane of config.lanes) {
     try {
-      snapshots.push(await snapshotLane(client, config, lane, workspaces));
+      snapshots.push(
+        await snapshotLane(client, config, lane, workspaces, lastActions.get(lane.id))
+      );
     } catch (error) {
       log.error(`could not resolve lane ${lane.id}:`, error);
       snapshots.push({
         id: lane.id,
         provider: lane.provider,
-        assignedProvider: lane.provider === "any" ? null : lane.provider,
-        state: "not_created",
+        assignedProvider:
+          lastActions.get(lane.id)?.provider ??
+          (lane.provider === "any" ? null : lane.provider),
+        state: "unknown",
         lastUserMessageAt: null,
         after: lane.after,
+        nudgeCount: countLaneActions(lane.id, "nudge"),
       });
     }
   }
@@ -484,9 +611,13 @@ async function snapshotLane(
   client: ConductorApiClient,
   config: LanesConfig,
   lane: LaneConfig,
-  workspaces: ConductorApiWorkspace[]
+  workspaces: ConductorApiWorkspace[],
+  lastAction: LaneActionRecord | undefined
 ): Promise<LaneSnapshot> {
+  const fallbackProvider =
+    lastAction?.provider ?? (lane.provider === "any" ? null : lane.provider);
   const workspace = await findLaneWorkspace(client, config, lane, workspaces);
+  const nudgeCount = countLaneActions(lane.id, "nudge");
   if (!workspace) {
     return {
       id: lane.id,
@@ -495,18 +626,18 @@ async function snapshotLane(
       state: "not_created",
       lastUserMessageAt: null,
       after: lane.after,
+      nudgeCount,
     };
   }
 
   const parsed = parseLaneWorkspaceName(workspace.name);
-  const assignedProvider =
-    parsed?.provider ??
-    (lane.provider === "any" ? null : lane.provider);
+  const assignedProvider = parsed?.provider ?? fallbackProvider;
 
   const sessionId = await resolveLaneSessionId(
     client,
     config,
     lane,
+    workspaces,
     workspace.id
   );
   if (!sessionId) {
@@ -517,20 +648,41 @@ async function snapshotLane(
       state: "initializing",
       lastUserMessageAt: null,
       after: lane.after,
+      nudgeCount,
     };
   }
 
   let sessionStatus: "idle" | "working" | "error" | null = null;
+  let statusUnknown = false;
   try {
     sessionStatus = (await client.getSessionStatus(sessionId)).status;
   } catch (error) {
+    statusUnknown = true;
     log.warn(`session status for ${lane.id} failed:`, error);
   }
 
-  const messages = await listAllSessionMessages(client, sessionId);
+  let messages: ConductorApiMessage[] = [];
+  try {
+    messages = await listAllSessionMessages(client, sessionId);
+  } catch (error) {
+    log.warn(`transcript for ${lane.id} failed:`, error);
+    if (statusUnknown) {
+      return {
+        id: lane.id,
+        provider: lane.provider,
+        assignedProvider,
+        state: "unknown",
+        lastUserMessageAt: null,
+        after: lane.after,
+        nudgeCount,
+      };
+    }
+  }
+
   const derived = deriveLaneRuntimeState({
     workspaceFound: true,
     sessionStatus,
+    statusUnknown,
     messages: messages.map((message) => ({
       type: message.type,
       content: message.content,
@@ -543,6 +695,7 @@ async function snapshotLane(
     assignedProvider,
     ...derived,
     after: lane.after,
+    nudgeCount,
   };
 }
 
@@ -550,13 +703,18 @@ async function findLaneWorkspace(
   client: ConductorApiClient,
   config: LanesConfig,
   lane: LaneConfig,
-  index?: ConductorApiWorkspace[]
+  index: ConductorApiWorkspace[]
 ): Promise<ConductorApiWorkspace | null> {
   if (lane.workspaceId) {
     try {
       return await client.getWorkspace(lane.workspaceId);
     } catch (error) {
-      log.warn(`getWorkspace ${lane.workspaceId} failed:`, error);
+      if (!isNotFoundError(error)) {
+        throw new LaneWorkspaceIndexError(
+          `could not load workspace ${lane.workspaceId} for lane ${lane.id}`,
+          { cause: error }
+        );
+      }
     }
   }
 
@@ -565,13 +723,17 @@ async function findLaneWorkspace(
       const status = await client.getSessionStatus(lane.sessionId);
       return await client.getWorkspace(status.workspaceId);
     } catch (error) {
-      log.warn(`session ${lane.sessionId} lookup failed:`, error);
+      if (!isNotFoundError(error)) {
+        throw new LaneWorkspaceIndexError(
+          `could not load session ${lane.sessionId} for lane ${lane.id}`,
+          { cause: error }
+        );
+      }
     }
   }
 
   const prefix = laneWorkspaceNamePrefix(lane.id);
-  const pool = index ?? (await loadWorkspaceIndex(client, config));
-  const matches = workspacesMatchingPrefix(pool, prefix);
+  const matches = workspacesMatchingPrefix(index, prefix);
   if (matches.length === 0) return null;
   return matches.sort((a, b) =>
     (b.lastActivityAt ?? b.createdAt).localeCompare(
@@ -584,11 +746,12 @@ async function resolveLaneSessionId(
   client: ConductorApiClient,
   config: LanesConfig,
   lane: LaneConfig,
+  workspaces: ConductorApiWorkspace[],
   workspaceId?: string
 ): Promise<string | null> {
   if (lane.sessionId) return lane.sessionId;
   const id =
-    workspaceId ?? (await findLaneWorkspace(client, config, lane))?.id;
+    workspaceId ?? (await findLaneWorkspace(client, config, lane, workspaces))?.id;
   if (!id) return null;
   try {
     const sessions = await client.listWorkspaceSessions(id);
@@ -600,55 +763,105 @@ async function resolveLaneSessionId(
   }
 }
 
-async function loadWorkspaceIndex(
+/**
+ * Per-lane name-filtered listing. Throws when existence cannot be
+ * established, so a tick never treats a listing outage as "not created".
+ *
+ * @internal exported for scheduler unit tests.
+ */
+export async function loadWorkspaceIndex(
   client: ConductorApiClient,
   config: LanesConfig
 ): Promise<ConductorApiWorkspace[]> {
-  try {
-    const listed = await client.listWorkspaces({ mine: true });
-    if (listed.length > 0) return listed;
-    // An empty mine listing can still be correct; also try unfiltered and
-    // keep both so a name-prefix match cannot miss an existing workspace.
-    const all = await client.listWorkspaces();
-    return all.length > 0 ? all : listed;
-  } catch (error) {
-    log.warn(
-      "listWorkspaces failed; falling back to per-project listing:",
-      error
-    );
+  const found = new Map<string, ConductorApiWorkspace>();
+  const unresolved = new Set<string>();
+  const errors: string[] = [];
+
+  for (const lane of config.lanes) {
+    const prefix = laneWorkspaceNamePrefix(lane.id);
+    try {
+      const listed = await client.listWorkspaces({ mine: true, name: prefix });
+      for (const workspace of listed) found.set(workspace.id, workspace);
+    } catch (error) {
+      errors.push(`${lane.id}: ${describeError(error)}`);
+      unresolved.add(lane.id);
+    }
   }
 
+  if (unresolved.size === 0) {
+    return [...found.values()];
+  }
+
+  const fallbackErrors: string[] = [];
+  let fallbackSucceeded = false;
+  try {
+    const fallback = await loadProjectWorkspaceFallback(client, config);
+    fallbackSucceeded = true;
+    for (const workspace of fallback) found.set(workspace.id, workspace);
+  } catch (error) {
+    fallbackErrors.push(describeError(error));
+  }
+
+  if (fallbackSucceeded) {
+    return [...found.values()];
+  }
+
+  throw new LaneWorkspaceIndexError(
+    `could not list lane workspaces (${[...errors, ...fallbackErrors].join("; ") || "unknown error"})`
+  );
+}
+
+async function loadProjectWorkspaceFallback(
+  client: ConductorApiClient,
+  config: LanesConfig
+): Promise<ConductorApiWorkspace[]> {
   const found: ConductorApiWorkspace[] = [];
   const seen = new Set<string>();
   const projectIds = new Set(
-    config.lanes.map((lane) => lane.projectId).filter((id): id is string => Boolean(id))
+    config.lanes
+      .map((lane) => lane.projectId)
+      .filter((id): id is string => Boolean(id))
   );
 
-  let projects: Awaited<ReturnType<ConductorApiClient["listProjects"]>> = [];
+  let projects: Awaited<ReturnType<ConductorApiClient["listProjects"]>>;
   try {
     projects = await client.listProjects();
   } catch (error) {
-    log.warn("listProjects fallback failed:", error);
+    throw new LaneWorkspaceIndexError(
+      `per-project workspace listing failed: ${describeError(error)}`,
+      { cause: error }
+    );
   }
 
-  for (const project of projects) {
-    const wanted =
+  const wantedProjects = projects.filter(
+    (project) =>
       projectIds.has(project.id) ||
       config.lanes.some(
         (lane) =>
           normalizeRemote(lane.repoUrl) === normalizeRemote(project.gitRemote)
-      );
-    if (!wanted) continue;
+      )
+  );
+
+  let listedAny = wantedProjects.length === 0;
+  const listErrors: string[] = [];
+  for (const project of wantedProjects) {
     try {
       const workspaces = await client.listProjectWorkspaces(project.id);
+      listedAny = true;
       for (const workspace of workspaces) {
         if (seen.has(workspace.id)) continue;
         seen.add(workspace.id);
         found.push(workspace);
       }
     } catch (error) {
-      log.warn(`listProjectWorkspaces ${project.id} failed:`, error);
+      listErrors.push(`${project.id}: ${describeError(error)}`);
     }
+  }
+
+  if (!listedAny) {
+    throw new LaneWorkspaceIndexError(
+      `per-project workspace listing failed (${listErrors.join("; ") || "no matching projects listed"})`
+    );
   }
   return found;
 }
@@ -712,6 +925,22 @@ function normalizeRemote(value: string): string {
     .replace(/\.git$/i, "")
     .replace(/\/+$/, "")
     .toLowerCase();
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof ConductorApiError && error.status === 404;
+}
+
+function logInvalidConfig(message: string): void {
+  const now = Date.now();
+  if (
+    message === lastInvalidConfigLog.message &&
+    now - lastInvalidConfigLog.at < INVALID_CONFIG_LOG_MS
+  ) {
+    return;
+  }
+  lastInvalidConfigLog = { message, at: now };
+  log.error(message);
 }
 
 function describeError(error: unknown): string {

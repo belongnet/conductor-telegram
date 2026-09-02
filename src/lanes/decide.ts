@@ -4,12 +4,15 @@ export const LANE_NUDGE_MESSAGE =
 export const GITHUB_PR_URL_RE =
   /https?:\/\/(?:www\.)?github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/i;
 
+const TOOL_ITEM_TYPE_RE = /tool|command|function|mcp/;
+
 export type LaneRuntimeState =
   | "working"
   | "done"
   | "paused"
   | "initializing"
-  | "not_created";
+  | "not_created"
+  | "unknown";
 
 export type LaneSnapshot = {
   id: string;
@@ -18,22 +21,25 @@ export type LaneSnapshot = {
   /**
    * Provider currently occupying this lane. Named lanes use their config
    * provider once created; `"any"` lanes use the provider recorded in the
-   * workspace name.
+   * workspace name or last recorded action.
    */
   assignedProvider: string | null;
   state: LaneRuntimeState;
   lastUserMessageAt: string | null;
   after: string[];
+  nudgeCount: number;
 };
 
 export type ProviderLimits = {
   name: string;
   gapHours: number;
   maxActive: number;
+  maxNudges?: number;
 };
 
 export type LaneAction =
   | { type: "nudge"; laneId: string; provider: string }
+  | { type: "prompt"; laneId: string; provider: string }
   | { type: "create"; laneId: string; provider: string };
 
 export type DecideLaneActionsInput = {
@@ -83,14 +89,70 @@ export function isAgentTranscriptEvent(message: {
   return transcriptRole(message) === "assistant";
 }
 
-export function transcriptEventText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-  try {
-    return JSON.stringify(content);
-  } catch {
-    return String(content);
+/**
+ * Assistant-visible text only. Tool/command payloads (including
+ * `rawPayload` `item.started` / `item.completed` tool items) are ignored
+ * so a `gh pr diff N` in a review lane cannot mark the lane done.
+ */
+export function assistantTextFromTranscriptEvent(message: {
+  type: string;
+  content?: unknown;
+}): string {
+  if (!isAgentTranscriptEvent(message)) return "";
+  if (typeof message.content === "string") return message.content;
+  const blocks: string[] = [];
+  collectAssistantText(message.content, blocks, 0);
+  return blocks.join("\n");
+}
+
+function collectAssistantText(
+  value: unknown,
+  blocks: string[],
+  depth: number
+): void {
+  if (depth > 10 || value == null) return;
+  if (typeof value === "string") return;
+  if (Array.isArray(value)) {
+    for (const entry of value) collectAssistantText(entry, blocks, depth + 1);
+    return;
   }
+  if (typeof value !== "object") return;
+  const obj = value as Record<string, unknown>;
+  const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
+  if (isToolItemType(type)) return;
+
+  if (obj.item && typeof obj.item === "object" && !Array.isArray(obj.item)) {
+    const item = obj.item as Record<string, unknown>;
+    const itemType = typeof item.type === "string" ? item.type.toLowerCase() : "";
+    if (isToolItemType(itemType)) return;
+    pushTextField(item, blocks);
+    collectAssistantText(item.content, blocks, depth + 1);
+    return;
+  }
+
+  pushTextField(obj, blocks);
+  if (obj.message) collectAssistantText(obj.message, blocks, depth + 1);
+  if (obj.content && typeof obj.content !== "string") {
+    collectAssistantText(obj.content, blocks, depth + 1);
+  }
+  if (obj.rawPayload) collectAssistantText(obj.rawPayload, blocks, depth + 1);
+  if (obj.event) collectAssistantText(obj.event, blocks, depth + 1);
+}
+
+function pushTextField(obj: Record<string, unknown>, blocks: string[]): void {
+  const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
+  if (isToolItemType(type)) return;
+  if (typeof obj.text === "string" && obj.text.trim()) {
+    blocks.push(obj.text);
+  }
+  if (typeof obj.content === "string" && obj.content.trim()) {
+    blocks.push(obj.content);
+  }
+}
+
+function isToolItemType(type: string): boolean {
+  if (!type) return false;
+  return TOOL_ITEM_TYPE_RE.test(type);
 }
 
 function transcriptRole(message: {
@@ -135,6 +197,7 @@ function transcriptRole(message: {
 export function deriveLaneRuntimeState(input: {
   workspaceFound: boolean;
   sessionStatus: "idle" | "working" | "error" | null;
+  statusUnknown?: boolean;
   messages: ReadonlyArray<{ type: string; content?: unknown; receivedAt: string }>;
 }): {
   state: LaneRuntimeState;
@@ -158,11 +221,30 @@ export function deriveLaneRuntimeState(input: {
     return { state: "working", lastUserMessageAt };
   }
 
-  const done = input.messages.some(
-    (message) =>
-      isAgentTranscriptEvent(message) &&
-      transcriptContainsGithubPrUrl(transcriptEventText(message.content))
+  if (input.statusUnknown) {
+    return { state: "unknown", lastUserMessageAt };
+  }
+
+  // Only the assistant text of the turn after the last user message — an
+  // idle session's final reply — can mark the lane done.
+  const lastUserIndex = input.messages.reduce(
+    (index, message, current) =>
+      isUserTranscriptEvent(message) ? current : index,
+    -1
   );
+  const lastTurn = input.messages.slice(lastUserIndex + 1);
+  const lastAgentWithText = [...lastTurn]
+    .reverse()
+    .find(
+      (message) =>
+        isAgentTranscriptEvent(message) &&
+        assistantTextFromTranscriptEvent(message).trim()
+    );
+  const done =
+    lastAgentWithText !== undefined &&
+    transcriptContainsGithubPrUrl(
+      assistantTextFromTranscriptEvent(lastAgentWithText)
+    );
   if (done) {
     return { state: "done", lastUserMessageAt };
   }
@@ -172,9 +254,10 @@ export function deriveLaneRuntimeState(input: {
 
 /**
  * Pure scheduler: at most one action per provider whose working count is
- * below `maxActive`. Nudge the first eligible paused lane; otherwise create
- * the first not-created lane for that provider (or `"any"`). Failed lanes
- * are skipped so the queue can advance.
+ * below `maxActive`. Nudge the first eligible paused lane; otherwise send
+ * the first prompt to an initializing lane; otherwise create the first
+ * not-created lane for that provider (or `"any"`). Failed lanes are
+ * skipped so the queue can advance.
  */
 export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
   if (input.paused) return [];
@@ -189,6 +272,7 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
 
   const assignedTo = (lane: LaneSnapshot, providerName: string): boolean => {
     if (lane.assignedProvider) return lane.assignedProvider === providerName;
+    if (lane.provider === "any") return true;
     return lane.provider === providerName;
   };
 
@@ -205,6 +289,12 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
       if (!assignedTo(lane, provider.name)) return false;
       if (!depsDone(lane)) return false;
       if (!lane.lastUserMessageAt) return false;
+      if (
+        provider.maxNudges !== undefined &&
+        lane.nudgeCount >= provider.maxNudges
+      ) {
+        return false;
+      }
       const last = Date.parse(lane.lastUserMessageAt);
       if (!Number.isFinite(last)) return false;
       const ageHours = (input.now.getTime() - last) / 3_600_000;
@@ -215,6 +305,22 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
       actions.push({
         type: "nudge",
         laneId: nudgeTarget.id,
+        provider: provider.name,
+      });
+      continue;
+    }
+
+    const promptTarget = input.lanes.find((lane) => {
+      if (claimed.has(lane.id)) return false;
+      if (lane.state !== "initializing") return false;
+      if (!assignedTo(lane, provider.name)) return false;
+      return depsDone(lane);
+    });
+    if (promptTarget) {
+      claimed.add(promptTarget.id);
+      actions.push({
+        type: "prompt",
+        laneId: promptTarget.id,
         provider: provider.name,
       });
       continue;

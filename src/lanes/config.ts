@@ -30,6 +30,7 @@ const ProviderSchema = z.object({
   effort: z.string().min(1).default("high"),
   gapHours: z.number().finite().nonnegative(),
   maxActive: z.number().int().positive().default(1),
+  maxNudges: z.number().int().positive().default(8),
 });
 
 const LaneSchema = z.object({
@@ -86,6 +87,7 @@ export type LanesProviderConfig = {
   effort: string;
   gapHours: number;
   maxActive: number;
+  maxNudges: number;
 };
 
 export type LaneConfig = {

@@ -3468,8 +3468,10 @@ const LANES_LAST_TICK_KEY = "lanes_last_tick_at";
 export type LaneActionKind =
   | "create"
   | "nudge"
+  | "prompt"
   | "create_failed"
   | "nudge_failed"
+  | "prompt_failed"
   | "create_refused";
 
 export interface LaneActionRecord {
@@ -3519,6 +3521,19 @@ export function recordLaneAction(input: {
     detail: input.detail ?? null,
     createdAt: now,
   };
+}
+
+export function countLaneActions(
+  laneId: string,
+  action: LaneActionKind
+): number {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM lane_actions WHERE lane_id = ? AND action = ?`
+    )
+    .get(laneId, action) as { n: number };
+  return Number(row?.n ?? 0);
 }
 
 export function getLatestLaneAction(laneId: string): LaneActionRecord | null {

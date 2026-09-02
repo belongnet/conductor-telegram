@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  assistantTextFromTranscriptEvent,
   decideLaneActions,
   deriveLaneRuntimeState,
   laneWorkspaceName,
@@ -25,6 +26,7 @@ function lane(overrides: Partial<LaneSnapshot> & Pick<LaneSnapshot, "id">): Lane
     state: "not_created",
     lastUserMessageAt: null,
     after: [],
+    nudgeCount: 0,
     ...overrides,
   };
 }
@@ -84,8 +86,8 @@ test("a lane whose dependency is not done is neither created nor nudged", () => 
     lanes: [
       lane({
         id: "L1",
-        state: "initializing",
-        lastUserMessageAt: null,
+        state: "working",
+        lastUserMessageAt: OLD_USER,
       }),
       lane({
         id: "L2",
@@ -107,7 +109,7 @@ test("a lane whose dependency is not done is neither created nor nudged", () => 
   assert.deepEqual(actions, []);
 });
 
-test("an initializing lane is never nudged", () => {
+test("an initializing lane is never nudged; its first prompt is retried instead", () => {
   const actions = decideLaneActions({
     now: NOW,
     paused: false,
@@ -127,7 +129,7 @@ test("an initializing lane is never nudged", () => {
   });
 
   assert.deepEqual(actions, [
-    { type: "create", laneId: "L2", provider: "primary" },
+    { type: "prompt", laneId: "L1", provider: "primary" },
   ]);
 });
 
@@ -297,6 +299,130 @@ test("deriveLaneRuntimeState: working, done, initializing, paused, not created",
     }).state,
     "paused"
   );
+});
+
+test("a PR URL in a tool payload does not mark the lane done", () => {
+  const toolEvent = {
+    type: "agent",
+    content: {
+      rawPayload: {
+        event: {
+          type: "item.completed",
+          item: {
+            type: "command_execution",
+            command: "gh pr diff 12",
+            text: "https://github.com/example-org/example-repo/pull/12",
+          },
+        },
+      },
+    },
+    receivedAt: NOW.toISOString(),
+  };
+  assert.equal(assistantTextFromTranscriptEvent(toolEvent), "");
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "userMessage", content: "review the PR", receivedAt: OLD_USER },
+        toolEvent,
+      ],
+    }).state,
+    "paused"
+  );
+});
+
+test("a PR URL in the last assistant text of an idle turn marks the lane done", () => {
+  const agentEvent = {
+    type: "agent",
+    content: {
+      rawPayload: {
+        event: {
+          type: "item.completed",
+          item: {
+            type: "text",
+            text: "Opened https://github.com/example-org/example-repo/pull/12",
+          },
+        },
+      },
+    },
+    receivedAt: NOW.toISOString(),
+  };
+  assert.match(
+    assistantTextFromTranscriptEvent(agentEvent),
+    /example-org\/example-repo\/pull\/12/
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "user", content: "go", receivedAt: OLD_USER },
+        agentEvent,
+      ],
+    }).state,
+    "done"
+  );
+});
+
+test("an unknown session status is not nudged", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "unknown",
+        lastUserMessageAt: OLD_USER,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
+test("maxNudges stops a paused lane from being nudged forever", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: [{ name: "primary", gapHours: 4.5, maxActive: 1, maxNudges: 2 }],
+    lanes: [
+      lane({
+        id: "L1",
+        state: "paused",
+        lastUserMessageAt: OLD_USER,
+        nudgeCount: 2,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L2", provider: "primary" },
+  ]);
+});
+
+test("an any-provider lane without a name prefix still occupies a slot via last action", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        provider: "any",
+        assignedProvider: "primary",
+        state: "paused",
+        lastUserMessageAt: OLD_USER,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, [
+    { type: "nudge", laneId: "L1", provider: "primary" },
+  ]);
 });
 
 test("workspace names encode lane id and provider", () => {
