@@ -167,6 +167,17 @@ async function runLanesTickUnlocked(options: {
         statuses: [],
       };
     }
+    // Pause before any workspace/status/transcript walk so a scheduled
+    // tick after `/lanes pause` does not keep hitting the Cloud API.
+    if (paused) {
+      setLanesLastTickAt(new Date().toISOString());
+      return {
+        skipped: true,
+        reason: "Lanes scheduler is paused.",
+        actions: [],
+        statuses: [],
+      };
+    }
   }
 
   let client: ConductorApiClient | null;
@@ -197,15 +208,6 @@ async function runLanesTickUnlocked(options: {
   const lastActions = getLatestLaneActions(config.lanes.map((lane) => lane.id));
   const statuses = statusRows(config, snapshots, lastActions);
 
-  if (paused && !options.force) {
-    setLanesLastTickAt(new Date().toISOString());
-    return {
-      skipped: true,
-      reason: "Lanes scheduler is paused.",
-      actions: [],
-      statuses,
-    };
-  }
   if (paused && options.force) {
     return {
       skipped: true,
@@ -569,6 +571,7 @@ function applyLocalSnapshotUpdate(
   if (!snapshot || !outcome.ok) return;
   snapshot.assignedProvider = outcome.assignedProvider ?? action.provider;
   snapshot.lastUserMessageAt = new Date().toISOString();
+  snapshot.lastActionKind = action.type;
   if (action.type === "nudge") {
     snapshot.state = "working";
     snapshot.nudgeCount += 1;
@@ -591,17 +594,9 @@ async function resolveLaneSnapshots(
       );
     } catch (error) {
       log.error(`could not resolve lane ${lane.id}:`, error);
-      snapshots.push({
-        id: lane.id,
-        provider: lane.provider,
-        assignedProvider:
-          lastActions.get(lane.id)?.provider ??
-          (lane.provider === "any" ? null : lane.provider),
-        state: "unknown",
-        lastUserMessageAt: null,
-        after: lane.after,
-        nudgeCount: countLaneActions(lane.id, "nudge"),
-      });
+      snapshots.push(
+        unknownLaneSnapshot(lane, lastActions.get(lane.id))
+      );
     }
   }
   return snapshots;
@@ -618,6 +613,7 @@ async function snapshotLane(
     lastAction?.provider ?? (lane.provider === "any" ? null : lane.provider);
   const workspace = await findLaneWorkspace(client, config, lane, workspaces);
   const nudgeCount = countLaneActions(lane.id, "nudge");
+  const promptFailedCount = countLaneActions(lane.id, "prompt_failed");
   if (!workspace) {
     return {
       id: lane.id,
@@ -627,19 +623,27 @@ async function snapshotLane(
       lastUserMessageAt: null,
       after: lane.after,
       nudgeCount,
+      promptFailedCount,
+      lastActionKind: lastAction?.action ?? null,
     };
   }
 
   const parsed = parseLaneWorkspaceName(workspace.name);
   const assignedProvider = parsed?.provider ?? fallbackProvider;
 
-  const sessionId = await resolveLaneSessionId(
-    client,
-    config,
-    lane,
-    workspaces,
-    workspace.id
-  );
+  let sessionId: string | null;
+  try {
+    sessionId = await resolveLaneSessionId(
+      client,
+      config,
+      lane,
+      workspaces,
+      workspace.id
+    );
+  } catch (error) {
+    log.warn(`list sessions for ${lane.id} failed:`, error);
+    return unknownLaneSnapshot(lane, lastAction, assignedProvider);
+  }
   if (!sessionId) {
     return {
       id: lane.id,
@@ -649,6 +653,8 @@ async function snapshotLane(
       lastUserMessageAt: null,
       after: lane.after,
       nudgeCount,
+      promptFailedCount,
+      lastActionKind: lastAction?.action ?? null,
     };
   }
 
@@ -661,22 +667,12 @@ async function snapshotLane(
     log.warn(`session status for ${lane.id} failed:`, error);
   }
 
-  let messages: ConductorApiMessage[] = [];
+  let messages: ConductorApiMessage[];
   try {
     messages = await listAllSessionMessages(client, sessionId);
   } catch (error) {
     log.warn(`transcript for ${lane.id} failed:`, error);
-    if (statusUnknown) {
-      return {
-        id: lane.id,
-        provider: lane.provider,
-        assignedProvider,
-        state: "unknown",
-        lastUserMessageAt: null,
-        after: lane.after,
-        nudgeCount,
-      };
-    }
+    return unknownLaneSnapshot(lane, lastAction, assignedProvider);
   }
 
   const derived = deriveLaneRuntimeState({
@@ -696,6 +692,8 @@ async function snapshotLane(
     ...derived,
     after: lane.after,
     nudgeCount,
+    promptFailedCount,
+    lastActionKind: lastAction?.action ?? null,
   };
 }
 
@@ -758,8 +756,10 @@ async function resolveLaneSessionId(
     const live = sessions.filter((session) => !session.archivedAt);
     return (live[0] ?? sessions[0])?.id ?? null;
   } catch (error) {
-    log.warn(`list sessions for ${lane.id} failed:`, error);
-    return null;
+    throw new LaneWorkspaceIndexError(
+      `could not list sessions for lane ${lane.id}`,
+      { cause: error }
+    );
   }
 }
 
@@ -864,6 +864,27 @@ async function loadProjectWorkspaceFallback(
     );
   }
   return found;
+}
+
+function unknownLaneSnapshot(
+  lane: LaneConfig,
+  lastAction: LaneActionRecord | undefined,
+  assignedProvider?: string | null
+): LaneSnapshot {
+  return {
+    id: lane.id,
+    provider: lane.provider,
+    assignedProvider:
+      assignedProvider ??
+      lastAction?.provider ??
+      (lane.provider === "any" ? null : lane.provider),
+    state: "unknown",
+    lastUserMessageAt: null,
+    after: lane.after,
+    nudgeCount: countLaneActions(lane.id, "nudge"),
+    promptFailedCount: countLaneActions(lane.id, "prompt_failed"),
+    lastActionKind: lastAction?.action ?? null,
+  };
 }
 
 function workspacesMatchingPrefix(

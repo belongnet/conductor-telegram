@@ -28,6 +28,9 @@ export type LaneSnapshot = {
   lastUserMessageAt: string | null;
   after: string[];
   nudgeCount: number;
+  promptFailedCount: number;
+  /** Last recorded SQLite action, used to gate first-prompt retries. */
+  lastActionKind: string | null;
 };
 
 export type ProviderLimits = {
@@ -213,16 +216,19 @@ export function deriveLaneRuntimeState(input: {
       ? userEvents[userEvents.length - 1].receivedAt
       : null;
 
-  if (userEvents.length === 0) {
-    return { state: "initializing", lastUserMessageAt: null };
-  }
-
+  // A live turn is working even with an empty or unread transcript. Checking
+  // this before the zero-user-message branch prevents a failed/empty
+  // transcript fetch from re-sending the full lane prompt mid-turn.
   if (input.sessionStatus === "working") {
     return { state: "working", lastUserMessageAt };
   }
 
   if (input.statusUnknown) {
     return { state: "unknown", lastUserMessageAt };
+  }
+
+  if (userEvents.length === 0) {
+    return { state: "initializing", lastUserMessageAt: null };
   }
 
   // Only the assistant text of the turn after the last user message — an
@@ -254,10 +260,10 @@ export function deriveLaneRuntimeState(input: {
 
 /**
  * Pure scheduler: at most one action per provider whose working count is
- * below `maxActive`. Nudge the first eligible paused lane; otherwise send
- * the first prompt to an initializing lane; otherwise create the first
- * not-created lane for that provider (or `"any"`). Failed lanes are
- * skipped so the queue can advance.
+ * below `maxActive`. Nudge the first eligible paused lane; otherwise retry
+ * the first prompt of an initializing lane whose last recorded action is a
+ * failed first send; otherwise create the first not-created lane for that
+ * provider (or `"any"`). Failed lanes are skipped so the queue can advance.
  */
 export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
   if (input.paused) return [];
@@ -314,6 +320,13 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
       if (claimed.has(lane.id)) return false;
       if (lane.state !== "initializing") return false;
       if (!assignedTo(lane, provider.name)) return false;
+      if (!isOrphanedFirstPrompt(lane)) return false;
+      if (
+        provider.maxNudges !== undefined &&
+        lane.promptFailedCount >= provider.maxNudges
+      ) {
+        return false;
+      }
       return depsDone(lane);
     });
     if (promptTarget) {
@@ -345,4 +358,10 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
   }
 
   return actions;
+}
+
+const ORPHANED_PROMPT_ACTIONS = new Set(["create_failed", "prompt_failed"]);
+
+function isOrphanedFirstPrompt(lane: LaneSnapshot): boolean {
+  return ORPHANED_PROMPT_ACTIONS.has(lane.lastActionKind ?? "");
 }

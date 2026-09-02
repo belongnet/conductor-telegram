@@ -27,6 +27,8 @@ function lane(overrides: Partial<LaneSnapshot> & Pick<LaneSnapshot, "id">): Lane
     lastUserMessageAt: null,
     after: [],
     nudgeCount: 0,
+    promptFailedCount: 0,
+    lastActionKind: null,
     ...overrides,
   };
 }
@@ -119,6 +121,7 @@ test("an initializing lane is never nudged; its first prompt is retried instead"
         id: "L1",
         state: "initializing",
         lastUserMessageAt: null,
+        lastActionKind: "create_failed",
       }),
       lane({
         id: "L2",
@@ -130,6 +133,31 @@ test("an initializing lane is never nudged; its first prompt is retried instead"
 
   assert.deepEqual(actions, [
     { type: "prompt", laneId: "L1", provider: "primary" },
+  ]);
+});
+
+test("an initializing lane is not re-prompted unless the first send failed", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "initializing",
+        lastUserMessageAt: null,
+        lastActionKind: "create",
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L2", provider: "primary" },
   ]);
 });
 
@@ -263,6 +291,14 @@ test("deriveLaneRuntimeState: working, done, initializing, paused, not created",
     deriveLaneRuntimeState({
       workspaceFound: true,
       sessionStatus: "working",
+      messages: [],
+    }).state,
+    "working"
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "working",
       messages: [
         {
           type: "user",
@@ -363,6 +399,47 @@ test("a PR URL in the last assistant text of an idle turn marks the lane done", 
     }).state,
     "done"
   );
+});
+
+test("a working lane with an empty transcript is not prompted", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "working",
+        lastUserMessageAt: null,
+        lastActionKind: "create_failed",
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
+test("maxNudges also caps retries of a failed first prompt", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: [{ name: "primary", gapHours: 4.5, maxActive: 1, maxNudges: 2 }],
+    lanes: [
+      lane({
+        id: "L1",
+        state: "initializing",
+        lastActionKind: "prompt_failed",
+        promptFailedCount: 2,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, [
+    { type: "create", laneId: "L2", provider: "primary" },
+  ]);
 });
 
 test("an unknown session status is not nudged", () => {
