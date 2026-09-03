@@ -792,36 +792,33 @@ export async function loadWorkspaceIndex(
     return [...found.values()];
   }
 
-  const fallbackErrors: string[] = [];
-  let fallbackSucceeded = false;
   try {
-    const fallback = await loadProjectWorkspaceFallback(client, config);
-    fallbackSucceeded = true;
+    const fallback = await loadProjectWorkspaceFallback(
+      client,
+      config,
+      unresolved
+    );
     for (const workspace of fallback) found.set(workspace.id, workspace);
   } catch (error) {
-    fallbackErrors.push(describeError(error));
+    throw new LaneWorkspaceIndexError(
+      `could not list lane workspaces (${[...errors, describeError(error)].join("; ") || "unknown error"})`,
+      { cause: error }
+    );
   }
 
-  if (fallbackSucceeded) {
-    return [...found.values()];
-  }
-
-  throw new LaneWorkspaceIndexError(
-    `could not list lane workspaces (${[...errors, ...fallbackErrors].join("; ") || "unknown error"})`
-  );
+  return [...found.values()];
 }
 
 async function loadProjectWorkspaceFallback(
   client: ConductorApiClient,
-  config: LanesConfig
+  config: LanesConfig,
+  unresolvedLaneIds: ReadonlySet<string>
 ): Promise<ConductorApiWorkspace[]> {
+  const unresolvedLanes = config.lanes.filter((lane) =>
+    unresolvedLaneIds.has(lane.id)
+  );
   const found: ConductorApiWorkspace[] = [];
   const seen = new Set<string>();
-  const projectIds = new Set(
-    config.lanes
-      .map((lane) => lane.projectId)
-      .filter((id): id is string => Boolean(id))
-  );
 
   let projects: Awaited<ReturnType<ConductorApiClient["listProjects"]>>;
   try {
@@ -833,37 +830,71 @@ async function loadProjectWorkspaceFallback(
     );
   }
 
-  const wantedProjects = projects.filter(
-    (project) =>
-      projectIds.has(project.id) ||
-      config.lanes.some(
-        (lane) =>
-          normalizeRemote(lane.repoUrl) === normalizeRemote(project.gitRemote)
-      )
-  );
+  const neededProjectIds = new Set<string>();
+  const unmapped: string[] = [];
+  for (const lane of unresolvedLanes) {
+    const candidates = projectsForLane(lane, projects);
+    if (candidates.length === 0) {
+      unmapped.push(lane.id);
+      continue;
+    }
+    for (const id of candidates) neededProjectIds.add(id);
+  }
+  if (unmapped.length > 0) {
+    throw new LaneWorkspaceIndexError(
+      `could not prove workspace absence for lane(s) ${unmapped.join(", ")}: no matching Cloud project`
+    );
+  }
 
-  let listedAny = wantedProjects.length === 0;
+  const listedProjects = new Set<string>();
   const listErrors: string[] = [];
-  for (const project of wantedProjects) {
+  for (const projectId of neededProjectIds) {
     try {
-      const workspaces = await client.listProjectWorkspaces(project.id);
-      listedAny = true;
+      const workspaces = await client.listProjectWorkspaces(projectId);
+      listedProjects.add(projectId);
       for (const workspace of workspaces) {
         if (seen.has(workspace.id)) continue;
         seen.add(workspace.id);
         found.push(workspace);
       }
     } catch (error) {
-      listErrors.push(`${project.id}: ${describeError(error)}`);
+      listErrors.push(`${projectId}: ${describeError(error)}`);
     }
   }
 
-  if (!listedAny) {
+  if (listErrors.length > 0) {
     throw new LaneWorkspaceIndexError(
-      `per-project workspace listing failed (${listErrors.join("; ") || "no matching projects listed"})`
+      `per-project workspace listing failed (${listErrors.join("; ")})`
     );
   }
+
+  for (const lane of unresolvedLanes) {
+    const missing = projectsForLane(lane, projects).filter(
+      (id) => !listedProjects.has(id)
+    );
+    if (missing.length > 0) {
+      throw new LaneWorkspaceIndexError(
+        `could not list projects for lane ${lane.id} (${missing.join(", ")})`
+      );
+    }
+  }
+
   return found;
+}
+
+function projectsForLane(
+  lane: LaneConfig,
+  projects: ReadonlyArray<{ id: string; gitRemote: string }>
+): string[] {
+  const ids = new Set<string>();
+  if (lane.projectId) ids.add(lane.projectId);
+  const laneRemote = normalizeRemote(lane.repoUrl);
+  for (const project of projects) {
+    if (normalizeRemote(project.gitRemote) === laneRemote) {
+      ids.add(project.id);
+    }
+  }
+  return [...ids];
 }
 
 function unknownLaneSnapshot(
@@ -941,11 +972,17 @@ function statusRows(
 }
 
 function normalizeRemote(value: string): string {
-  return value
-    .trim()
-    .replace(/\.git$/i, "")
-    .replace(/\/+$/, "")
-    .toLowerCase();
+  let remote = value.trim();
+  if (!remote.includes("://")) {
+    const scp = remote.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+    if (scp) {
+      remote = `${scp[1]}/${scp[2]}`;
+    }
+  } else {
+    remote = remote.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    remote = remote.replace(/^[^@/\s]+@/, "");
+  }
+  return remote.replace(/\.git$/i, "").replace(/\/+$/, "").toLowerCase();
 }
 
 function isNotFoundError(error: unknown): boolean {

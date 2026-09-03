@@ -1,6 +1,6 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -44,6 +44,7 @@ after(() => {
 
 mkdirSync(path.join(TEMP_DIR, "prompts"), { recursive: true });
 writeFileSync(path.join(TEMP_DIR, "prompts", "l1.md"), "Do the example work.");
+writeFileSync(path.join(TEMP_DIR, "prompts", "l2.md"), "Do the second example work.");
 writeFileSync(
   path.join(TEMP_DIR, "lanes.json"),
   JSON.stringify({
@@ -76,6 +77,92 @@ function config(): ConstructorParameters<typeof ConductorApiClient>[0] {
     timeoutMs: 1_000,
     maxRetries: 0,
   };
+}
+
+function twoProjectLanesConfig(): LanesConfig {
+  return {
+    intervalMinutes: 30,
+    providers: {
+      primary: {
+        agent: "claude",
+        model: "claude-example-model",
+        effort: "high",
+        gapHours: 4.5,
+        maxActive: 1,
+        maxNudges: 8,
+      },
+    },
+    lanes: [
+      {
+        id: "L1",
+        title: "Example first lane",
+        provider: "primary",
+        repoUrl: "https://github.com/example-org/example-repo",
+        projectId: "project-a",
+        prompt: "prompts/l1.md",
+        after: [],
+      },
+      {
+        id: "L2",
+        title: "Example second lane",
+        provider: "primary",
+        repoUrl: "https://github.com/example-org/example-repo-two",
+        projectId: "project-b",
+        prompt: "prompts/l2.md",
+        after: [],
+      },
+    ],
+    configPath: path.join(TEMP_DIR, "lanes.json"),
+  };
+}
+
+function twoProjectPartialOutageFetcher(creates: { n: number }): typeof fetch {
+  return (async (url: string | URL | Request, init: RequestInit = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/v0/workspaces" && init.method === "POST") {
+      creates.n += 1;
+      return json(
+        {
+          workspaceId: "workspace-dup",
+          sessionId: "session-dup",
+          deepLink: "https://conductor.build/workspace-dup",
+        },
+        201
+      );
+    }
+    if (parsed.pathname === "/v0/workspaces") {
+      const name = parsed.searchParams.get("name") ?? "";
+      if (name.includes("[lane:L1:")) {
+        return json({ userMessage: "unavailable" }, 503);
+      }
+      return json(workspacePage([]));
+    }
+    if (parsed.pathname === "/v0/projects") {
+      return json({
+        data: [
+          {
+            id: "project-a",
+            name: "example-a",
+            gitRemote: "https://github.com/example-org/example-repo.git",
+          },
+          {
+            id: "project-b",
+            name: "example-b",
+            gitRemote: "https://github.com/example-org/example-repo-two.git",
+          },
+        ],
+        offset: 0,
+        hasMore: false,
+      });
+    }
+    if (parsed.pathname === "/v0/projects/project-a/workspaces") {
+      return json({ userMessage: "unavailable" }, 503);
+    }
+    if (parsed.pathname === "/v0/projects/project-b/workspaces") {
+      return json({ data: [], offset: 0, hasMore: false });
+    }
+    return json({ userMessage: `unhandled ${parsed.pathname}` }, 404);
+  }) as typeof fetch;
 }
 
 function lanesConfig(): LanesConfig {
@@ -156,6 +243,118 @@ test("a listing outage skips the tick instead of creating a duplicate workspace"
   assert.match(result.reason ?? "", /could not list lane workspaces|unavailable|HTTP 503/i);
   assert.equal(notices.length, 0);
   assert.equal(getLatestLaneAction("L1"), null);
+});
+
+test("a partial project-list fallback outage does not look like an empty index", async () => {
+  const creates = { n: 0 };
+  const client = new ConductorApiClient(
+    config(),
+    twoProjectPartialOutageFetcher(creates)
+  );
+  await assert.rejects(
+    () => loadWorkspaceIndex(client, twoProjectLanesConfig()),
+    LaneWorkspaceIndexError
+  );
+  assert.equal(creates.n, 0);
+});
+
+test("a partial project-list fallback outage skips the tick instead of creating a duplicate workspace", async () => {
+  resetLanesDb();
+  const originalConfig = readFileSync(path.join(TEMP_DIR, "lanes.json"), "utf8");
+  writeFileSync(
+    path.join(TEMP_DIR, "lanes.json"),
+    JSON.stringify({
+      intervalMinutes: 30,
+      providers: {
+        primary: {
+          agent: "claude",
+          model: "claude-example-model",
+          effort: "high",
+          gapHours: 4.5,
+          maxActive: 1,
+        },
+      },
+      lanes: [
+        {
+          id: "L1",
+          title: "Example first lane",
+          provider: "primary",
+          repoUrl: "https://github.com/example-org/example-repo",
+          projectId: "project-a",
+          prompt: "prompts/l1.md",
+        },
+        {
+          id: "L2",
+          title: "Example second lane",
+          provider: "primary",
+          repoUrl: "https://github.com/example-org/example-repo-two",
+          projectId: "project-b",
+          prompt: "prompts/l2.md",
+        },
+      ],
+    })
+  );
+  const creates = { n: 0 };
+  globalThis.fetch = twoProjectPartialOutageFetcher(creates);
+  try {
+    const result = await runLanesTick({
+      notify: async () => undefined,
+      force: true,
+    });
+    assert.equal(result.skipped, true);
+    assert.match(
+      result.reason ?? "",
+      /could not list lane workspaces|per-project workspace listing failed|unavailable|HTTP 503/i
+    );
+    assert.equal(creates.n, 0);
+    assert.equal(getLatestLaneAction("L1"), null);
+    assert.equal(getLatestLaneAction("L2"), null);
+  } finally {
+    writeFileSync(path.join(TEMP_DIR, "lanes.json"), originalConfig);
+  }
+});
+
+test("an unresolved lane with no matching project does not look like an empty index", async () => {
+  const creates = { n: 0 };
+  const client = new ConductorApiClient(
+    config(),
+    (async (url: string | URL | Request, init: RequestInit = {}) => {
+      const parsed = new URL(String(url));
+      if (parsed.pathname === "/v0/workspaces" && init.method === "POST") {
+        creates.n += 1;
+        return json(
+          {
+            workspaceId: "workspace-dup",
+            sessionId: "session-dup",
+            deepLink: "https://conductor.build/workspace-dup",
+          },
+          201
+        );
+      }
+      if (parsed.pathname === "/v0/workspaces") {
+        return json({ userMessage: "unavailable" }, 503);
+      }
+      if (parsed.pathname === "/v0/projects") {
+        return json({
+          data: [
+            {
+              id: "project-other",
+              name: "other",
+              gitRemote: "https://github.com/example-org/other-repo.git",
+            },
+          ],
+          offset: 0,
+          hasMore: false,
+        });
+      }
+      return json({ userMessage: `unhandled ${parsed.pathname}` }, 404);
+    }) as typeof fetch
+  );
+  await assert.rejects(
+    () => loadWorkspaceIndex(client, lanesConfig()),
+    LaneWorkspaceIndexError
+  );
+  assert.equal(creates.n, 0);
 });
 
 test("create refuses when the workspace already exists", async () => {

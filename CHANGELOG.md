@@ -8,7 +8,7 @@ All notable changes to conductor-telegram are documented here.
 - Optional config-driven Cloud lanes scheduler. When `LANES_CONFIG` or `~/.conductor-telegram/lanes.json` is present, the bot keeps at most one working lane per paid provider from an ordered queue with dependencies, nudging paused work after a gap or creating the next ready lane. `/lanes`, `/lanes run`, `/lanes pause`, and `/lanes resume` are owner-only. See `docs/lanes.example.json`.
 
 ### Fixed
-- Lanes ticks skip creation when workspace listing fails, so an API outage cannot bill a duplicate `[lane:…]` workspace.
+- Lanes ticks skip creation when workspace listing fails, including a partial per-project fallback outage, so an API outage cannot bill a duplicate `[lane:…]` workspace.
 - An initializing lane whose first prompt never landed is re-prompted instead of being skipped forever. A transcript fetch failure or empty transcript on a live session is `unknown`/`working`, not a prompt retry.
 - Lane "done" detection uses assistant text from the last idle turn, not tool/command payloads that happen to mention a pull request.
 
