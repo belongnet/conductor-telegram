@@ -28,6 +28,7 @@ const SessionSchema = z.object({
   id: IdSchema,
   deepLink: z.string(),
   name: z.string().optional(),
+  createdAt: z.string().optional(),
   model: z.string().optional(),
   resolvedModel: z.string().optional(),
   effort: z.string().optional(),
@@ -42,6 +43,7 @@ const WorkspaceSchema = z.object({
   deepLink: z.string(),
   creatorId: z.string().optional(),
   lastActivityAt: z.string().optional(),
+  archivedAt: z.string().nullable().optional(),
 });
 
 const SessionPageSchema = z.object({
@@ -352,12 +354,20 @@ export class ConductorApiClient {
     );
   }
 
-  listWorkspaceSessions(workspaceId: string): Promise<ConductorApiSession[]> {
+  listWorkspaceSessions(
+    workspaceId: string,
+    options: { includeArchived?: boolean } = {}
+  ): Promise<ConductorApiSession[]> {
     return this.walkPages(
       (offset) =>
         withQuery(
           `/v0/workspaces/${encodeURIComponent(workspaceId)}/sessions`,
-          { limit: PAGE_SIZE, offset }
+          {
+            limit: PAGE_SIZE,
+            offset,
+            includeArchived:
+              options.includeArchived === true ? "true" : undefined,
+          }
         ),
       SessionPageSchema,
       "session"
@@ -557,6 +567,7 @@ export class ConductorApiClient {
     options: {
       mine?: boolean;
       name?: string;
+      includeArchived?: boolean;
       signal?: AbortSignal;
     } = {}
   ): Promise<ConductorApiWorkspace[]> {
@@ -567,6 +578,8 @@ export class ConductorApiClient {
           offset,
           mine: options.mine === true ? "true" : undefined,
           name: options.name?.trim() || undefined,
+          includeArchived:
+            options.includeArchived === true ? "true" : undefined,
         }),
       WorkspacePageSchema,
       "workspace",

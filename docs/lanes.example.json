@@ -24,6 +24,14 @@
       "gapHours": 4.5,
       "maxActive": 1,
       "maxNudges": 8
+    },
+    "validator": {
+      "agent": "codex",
+      "model": "validation-example-model",
+      "effort": "high",
+      "gapHours": 4.5,
+      "maxActive": 1,
+      "maxNudges": 8
     }
   },
   "lanes": [
@@ -33,7 +41,29 @@
       "provider": "primary",
       "repoUrl": "https://github.com/example-org/example-repo",
       "prompt": "prompts/l1.md",
-      "after": []
+      "after": [],
+      "delivery": {
+        "review": {
+          "rotation": ["secondary", "cursor", "validator"],
+          "prompt": "prompts/review.md"
+        },
+        "finals": {
+          "rotation": ["secondary", "cursor", "validator"],
+          "prompt": "prompts/final.md"
+        },
+        "merge": {
+          "rotation": ["validator", "secondary", "cursor"],
+          "prompt": "prompts/merge.md",
+          "method": "squash",
+          "deployNotes": "No automatic deploy is configured.",
+          "replayNotes": "No replay is required."
+        },
+        "validation": {
+          "rotation": ["validator", "cursor", "secondary"],
+          "prompt": "prompts/validation.md",
+          "verification": "npm test && npm run typecheck"
+        }
+      }
     },
     {
       "id": "L2",

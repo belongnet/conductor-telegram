@@ -33,6 +33,26 @@ const ProviderSchema = z.object({
   maxNudges: z.number().int().positive().default(8),
 });
 
+const StageBaseSchema = z.object({
+  rotation: z.array(ProviderNameSchema).min(1),
+  prompt: z.string().min(1),
+});
+
+const DeliverySchema = z.object({
+  review: StageBaseSchema.optional(),
+  finals: StageBaseSchema.extend({
+    rotation: z.array(ProviderNameSchema).min(2),
+  }).optional(),
+  merge: StageBaseSchema.extend({
+    method: z.enum(["squash", "merge", "rebase"]).default("squash"),
+    deployNotes: z.string().default(""),
+    replayNotes: z.string().default(""),
+  }).optional(),
+  validation: StageBaseSchema.extend({
+    verification: z.string().min(1),
+  }).optional(),
+});
+
 const LaneSchema = z.object({
   id: LaneIdSchema,
   title: z.string().min(1),
@@ -43,6 +63,7 @@ const LaneSchema = z.object({
   after: z.array(LaneIdSchema).default([]),
   sessionId: z.string().min(1).optional(),
   workspaceId: z.string().min(1).optional(),
+  delivery: DeliverySchema.optional(),
 });
 
 const LanesConfigSchema = z
@@ -78,6 +99,73 @@ const LanesConfigSchema = z
           });
         }
       }
+      const stages: Array<[string, { rotation: string[] }]> = lane.delivery
+        ? Object.entries(lane.delivery).flatMap(([name, stage]) =>
+            stage ? [[name, stage]] : []
+          )
+        : [];
+      if (lane.delivery?.merge && !lane.delivery.finals) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery", "merge"],
+          message: "merge requires finals so two current approvals can be proven",
+        });
+      }
+      if (lane.delivery?.validation && !lane.delivery.merge) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery", "validation"],
+          message: "validation requires merge so a merged base can be proven",
+        });
+      }
+      if (
+        lane.provider !== "any" &&
+        lane.delivery?.review &&
+        !lane.delivery.review.rotation.some(
+          (provider) => provider !== lane.provider
+        )
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery", "review", "rotation"],
+          message: "review rotation needs a provider other than the author",
+        });
+      }
+      if (
+        lane.provider !== "any" &&
+        lane.delivery?.finals &&
+        new Set(
+          lane.delivery.finals.rotation.filter(
+            (provider) => provider !== lane.provider
+          )
+        ).size < 2
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery", "finals", "rotation"],
+          message: "finals rotation needs two providers other than the author",
+        });
+      }
+      for (const [stageName, stage] of stages) {
+        const seenProviders = new Set<string>();
+        for (const [providerIndex, provider] of stage.rotation.entries()) {
+          if (!(provider in config.providers)) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["lanes", index, "delivery", stageName, "rotation", providerIndex],
+              message: `unknown provider "${provider}"`,
+            });
+          }
+          if (seenProviders.has(provider)) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["lanes", index, "delivery", stageName, "rotation", providerIndex],
+              message: `duplicate provider "${provider}"`,
+            });
+          }
+          seenProviders.add(provider);
+        }
+      }
     }
   });
 
@@ -100,6 +188,29 @@ export type LaneConfig = {
   after: string[];
   sessionId?: string;
   workspaceId?: string;
+  delivery?: LaneDeliveryConfig;
+};
+
+export type LaneStageConfig = {
+  rotation: string[];
+  prompt: string;
+};
+
+export type LaneMergeConfig = LaneStageConfig & {
+  method: "squash" | "merge" | "rebase";
+  deployNotes: string;
+  replayNotes: string;
+};
+
+export type LaneValidationConfig = LaneStageConfig & {
+  verification: string;
+};
+
+export type LaneDeliveryConfig = {
+  review?: LaneStageConfig;
+  finals?: LaneStageConfig;
+  merge?: LaneMergeConfig;
+  validation?: LaneValidationConfig;
 };
 
 export type LanesConfig = {

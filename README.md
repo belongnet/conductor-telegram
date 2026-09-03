@@ -59,6 +59,7 @@ src/
 ├── lanes/
 │   ├── config.ts          # Optional lanes.json loading
 │   ├── decide.ts          # Pure queue/nudge/create decisions
+│   ├── pipeline.ts        # Review, finals, merge, validation, and hygiene
 │   └── scheduler.ts       # Interval tick, API actions, owner notices
 └── types/
     └── index.ts       # TypeScript interfaces
@@ -73,7 +74,7 @@ src/
 | `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
 | `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
 | `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
-| `/lanes` | `/lanes [run\|pause\|resume]` | Config-driven Cloud lane scheduler: status table, run a tick, or pause/resume |
+| `/lanes` | `/lanes [run\|pause\|resume\|archive\|merge <id>]` | Cloud lane delivery stages, manual tick/hygiene, pause/resume, or an eligible merge attempt |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
 | `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
@@ -119,9 +120,20 @@ Photos, screenshots, voice notes, and audio files sent as replies are staged or 
 
 An optional in-process scheduler keeps at most one working Cloud lane per configured provider, using that provider's model, from an ordered queue with dependencies. It is inert unless a config file is present at `LANES_CONFIG` or `~/.conductor-telegram/lanes.json`. Copy `docs/lanes.example.json` and replace the placeholders (`L1`, `https://github.com/example-org/example-repo`, example model ids).
 
-Each tick (every `intervalMinutes`, and on `/lanes run`) looks up workspaces named `[lane:<id>:…` with a per-lane name filter, or an explicit `sessionId` / `workspaceId`. A listing outage — including a partial per-project fallback outage — skips the tick instead of creating a duplicate workspace. A lane is **working** when its session status is `working` (even if the transcript is empty or unread), **done** when the last idle-turn assistant text contains a GitHub pull-request URL (tool payloads and reasoning/thinking items are ignored), **initializing** when no user message has been recorded yet, **paused** when it exists and is idle or in `error` but not done (`error` can be nudged), **unknown** when status cannot be read or an idle transcript cannot be read, and **not created** otherwise. Providers under `maxActive` nudge the first paused, dependency-ready lane whose last user message is older than `gapHours` (until `maxNudges`), else retry the configured prompt only when the last recorded action is a failed first send (`create_failed` / `prompt_failed`, also until `maxNudges`), else create the first not-created lane for that provider (or `"any"`). Failed creates and nudges are logged and the tick moves on. `/lanes pause` skips scheduled ticks before any Cloud listing.
+Each tick (every `intervalMinutes`, and on `/lanes run`) looks up matching workspaces **including archived workspaces** by `[lane:<id>:…]` name containment, or by an explicit `sessionId` / `workspaceId`; names containing `[abandoned` are ignored. A listing outage — including a partial per-project fallback outage — skips the tick instead of creating a duplicate workspace. A lane is **working** when its newest session is `working` (even if the transcript is empty or unread), **done** when the last idle-turn assistant text contains a GitHub pull-request URL (tool payloads and reasoning/thinking items are ignored), **initializing** when no user message has been recorded yet, **paused** when it exists and is idle or in `error` but not done, **unknown** when status cannot be read or an idle transcript cannot be read, and **not created** otherwise. Providers under `maxActive` resume or create dependency-ready work. `/lanes pause` suppresses scheduled Cloud walks before any listing.
 
-`/lanes` is owner-only through the existing auth middleware. `/lanes pause` / `/lanes resume` set a process-global flag in SQLite. Each create, nudge, or failure sends a one-line notice to the owner chat.
+Each lane may add an optional `delivery` object, with any combination of `review`, `finals`, `merge`, and `validation`. `merge` requires `finals`, and `validation` requires `merge`, so the scheduler can prove its preconditions:
+
+- `review` creates one adversarial reviewer on the first free provider in `rotation` other than the author, waits for its GitHub review, then messages the author once.
+- `finals` runs two sequential final reviewers on distinct non-author providers. Their GitHub review body starts with `FINAL-REVIEW (<real model>): {"verdict":"approve"|"changes", ...}`. A change verdict returns the lane to its author and starts a fresh round after the next pushed turn.
+- `merge` checks that the PR is open, conflict-free, dependency-unblocked, and has two current approvals. It uses `method` (`squash`, `merge`, or `rebase`) and records `MERGED BY AGENTS` with the merge SHA plus configured deploy/replay notes. Conflicts go back to the author for a rebase.
+- `validation` runs `verification` against the merged base on a provider distinct from the author and merge executor, comments `VALIDATED (<real model>)` or `VALIDATION FAILED (<real model>)`, and may open a narrowly scoped fix PR.
+
+Stage prompts are paths relative to `lanes.json` and support `{{laneId}}`, `{{laneTitle}}`, `{{prUrl}}`, `{{round}}`, `{{slot}}`, `{{model}}`, `{{previousFinalReview}}`, `{{mergeMethod}}`, `{{deployNotes}}`, `{{replayNotes}}`, and `{{verification}}`. Required safety/marker instructions are appended by the scheduler. The example config and prompt templates live in `docs/lanes.example.json` and `docs/prompts/`.
+
+The scheduler keeps its delivery and nudge ledger in SQLite. Two nudges without a newer assistant response mark a session dead; recovery starts a **new session in the same workspace** and always targets that workspace's newest session. Rate-limit reset timestamps found in assistant transcripts suppress work until the reset, and the next available provider in a stage rotation acts as the stand-in using its real model in markers.
+
+Hygiene runs after each active tick. It archives finished review/final/merge/validation workspaces and all lane workspaces after merge, never archives a working newest session, and never recreates a matching archived workspace. `/lanes archive` runs the same hygiene immediately. `/lanes merge <id>` forces a policy check but cannot bypass final approvals or dependency/conflict rules. `/lanes` shows `author → review → finals → merge → validation` progress per lane. All `/lanes` forms remain owner-only through the existing middleware; merges, validations, and archive batches send one-line Telegram notices.
 
 Prompt paths in the config are relative to the config file's directory.
 

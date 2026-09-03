@@ -81,6 +81,8 @@ import {
 } from "../store/queries.js";
 import {
   collectLaneStatuses,
+  forceLaneMergeAttempt,
+  runLanesHygieneNow,
   runLanesTick,
   type LaneStatusRow,
 } from "../lanes/scheduler.js";
@@ -2157,7 +2159,7 @@ function formatLaneStatusTable(statuses: LaneStatusRow[], paused: boolean): stri
     const last = row.lastAction
       ? `${row.lastAction.action} ${formatRelativeTime(row.lastAction.createdAt)}`
       : "—";
-    return `<code>${escHtml(row.id)}</code> · ${escHtml(provider)} · ${escHtml(row.state)} · ${escHtml(last)}`;
+    return `<code>${escHtml(row.id)}</code> · ${escHtml(provider)} · ${escHtml(row.state)} · ${escHtml(last)}\n  ${escHtml(row.deliveryStage)}`;
   });
   const pauseNote = paused ? "\n\nPaused. /lanes resume to continue." : "";
   return `<b>Lanes</b>\n\n${lines.join("\n")}${pauseNote}`;
@@ -2166,12 +2168,19 @@ function formatLaneStatusTable(statuses: LaneStatusRow[], paused: boolean): stri
 /** @internal exported for lanes command unit tests; not part of the public bot API. */
 export async function handleLanes(ctx: Context): Promise<void> {
   const text = (ctx.message as any)?.text ?? "";
-  const arg = stripCommandPrefix(text, "lanes").toLowerCase();
+  const rawArg = stripCommandPrefix(text, "lanes").trim();
+  const [subcommand = "", laneId] = rawArg.split(/\s+/, 2);
+  const arg = subcommand.toLowerCase();
 
-  if (arg && !["run", "pause", "resume"].includes(arg)) {
+  if (arg && !["run", "pause", "resume", "archive", "merge"].includes(arg)) {
     await ctx.reply(
-      "Usage: /lanes — status\n/lanes run — tick now\n/lanes pause — stop scheduling\n/lanes resume — continue scheduling"
+      "Usage: /lanes — status\n/lanes run — tick now\n/lanes pause — stop scheduling\n/lanes resume — continue scheduling\n/lanes archive — run hygiene now\n/lanes merge <id> — attempt an eligible merge"
     );
+    return;
+  }
+
+  if (arg === "merge" && !laneId) {
+    await ctx.reply("Usage: /lanes merge <id>");
     return;
   }
 
@@ -2183,6 +2192,32 @@ export async function handleLanes(ctx: Context): Promise<void> {
   if (arg === "resume") {
     setLanesPaused(false);
     await ctx.reply("Lanes scheduler resumed.");
+    return;
+  }
+  if (arg === "archive") {
+    const result = await runLanesHygieneNow({
+      notify: async (notice) => {
+        await ctx.reply(notice);
+      },
+    });
+    if (result.reason) await ctx.reply(result.reason);
+    else if (result.archived === 0) {
+      await ctx.reply("🗄️ lanes hygiene complete; nothing to archive");
+    }
+    return;
+  }
+  if (arg === "merge") {
+    const result = await forceLaneMergeAttempt({
+      laneId: laneId!,
+      notify: async (notice) => {
+        await ctx.reply(notice);
+      },
+    });
+    await ctx.reply(
+      result.attempted
+        ? `Merge policy check started for ${laneId}.`
+        : result.reason ?? `Lane ${laneId} is not merge-eligible.`
+    );
     return;
   }
 
@@ -4107,7 +4142,7 @@ Commands:
 /cloud &lt;project&gt; &lt;prompt&gt; — Start a ☁️ cloud workspace (no Mac needed)
 /projects [name] — List ☁️ cloud projects, or one project's workspaces
 /fleet [hours] — ☁️ org-wide cloud activity report
-/lanes — Lane scheduler status; /lanes run, pause, resume
+/lanes — Lane delivery status; /lanes run, pause, resume, archive, merge &lt;id&gt;
 /rename &lt;name&gt; — Rename the current ☁️ cloud workspace
 /renamethread &lt;name&gt; — Rename the current ☁️ cloud thread
 /send &lt;workspace&gt; &lt;message&gt; — Send follow-up to agent

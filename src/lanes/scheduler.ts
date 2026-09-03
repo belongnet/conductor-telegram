@@ -12,10 +12,14 @@ import { createLogger } from "../bot/logger.js";
 import { supervisedInterval } from "../bot/supervisor.js";
 import {
   countLaneActions,
+  getLaneDeliveryState,
   getLanesLastTickAt,
   getLatestLaneActions,
   isLanesPaused,
+  observeLaneSession,
   recordLaneAction,
+  recordLaneSessionNudge,
+  setLaneProviderOutage,
   setLanesLastTickAt,
   type LaneActionRecord,
 } from "../store/queries.js";
@@ -28,8 +32,10 @@ import {
 } from "./config.js";
 import {
   LANE_NUDGE_MESSAGE,
+  assistantTextFromTranscriptEvent,
   decideLaneActions,
   deriveLaneRuntimeState,
+  githubPrUrlFromText,
   laneWorkspaceName,
   laneWorkspaceNamePrefix,
   parseLaneWorkspaceName,
@@ -37,6 +43,14 @@ import {
   type LaneRuntimeState,
   type LaneSnapshot,
 } from "./decide.js";
+import {
+  getLaneStageView,
+  mergeDependencyBlockers,
+  parseRateLimitReset,
+  runDeliveryPipeline,
+  runLaneHygiene,
+  type LaneDeliveryState,
+} from "./pipeline.js";
 
 const log = createLogger("lanes");
 const DUE_CHECK_MS = 60_000;
@@ -59,6 +73,7 @@ export type LaneStatusRow = {
   assignedProvider: string | null;
   state: LaneRuntimeState;
   lastAction: LaneActionRecord | null;
+  deliveryStage: string;
 };
 
 export type LanesTickResult = {
@@ -263,6 +278,28 @@ async function runLanesTickUnlocked(options: {
     await notifyAction(options.notify, action, outcome);
   }
 
+  try {
+    await runDeliveryPipeline({
+      client,
+      config,
+      snapshots,
+      workspaces,
+      notify: options.notify,
+    });
+  } catch (error) {
+    log.error("delivery pipeline failed:", error);
+  }
+  try {
+    await runLaneHygiene({
+      client,
+      config,
+      workspaces,
+      notify: options.notify,
+    });
+  } catch (error) {
+    log.error("lane hygiene failed:", error);
+  }
+
   setLanesLastTickAt(new Date().toISOString());
   const refreshedActions = getLatestLaneActions(
     config.lanes.map((lane) => lane.id)
@@ -343,6 +380,88 @@ export async function collectLaneStatuses(): Promise<{
   }
 }
 
+export async function runLanesHygieneNow(options: {
+  notify: LanesNotify;
+}): Promise<{ archived: number; reason?: string }> {
+  const config = loadLanesConfig();
+  if (!config) {
+    return { archived: 0, reason: "Lanes scheduler is off — no lanes config file found." };
+  }
+  const client = createConductorApiClientFromEnv();
+  if (!client) {
+    return { archived: 0, reason: "Conductor Cloud API is not configured." };
+  }
+  const workspaces = await loadWorkspaceIndex(client, config);
+  const archived = await runLaneHygiene({
+    client,
+    config,
+    workspaces,
+    notify: options.notify,
+  });
+  return { archived };
+}
+
+export async function forceLaneMergeAttempt(options: {
+  laneId: string;
+  notify: LanesNotify;
+}): Promise<{ attempted: boolean; reason?: string }> {
+  const config = loadLanesConfig();
+  if (!config) return { attempted: false, reason: "Lanes scheduler is off." };
+  const lane = config.lanes.find(
+    (entry) => entry.id.toLowerCase() === options.laneId.toLowerCase()
+  );
+  if (!lane) {
+    return { attempted: false, reason: `Unknown lane ${options.laneId}.` };
+  }
+  if (!lane.delivery?.merge) {
+    return { attempted: false, reason: `Lane ${lane.id} has no merge stage.` };
+  }
+  const state = getLaneDeliveryState<LaneDeliveryState>(lane.id);
+  if (!state || state.stage !== "merge") {
+    return {
+      attempted: false,
+      reason: `Lane ${lane.id} is not at the merge stage.`,
+    };
+  }
+  const approvals = state.finals.filter(
+    (run) => run.round === state.round && run.verdict === "approve"
+  );
+  if (approvals.length < 2) {
+    return {
+      attempted: false,
+      reason: `Lane ${lane.id} needs two current final approvals.`,
+    };
+  }
+  const states = new Map(
+    config.lanes.map((entry) => [
+      entry.id,
+      getLaneDeliveryState<LaneDeliveryState>(entry.id),
+    ])
+  );
+  const blockers = mergeDependencyBlockers(lane, states);
+  if (blockers.length > 0) {
+    return {
+      attempted: false,
+      reason: `Lane ${lane.id} is waiting for merged dependencies: ${blockers.join(", ")}.`,
+    };
+  }
+  const client = createConductorApiClientFromEnv();
+  if (!client) {
+    return { attempted: false, reason: "Conductor Cloud API is not configured." };
+  }
+  const workspaces = await loadWorkspaceIndex(client, config);
+  const snapshots = await resolveLaneSnapshots(client, config, workspaces);
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots,
+    workspaces,
+    notify: options.notify,
+    forceMergeLaneId: lane.id,
+  });
+  return { attempted: true };
+}
+
 type ExecuteOutcome = {
   ok: boolean;
   notice: string;
@@ -357,6 +476,53 @@ export async function executeLaneAction(
   action: LaneAction,
   workspaces: ConductorApiWorkspace[]
 ): Promise<ExecuteOutcome> {
+  if (action.type === "restart") {
+    let workspace: ConductorApiWorkspace | null;
+    try {
+      workspace = await findLaneWorkspace(client, config, lane, workspaces);
+      if (!workspace) throw new Error("no workspace found");
+      const provider = config.providers[action.provider];
+      const session = await client.createSession({
+        workspaceId: workspace.id,
+        name: `${lane.id} recovery`,
+        agent: provider.agent,
+        model: provider.model,
+        effort: provider.effort,
+      });
+      await client.sendMessage({
+        sessionId: session.id,
+        message:
+          "Continue the lane in this same workspace. Inspect the existing branch and prior work, finish the task, and end with the PR URL.",
+        messageId: randomUUID(),
+      });
+      observeLaneSession({
+        sessionId: session.id,
+        laneId: lane.id,
+        role: "author",
+        lastAssistantAt: null,
+      });
+      recordLaneAction({
+        laneId: lane.id,
+        provider: action.provider,
+        action: "restart",
+        detail: `${workspace.id}:${session.id}`,
+      });
+      return {
+        ok: true,
+        notice: `restarted ${lane.id} in workspace ${workspace.id}`,
+        assignedProvider: action.provider,
+      };
+    } catch (error) {
+      const notice = `restart ${lane.id} failed: ${describeError(error)}`;
+      recordLaneAction({
+        laneId: lane.id,
+        provider: action.provider,
+        action: "restart_failed",
+        detail: describeError(error),
+      });
+      return { ok: false, notice };
+    }
+  }
   if (action.type === "nudge") {
     return sendLaneMessage({
       client,
@@ -526,6 +692,9 @@ async function sendLaneMessage(input: {
       message: input.message,
       messageId: randomUUID(),
     });
+    if (input.successKind === "nudge") {
+      recordLaneSessionNudge(sessionId);
+    }
     recordLaneAction({
       laneId: input.lane.id,
       provider: input.action.provider,
@@ -575,8 +744,11 @@ function applyLocalSnapshotUpdate(
   if (action.type === "nudge") {
     snapshot.state = "working";
     snapshot.nudgeCount += 1;
-  } else {
+  } else if (action.type !== "restart") {
     snapshot.state = "paused";
+  } else {
+    snapshot.state = "working";
+    snapshot.unansweredNudges = 0;
   }
 }
 
@@ -625,6 +797,12 @@ async function snapshotLane(
       nudgeCount,
       promptFailedCount,
       lastActionKind: lastAction?.action ?? null,
+      workspaceId: null,
+      sessionId: null,
+      prUrl: null,
+      lastAssistantAt: null,
+      unansweredNudges: 0,
+      rateLimitUntil: null,
     };
   }
 
@@ -655,6 +833,12 @@ async function snapshotLane(
       nudgeCount,
       promptFailedCount,
       lastActionKind: lastAction?.action ?? null,
+      workspaceId: workspace.id,
+      sessionId: null,
+      prUrl: null,
+      lastAssistantAt: null,
+      unansweredNudges: 0,
+      rateLimitUntil: null,
     };
   }
 
@@ -698,6 +882,28 @@ async function snapshotLane(
       receivedAt: message.receivedAt,
     })),
   });
+  const assistantMessages = messages.filter(
+    (message) => assistantTextFromTranscriptEvent(message).trim().length > 0
+  );
+  const lastAssistant = assistantMessages.at(-1);
+  const lastAssistantText = lastAssistant
+    ? assistantTextFromTranscriptEvent(lastAssistant)
+    : "";
+  const rateLimitUntil = parseRateLimitReset(
+    assistantMessages
+      .map((message) => assistantTextFromTranscriptEvent(message))
+      .join("\n")
+  );
+  if (rateLimitUntil && assignedProvider) {
+    setLaneProviderOutage(assignedProvider, rateLimitUntil);
+  }
+  const health = observeLaneSession({
+    sessionId,
+    laneId: lane.id,
+    role: "author",
+    lastAssistantAt: lastAssistant?.receivedAt ?? null,
+    rateLimitUntil,
+  });
   return {
     id: lane.id,
     provider: lane.provider,
@@ -707,6 +913,12 @@ async function snapshotLane(
     nudgeCount,
     promptFailedCount,
     lastActionKind: lastAction?.action ?? null,
+    workspaceId: workspace.id,
+    sessionId,
+    prUrl: githubPrUrlFromText(lastAssistantText),
+    lastAssistantAt: lastAssistant?.receivedAt ?? null,
+    unansweredNudges: health.unansweredNudges,
+    rateLimitUntil: health.rateLimitUntil,
   };
 }
 
@@ -765,9 +977,18 @@ async function resolveLaneSessionId(
     workspaceId ?? (await findLaneWorkspace(client, config, lane, workspaces))?.id;
   if (!id) return null;
   try {
-    const sessions = await client.listWorkspaceSessions(id);
-    const live = sessions.filter((session) => !session.archivedAt);
-    return (live[0] ?? sessions[0])?.id ?? null;
+    const sessions = await client.listWorkspaceSessions(id, {
+      includeArchived: true,
+    });
+    const sorted = sessions
+      .map((session, index) => ({ session, index }))
+      .sort((a, b) => {
+        const byDate = (b.session.createdAt ?? "").localeCompare(
+          a.session.createdAt ?? ""
+        );
+        return byDate || a.index - b.index;
+      });
+    return sorted[0]?.session.id ?? null;
   } catch (error) {
     throw new LaneWorkspaceIndexError(
       `could not list sessions for lane ${lane.id}`,
@@ -793,7 +1014,11 @@ export async function loadWorkspaceIndex(
   for (const lane of config.lanes) {
     const prefix = laneWorkspaceNamePrefix(lane.id);
     try {
-      const listed = await client.listWorkspaces({ mine: true, name: prefix });
+      const listed = await client.listWorkspaces({
+        mine: true,
+        name: prefix,
+        includeArchived: true,
+      });
       for (const workspace of listed) found.set(workspace.id, workspace);
     } catch (error) {
       errors.push(`${lane.id}: ${describeError(error)}`);
@@ -935,7 +1160,11 @@ function workspacesMatchingPrefix(
   workspaces: ConductorApiWorkspace[],
   prefix: string
 ): ConductorApiWorkspace[] {
-  return workspaces.filter((workspace) => workspace.name.startsWith(prefix));
+  return workspaces.filter((workspace) => {
+    if (!workspace.name.includes(prefix)) return false;
+    if (workspace.name.toLowerCase().includes("[abandoned")) return false;
+    return parseLaneWorkspaceName(workspace.name) !== null;
+  });
 }
 
 async function listAllSessionMessages(
@@ -980,6 +1209,7 @@ function statusRows(
       assignedProvider: snapshot?.assignedProvider ?? null,
       state: snapshot?.state ?? "not_created",
       lastAction: lastActions.get(lane.id) ?? null,
+      deliveryStage: getLaneStageView(lane),
     };
   });
 }

@@ -92,3 +92,48 @@ test("lanes config rejects an unknown provider", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("lanes config validates optional delivery rotations", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-lanes-delivery-"));
+  const configPath = path.join(dir, "lanes.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      intervalMinutes: 30,
+      providers: {
+        author: { agent: "claude", model: "author-model", gapHours: 4 },
+        reviewer: { agent: "codex", model: "review-model", gapHours: 4 },
+        validator: { agent: "cursor", model: "validation-model", gapHours: 4 },
+      },
+      lanes: [
+        {
+          id: "L1",
+          title: "Example delivery",
+          provider: "author",
+          repoUrl: "https://github.com/example-org/example-repo",
+          prompt: "prompts/author.md",
+          delivery: {
+            review: { rotation: ["reviewer", "validator"], prompt: "prompts/review.md" },
+            finals: { rotation: ["reviewer", "validator"], prompt: "prompts/final.md" },
+            merge: { rotation: ["validator"], prompt: "prompts/merge.md" },
+            validation: {
+              rotation: ["reviewer"],
+              prompt: "prompts/validation.md",
+              verification: "npm test",
+            },
+          },
+        },
+      ],
+    })
+  );
+  try {
+    const loaded = loadLanesConfig({ LANES_CONFIG: configPath });
+    assert.equal(loaded?.lanes[0]?.delivery?.merge?.method, "squash");
+    assert.deepEqual(loaded?.lanes[0]?.delivery?.finals?.rotation, [
+      "reviewer",
+      "validator",
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

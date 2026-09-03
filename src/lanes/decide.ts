@@ -37,6 +37,12 @@ export type LaneSnapshot = {
   promptFailedCount: number;
   /** Last recorded SQLite action, used to gate first-prompt retries. */
   lastActionKind: string | null;
+  workspaceId?: string | null;
+  sessionId?: string | null;
+  prUrl?: string | null;
+  lastAssistantAt?: string | null;
+  unansweredNudges?: number;
+  rateLimitUntil?: string | null;
 };
 
 export type ProviderLimits = {
@@ -48,6 +54,7 @@ export type ProviderLimits = {
 
 export type LaneAction =
   | { type: "nudge"; laneId: string; provider: string }
+  | { type: "restart"; laneId: string; provider: string }
   | { type: "prompt"; laneId: string; provider: string }
   | { type: "create"; laneId: string; provider: string };
 
@@ -75,9 +82,13 @@ export function laneWorkspaceName(
 export function parseLaneWorkspaceName(
   name: string
 ): { laneId: string; provider: string } | null {
-  const match = name.match(/^\[lane:([^:\]]+):([^\]]+)\]/);
+  const match = name.match(/\[lane:([^:\]]+):([^:\]]+)\]/);
   if (!match) return null;
   return { laneId: match[1], provider: match[2] };
+}
+
+export function githubPrUrlFromText(text: string): string | null {
+  return text.match(GITHUB_PR_URL_RE)?.[0] ?? null;
 }
 
 export function transcriptContainsGithubPrUrl(text: string): boolean {
@@ -303,15 +314,15 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
     ).length;
     if (workingCount >= provider.maxActive) continue;
 
-    const nudgeTarget = input.lanes.find((lane) => {
+    const eligiblePaused = (lane: LaneSnapshot): boolean => {
       if (claimed.has(lane.id)) return false;
       if (lane.state !== "paused") return false;
       if (!assignedTo(lane, provider.name)) return false;
       if (!depsDone(lane)) return false;
       if (!lane.lastUserMessageAt) return false;
       if (
-        provider.maxNudges !== undefined &&
-        lane.nudgeCount >= provider.maxNudges
+        lane.rateLimitUntil &&
+        Date.parse(lane.rateLimitUntil) > input.now.getTime()
       ) {
         return false;
       }
@@ -319,7 +330,30 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
       if (!Number.isFinite(last)) return false;
       const ageHours = (input.now.getTime() - last) / 3_600_000;
       return ageHours >= provider.gapHours;
-    });
+    };
+
+    const restartTarget = input.lanes.find(
+      (lane) =>
+        eligiblePaused(lane) &&
+        (lane.unansweredNudges ?? 0) >= 2 &&
+        Boolean(lane.workspaceId)
+    );
+    if (restartTarget) {
+      claimed.add(restartTarget.id);
+      actions.push({
+        type: "restart",
+        laneId: restartTarget.id,
+        provider: provider.name,
+      });
+      continue;
+    }
+
+    const nudgeTarget = input.lanes.find(
+      (lane) =>
+        eligiblePaused(lane) &&
+        (provider.maxNudges === undefined ||
+          (lane.unansweredNudges ?? lane.nudgeCount) < provider.maxNudges)
+    );
     if (nudgeTarget) {
       claimed.add(nudgeTarget.id);
       actions.push({
