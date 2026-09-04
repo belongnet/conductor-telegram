@@ -572,6 +572,49 @@ test("an unknown session status is not nudged", () => {
   assert.deepEqual(actions, []);
 });
 
+test("an unknown lane occupies a provider slot", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "unknown",
+        lastUserMessageAt: OLD_USER,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
+test("an unknown any-provider lane occupies every provider slot", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        provider: "any",
+        assignedProvider: null,
+        state: "unknown",
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
 test("maxNudges stops a paused lane from being nudged forever", () => {
   const actions = decideLaneActions({
     now: NOW,

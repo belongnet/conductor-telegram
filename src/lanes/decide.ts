@@ -294,10 +294,12 @@ export function deriveLaneRuntimeState(input: {
 
 /**
  * Pure scheduler: at most one action per provider whose working count is
- * below `maxActive`. Nudge the first eligible paused lane; otherwise retry
- * the first prompt of an initializing lane whose last recorded action is a
- * failed first send; otherwise create the first not-created lane for that
- * provider (or `"any"`). Failed lanes are skipped so the queue can advance.
+ * below `maxActive`. Unknown snapshots occupy a slot the same way working
+ * ones do, so a status or listing outage cannot start another paid lane.
+ * Nudge the first eligible paused lane; otherwise retry the first prompt of
+ * an initializing lane whose last recorded action is a failed first send;
+ * otherwise create the first not-created lane for that provider (or
+ * `"any"`). Failed lanes are skipped so the queue can advance.
  */
 export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
   if (input.paused) return [];
@@ -319,7 +321,8 @@ export function decideLaneActions(input: DecideLaneActionsInput): LaneAction[] {
   for (const provider of input.providers) {
     const workingCount = input.lanes.filter(
       (lane) =>
-        lane.state === "working" && assignedTo(lane, provider.name)
+        (lane.state === "working" || lane.state === "unknown") &&
+        assignedTo(lane, provider.name)
     ).length;
     if (workingCount >= provider.maxActive) continue;
 
