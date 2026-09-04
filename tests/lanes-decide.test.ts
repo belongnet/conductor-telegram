@@ -401,6 +401,34 @@ test("a PR URL in the last assistant text of an idle turn marks the lane done", 
   );
 });
 
+test("a PR URL in Codex reasoning text does not mark the lane done", () => {
+  const reasoningEvent = {
+    type: "agent",
+    content: {
+      rawPayload: {
+        type: "item.completed",
+        item: {
+          type: "reasoning",
+          text: "Inspecting https://github.com/example-org/example-repo/pull/41 before replying",
+        },
+      },
+    },
+    receivedAt: NOW.toISOString(),
+  };
+  assert.equal(assistantTextFromTranscriptEvent(reasoningEvent), "");
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "user", content: "review the PR", receivedAt: OLD_USER },
+        reasoningEvent,
+      ],
+    }).state,
+    "paused"
+  );
+});
+
 test("a working lane with an empty transcript is not prompted", () => {
   const actions = decideLaneActions({
     now: NOW,

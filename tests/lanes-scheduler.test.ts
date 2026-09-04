@@ -575,7 +575,104 @@ test("a transcript fetch failure does not re-send the lane prompt", async () => 
   assert.equal(result.skipped, false);
   assert.equal(result.actions.length, 0);
   assert.equal(promptPosts, 0);
-  assert.equal(result.statuses[0]?.state, "unknown");
+  assert.equal(result.statuses[0]?.state, "working");
+});
+
+test("a working session whose transcript cannot be read still occupies the provider slot", async () => {
+  resetLanesDb();
+  const originalConfig = readFileSync(path.join(TEMP_DIR, "lanes.json"), "utf8");
+  writeFileSync(
+    path.join(TEMP_DIR, "lanes.json"),
+    JSON.stringify({
+      intervalMinutes: 30,
+      providers: {
+        primary: {
+          agent: "claude",
+          model: "claude-example-model",
+          effort: "high",
+          gapHours: 4.5,
+          maxActive: 1,
+        },
+      },
+      lanes: [
+        {
+          id: "L1",
+          title: "Example first lane",
+          provider: "primary",
+          repoUrl: "https://github.com/example-org/example-repo",
+          prompt: "prompts/l1.md",
+        },
+        {
+          id: "L2",
+          title: "Example second lane",
+          provider: "primary",
+          repoUrl: "https://github.com/example-org/example-repo-two",
+          prompt: "prompts/l2.md",
+        },
+      ],
+    })
+  );
+  let creates = 0;
+  globalThis.fetch = (async (url: string | URL | Request, init: RequestInit = {}) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname === "/v0/workspaces" && init.method === "POST") {
+      creates += 1;
+      return json(
+        {
+          workspaceId: "workspace-dup",
+          sessionId: "session-dup",
+          deepLink: "https://conductor.build/workspace-dup",
+        },
+        201
+      );
+    }
+    if (parsed.pathname === "/v0/workspaces") {
+      const name = parsed.searchParams.get("name") ?? "";
+      if (name.includes("[lane:L1:")) {
+        return json(
+          workspacePage([
+            {
+              id: "workspace-1",
+              name: "[lane:L1:primary] Example first lane",
+            },
+          ])
+        );
+      }
+      return json(workspacePage([]));
+    }
+    if (parsed.pathname === "/v0/workspaces/workspace-1/sessions") {
+      return json({
+        data: [{ id: "session-1", deepLink: "https://conductor.build/session-1" }],
+        offset: 0,
+        hasMore: false,
+      });
+    }
+    if (parsed.pathname === "/v0/sessions/session-1/status") {
+      return json({
+        workspaceId: "workspace-1",
+        sessionId: "session-1",
+        status: "working",
+        updatedAt: "2026-09-01T00:00:00.000Z",
+      });
+    }
+    if (parsed.pathname === "/v0/sessions/session-1/messages") {
+      return json({ userMessage: "unavailable" }, 503);
+    }
+    return json({ userMessage: `unhandled ${parsed.pathname}` }, 404);
+  }) as typeof fetch;
+  try {
+    const result = await runLanesTick({
+      notify: async () => undefined,
+      force: true,
+    });
+    assert.equal(result.skipped, false);
+    assert.equal(result.actions.length, 0);
+    assert.equal(creates, 0);
+    assert.equal(result.statuses[0]?.state, "working");
+    assert.equal(result.statuses[1]?.state, "not_created");
+  } finally {
+    writeFileSync(path.join(TEMP_DIR, "lanes.json"), originalConfig);
+  }
 });
 
 test("a working session with an empty transcript is not prompted", async () => {

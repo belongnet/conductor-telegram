@@ -4,7 +4,13 @@ export const LANE_NUDGE_MESSAGE =
 export const GITHUB_PR_URL_RE =
   /https?:\/\/(?:www\.)?github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/i;
 
-const TOOL_ITEM_TYPE_RE = /tool|command|function|mcp/;
+const HIDDEN_ITEM_TYPE_RE = /tool|command|function|mcp|reasoning|thinking/;
+const VISIBLE_ASSISTANT_ITEM_TYPES = new Set([
+  "text",
+  "agent_message",
+  "message",
+  "output_text",
+]);
 
 export type LaneRuntimeState =
   | "working"
@@ -93,15 +99,17 @@ export function isAgentTranscriptEvent(message: {
 }
 
 /**
- * Assistant-visible text only. Tool/command payloads (including
- * `rawPayload` `item.started` / `item.completed` tool items) are ignored
- * so a `gh pr diff N` in a review lane cannot mark the lane done.
+ * Assistant-visible text only. Tool/command payloads and non-visible
+ * lifecycle items such as `reasoning` / `thinking` are ignored so a
+ * review lane cannot mark itself done from an internal thought that
+ * mentions a pull request.
  */
 export function assistantTextFromTranscriptEvent(message: {
   type: string;
   content?: unknown;
 }): string {
   if (!isAgentTranscriptEvent(message)) return "";
+  if (isHiddenItemType(message.type)) return "";
   if (typeof message.content === "string") return message.content;
   const blocks: string[] = [];
   collectAssistantText(message.content, blocks, 0);
@@ -122,12 +130,12 @@ function collectAssistantText(
   if (typeof value !== "object") return;
   const obj = value as Record<string, unknown>;
   const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
-  if (isToolItemType(type)) return;
+  if (isHiddenItemType(type)) return;
 
   if (obj.item && typeof obj.item === "object" && !Array.isArray(obj.item)) {
     const item = obj.item as Record<string, unknown>;
     const itemType = typeof item.type === "string" ? item.type.toLowerCase() : "";
-    if (isToolItemType(itemType)) return;
+    if (!isVisibleAssistantItemType(itemType)) return;
     pushTextField(item, blocks);
     collectAssistantText(item.content, blocks, depth + 1);
     return;
@@ -144,7 +152,7 @@ function collectAssistantText(
 
 function pushTextField(obj: Record<string, unknown>, blocks: string[]): void {
   const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
-  if (isToolItemType(type)) return;
+  if (!isVisibleAssistantItemType(type)) return;
   if (typeof obj.text === "string" && obj.text.trim()) {
     blocks.push(obj.text);
   }
@@ -153,9 +161,15 @@ function pushTextField(obj: Record<string, unknown>, blocks: string[]): void {
   }
 }
 
-function isToolItemType(type: string): boolean {
+function isHiddenItemType(type: string): boolean {
   if (!type) return false;
-  return TOOL_ITEM_TYPE_RE.test(type);
+  return HIDDEN_ITEM_TYPE_RE.test(type.toLowerCase());
+}
+
+function isVisibleAssistantItemType(type: string): boolean {
+  if (!type) return true;
+  if (isHiddenItemType(type)) return false;
+  return VISIBLE_ASSISTANT_ITEM_TYPES.has(type.toLowerCase());
 }
 
 function transcriptRole(message: {

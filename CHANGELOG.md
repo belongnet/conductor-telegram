@@ -9,8 +9,8 @@ All notable changes to conductor-telegram are documented here.
 
 ### Fixed
 - Lanes ticks skip creation when workspace listing fails, including a partial per-project fallback outage, so an API outage cannot bill a duplicate `[lane:…]` workspace.
-- An initializing lane whose first prompt never landed is re-prompted instead of being skipped forever. A transcript fetch failure or empty transcript on a live session is `unknown`/`working`, not a prompt retry.
-- Lane "done" detection uses assistant text from the last idle turn, not tool/command payloads that happen to mention a pull request.
+- An initializing lane whose first prompt never landed is re-prompted instead of being skipped forever. A transcript fetch failure on a live `working` session keeps occupying the provider slot; an idle/unread transcript is `unknown`, not a prompt retry.
+- Lane "done" detection uses assistant text from the last idle turn, not tool/command payloads or Codex reasoning/thinking items that happen to mention a pull request.
 
 ## [0.7.0] - 2026-08-30
 

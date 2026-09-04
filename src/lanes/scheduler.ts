@@ -672,6 +672,19 @@ async function snapshotLane(
     messages = await listAllSessionMessages(client, sessionId);
   } catch (error) {
     log.warn(`transcript for ${lane.id} failed:`, error);
+    if (!statusUnknown && sessionStatus === "working") {
+      return {
+        id: lane.id,
+        provider: lane.provider,
+        assignedProvider,
+        state: "working",
+        lastUserMessageAt: null,
+        after: lane.after,
+        nudgeCount,
+        promptFailedCount,
+        lastActionKind: lastAction?.action ?? null,
+      };
+    }
     return unknownLaneSnapshot(lane, lastAction, assignedProvider);
   }
 
