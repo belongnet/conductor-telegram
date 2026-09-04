@@ -56,6 +56,10 @@ src/
 │   └── queries.ts     # CRUD operations
 ├── integrations/
 │   └── conductor-api.ts  # Supported Conductor Cloud API transport
+├── lanes/
+│   ├── config.ts          # Optional lanes.json loading
+│   ├── decide.ts          # Pure queue/nudge/create decisions
+│   └── scheduler.ts       # Interval tick, API actions, owner notices
 └── types/
     └── index.ts       # TypeScript interfaces
 ```
@@ -69,6 +73,7 @@ src/
 | `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
 | `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
 | `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
+| `/lanes` | `/lanes [run\|pause\|resume]` | Config-driven Cloud lane scheduler: status table, run a tick, or pause/resume |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
 | `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
@@ -104,11 +109,21 @@ Repo-targeted Telegram launches are Cloud-first. `/run`, repo-topic messages, an
 
 If a local prompt later fails because its CLI login disappeared, the bot can take the same Telegram workspace over through Cloud. Automatic replay is limited to launcher-confirmed startup authentication failures before any assistant or tool activity. The worktree must be clean and its exact commit must already exist on an `origin` branch; the bot rechecks that branch after Cloud provisioning and before it sends work. Because the public Cloud API does not expose the provisioned checkout SHA, the handoff carries the expected SHA and tells the Cloud agent to verify HEAD before any side effect. Dirty files, unpushed commits, and partially executed prompts are never silently replayed. The Cloud binding and first prompt are persisted as a recoverable pending launch before delivery; later overlapping requests use a durable, ordered outbox with stable message identities. Stop intent and uncertain cleanup also survive restarts, so a canceled pending launch cannot be replayed later. A Stop or Archive the API rejects is retried across restarts, but only until it is clearly hopeless: because a pending terminal request blocks later sends, one that cannot succeed is retired with an explanatory message rather than gating the workspace forever. Restricted read-only reviews remain local until the public Cloud API exposes equivalent permission-policy enforcement.
 
-Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, or query (`/projects`, `/fleet`) org resources — without it, every member of the configured group shares that privilege.
+Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, query (`/projects`, `/fleet`), or run the lanes scheduler (`/lanes`) — without it, every member of the configured group shares that privilege.
 
 The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
 
 Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
+
+## Lanes scheduler
+
+An optional in-process scheduler keeps at most one working Cloud lane per configured provider, using that provider's model, from an ordered queue with dependencies. It is inert unless a config file is present at `LANES_CONFIG` or `~/.conductor-telegram/lanes.json`. Copy `docs/lanes.example.json` and replace the placeholders (`L1`, `https://github.com/example-org/example-repo`, example model ids).
+
+Each tick (every `intervalMinutes`, and on `/lanes run`) looks up workspaces named `[lane:<id>:…` with a per-lane name filter, or an explicit `sessionId` / `workspaceId`. A listing outage — including a partial per-project fallback outage — skips the tick instead of creating a duplicate workspace. A lane is **working** when its session status is `working` (even if the transcript is empty or unread), **done** when the last idle-turn assistant text contains a GitHub pull-request URL (tool payloads and reasoning/thinking items are ignored), **initializing** when no user message has been recorded yet, **paused** when it exists and is idle or in `error` but not done (`error` can be nudged), **unknown** when status cannot be read or an idle transcript cannot be read, and **not created** otherwise. An unknown lane occupies its provider slot until the owner fixes the config (`/lanes` shows it as unknown); an `"any"` lane that is unknown with no assigned provider occupies every provider. Providers under `maxActive` nudge the first paused, dependency-ready lane whose last user message is older than `gapHours` (until `maxNudges`), else retry the configured prompt only when the last recorded action is a failed first send (`create_failed` / `prompt_failed`, also until `maxNudges`), else create the first not-created lane for that provider (or `"any"`). Failed creates and nudges are logged and the tick moves on. `/lanes pause` skips scheduled ticks before any Cloud listing.
+
+`/lanes` is owner-only through the existing auth middleware. `/lanes pause` / `/lanes resume` set a process-global flag in SQLite. Each create, nudge, or failure sends a one-line notice to the owner chat.
+
+Prompt paths in the config are relative to the config file's directory.
 
 ## Manual Telegram setup
 
@@ -186,6 +201,7 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | | `CONDUCTOR_API_BASE_URL` | Conductor API origin (default: `https://api.conductor.build`) |
 | | `CONDUCTOR_API_KEY` | Bearer API key for supported Conductor Cloud operations |
 | | `CONDUCTOR_CLOUD_BACKEND` | `auto` (use API when keyed), `api` (require key), or `off` |
+| | `LANES_CONFIG` | Path to the optional lanes scheduler JSON (default `~/.conductor-telegram/lanes.json`) |
 | | `TELEGRAM_WHISPER_MODEL` | whisper.cpp model name or path (default: `base`) |
 
 Conductor app settings are read from `~/.conductor/settings.toml` first, with the legacy Conductor DB `settings` table as fallback. The bot uses Conductor's default/review model settings, Codex thinking levels, Claude effort levels, and git branch prefix settings when Telegram-specific env vars are not set.
@@ -235,11 +251,12 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `telegram_message_links` | Maps Telegram messages to workspaces for reply routing |
 | `thread_cursors` | Per-Conductor-session forwarding cursors for thread fan-out |
 | `bot_heartbeat` | Process liveness, boot count, and last exit details |
-| `meta` | Durable Cloud launches, ordered messages, stop/archive intents, work leases, and recovery notices |
+| `meta` | Durable Cloud launches, ordered messages, stop/archive intents, work leases, recovery notices, and the lanes pause flag |
 | `pr_records` | GitHub PR/check/merge state verified by repo + branch |
 | `merge_intents` | Expiring requester-bound confirmations for an exact PR head SHA |
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
 | `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
+| `lane_actions` | Create/nudge history for the optional lanes scheduler |
 
 ## Development
 

@@ -154,6 +154,18 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_route_attempts_chat_created
     ON route_attempts(chat_id, created_at);
+
+  CREATE TABLE IF NOT EXISTS lane_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lane_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_lane_actions_lane_created
+    ON lane_actions(lane_id, created_at DESC);
 `;
 
 let _db: Database.Database | null = null;

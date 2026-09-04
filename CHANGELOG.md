@@ -4,6 +4,11 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-04
+
+### Added
+- Optional config-driven Cloud lanes scheduler. When `LANES_CONFIG` or `~/.conductor-telegram/lanes.json` is present, the bot keeps at most one working lane per paid provider from an ordered queue with dependencies, nudging paused work after a gap or creating the next ready lane. Listing, status, and transcript outages fail closed so a tick cannot bill a duplicate workspace or start a second paid lane on the same provider. `/lanes`, `/lanes run`, `/lanes pause`, and `/lanes resume` are owner-only. See `docs/lanes.example.json`.
+
 ## [0.7.0] - 2026-08-30
 
 ### Added
