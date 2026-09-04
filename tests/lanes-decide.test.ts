@@ -401,6 +401,92 @@ test("a PR URL in the last assistant text of an idle turn marks the lane done", 
   );
 });
 
+test("a Codex Cloud agentMessage item with a PR URL marks the lane done", () => {
+  const agentEvent = {
+    type: "agent",
+    content: {
+      rawPayload: {
+        event: {
+          type: "item.completed",
+          item: {
+            type: "agentMessage",
+            text: "Opened https://github.com/example-org/example-repo/pull/12",
+          },
+        },
+      },
+    },
+    receivedAt: NOW.toISOString(),
+  };
+  assert.match(
+    assistantTextFromTranscriptEvent(agentEvent),
+    /example-org\/example-repo\/pull\/12/
+  );
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "user", content: "go", receivedAt: OLD_USER },
+        agentEvent,
+      ],
+    }).state,
+    "done"
+  );
+
+  const cliEvent = {
+    type: "agent",
+    content: {
+      rawPayload: {
+        event: {
+          type: "item.completed",
+          item: {
+            type: "agent_message",
+            text: "Opened https://github.com/example-org/example-repo/pull/12",
+          },
+        },
+      },
+    },
+    receivedAt: NOW.toISOString(),
+  };
+  assert.match(
+    assistantTextFromTranscriptEvent(cliEvent),
+    /example-org\/example-repo\/pull\/12/
+  );
+});
+
+test("injected user-role text inside an agent event does not mark the lane done", () => {
+  const injected = {
+    type: "agent",
+    content: {
+      rawPayload: {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Skill reminder: see https://github.com/example-org/example-repo/pull/12",
+            },
+          ],
+        },
+      },
+    },
+    receivedAt: NOW.toISOString(),
+  };
+  assert.equal(assistantTextFromTranscriptEvent(injected), "");
+  assert.equal(
+    deriveLaneRuntimeState({
+      workspaceFound: true,
+      sessionStatus: "idle",
+      messages: [
+        { type: "user", content: "review the PR", receivedAt: OLD_USER },
+        injected,
+      ],
+    }).state,
+    "paused"
+  );
+});
+
 test("a PR URL in Codex reasoning text does not mark the lane done", () => {
   const reasoningEvent = {
     type: "agent",
@@ -480,6 +566,49 @@ test("an unknown session status is not nudged", () => {
         id: "L1",
         state: "unknown",
         lastUserMessageAt: OLD_USER,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
+test("an unknown lane occupies a provider slot", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        state: "unknown",
+        lastUserMessageAt: OLD_USER,
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
+      }),
+    ],
+  });
+  assert.deepEqual(actions, []);
+});
+
+test("an unknown any-provider lane occupies every provider slot", () => {
+  const actions = decideLaneActions({
+    now: NOW,
+    paused: false,
+    providers: PROVIDERS,
+    lanes: [
+      lane({
+        id: "L1",
+        provider: "any",
+        assignedProvider: null,
+        state: "unknown",
+      }),
+      lane({
+        id: "L2",
+        state: "not_created",
+        assignedProvider: null,
       }),
     ],
   });
