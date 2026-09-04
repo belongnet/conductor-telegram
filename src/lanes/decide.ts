@@ -7,9 +7,9 @@ export const GITHUB_PR_URL_RE =
 const HIDDEN_ITEM_TYPE_RE = /tool|command|function|mcp|reasoning|thinking/;
 const VISIBLE_ASSISTANT_ITEM_TYPES = new Set([
   "text",
-  "agent_message",
+  "agentmessage",
   "message",
-  "output_text",
+  "outputtext",
 ]);
 
 export type LaneRuntimeState =
@@ -129,11 +129,13 @@ function collectAssistantText(
   }
   if (typeof value !== "object") return;
   const obj = value as Record<string, unknown>;
+  if (isUserRoleObject(obj)) return;
   const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
   if (isHiddenItemType(type)) return;
 
   if (obj.item && typeof obj.item === "object" && !Array.isArray(obj.item)) {
     const item = obj.item as Record<string, unknown>;
+    if (isUserRoleObject(item)) return;
     const itemType = typeof item.type === "string" ? item.type.toLowerCase() : "";
     if (!isVisibleAssistantItemType(itemType)) return;
     pushTextField(item, blocks);
@@ -151,6 +153,7 @@ function collectAssistantText(
 }
 
 function pushTextField(obj: Record<string, unknown>, blocks: string[]): void {
+  if (isUserRoleObject(obj)) return;
   const type = typeof obj.type === "string" ? obj.type.toLowerCase() : "";
   if (!isVisibleAssistantItemType(type)) return;
   if (typeof obj.text === "string" && obj.text.trim()) {
@@ -161,15 +164,32 @@ function pushTextField(obj: Record<string, unknown>, blocks: string[]): void {
   }
 }
 
+function normalizeItemType(type: string): string {
+  return type.toLowerCase().replace(/[_-]/g, "");
+}
+
 function isHiddenItemType(type: string): boolean {
   if (!type) return false;
-  return HIDDEN_ITEM_TYPE_RE.test(type.toLowerCase());
+  return HIDDEN_ITEM_TYPE_RE.test(normalizeItemType(type));
 }
 
 function isVisibleAssistantItemType(type: string): boolean {
   if (!type) return true;
-  if (isHiddenItemType(type)) return false;
-  return VISIBLE_ASSISTANT_ITEM_TYPES.has(type.toLowerCase());
+  const normalized = normalizeItemType(type);
+  if (isHiddenItemType(normalized)) return false;
+  return VISIBLE_ASSISTANT_ITEM_TYPES.has(normalized);
+}
+
+function isUserRoleObject(obj: Record<string, unknown>): boolean {
+  const role = typeof obj.role === "string" ? normalizeItemType(obj.role) : "";
+  const type = typeof obj.type === "string" ? normalizeItemType(obj.type) : "";
+  return (
+    role === "user" ||
+    role === "human" ||
+    type === "user" ||
+    type === "human" ||
+    type === "usermessage"
+  );
 }
 
 function transcriptRole(message: {
