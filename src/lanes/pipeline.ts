@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import {
+  canMergePr,
+  refreshPrByUrl,
+  type GithubPrPolicySnapshot,
+} from "../bot/github.js";
 import type {
   ConductorApiClient,
   ConductorApiMessage,
@@ -24,6 +29,7 @@ import type {
 } from "./config.js";
 import {
   assistantTextFromTranscriptEvent,
+  githubPrUrlMatchesRepo,
   type LaneSnapshot,
 } from "./decide.js";
 
@@ -67,6 +73,7 @@ export type LaneDeliveryState = {
   finals: DeliveryRun[];
   merge?: DeliveryRun;
   validation?: DeliveryRun;
+  mergeHeadSha?: string;
   mergedSha?: string;
   validationResult?: "passed" | "failed";
 };
@@ -126,12 +133,16 @@ export function parseMergedSha(text: string): string | null {
   const matches = [...text.matchAll(MERGED_RE)];
   const match = matches[matches.length - 1];
   if (!match) return null;
-  if (match[2]) return match[2].toLowerCase();
+  if (match[2] && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(match[2])) {
+    return match[2].toLowerCase();
+  }
   if (match[1]) {
     try {
       const payload = JSON.parse(match[1]) as Record<string, unknown>;
       const sha = typeof payload.sha === "string" ? payload.sha : null;
-      if (sha && /^[0-9a-f]{7,40}$/i.test(sha)) return sha.toLowerCase();
+      if (sha && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) {
+        return sha.toLowerCase();
+      }
     } catch {
       return null;
     }
@@ -155,6 +166,7 @@ export function parseValidationMarker(
 export function parseRateLimitReset(
   text: string,
   now = new Date(),
+  relativeTo = now,
 ): string | null {
   let latest: number | null = null;
   for (const match of text.matchAll(RATE_LIMIT_ISO_RE)) {
@@ -168,7 +180,8 @@ export function parseRateLimitReset(
     if (!Number.isFinite(amount) || amount <= 0) continue;
     const unit = match[2].toLowerCase();
     const durationMs = amount * (unit.startsWith("h") ? 3_600_000 : 60_000);
-    latest = Math.max(latest ?? 0, now.getTime() + durationMs);
+    const reset = relativeTo.getTime() + durationMs;
+    if (reset > now.getTime()) latest = Math.max(latest ?? 0, reset);
   }
   return latest === null ? null : new Date(latest).toISOString();
 }
@@ -217,10 +230,17 @@ export function selectRotatedProvider(input: {
 export function mergeDependencyBlockers(
   lane: LaneConfig,
   states: ReadonlyMap<string, LaneDeliveryState | null>,
+  snapshots: readonly LaneSnapshot[] = [],
+  lanes: readonly LaneConfig[] = [],
 ): string[] {
   return lane.after.filter((dependency) => {
     const state = states.get(dependency);
-    return !state?.mergedSha;
+    if (state?.mergedSha) return false;
+    const dependencyLane = lanes.find((entry) => entry.id === dependency);
+    if (!dependencyLane?.delivery) {
+      return snapshots.find((entry) => entry.id === dependency)?.state !== "done";
+    }
+    return true;
   });
 }
 
@@ -297,6 +317,7 @@ export async function runDeliveryPipeline(input: {
   workspaces: ConductorApiWorkspace[];
   notify: (text: string) => Promise<void>;
   forceMergeLaneId?: string;
+  refreshPr?: (prUrl: string) => Promise<GithubPrPolicySnapshot>;
 }): Promise<void> {
   const states = new Map<string, LaneDeliveryState | null>(
     input.config.lanes.map((lane) => [
@@ -394,7 +415,12 @@ export async function runDeliveryPipeline(input: {
     } else if (state.stage === "finals" && lane.delivery.finals) {
       await advanceFinals(input, lane, snapshot, state, states, occupied);
     } else if (state.stage === "merge" && lane.delivery.merge) {
-      const blockers = mergeDependencyBlockers(lane, states);
+      const blockers = mergeDependencyBlockers(
+        lane,
+        states,
+        input.snapshots,
+        input.config.lanes,
+      );
       if (blockers.length === 0) {
         await advanceMerge(input, lane, snapshot, state, states, occupied);
       }
@@ -441,6 +467,7 @@ async function advanceReview(
       state.review,
       observation,
       `Finish the adversarial review of ${state.prUrl} and post exactly one GitHub review.`,
+      occupied,
     );
     return;
   }
@@ -524,6 +551,7 @@ async function advanceFinals(
         pending,
         observation,
         `Post the final GitHub review on ${state.prUrl}. Its first line must use your real model: FINAL-REVIEW (${pending.model}): {"verdict":"approve"|"changes"}.`,
+        occupied,
       );
       return;
     }
@@ -557,38 +585,9 @@ async function advanceFinals(
       current.length === 2 &&
       current.every((run) => run.verdict === "approve")
     ) {
-      const mergedSha = parseMergedSha(observation.assistantText);
-      if (mergedSha) {
-        state.mergedSha = mergedSha;
-        state.stage = lane.delivery?.validation ? "validation" : "complete";
-        await safeNotify(input.notify, `✅ ${lane.id} merged (${mergedSha})`);
-      } else if (isMergeConflict(observation.assistantText)) {
-        state.feedbackMessageId ??= randomUUID();
-        saveState(state, states);
-        const sent = await messageAuthor(
-          input.client,
-          author,
-          `Rebase ${state.prUrl} onto its target branch, resolve conflicts, push, and end your turn with the PR URL.`,
-          state.feedbackMessageId,
-        );
-        if (!sent) return;
-        state.feedbackSentAt = new Date().toISOString();
-        state.stage = "final_fixes";
-        recordLaneAction({
-          laneId: lane.id,
-          provider: state.authorProvider,
-          action: "final_feedback",
-          detail: `merge conflict after round ${state.round}`,
-        });
-        await safeNotify(
-          input.notify,
-          `🚦 ${lane.id} merge conflict sent to the author`,
-        );
-      } else {
-        state.stage = lane.delivery?.merge
-          ? "merge"
-          : stageAfter(lane.delivery!, "finals");
-      }
+      state.stage = lane.delivery?.merge
+        ? "merge"
+        : stageAfter(lane.delivery!, "finals");
     }
     saveState(state, states);
   }
@@ -609,7 +608,67 @@ async function advanceMerge(
   ) {
     return;
   }
+  const policy = await (input.refreshPr ?? refreshPrByUrl)(state.prUrl);
+  if (
+    !githubPrUrlMatchesRepo(state.prUrl, lane.repoUrl) ||
+    !githubPrUrlMatchesRepo(policy.url, lane.repoUrl)
+  ) {
+    return;
+  }
+
+  if (policy.state === "merged") {
+    if (!policy.mergeCommitSha) return;
+    if (!state.merge) {
+      await recordVerifiedMerge(input, lane, state, states, policy.mergeCommitSha);
+      return;
+    }
+    const observation = await observeRun(input.client, state.merge, lane.id);
+    if (observation.status === "working") {
+      occupied.add(state.merge.provider);
+      return;
+    }
+    const reportedSha = parseMergedSha(observation.assistantText);
+    if (reportedSha !== policy.mergeCommitSha) {
+      await keepRunAlive(
+        input,
+        lane,
+        state.merge,
+        observation,
+        `GitHub reports merge commit ${policy.mergeCommitSha}. Post the configured MERGED BY AGENTS comment and end with MERGED BY AGENTS: {"sha":"${policy.mergeCommitSha}"}.`,
+        occupied,
+      );
+      return;
+    }
+    state.merge.completedAt =
+      observation.latestAssistantAt ?? new Date().toISOString();
+    await recordVerifiedMerge(input, lane, state, states, policy.mergeCommitSha);
+    return;
+  }
+
+  if (policy.mergeable?.toUpperCase() === "CONFLICTING") {
+    await returnMergeConflict(input, lane, author, state, states);
+    return;
+  }
+
+  if (
+    state.mergeHeadSha &&
+    policy.headSha &&
+    state.mergeHeadSha !== policy.headSha
+  ) {
+    state.round += 1;
+    state.finals = [];
+    state.merge = undefined;
+    state.mergeHeadSha = undefined;
+    state.stage = "finals";
+    saveState(state, states);
+    return;
+  }
+
+  if (!canMergePr(policy) || !hasCurrentFinalApprovals(state, policy)) {
+    return;
+  }
   if (!state.merge) {
+    state.mergeHeadSha = policy.headSha ?? undefined;
     state.merge = await ensureRun({
       ...input,
       lane,
@@ -618,7 +677,7 @@ async function advanceMerge(
       role: "merge",
       stage: lane.delivery!.merge!,
       occupied,
-      exclude: new Set(state.finals.map((run) => run.provider)),
+      exclude: new Set([state.authorProvider]),
     });
     if (state.merge) saveState(state, states);
     return;
@@ -628,56 +687,96 @@ async function advanceMerge(
     occupied.add(state.merge.provider);
     return;
   }
-  const mergedSha = parseMergedSha(observation.assistantText);
-  if (mergedSha) {
-    state.merge.completedAt =
-      observation.latestAssistantAt ?? new Date().toISOString();
-    state.mergedSha = mergedSha;
-    state.stage = lane.delivery?.validation ? "validation" : "complete";
-    recordLaneAction({
-      laneId: lane.id,
-      provider: state.merge.provider,
-      action: "merge_feedback",
-      detail: mergedSha,
-    });
-    await safeNotify(input.notify, `✅ ${lane.id} merged (${mergedSha})`);
-    saveState(state, states);
-    return;
-  }
-  if (isMergeConflict(observation.assistantText)) {
-    state.feedbackMessageId ??= randomUUID();
-    saveState(state, states);
-    const sent = await messageAuthor(
-      input.client,
-      author,
-      `Rebase ${state.prUrl} onto its target branch, resolve conflicts, push, and end your turn with the PR URL.`,
-      state.feedbackMessageId,
-    );
-    if (!sent) return;
-    state.feedbackSentAt = new Date().toISOString();
-    state.stage = "final_fixes";
-    state.merge.completedAt =
-      observation.latestAssistantAt ?? new Date().toISOString();
-    await safeNotify(
-      input.notify,
-      `🚦 ${lane.id} merge conflict sent to the author`,
-    );
-    saveState(state, states);
-    return;
-  }
   await keepRunAlive(
     input,
     lane,
     state.merge,
     observation,
     `Re-check the open PR ${state.prUrl}. Merge only if policy allows, or report MERGE BLOCKED with the reason.`,
+    occupied,
   );
 }
 
-function isMergeConflict(text: string): boolean {
-  return /MERGE BLOCKED[^\n]*conflict|conflict(?:ing)? PR|needs? (?:a )?rebase/i.test(
-    text,
+export function hasCurrentFinalApprovals(
+  state: LaneDeliveryState,
+  policy: GithubPrPolicySnapshot,
+): boolean {
+  if (!policy.headSha) return false;
+  const expected = state.finals
+    .filter(
+      (run) =>
+        run.round === state.round && run.verdict === "approve" && run.marker,
+    )
+    .map((run) => run.marker!);
+  if (expected.length !== 2) return false;
+  const latest = policy.reviews
+    .filter((review) => review.commitSha === policy.headSha)
+    .filter((review) => parseFinalReviewMarkers(review.body).length > 0)
+    .sort((a, b) => a.submittedAt.localeCompare(b.submittedAt))
+    .slice(-2);
+  if (latest.length !== 2) return false;
+  const actual = latest.map((review) => {
+    const marker = parseFinalReviewMarkers(review.body).at(-1);
+    return marker?.verdict === "approve" &&
+      review.body.trimStart().startsWith(marker.raw)
+      ? marker.raw
+      : null;
+  });
+  const actualMarkers = actual.filter(
+    (marker): marker is string => marker !== null,
   );
+  if (actualMarkers.length !== actual.length) return false;
+  return (
+    [...actualMarkers].sort().join("\n") === [...expected].sort().join("\n")
+  );
+}
+
+async function returnMergeConflict(
+  input: Parameters<typeof runDeliveryPipeline>[0],
+  lane: LaneConfig,
+  author: LaneSnapshot,
+  state: LaneDeliveryState,
+  states: Map<string, LaneDeliveryState | null>,
+): Promise<void> {
+  state.feedbackMessageId ??= randomUUID();
+  saveState(state, states);
+  const sent = await messageAuthor(
+    input.client,
+    author,
+    `Rebase ${state.prUrl} onto its target branch, resolve conflicts, push, and end your turn with the PR URL.`,
+    state.feedbackMessageId,
+  );
+  if (!sent) return;
+  state.feedbackSentAt = new Date().toISOString();
+  state.stage = "final_fixes";
+  if (state.merge) state.merge.completedAt = state.feedbackSentAt;
+  recordLaneAction({
+    laneId: lane.id,
+    provider: state.authorProvider,
+    action: "final_feedback",
+    detail: `GitHub reports merge conflict after round ${state.round}`,
+  });
+  await safeNotify(input.notify, `🚦 ${lane.id} merge conflict sent to the author`);
+  saveState(state, states);
+}
+
+async function recordVerifiedMerge(
+  input: Parameters<typeof runDeliveryPipeline>[0],
+  lane: LaneConfig,
+  state: LaneDeliveryState,
+  states: Map<string, LaneDeliveryState | null>,
+  mergedSha: string,
+): Promise<void> {
+  state.mergedSha = mergedSha;
+  state.stage = lane.delivery?.validation ? "validation" : "complete";
+  recordLaneAction({
+    laneId: lane.id,
+    provider: state.merge?.provider ?? "github",
+    action: "merge_feedback",
+    detail: mergedSha,
+  });
+  await safeNotify(input.notify, `✅ ${lane.id} merged (${mergedSha})`);
+  saveState(state, states);
 }
 
 async function advanceValidation(
@@ -724,6 +823,7 @@ async function advanceValidation(
       state.validation,
       observation,
       `Finish validation and comment VALIDATED (${state.validation.model}) or VALIDATION FAILED (${state.validation.model}).`,
+      occupied,
     );
     return;
   }
@@ -762,18 +862,53 @@ async function ensureRun(
   input: EnsureRunInput,
 ): Promise<DeliveryRun | undefined> {
   const token = roleToken(input.lane.id, input.role, input.round, input.slot);
-  const existing = input.workspaces
+  const matches = input.workspaces
     .filter((workspace) => !isAbandonedWorkspace(workspace.name))
     .filter((workspace) => workspace.name.includes(token))
-    .sort(compareNewest)[0];
+    .sort(compareNewest);
+  const existing = matches.find((workspace) => !workspace.archivedAt);
+  if (!existing && matches.length > 0) return undefined;
   if (existing) {
     const sessions = await input.client.listWorkspaceSessions(existing.id, {
       includeArchived: true,
     });
-    const session = newestSession(sessions);
-    if (!session) return undefined;
     const parsed = parsePipelineWorkspaceName(existing.name);
     const provider = parsed?.provider ?? input.stage.rotation[0];
+    const session = newestSession(sessions);
+    if (input.role === "merge" || !session) {
+      const providerConfig = input.config.providers[provider];
+      if (!providerConfig) return undefined;
+      const created = await input.client.createSession({
+        workspaceId: existing.id,
+        name: `${input.role} round ${input.round ?? input.state.round}`,
+        agent: providerConfig.agent,
+        model: providerConfig.model,
+        effort: providerConfig.effort,
+      });
+      const run: DeliveryRun = {
+        role: input.role,
+        workspaceId: existing.id,
+        sessionId: created.id,
+        provider,
+        model: providerConfig.model,
+        startedAt: new Date().toISOString(),
+        round: input.round,
+        slot: input.slot,
+      };
+      await input.client.sendMessage({
+        sessionId: created.id,
+        message: renderRunPrompt(input, run),
+        messageId: randomUUID(),
+      });
+      observeLaneSession({
+        sessionId: created.id,
+        laneId: input.lane.id,
+        role: input.role,
+        lastAssistantAt: null,
+      });
+      input.occupied.add(provider);
+      return run;
+    }
     return {
       role: input.role,
       workspaceId: existing.id,
@@ -880,6 +1015,7 @@ function renderRunPrompt(input: EnsureRunInput, run: DeliveryRun): string {
     deployNotes: merge?.deployNotes ?? "",
     replayNotes: merge?.replayNotes ?? "",
     verification: input.lane.delivery?.validation?.verification ?? "",
+    mergeHeadSha: input.state.mergeHeadSha ?? "",
   };
   let rendered = template.replace(
     /\{\{([A-Za-z][A-Za-z0-9]*)\}\}/g,
@@ -899,15 +1035,11 @@ function invariantPrompt(input: EnsureRunInput, run: DeliveryRun): string {
       input.slot === 2
         ? ` You are the deciding second reviewer. The first final marker was: ${input.previousMarker ?? "missing"}.`
         : "";
-    const mergeInstruction =
-      input.slot === 2 && input.lane.delivery?.merge
-        ? ` If both latest final markers approve, merge with ${input.lane.delivery.merge.method}, comment \"MERGED BY AGENTS\" with the merge SHA and configured deploy/replay notes, and report MERGED BY AGENTS: {\"sha\":\"<sha>\"}.`
-        : "";
-    return `Review ${input.state.prUrl} and post exactly one GitHub review whose first line is FINAL-REVIEW (${run.model}): {\"verdict\":\"approve\"|\"changes\"}. The model label must be your real configured model.${decidingContext}${mergeInstruction}`;
+    return `Review ${input.state.prUrl} and post exactly one GitHub review whose first line is FINAL-REVIEW (${run.model}): {\"verdict\":\"approve\"|\"changes\"}. The model label must be your real configured model.${decidingContext}`;
   }
   if (input.role === "merge") {
     const merge = input.lane.delivery!.merge!;
-    return `Check that ${input.state.prUrl} is open and its two latest FINAL-REVIEW markers approve. If it conflicts, do not merge; report MERGE BLOCKED: conflict. Otherwise merge using ${merge.method}, comment \"MERGED BY AGENTS\" with the merge SHA, deploy notes \"${merge.deployNotes}\", and replay notes \"${merge.replayNotes}\". End with MERGED BY AGENTS: {\"sha\":\"<sha>\"}.`;
+    return `The scheduler verified that ${input.state.prUrl} is open, mergeable, passing, approved, and at exact head ${input.state.mergeHeadSha}. Recheck those conditions and merge only that head using ${merge.method}; use --match-head-commit when supported. If GitHub now reports a conflict, do not merge; report MERGE BLOCKED: conflict. Comment \"MERGED BY AGENTS\" with the full merge SHA, deploy notes \"${merge.deployNotes}\", and replay notes \"${merge.replayNotes}\". End with MERGED BY AGENTS: {\"sha\":\"<full merge sha>\"}.`;
   }
   const validation = input.lane.delivery!.validation!;
   return `Validate the merged base containing ${input.state.mergedSha ?? "the merge"} by running: ${validation.verification}. Comment VALIDATED (${run.model}) or VALIDATION FAILED (${run.model}) on ${input.state.prUrl}. If a failure is small and safe, open a fix PR. End with the same validation marker.`;
@@ -936,10 +1068,17 @@ async function observeRun(
     (message) => assistantTextFromTranscriptEvent(message).trim().length > 0,
   );
   const latestAssistantAt = assistantMessages.at(-1)?.receivedAt ?? null;
+  const latestAssistantText = assistantMessages.at(-1)
+    ? assistantTextFromTranscriptEvent(assistantMessages.at(-1)!)
+    : "";
   const assistantText = assistantMessages
     .map((message) => assistantTextFromTranscriptEvent(message))
     .join("\n");
-  const rateLimitUntil = parseRateLimitReset(assistantText);
+  const rateLimitUntil = parseRateLimitReset(
+    latestAssistantText,
+    new Date(),
+    latestAssistantAt ? new Date(latestAssistantAt) : new Date(),
+  );
   if (rateLimitUntil) setLaneProviderOutage(run.provider, rateLimitUntil);
   const health = observeLaneSession({
     sessionId: run.sessionId,
@@ -957,6 +1096,7 @@ async function keepRunAlive(
   run: DeliveryRun,
   observation: RunObservation,
   message: string,
+  occupied: Set<string>,
 ): Promise<void> {
   const provider = input.config.providers[run.provider];
   const now = new Date();
@@ -1002,6 +1142,7 @@ async function keepRunAlive(
       role: run.role,
       lastAssistantAt: null,
     });
+    occupied.add(run.provider);
     recordLaneAction({
       laneId: lane.id,
       provider: run.provider,
@@ -1130,12 +1271,9 @@ export function shouldArchiveWorkspace(
     );
   }
   if (role.role === "merge") {
-    return [
-      "validation",
-      "complete",
-      "validation_failed",
-      "final_fixes",
-    ].includes(state.stage);
+    return ["validation", "complete", "validation_failed"].includes(
+      state.stage,
+    );
   }
   return ["complete", "validation_failed"].includes(state.stage);
 }
@@ -1189,8 +1327,9 @@ function readTemplate(config: LanesConfig, templatePath: string): string {
 function newestSession(
   sessions: ConductorApiSession[],
 ): ConductorApiSession | null {
-  if (sessions.length === 0) return null;
-  return sessions
+  const active = sessions.filter((session) => !session.archivedAt);
+  if (active.length === 0) return null;
+  return active
     .map((session, index) => ({ session, index }))
     .sort((a, b) => {
       const byDate = (b.session.createdAt ?? "").localeCompare(

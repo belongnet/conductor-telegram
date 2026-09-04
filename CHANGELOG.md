@@ -6,7 +6,7 @@ All notable changes to conductor-telegram are documented here.
 
 ### Added
 - Optional config-driven Cloud lanes scheduler. When `LANES_CONFIG` or `~/.conductor-telegram/lanes.json` is present, the bot keeps at most one working lane per paid provider from an ordered queue with dependencies, nudging paused work after a gap or creating the next ready lane. `/lanes`, `/lanes run`, `/lanes pause`, and `/lanes resume` are owner-only. See `docs/lanes.example.json`.
-- Optional per-lane delivery stages now carry a PR through adversarial review, two provider-distinct final reviews, policy-checked merge, and post-merge validation. Provider rotations support rate-limit stand-ins, markers use the real model, and `/lanes` exposes stage progress plus `archive` and `merge <id>` controls.
+- Optional per-lane delivery stages now carry a PR through adversarial review, two provider-distinct final reviews, a GitHub-refreshed merge gate, and post-merge validation. The merge gate binds the PR to the configured repository, checks the exact reviewed head and GitHub policy state, and verifies the reported merge SHA against GitHub. Provider rotations support rate-limit stand-ins, markers use the real model, and `/lanes` exposes stage progress plus `archive` and `merge <id>` controls.
 - Lane delivery state, unanswered-nudge health, and provider outage resets are durable in SQLite. Dead agents restart in a new session inside the existing workspace, while tick hygiene safely archives completed work without recreating archived or abandoned workspaces.
 
 ### Fixed

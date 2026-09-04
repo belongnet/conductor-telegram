@@ -16,12 +16,17 @@ for (const name of ["review.md", "final.md", "merge.md", "validation.md"]) {
 }
 
 import type { ConductorApiClient } from "../src/integrations/conductor-api.js";
+import type { GithubPrPolicySnapshot } from "../src/bot/github.js";
 import type { LaneConfig, LanesConfig } from "../src/lanes/config.js";
 import type { LaneSnapshot } from "../src/lanes/decide.js";
-import { decideLaneActions } from "../src/lanes/decide.js";
+import {
+  decideLaneActions,
+  githubPrUrlFromTextForRepo,
+} from "../src/lanes/decide.js";
 import { executeLaneAction } from "../src/lanes/scheduler.js";
 import {
   isAbandonedWorkspace,
+  hasCurrentFinalApprovals,
   mergeDependencyBlockers,
   parseFinalReviewMarkers,
   parseMergedSha,
@@ -52,7 +57,7 @@ test("machine-readable final, merge, and validation markers parse from fixture t
     "FINAL-REVIEW (model-a): not-json",
     'FINAL-REVIEW (model-a): {"verdict":"approve","risk":"low"}',
     'FINAL-REVIEW (model-b): {"verdict":"changes","reason":"test gap"}',
-    'MERGED BY AGENTS: {"sha":"abcdef1234567"}',
+    'MERGED BY AGENTS: {"sha":"abcdef1234567890abcdef1234567890abcdef12"}',
     "VALIDATED (model-c)",
   ].join("\n");
 
@@ -66,7 +71,14 @@ test("machine-readable final, merge, and validation markers parse from fixture t
       ["model-b", "changes"],
     ],
   );
-  assert.equal(parseMergedSha(transcript), "abcdef1234567");
+  assert.equal(
+    parseMergedSha(transcript),
+    "abcdef1234567890abcdef1234567890abcdef12",
+  );
+  assert.equal(
+    parseMergedSha('MERGED BY AGENTS: {"sha":"abcdef1"}'),
+    null,
+  );
   assert.deepEqual(parseValidationMarker(transcript), {
     result: "passed",
     model: "model-c",
@@ -94,6 +106,14 @@ test("rate-limit resets and two-unanswered-nudge death detection are determinist
   assert.equal(
     parseRateLimitReset("Quota reached; resets in 3 hours.", NOW),
     "2026-09-03T15:00:00.000Z",
+  );
+  assert.equal(
+    parseRateLimitReset(
+      "Quota reached; resets in 3 hours.",
+      new Date("2026-09-04T12:00:00.000Z"),
+      NOW,
+    ),
+    null,
   );
   assert.equal(
     shouldRestartDeadSession({
@@ -219,6 +239,30 @@ test("merge waits for every dependency lane to have a merge SHA", () => {
   assert.deepEqual(mergeDependencyBlockers(lane, states), ["Lx"]);
 });
 
+test("merge accepts a done dependency that has no delivery pipeline", () => {
+  const lane = laneConfig({ after: ["L0"] });
+  const dependency = laneConfig({ id: "L0", delivery: undefined });
+  assert.deepEqual(
+    mergeDependencyBlockers(
+      lane,
+      new Map([["L0", null]]),
+      [{ ...authorSnapshot(NOW.toISOString()), id: "L0" }],
+      [dependency, lane],
+    ),
+    [],
+  );
+});
+
+test("PR discovery is repo-bound and prefers the last matching URL", () => {
+  assert.equal(
+    githubPrUrlFromTextForRepo(
+      "See https://github.com/other/example/pull/2 then https://github.com/example-org/example-repo/pull/3 and https://github.com/example-org/example-repo/pull/4",
+      "https://github.com/example-org/example-repo.git",
+    ),
+    "https://github.com/example-org/example-repo/pull/4",
+  );
+});
+
 test("fixture transcript advances review to author fixes, then starts finals after a push", async () => {
   const config = lanesConfig();
   const lane = config.lanes[0];
@@ -317,7 +361,7 @@ test("fixture transcript advances review to author fixes, then starts finals aft
   assert.equal(final?.finals[0]?.provider, "reviewer");
 });
 
-test("fixture markers advance two final approvals through merge to validation", async () => {
+test("fixture markers require GitHub policy before merge and exact GitHub SHA afterward", async () => {
   const config = lanesConfig();
   const lane = { ...config.lanes[0], id: "L2" };
   config.lanes = [lane];
@@ -351,6 +395,10 @@ test("fixture markers advance two final approvals through merge to validation", 
     ],
   });
   setLaneDeliveryState("L2", state);
+  const headSha = "1111111111111111111111111111111111111111";
+  const mergeSha = "2222222222222222222222222222222222222222";
+  let merged = false;
+  let mergeCreated = false;
   let validationCreated = false;
   const client = {
     listWorkspaceSessions: async (workspaceId: string) => [
@@ -358,6 +406,8 @@ test("fixture markers advance two final approvals through merge to validation", 
         id:
           workspaceId === "final-two-workspace"
             ? "final-two-session"
+            : workspaceId === "merge-workspace"
+              ? "merge-session"
             : workspaceId === "validation-workspace"
               ? "validation-session"
               : "author-session",
@@ -374,7 +424,9 @@ test("fixture markers advance two final approvals through merge to validation", 
     listSessionMessages: async (input: { sessionId: string }) => {
       const text =
         input.sessionId === "final-two-session"
-          ? 'FINAL-REVIEW (validation-model): {"verdict":"approve"}\nMERGED BY AGENTS: {"sha":"abcdef1234567"}'
+          ? 'FINAL-REVIEW (validation-model): {"verdict":"approve"}'
+          : input.sessionId === "merge-session"
+            ? `MERGED BY AGENTS: {"sha":"${mergeSha}"}`
           : input.sessionId === "validation-session"
             ? "VALIDATED (review-model)"
             : "";
@@ -382,12 +434,14 @@ test("fixture markers advance two final approvals through merge to validation", 
         ? [assistantMessage(input.sessionId, text, "2026-09-03T11:00:00.000Z")]
         : [];
     },
-    createWorkspace: async () => {
-      validationCreated = true;
+    createWorkspace: async (input: { name: string }) => {
+      const isMerge = input.name.includes(":merge:");
+      mergeCreated ||= isMerge;
+      validationCreated ||= !isMerge;
       return {
-        workspaceId: "validation-workspace",
-        sessionId: "validation-session",
-        deepLink: "https://conductor.build/validation",
+        workspaceId: isMerge ? "merge-workspace" : "validation-workspace",
+        sessionId: isMerge ? "merge-session" : "validation-session",
+        deepLink: `https://conductor.build/${isMerge ? "merge" : "validation"}`,
       };
     },
     sendMessage: async (input: { messageId: string }) => ({
@@ -400,6 +454,24 @@ test("fixture markers advance two final approvals through merge to validation", 
     workspace("final-one-workspace", "[lane:L2:final:r1:s1:reviewer] Example"),
     workspace("final-two-workspace", "[lane:L2:final:r1:s2:validator] Example"),
   ];
+  const refreshPr = async () =>
+    prPolicy({
+      state: merged ? "merged" : "open",
+      headSha,
+      mergeCommitSha: merged ? mergeSha : null,
+      reviews: [
+        prReview(
+          'FINAL-REVIEW (review-model): {"verdict":"approve"}',
+          headSha,
+          "2026-09-03T09:00:00.000Z",
+        ),
+        prReview(
+          'FINAL-REVIEW (validation-model): {"verdict":"approve"}',
+          headSha,
+          "2026-09-03T11:00:00.000Z",
+        ),
+      ],
+    });
 
   await runDeliveryPipeline({
     client,
@@ -407,6 +479,35 @@ test("fixture markers advance two final approvals through merge to validation", 
     snapshots: [snapshot],
     workspaces: finalWorkspaces,
     notify: async () => undefined,
+    refreshPr,
+  });
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L2")?.stage, "merge");
+
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots: [snapshot],
+    workspaces: finalWorkspaces,
+    notify: async () => undefined,
+    refreshPr,
+  });
+  assert.equal(mergeCreated, true);
+  assert.equal(
+    getLaneDeliveryState<LaneDeliveryState>("L2")?.mergeHeadSha,
+    headSha,
+  );
+
+  merged = true;
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots: [snapshot],
+    workspaces: [
+      ...finalWorkspaces,
+      workspace("merge-workspace", "[lane:L2:merge:validator] Example"),
+    ],
+    notify: async () => undefined,
+    refreshPr,
   });
   assert.equal(
     getLaneDeliveryState<LaneDeliveryState>("L2")?.stage,
@@ -417,8 +518,12 @@ test("fixture markers advance two final approvals through merge to validation", 
     client,
     config,
     snapshots: [snapshot],
-    workspaces: finalWorkspaces,
+    workspaces: [
+      ...finalWorkspaces,
+      workspace("merge-workspace", "[lane:L2:merge:validator] Example"),
+    ],
     notify: async () => undefined,
+    refreshPr,
   });
   const validating = getLaneDeliveryState<LaneDeliveryState>("L2");
   assert.equal(validationCreated, true);
@@ -430,16 +535,186 @@ test("fixture markers advance two final approvals through merge to validation", 
     snapshots: [snapshot],
     workspaces: [
       ...finalWorkspaces,
+      workspace("merge-workspace", "[lane:L2:merge:validator] Example"),
       workspace(
         "validation-workspace",
         "[lane:L2:validation:reviewer] Example",
       ),
     ],
     notify: async () => undefined,
+    refreshPr,
   });
   const complete = getLaneDeliveryState<LaneDeliveryState>("L2");
   assert.equal(complete?.stage, "complete");
   assert.equal(complete?.validationResult, "passed");
+});
+
+test("current final approvals must be GitHub reviews on the exact head", () => {
+  const state = approvedFinalState("L3");
+  const headSha = "3333333333333333333333333333333333333333";
+  const current = prPolicy({
+    headSha,
+    reviews: [
+      prReview(state.finals[0].marker!, headSha, "2026-09-03T09:00:00Z"),
+      prReview(state.finals[1].marker!, headSha, "2026-09-03T10:00:00Z"),
+    ],
+  });
+  assert.equal(hasCurrentFinalApprovals(state, current), true);
+  current.reviews[1].commitSha = "4444444444444444444444444444444444444444";
+  assert.equal(hasCurrentFinalApprovals(state, current), false);
+});
+
+test("GitHub conflict returns the lane to its author without trusting transcript prose", async () => {
+  const config = lanesConfig();
+  const lane = { ...config.lanes[0], id: "L4" };
+  config.lanes = [lane];
+  const state = approvedFinalState("L4");
+  setLaneDeliveryState("L4", state);
+  let created = false;
+  let authorMessage = "";
+  const client = {
+    listWorkspaceSessions: async () => [
+      {
+        id: "author-session",
+        deepLink: "https://conductor.build/session",
+        createdAt: NOW.toISOString(),
+      },
+    ],
+    sendMessage: async (input: { message: string; messageId: string }) => {
+      authorMessage = input.message;
+      return { messageId: input.messageId, state: "queued" as const };
+    },
+    createWorkspace: async () => {
+      created = true;
+      throw new Error("must not create a merge workspace for a conflict");
+    },
+  } as unknown as ConductorApiClient;
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots: [{ ...authorSnapshot(NOW.toISOString()), id: "L4" }],
+    workspaces: [],
+    notify: async () => undefined,
+    refreshPr: async () =>
+      prPolicy({ mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" }),
+  });
+  assert.equal(created, false);
+  assert.match(authorMessage, /^Rebase /);
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L4")?.stage, "final_fixes");
+  assert.equal(
+    shouldArchiveWorkspace(
+      { role: "merge", laneId: "L4", provider: "validator" },
+      getLaneDeliveryState<LaneDeliveryState>("L4")!,
+    ),
+    false,
+  );
+});
+
+test("ordinary conflict and rebase prose cannot trigger the conflict transition", async () => {
+  const config = lanesConfig();
+  const lane = { ...config.lanes[0], id: "L6" };
+  config.lanes = [lane];
+  const state = approvedFinalState("L6");
+  state.mergeHeadSha = "1111111111111111111111111111111111111111";
+  state.merge = {
+    role: "merge",
+    workspaceId: "merge-workspace",
+    sessionId: "merge-session",
+    provider: "validator",
+    model: "validation-model",
+    startedAt: "2026-09-03T08:00:00.000Z",
+  };
+  setLaneDeliveryState("L6", state);
+  const client = {
+    listWorkspaceSessions: async () => [
+      {
+        id: "merge-session",
+        deepLink: "https://conductor.build/session",
+        createdAt: NOW.toISOString(),
+      },
+    ],
+    getSessionStatus: async () => ({
+      workspaceId: "merge-workspace",
+      sessionId: "merge-session",
+      status: "idle" as const,
+      updatedAt: NOW.toISOString(),
+    }),
+    listSessionMessages: async () => [
+      assistantMessage(
+        "merge-session",
+        "There are no conflicting PRs. The guide says a branch sometimes needs rebase.",
+        NOW.toISOString(),
+      ),
+    ],
+    sendMessage: async (input: { messageId: string }) => ({
+      messageId: input.messageId,
+      state: "queued" as const,
+    }),
+  } as unknown as ConductorApiClient;
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots: [{ ...authorSnapshot(NOW.toISOString()), id: "L6" }],
+    workspaces: [
+      workspace("merge-workspace", "[lane:L6:merge:validator] Example"),
+    ],
+    notify: async () => undefined,
+    refreshPr: async () => prPolicy(),
+  });
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L6")?.stage, "merge");
+});
+
+test("GitHub policy blocks merge workspace creation while checks are pending", async () => {
+  const config = lanesConfig();
+  const lane = { ...config.lanes[0], id: "L7" };
+  config.lanes = [lane];
+  setLaneDeliveryState("L7", approvedFinalState("L7"));
+  let created = false;
+  const client = {
+    createWorkspace: async () => {
+      created = true;
+      throw new Error("pending checks must fail closed");
+    },
+  } as unknown as ConductorApiClient;
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots: [{ ...authorSnapshot(NOW.toISOString()), id: "L7" }],
+    workspaces: [],
+    notify: async () => undefined,
+    refreshPr: async () => prPolicy({ checksStatus: "pending" }),
+  });
+  assert.equal(created, false);
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L7")?.merge, undefined);
+});
+
+test("an archived matching merge workspace is not rebound or recreated", async () => {
+  const config = lanesConfig();
+  const lane = { ...config.lanes[0], id: "L5" };
+  config.lanes = [lane];
+  setLaneDeliveryState("L5", approvedFinalState("L5"));
+  let created = false;
+  const client = {
+    createWorkspace: async () => {
+      created = true;
+      throw new Error("archived names must not be recreated");
+    },
+  } as unknown as ConductorApiClient;
+  await runDeliveryPipeline({
+    client,
+    config,
+    snapshots: [{ ...authorSnapshot(NOW.toISOString()), id: "L5" }],
+    workspaces: [
+      {
+        ...workspace("old-merge", "[lane:L5:merge:validator] Example"),
+        archivedAt: "2026-09-03T11:00:00.000Z",
+      },
+    ],
+    notify: async () => undefined,
+    refreshPr: async () => prPolicy(),
+  });
+  assert.equal(created, false);
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L5")?.merge, undefined);
 });
 
 function deliveryState(
@@ -456,6 +731,76 @@ function deliveryState(
     finals: [],
     ...overrides,
   };
+}
+
+function approvedFinalState(laneId: string): LaneDeliveryState {
+  return deliveryState({
+    laneId,
+    stage: "merge",
+    finals: [
+      {
+        role: "final",
+        workspaceId: "final-one-workspace",
+        sessionId: "final-one-session",
+        provider: "reviewer",
+        model: "review-model",
+        startedAt: "2026-09-03T08:00:00.000Z",
+        round: 1,
+        slot: 1,
+        verdict: "approve",
+        marker: 'FINAL-REVIEW (review-model): {"verdict":"approve"}',
+        completedAt: "2026-09-03T09:00:00.000Z",
+      },
+      {
+        role: "final",
+        workspaceId: "final-two-workspace",
+        sessionId: "final-two-session",
+        provider: "validator",
+        model: "validation-model",
+        startedAt: "2026-09-03T09:00:00.000Z",
+        round: 1,
+        slot: 2,
+        verdict: "approve",
+        marker: 'FINAL-REVIEW (validation-model): {"verdict":"approve"}',
+        completedAt: "2026-09-03T10:00:00.000Z",
+      },
+    ],
+  });
+}
+
+function prPolicy(
+  overrides: Partial<GithubPrPolicySnapshot> = {},
+): GithubPrPolicySnapshot {
+  return {
+    url: "https://github.com/example-org/example-repo/pull/1",
+    prNumber: 1,
+    state: "open",
+    isDraft: false,
+    headSha: "1111111111111111111111111111111111111111",
+    reviewDecision: "APPROVED",
+    mergeStateStatus: "CLEAN",
+    mergeable: "MERGEABLE",
+    checksStatus: "passing",
+    checksSummary: "2 passing",
+    mergeCommitSha: null,
+    reviews: [
+      prReview(
+        'FINAL-REVIEW (review-model): {"verdict":"approve"}',
+        "1111111111111111111111111111111111111111",
+        "2026-09-03T09:00:00.000Z",
+      ),
+      prReview(
+        'FINAL-REVIEW (validation-model): {"verdict":"approve"}',
+        "1111111111111111111111111111111111111111",
+        "2026-09-03T10:00:00.000Z",
+      ),
+    ],
+    ...overrides,
+  };
+}
+
+function prReview(body: string, commitSha: string, submittedAt: string) {
+  return { body, state: "COMMENTED", commitSha, submittedAt };
 }
 
 function laneConfig(overrides: Partial<LaneConfig> = {}): LaneConfig {

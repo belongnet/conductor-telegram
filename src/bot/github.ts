@@ -25,6 +25,35 @@ interface GithubPrJson {
   mergeStateStatus?: string | null;
   mergeable?: string | null;
   statusCheckRollup?: unknown[];
+  mergeCommit?: { oid?: string } | null;
+  reviews?: Array<{
+    body?: string;
+    state?: string;
+    submittedAt?: string;
+    commit?: { oid?: string } | null;
+  }>;
+}
+
+export interface GithubPrReviewSnapshot {
+  body: string;
+  state: string;
+  submittedAt: string;
+  commitSha: string | null;
+}
+
+export interface GithubPrPolicySnapshot {
+  url: string;
+  prNumber: number | null;
+  state: PrState;
+  isDraft: boolean;
+  headSha: string | null;
+  reviewDecision: string | null;
+  mergeStateStatus: string | null;
+  mergeable: string | null;
+  checksStatus: PrChecksStatus;
+  checksSummary: string;
+  mergeCommitSha: string | null;
+  reviews: GithubPrReviewSnapshot[];
 }
 
 export interface PrRefreshResult {
@@ -40,7 +69,19 @@ export function workspaceBranch(workspace: Workspace): string | null {
   );
 }
 
-export function canMergePr(record: PrRecord): boolean {
+export function canMergePr(
+  record: Pick<
+    PrRecord,
+    | "state"
+    | "isDraft"
+    | "prNumber"
+    | "headSha"
+    | "reviewDecision"
+    | "checksStatus"
+    | "mergeable"
+    | "mergeStateStatus"
+  >,
+): boolean {
   if (record.state !== "open") return false;
   if (record.isDraft) return false;
   if (!record.prNumber || !Number.isInteger(record.prNumber)) return false;
@@ -50,6 +91,59 @@ export function canMergePr(record: PrRecord): boolean {
   if (record.mergeable?.toUpperCase() !== "MERGEABLE") return false;
   const mergeState = record.mergeStateStatus?.toUpperCase() ?? "";
   return mergeState === "CLEAN" || mergeState === "HAS_HOOKS";
+}
+
+export async function refreshPrByUrl(
+  prUrl: string,
+): Promise<GithubPrPolicySnapshot> {
+  const result = await runGh([
+    "pr",
+    "view",
+    prUrl,
+    "--json",
+    [
+      "url",
+      "number",
+      "state",
+      "isDraft",
+      "headRefOid",
+      "reviewDecision",
+      "mergeStateStatus",
+      "mergeable",
+      "statusCheckRollup",
+      "mergeCommit",
+      "reviews",
+    ].join(","),
+  ]);
+  if (result.code !== 0) {
+    throw new Error(`Could not refresh ${prUrl}: ${compactError(result)}`);
+  }
+  let pr: GithubPrJson;
+  try {
+    pr = JSON.parse(result.stdout) as GithubPrJson;
+  } catch {
+    throw new Error(`GitHub returned malformed PR JSON for ${prUrl}.`);
+  }
+  const checks = summarizeChecks(pr.statusCheckRollup ?? []);
+  return {
+    url: pr.url ?? prUrl,
+    prNumber: pr.number ?? null,
+    state: normalizePrState(pr.state),
+    isDraft: Boolean(pr.isDraft),
+    headSha: pr.headRefOid ?? null,
+    reviewDecision: pr.reviewDecision ?? null,
+    mergeStateStatus: pr.mergeStateStatus ?? null,
+    mergeable: pr.mergeable ?? null,
+    checksStatus: checks.status,
+    checksSummary: checks.summary,
+    mergeCommitSha: pr.mergeCommit?.oid?.toLowerCase() ?? null,
+    reviews: (pr.reviews ?? []).map((review) => ({
+      body: review.body ?? "",
+      state: review.state ?? "",
+      submittedAt: review.submittedAt ?? "",
+      commitSha: review.commit?.oid?.toLowerCase() ?? null,
+    })),
+  };
 }
 
 export function matchesExpectedPrHead(

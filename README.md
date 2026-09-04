@@ -126,10 +126,10 @@ Each lane may add an optional `delivery` object, with any combination of `review
 
 - `review` creates one adversarial reviewer on the first free provider in `rotation` other than the author, waits for its GitHub review, then messages the author once.
 - `finals` runs two sequential final reviewers on distinct non-author providers. Their GitHub review body starts with `FINAL-REVIEW (<real model>): {"verdict":"approve"|"changes", ...}`. A change verdict returns the lane to its author and starts a fresh round after the next pushed turn.
-- `merge` checks that the PR is open, conflict-free, dependency-unblocked, and has two current approvals. It uses `method` (`squash`, `merge`, or `rebase`) and records `MERGED BY AGENTS` with the merge SHA plus configured deploy/replay notes. Conflicts go back to the author for a rebase.
+- `merge` refreshes GitHub directly and requires a repo-bound open PR, the exact reviewed head, two latest approving final markers on that head, aggregate approval, passing checks, and a conflict-free merge state. It uses `method` (`squash`, `merge`, or `rebase`) and accepts `MERGED BY AGENTS` only when its full SHA matches GitHub's merge commit. Conflicts go back to the author for a rebase.
 - `validation` runs `verification` against the merged base on a provider distinct from the author and merge executor, comments `VALIDATED (<real model>)` or `VALIDATION FAILED (<real model>)`, and may open a narrowly scoped fix PR.
 
-Stage prompts are paths relative to `lanes.json` and support `{{laneId}}`, `{{laneTitle}}`, `{{prUrl}}`, `{{round}}`, `{{slot}}`, `{{model}}`, `{{previousFinalReview}}`, `{{mergeMethod}}`, `{{deployNotes}}`, `{{replayNotes}}`, and `{{verification}}`. Required safety/marker instructions are appended by the scheduler. The example config and prompt templates live in `docs/lanes.example.json` and `docs/prompts/`.
+Stage prompts are paths relative to `lanes.json` and support `{{laneId}}`, `{{laneTitle}}`, `{{prUrl}}`, `{{round}}`, `{{slot}}`, `{{model}}`, `{{previousFinalReview}}`, `{{mergeMethod}}`, `{{mergeHeadSha}}`, `{{deployNotes}}`, `{{replayNotes}}`, and `{{verification}}`. Required safety/marker instructions are appended by the scheduler. The example config and prompt templates live in `docs/lanes.example.json` and `docs/prompts/`.
 
 The scheduler keeps its delivery and nudge ledger in SQLite. Two nudges without a newer assistant response mark a session dead; recovery starts a **new session in the same workspace** and always targets that workspace's newest session. Rate-limit reset timestamps found in assistant transcripts suppress work until the reset, and the next available provider in a stage rotation acts as the stand-in using its real model in markers.
 
@@ -269,6 +269,9 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
 | `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
 | `lane_actions` | Create/nudge history for the optional lanes scheduler |
+| `lane_delivery_state` | Durable per-lane review, final, merge, and validation stage state |
+| `lane_session_health` | Unanswered-nudge and reset-time ledger for lane sessions |
+| `lane_provider_outages` | Provider rate-limit reset times used by stage rotations |
 
 ## Development
 

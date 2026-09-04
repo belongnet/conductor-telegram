@@ -137,3 +137,43 @@ test("lanes config validates optional delivery rotations", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("lanes config rejects a merge rotation containing only the author", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-lanes-self-merge-"));
+  const configPath = path.join(dir, "lanes.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      intervalMinutes: 30,
+      providers: {
+        author: { agent: "claude", model: "author-model", gapHours: 4 },
+        reviewer: { agent: "codex", model: "review-model", gapHours: 4 },
+        validator: { agent: "cursor", model: "validation-model", gapHours: 4 },
+      },
+      lanes: [
+        {
+          id: "L1",
+          title: "Example delivery",
+          provider: "author",
+          repoUrl: "https://github.com/example-org/example-repo",
+          prompt: "prompts/author.md",
+          delivery: {
+            finals: {
+              rotation: ["reviewer", "validator"],
+              prompt: "prompts/final.md",
+            },
+            merge: { rotation: ["author"], prompt: "prompts/merge.md" },
+          },
+        },
+      ],
+    }),
+  );
+  try {
+    assert.throws(
+      () => loadLanesConfig({ LANES_CONFIG: configPath }),
+      /merge rotation needs a provider other than the author/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

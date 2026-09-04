@@ -88,7 +88,51 @@ export function parseLaneWorkspaceName(
 }
 
 export function githubPrUrlFromText(text: string): string | null {
-  return text.match(GITHUB_PR_URL_RE)?.[0] ?? null;
+  return githubPrUrlFromTextForRepo(text);
+}
+
+export function githubPrUrlFromTextForRepo(
+  text: string,
+  repoUrl?: string,
+): string | null {
+  const matches = [
+    ...text.matchAll(new RegExp(GITHUB_PR_URL_RE.source, "gi")),
+  ].map((match) => match[0]);
+  const filtered = repoUrl
+    ? matches.filter((url) => githubPrUrlMatchesRepo(url, repoUrl))
+    : matches;
+  return filtered.at(-1) ?? null;
+}
+
+export function githubPrUrlMatchesRepo(
+  prUrl: string,
+  repoUrl: string,
+): boolean {
+  const prRepo = githubRepoSlug(prUrl, true);
+  const configuredRepo = githubRepoSlug(repoUrl, false);
+  return prRepo !== null && prRepo === configuredRepo;
+}
+
+function githubRepoSlug(url: string, requirePull: boolean): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.toLowerCase() !== "github.com") return null;
+    const parts = parsed.pathname
+      .replace(/\/+$/, "")
+      .replace(/\.git$/, "")
+      .split("/")
+      .filter(Boolean);
+    if (parts.length < 2) return null;
+    if (
+      requirePull &&
+      (parts.length !== 4 || parts[2] !== "pull" || !/^\d+$/.test(parts[3]))
+    ) {
+      return null;
+    }
+    return `${parts[0]}/${parts[1]}`.toLowerCase();
+  } catch {
+    return null;
+  }
 }
 
 export function transcriptContainsGithubPrUrl(text: string): boolean {

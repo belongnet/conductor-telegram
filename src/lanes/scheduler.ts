@@ -35,7 +35,7 @@ import {
   assistantTextFromTranscriptEvent,
   decideLaneActions,
   deriveLaneRuntimeState,
-  githubPrUrlFromText,
+  githubPrUrlFromTextForRepo,
   laneWorkspaceName,
   laneWorkspaceNamePrefix,
   parseLaneWorkspaceName,
@@ -383,83 +383,119 @@ export async function collectLaneStatuses(): Promise<{
 export async function runLanesHygieneNow(options: {
   notify: LanesNotify;
 }): Promise<{ archived: number; reason?: string }> {
-  const config = loadLanesConfig();
-  if (!config) {
-    return { archived: 0, reason: "Lanes scheduler is off — no lanes config file found." };
+  if (tickInFlight) {
+    return { archived: 0, reason: "A lanes tick is already running." };
   }
-  const client = createConductorApiClientFromEnv();
-  if (!client) {
-    return { archived: 0, reason: "Conductor Cloud API is not configured." };
+  tickInFlight = true;
+  try {
+    const config = loadLanesConfig();
+    if (!config) {
+      return {
+        archived: 0,
+        reason: "Lanes scheduler is off — no lanes config file found.",
+      };
+    }
+    const client = createConductorApiClientFromEnv();
+    if (!client) {
+      return { archived: 0, reason: "Conductor Cloud API is not configured." };
+    }
+    const workspaces = await loadWorkspaceIndex(client, config);
+    const archived = await runLaneHygiene({
+      client,
+      config,
+      workspaces,
+      notify: options.notify,
+    });
+    return { archived };
+  } catch (error) {
+    return {
+      archived: 0,
+      reason:
+        error instanceof LanesConfigError ? error.message : describeError(error),
+    };
+  } finally {
+    tickInFlight = false;
   }
-  const workspaces = await loadWorkspaceIndex(client, config);
-  const archived = await runLaneHygiene({
-    client,
-    config,
-    workspaces,
-    notify: options.notify,
-  });
-  return { archived };
 }
 
 export async function forceLaneMergeAttempt(options: {
   laneId: string;
   notify: LanesNotify;
 }): Promise<{ attempted: boolean; reason?: string }> {
-  const config = loadLanesConfig();
-  if (!config) return { attempted: false, reason: "Lanes scheduler is off." };
-  const lane = config.lanes.find(
-    (entry) => entry.id.toLowerCase() === options.laneId.toLowerCase()
-  );
-  if (!lane) {
-    return { attempted: false, reason: `Unknown lane ${options.laneId}.` };
+  if (tickInFlight) {
+    return { attempted: false, reason: "A lanes tick is already running." };
   }
-  if (!lane.delivery?.merge) {
-    return { attempted: false, reason: `Lane ${lane.id} has no merge stage.` };
-  }
-  const state = getLaneDeliveryState<LaneDeliveryState>(lane.id);
-  if (!state || state.stage !== "merge") {
+  tickInFlight = true;
+  try {
+    const config = loadLanesConfig();
+    if (!config) return { attempted: false, reason: "Lanes scheduler is off." };
+    const lane = config.lanes.find(
+      (entry) => entry.id.toLowerCase() === options.laneId.toLowerCase(),
+    );
+    if (!lane) {
+      return { attempted: false, reason: `Unknown lane ${options.laneId}.` };
+    }
+    if (!lane.delivery?.merge) {
+      return { attempted: false, reason: `Lane ${lane.id} has no merge stage.` };
+    }
+    const state = getLaneDeliveryState<LaneDeliveryState>(lane.id);
+    if (!state || state.stage !== "merge") {
+      return {
+        attempted: false,
+        reason: `Lane ${lane.id} is not at the merge stage.`,
+      };
+    }
+    const approvals = state.finals.filter(
+      (run) => run.round === state.round && run.verdict === "approve",
+    );
+    if (approvals.length < 2) {
+      return {
+        attempted: false,
+        reason: `Lane ${lane.id} needs two current final approvals.`,
+      };
+    }
+    const client = createConductorApiClientFromEnv();
+    if (!client) {
+      return { attempted: false, reason: "Conductor Cloud API is not configured." };
+    }
+    const workspaces = await loadWorkspaceIndex(client, config);
+    const snapshots = await resolveLaneSnapshots(client, config, workspaces);
+    const states = new Map(
+      config.lanes.map((entry) => [
+        entry.id,
+        getLaneDeliveryState<LaneDeliveryState>(entry.id),
+      ]),
+    );
+    const blockers = mergeDependencyBlockers(
+      lane,
+      states,
+      snapshots,
+      config.lanes,
+    );
+    if (blockers.length > 0) {
+      return {
+        attempted: false,
+        reason: `Lane ${lane.id} is waiting for merged dependencies: ${blockers.join(", ")}.`,
+      };
+    }
+    await runDeliveryPipeline({
+      client,
+      config,
+      snapshots,
+      workspaces,
+      notify: options.notify,
+      forceMergeLaneId: lane.id,
+    });
+    return { attempted: true };
+  } catch (error) {
     return {
       attempted: false,
-      reason: `Lane ${lane.id} is not at the merge stage.`,
+      reason:
+        error instanceof LanesConfigError ? error.message : describeError(error),
     };
+  } finally {
+    tickInFlight = false;
   }
-  const approvals = state.finals.filter(
-    (run) => run.round === state.round && run.verdict === "approve"
-  );
-  if (approvals.length < 2) {
-    return {
-      attempted: false,
-      reason: `Lane ${lane.id} needs two current final approvals.`,
-    };
-  }
-  const states = new Map(
-    config.lanes.map((entry) => [
-      entry.id,
-      getLaneDeliveryState<LaneDeliveryState>(entry.id),
-    ])
-  );
-  const blockers = mergeDependencyBlockers(lane, states);
-  if (blockers.length > 0) {
-    return {
-      attempted: false,
-      reason: `Lane ${lane.id} is waiting for merged dependencies: ${blockers.join(", ")}.`,
-    };
-  }
-  const client = createConductorApiClientFromEnv();
-  if (!client) {
-    return { attempted: false, reason: "Conductor Cloud API is not configured." };
-  }
-  const workspaces = await loadWorkspaceIndex(client, config);
-  const snapshots = await resolveLaneSnapshots(client, config, workspaces);
-  await runDeliveryPipeline({
-    client,
-    config,
-    snapshots,
-    workspaces,
-    notify: options.notify,
-    forceMergeLaneId: lane.id,
-  });
-  return { attempted: true };
 }
 
 type ExecuteOutcome = {
@@ -890,9 +926,9 @@ async function snapshotLane(
     ? assistantTextFromTranscriptEvent(lastAssistant)
     : "";
   const rateLimitUntil = parseRateLimitReset(
-    assistantMessages
-      .map((message) => assistantTextFromTranscriptEvent(message))
-      .join("\n")
+    lastAssistantText,
+    new Date(),
+    lastAssistant?.receivedAt ? new Date(lastAssistant.receivedAt) : new Date()
   );
   if (rateLimitUntil && assignedProvider) {
     setLaneProviderOutage(assignedProvider, rateLimitUntil);
@@ -915,7 +951,7 @@ async function snapshotLane(
     lastActionKind: lastAction?.action ?? null,
     workspaceId: workspace.id,
     sessionId,
-    prUrl: githubPrUrlFromText(lastAssistantText),
+    prUrl: githubPrUrlFromTextForRepo(lastAssistantText, lane.repoUrl),
     lastAssistantAt: lastAssistant?.receivedAt ?? null,
     unansweredNudges: health.unansweredNudges,
     rateLimitUntil: health.rateLimitUntil,

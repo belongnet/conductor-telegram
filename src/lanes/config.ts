@@ -146,6 +146,19 @@ const LanesConfigSchema = z
           message: "finals rotation needs two providers other than the author",
         });
       }
+      if (
+        lane.provider !== "any" &&
+        lane.delivery?.merge &&
+        !lane.delivery.merge.rotation.some(
+          (provider) => provider !== lane.provider,
+        )
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery", "merge", "rotation"],
+          message: "merge rotation needs a provider other than the author",
+        });
+      }
       for (const [stageName, stage] of stages) {
         const seenProviders = new Set<string>();
         for (const [providerIndex, provider] of stage.rotation.entries()) {
