@@ -1,0 +1,28 @@
+[Unit]
+Description=Conductor Telegram durable growth-lane controller (OVH standby)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=conductor-telegram
+Group=conductor-telegram
+Environment=LANES_SITE=ovh
+Environment=LANES_STATE_BACKEND=http
+Environment=CONDUCTOR_CLOUD_BACKEND=api
+Environment=CONDUCTOR_API_TIMEOUT_MS=30000
+Environment=CONDUCTOR_API_MAX_RETRIES=0
+EnvironmentFile=/etc/conductor-telegram/lanes.env
+ExecStart=/usr/bin/env -u BELONG_HUMAN_APPROVAL_KEY LANES_SITE=ovh LANES_STATE_BACKEND=http CONDUCTOR_CLOUD_BACKEND=api CONDUCTOR_API_TIMEOUT_MS=30000 CONDUCTOR_API_MAX_RETRIES=0 conductor-telegram lanes worker --no-color
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/conductor-telegram
+WorkingDirectory=/var/lib/conductor-telegram
+
+[Install]
+WantedBy=multi-user.target

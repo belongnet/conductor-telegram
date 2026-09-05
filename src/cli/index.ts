@@ -34,6 +34,8 @@ function parseFlags(args: string[]): {
       flags.dopplerConfig = args[++i];
     } else if (arg === "--with-updater") {
       flags.withUpdater = true;
+    } else if (arg === "--with-lanes") {
+      flags.withLanes = true;
     } else if (arg === "--version" || arg === "-v") {
       console.log(getVersionString());
       process.exit(0);
@@ -64,6 +66,7 @@ function printHelp(): void {
     setup            Interactive first-run configuration wizard
     doctor           Validate configuration and connectivity
     status           Show configuration health
+    lanes SUBCMD     Durable lane controller (worker|status|reconcile|import-legacy)
     service SUBCMD   Manage launchd background service (install|uninstall|start|stop|restart|status|logs)
     install-plugin   Install MCP server plugin into Claude Code
     help             Show this help message
@@ -78,6 +81,8 @@ function printHelp(): void {
                      Doppler config used by foreground and launchd runtime
     --with-updater   With 'service install': also enroll this machine in
                      auto-deploys from the repo's main branch (gateway hosts)
+    --with-lanes     With 'service install': install the independent HTTP-backed
+                     durable lanes worker (disabled by default)
     --quiet          Suppress startup banner
     --no-color       Disable colored output (also respects NO_COLOR env)
     --version, -v    Show version
@@ -93,7 +98,12 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const { command, flags, rest } = parseFlags(args);
 
-  if (command === "start" || command === "doctor" || command === "status") {
+  if (
+    command === "start" ||
+    command === "doctor" ||
+    command === "status" ||
+    command === "lanes"
+  ) {
     const { tryLoadConfig } = await import("./config.js");
     const { isDopplerRuntimeActive, resolveDopplerRuntime, runWithDoppler } =
       await import("./doppler.js");
@@ -110,10 +120,11 @@ async function main(): Promise<void> {
           process.exit(status);
         }
       } catch (error) {
-        // `start` must fail closed: running without the managed secrets would
-        // silently drop cloud control. `doctor` and `status` exist to explain
-        // exactly this kind of breakage, so they carry on and report it.
-        if (command === "start") throw error;
+        // Mutating runtimes must fail closed: running without the managed
+        // secrets would silently drop cloud or lane control. `doctor` and the
+        // top-level `status` command exist to explain this kind of breakage, so
+        // only those diagnostic paths carry on and report it.
+        if (command === "start" || command === "lanes") throw error;
         const detail = error instanceof Error ? error.message : String(error);
         console.error(`Warning: Doppler runtime unavailable (${detail}).`);
         console.error("Continuing with locally configured values.\n");
@@ -154,6 +165,13 @@ async function main(): Promise<void> {
     case "service": {
       const { runService } = await import("./service.js");
       await runService(rest, flags);
+      break;
+    }
+
+    case "lanes": {
+      const { runLanes } = await import("./lanes.js");
+      const commandIndex = args.indexOf("lanes");
+      await runLanes(commandIndex >= 0 ? args.slice(commandIndex + 1) : rest);
       break;
     }
 

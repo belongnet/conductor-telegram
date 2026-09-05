@@ -59,7 +59,12 @@ src/
 ├── lanes/
 │   ├── config.ts          # Optional lanes.json loading
 │   ├── decide.ts          # Pure queue/nudge/create decisions
-│   └── scheduler.ts       # Interval tick, API actions, owner notices
+│   ├── pipeline.ts        # Review, finals, merge, validation, and hygiene
+│   ├── scheduler.ts       # Backwards-compatible in-process scheduler
+│   ├── manifest.ts        # Strict Manifest v2 loader and prompt hashing
+│   ├── controller.ts      # Fenced deterministic delivery controller
+│   ├── state-store*.ts    # Command Center HTTP + explicit test SQLite seams
+│   └── worker.ts          # Independent Mac/OVH lease worker
 └── types/
     └── index.ts       # TypeScript interfaces
 ```
@@ -73,7 +78,7 @@ src/
 | `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
 | `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
 | `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
-| `/lanes` | `/lanes [run\|pause\|resume]` | Config-driven Cloud lane scheduler: status table, run a tick, or pause/resume |
+| `/lanes` | `/lanes [pause\|resume\|retry\|provider-disable\|archive-approval\|shadow\|cutover\|rollback]` | Durable lane status and audited controls when Manifest v2 is configured; legacy scheduler controls otherwise |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
 | `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
 | `/review` | `/review <workspace> [instructions]` | Launch a code review session |
@@ -115,13 +120,61 @@ The official API is still beta. Cloud operations therefore use runtime response 
 
 Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
-## Lanes scheduler
+## Durable lanes controller (Manifest v2)
+
+Manifest v2 is the production orchestration path. It is disabled by default and runs as an independent `conductor-telegram lanes worker` process, so Telegram polling failures cannot stop delivery. Runtime workspace/session IDs and PR URLs live only in Command Center/Postgres. The versioned manifest contains repositories, prompt paths and hashes, dependency milestones, provider policy, merge policy, and deterministic validation only.
+
+The Mac worker is the preferred lease holder and the OVH service is a standby. A 75-second renewable fenced lease, 20-second heartbeat, 30-second active poll, 3-minute idle poll, and 15-minute full reconciliation ensure that only one worker mutates Conductor or a Git host. The returning Mac does not preempt a live OVH lease. Every external mutation is preceded by a deterministic durable action intent; messages, attestations, and notices bind their exact SHA-256 body. A lost response must reconcile the exact external payload before it can retry, so a lookalike tag cannot be mistaken for the commissioned result.
+
+Copy [docs/lanes.manifest-v2.example.json](docs/lanes.manifest-v2.example.json) to `~/.conductor-telegram/lanes.manifest.v2.json`. Manifest v2 accepts only the approved provider/model/cap map (`claude/fable-5-1` at 3, `codex/gpt-5.6-sol` at 2, `cursor/grok-4.6` at 2), rejects runtime IDs and dependency cycles, and verifies every prompt SHA-256 both on startup and immediately before a commissioned delivery. Recurring schedules are `daily`, `weekly`, or `every <positive integer><m|h|d>`.
+
+Production workers require `LANES_STATE_BACKEND=http`, `COMMAND_CENTER_API_BASE_URL`, `COMMAND_CENTER_API_KEY`, `CONDUCTOR_API_KEY`, `BOT_TOKEN`, and `OWNER_CHAT_ID`. The OVH service is headless—it never polls or consumes Telegram updates—but it retains send-only credentials so the active lease holder can always emit a deduplicated safety alert. The Mac Telegram process additionally receives the separate `BELONG_HUMAN_APPROVAL_KEY`; that human key is forcibly removed from both lane-worker environments. `LANES_MANIFEST_SOURCE_REF` may carry the canonical Git revision; when omitted, both workers use the same content-addressed manifest SHA-256 rather than host-specific file paths. Add `GITLAB_TOKEN` only when a lane uses the GitLab adapter. SQLite requires both `LANES_STATE_BACKEND=sqlite` and `LANES_STANDALONE=1`; it is intended only for standalone tests and is never an HTTP fallback.
+
+The durable CLI is:
+
+```bash
+conductor-telegram lanes worker
+conductor-telegram lanes status --json
+conductor-telegram lanes reconcile
+conductor-telegram lanes import-legacy --source /path/to/legacy-queue.json --dry-run
+conductor-telegram lanes import-legacy --source /path/to/legacy-queue.json --apply
+```
+
+Run the dry-run first. Pinned legacy IDs are candidates only: the importer prefers the workspace linked to the current PR head, then the newest unarchived candidate with verified progress, and quarantines ambiguity. If an exact merged PR is the only authoritative truth and all of its old workspace candidates are archived, the importer adopts the merged SHA without reviving or binding an archived workspace. An apply requires the controller lease to be free and the exact manifest revision already active; it renews that lease during the authoritative rescan and revalidates the fence immediately before writing. Untagged adopted workspaces remain untrusted for hygiene and need one exact, 24-hour Telegram archive batch approval (`/lanes archive-approval batch`).
+
+On the Mac, save the production credentials in the configured Doppler environment, then install the independent launchd job:
+
+```bash
+conductor-telegram service install --with-lanes \
+  --doppler-project <project> \
+  --doppler-config <config>
+conductor-telegram doctor
+```
+
+The OVH standby unit is [packaging/systemd/conductor-telegram-lanes.service](packaging/systemd/conductor-telegram-lanes.service). Its root-owned `/etc/conductor-telegram/lanes.env` must point at the same HTTP state plane and manifest revision. The service is headless and does not run Telegram polling.
+
+The worker stages a deterministic revision such as `growth-v2-<20 hex>` and logs it. Start with `/lanes shadow <revision>`. A shadow full reconciliation is read-only and reports missing/ambiguous projects, managed/duplicate workspace names, binding drift, exact PR/head drift, and read errors. Active full reconciliation applies the same inventory checks to every manifest repository and managed workspace, including unknown run tags and archived/live drift; an early corrective action does not postpone the unfinished sweep for another 15 minutes. After that comparison, credential doctor, legacy import report, disposable canary, and CI all pass, the single human cutover is `/lanes cutover <revision>`. `/lanes rollback` disables dispatch without deleting state or workspaces; it never enables the legacy Python shepherd. `/lanes resume` can recover only a safety pause that originated in active mode; shadow and rollback require their explicit cutover sequence. A manifest revision cannot replace the active policy while an older revision still has nonterminal work.
+
+Delivery requires an adversarial reviewer distinct from the author, then two current-head final attestations from distinct providers. Attestations are accepted only from commissioned attempts with the exact nonce, run, stage, provider, head SHA, tag, and body hash, and terminal PR/review/validation output is not consumed until its Conductor session is idle. Merge is bound to owner/repository/base/head branch/head SHA and requires the configured named checks to pass; both Git hosts reassert the expected head after a merge response. Completion requires CI on the merged SHA and the manifest's exact command/probe evidence; commentary markers alone do not count. Terminal workspace grace starts at the original terminal transition, and an untagged archive approval is bound to an immutable, expiring list containing the current workspace ID. Archive hygiene performs a second live-session preflight after recording its intent and immediately before mutation; a newly working session pauses the controller instead of being archived. The controller observes repository-native CI but never deploys, publishes, performs outreach, spends money, or changes secrets.
+
+## Legacy lanes scheduler
 
 An optional in-process scheduler keeps at most one working Cloud lane per configured provider, using that provider's model, from an ordered queue with dependencies. It is inert unless a config file is present at `LANES_CONFIG` or `~/.conductor-telegram/lanes.json`. Copy `docs/lanes.example.json` and replace the placeholders (`L1`, `https://github.com/example-org/example-repo`, example model ids).
 
-Each tick (every `intervalMinutes`, and on `/lanes run`) looks up workspaces named `[lane:<id>:…` with a per-lane name filter, or an explicit `sessionId` / `workspaceId`. A listing outage — including a partial per-project fallback outage — skips the tick instead of creating a duplicate workspace. A lane is **working** when its session status is `working` (even if the transcript is empty or unread), **done** when the last idle-turn assistant text contains a GitHub pull-request URL (tool payloads and reasoning/thinking items are ignored), **initializing** when no user message has been recorded yet, **paused** when it exists and is idle or in `error` but not done (`error` can be nudged), **unknown** when status cannot be read or an idle transcript cannot be read, and **not created** otherwise. An unknown lane occupies its provider slot until the owner fixes the config (`/lanes` shows it as unknown); an `"any"` lane that is unknown with no assigned provider occupies every provider. Providers under `maxActive` nudge the first paused, dependency-ready lane whose last user message is older than `gapHours` (until `maxNudges`), else retry the configured prompt only when the last recorded action is a failed first send (`create_failed` / `prompt_failed`, also until `maxNudges`), else create the first not-created lane for that provider (or `"any"`). Failed creates and nudges are logged and the tick moves on. `/lanes pause` skips scheduled ticks before any Cloud listing.
+Each tick (every `intervalMinutes`, and on `/lanes run`) looks up matching workspaces **including archived workspaces** by `[lane:<id>:…]` name containment, or by an explicit `sessionId` / `workspaceId`; names containing `[abandoned` are ignored. A listing outage — including a partial per-project fallback outage — skips the tick instead of creating a duplicate workspace. A lane is **working** when its newest session is `working` (even if the transcript is empty or unread), **done** when the last idle-turn assistant text contains a GitHub pull-request URL (tool payloads and reasoning/thinking items are ignored), **initializing** when no user message has been recorded yet, **paused** when it exists and is idle or in `error` but not done, **unknown** when status cannot be read or an idle transcript cannot be read, and **not created** otherwise. Providers under `maxActive` resume or create dependency-ready work. `/lanes pause` suppresses scheduled Cloud walks before any listing.
 
-`/lanes` is owner-only through the existing auth middleware. `/lanes pause` / `/lanes resume` set a process-global flag in SQLite. Each create, nudge, or failure sends a one-line notice to the owner chat.
+Each lane may add an optional `delivery` object, with any combination of `review`, `finals`, `merge`, and `validation`. `merge` requires `finals`, and `validation` requires `merge`, so the scheduler can prove its preconditions:
+
+- `review` creates one adversarial reviewer on the first free provider in `rotation` other than the author, waits for its GitHub review, then messages the author once.
+- `finals` runs two sequential final reviewers on distinct non-author providers. Their GitHub review body starts with `FINAL-REVIEW (<real model>): {"verdict":"approve"|"changes", ...}`. A change verdict returns the lane to its author and starts a fresh round after the next pushed turn.
+- `merge` refreshes GitHub directly and requires a repo-bound open PR, the exact reviewed head, two commissioned approving GitHub attestations from distinct providers on that head, passing checks, and a conflict-free merge state. It does not depend on GitHub's aggregate approval state, so same-account validators remain verifiable. It uses `method` (`squash`, `merge`, or `rebase`) and accepts `MERGED BY AGENTS` only when its full SHA matches GitHub's merge commit. Conflicts go back to the author for a rebase.
+- `validation` runs the exact configured `verification` once against the merged base on a provider distinct from the author and merge executor. A `VALIDATED (<real model>)` or `VALIDATION FAILED (<real model>)` marker is advisory until a matching terminal Conductor command/tool receipt is present; passing completion also requires green CI on the merged SHA. Failed validation may open a narrowly scoped repair PR but never deploys directly.
+
+Stage prompts are paths relative to `lanes.json` and support `{{laneId}}`, `{{laneTitle}}`, `{{prUrl}}`, `{{round}}`, `{{slot}}`, `{{model}}`, `{{previousFinalReview}}`, `{{mergeMethod}}`, `{{mergeHeadSha}}`, `{{deployNotes}}`, `{{replayNotes}}`, and `{{verification}}`. Required safety/marker instructions are appended by the scheduler. The example config and prompt templates live in `docs/lanes.example.json` and `docs/prompts/`.
+
+The scheduler keeps its delivery and nudge ledger in SQLite. Two nudges without a newer assistant response mark a session dead; recovery starts a **new session in the same workspace** and always targets that workspace's newest session. Rate-limit reset timestamps found in assistant transcripts suppress work until the reset, and the next available provider in a stage rotation acts as the stand-in using its real model in markers.
+
+Hygiene runs after each active tick. It archives finished review/final/merge/validation workspaces and all lane workspaces after merge, never archives a working newest session, and never recreates a matching archived workspace. `/lanes archive` runs the same hygiene immediately. `/lanes merge <id>` forces a policy check but cannot bypass final approvals or dependency/conflict rules. `/lanes` shows `author → review → finals → merge → validation` progress per lane. All `/lanes` forms remain owner-only through the existing middleware; merges, validations, and archive batches send one-line Telegram notices.
 
 Prompt paths in the config are relative to the config file's directory.
 
@@ -171,6 +224,10 @@ conductor-telegram              Start the bot (foreground)
 conductor-telegram setup        Interactive configuration wizard
 conductor-telegram doctor       Validate config, token, paths, and connectivity
 conductor-telegram status       Show configuration health
+conductor-telegram lanes worker Run the independent fenced lane controller
+conductor-telegram lanes status --json  Read the durable control-plane snapshot
+conductor-telegram lanes reconcile      Run one full reconciliation pass
+conductor-telegram lanes import-legacy  Plan/apply the one-time legacy adoption
 conductor-telegram install-plugin  Install MCP server into Claude Code
 conductor-telegram help         Show all commands
 conductor-telegram --version    Show version
@@ -202,6 +259,13 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | | `CONDUCTOR_API_KEY` | Bearer API key for supported Conductor Cloud operations |
 | | `CONDUCTOR_CLOUD_BACKEND` | `auto` (use API when keyed), `api` (require key), or `off` |
 | | `LANES_CONFIG` | Path to the optional lanes scheduler JSON (default `~/.conductor-telegram/lanes.json`) |
+| | `LANES_MANIFEST` | Path to strict Manifest v2 (default `~/.conductor-telegram/lanes.manifest.v2.json`) |
+| | `LANES_MANIFEST_SOURCE_REF` | Optional canonical Git source revision; defaults to the cross-host manifest SHA-256 |
+| | `LANES_STATE_BACKEND` | Durable state backend: production must be `http`; `sqlite` is explicit standalone/test only |
+| | `COMMAND_CENTER_API_BASE_URL` | Command Center origin for the durable lane state API |
+| | `COMMAND_CENTER_API_KEY` | Service credential for the durable lane state API |
+| | `BELONG_HUMAN_APPROVAL_KEY` | Separate credential used by Telegram for cutover/rollback/archive approvals; excluded from the worker |
+| | `GITLAB_TOKEN` | GitLab API token, required only by manifests containing GitLab lanes |
 | | `TELEGRAM_WHISPER_MODEL` | whisper.cpp model name or path (default: `base`) |
 
 Conductor app settings are read from `~/.conductor/settings.toml` first, with the legacy Conductor DB `settings` table as fallback. The bot uses Conductor's default/review model settings, Codex thinking levels, Claude effort levels, and git branch prefix settings when Telegram-specific env vars are not set.
@@ -215,7 +279,7 @@ conductor-telegram service install \
 conductor-telegram doctor
 ```
 
-The installer verifies the persistent Doppler identity available to launchd, removes each Doppler-managed value from `config.json`, and writes a plist containing only the Doppler executable, project/config references, and an explicit allowlist of secret names—not secret values or a Doppler service token. The allowed names are `BOT_TOKEN`, `OWNER_CHAT_ID`, `OWNER_USER_ID`, `CONDUCTOR_API_BASE_URL`, `CONDUCTOR_API_KEY`, and `CONDUCTOR_CLOUD_BACKEND`. Use `BOT_TOKEN` exactly; `TELEGRAM_BOT_TOKEN` is not an alias.
+The installer verifies the persistent Doppler identity available to launchd, removes each Doppler-managed value from `config.json`, and writes a plist containing only the Doppler executable, project/config references, and an explicit allowlist of environment names—not values or a Doppler service token. The allowed names are `BOT_TOKEN`, `OWNER_CHAT_ID`, `OWNER_USER_ID`, `CONDUCTOR_API_BASE_URL`, `CONDUCTOR_API_KEY`, `CONDUCTOR_CLOUD_BACKEND`, `COMMAND_CENTER_API_BASE_URL`, `COMMAND_CENTER_API_KEY`, `BELONG_HUMAN_APPROVAL_KEY`, `GITLAB_TOKEN`, `LANES_MANIFEST`, and `LANES_MANIFEST_SOURCE_REF`. The lane worker deliberately receives every applicable value except `BELONG_HUMAN_APPROVAL_KEY`; only the Telegram process can commission human-gated controls. Use `BOT_TOKEN` exactly; `TELEGRAM_BOT_TOKEN` is not an alias.
 
 `start`, `status`, and `doctor` automatically re-enter the configured Doppler runtime. Run `service install` again after adding a new allowed secret name. A value-only rotation needs only a service restart.
 
@@ -257,6 +321,9 @@ SQLite database at `~/.conductor-telegram/conductor-telegram.db` with WAL mode f
 | `repo_topics` | Durable Telegram forum topics mapped to repos for no-guess launch routing |
 | `route_attempts` | Redacted routing audit log for routed, failed, confirmed, and cancelled attempts |
 | `lane_actions` | Create/nudge history for the optional lanes scheduler |
+| `lane_delivery_state` | Durable per-lane review, final, merge, and validation stage state |
+| `lane_session_health` | Unanswered-nudge and reset-time ledger for lane sessions |
+| `lane_provider_outages` | Provider rate-limit reset times used by stage rotations |
 
 ## Development
 
@@ -323,7 +390,7 @@ A gateway host keeps itself current. Enrolling is opt-in:
 conductor-telegram service install --with-updater
 ```
 
-This registers a third LaunchAgent, `net.belong.conductor-telegram.updater`, alongside the bot and its watchdog (a plain `service install` never enrolls you — published-package users keep the normal `npm i -g conductor-telegram@latest` upgrade contract). Every minute the agent fetches `origin/main` into a canonical checkout at `~/.conductor-telegram/gateway/repo` (cloning it on first run, so a fresh machine self-bootstraps), and whenever the remote moves it redeploys:
+This registers a third LaunchAgent, `net.belong.conductor-telegram.updater`, alongside the bot and its watchdog (plus the independent lanes job when `--with-lanes` is selected). A plain `service install` never enrolls the updater, so published-package users keep the normal `npm i -g conductor-telegram@latest` upgrade contract. Every minute the agent fetches `origin/main` into a canonical checkout at `~/.conductor-telegram/gateway/repo` (cloning it on first run, so a fresh machine self-bootstraps), and whenever the remote moves it redeploys:
 
 ```bash
 scripts/gateway-update.sh       # the poller — copied to ~/.conductor-telegram/bin/ at install

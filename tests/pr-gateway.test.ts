@@ -13,10 +13,13 @@ import {
   updateWorkspaceConductorName,
 } from "../src/store/queries.js";
 import {
+  buildExactHeadReviewRequest,
   buildExactHeadMergeArgs,
   canMergePr,
+  githubPrIdentity,
   matchesExpectedPrHead,
   normalizePrState,
+  requiredChecksGate,
   summarizeChecks,
   workspaceBranch,
 } from "../src/bot/github.js";
@@ -52,6 +55,18 @@ test("workspace name lookup refuses ambiguous city names unless scoped", () => {
 });
 
 test("PR state helpers normalize GitHub state and check rollups", () => {
+  assert.deepEqual(
+    githubPrIdentity("https://github.com/BelongNet/conductor-telegram/pull/69"),
+    { owner: "belongnet", repo: "conductor-telegram", number: 69 }
+  );
+  assert.equal(
+    githubPrIdentity("https://github.com/belongnet/conductor-telegram/pull/69?diff=split"),
+    null
+  );
+  assert.equal(
+    githubPrIdentity("https://token@github.com/belongnet/conductor-telegram/pull/69"),
+    null
+  );
   assert.equal(normalizePrState("OPEN"), "open");
   assert.equal(normalizePrState("MERGED"), "merged");
   assert.equal(normalizePrState("unexpected"), "unknown");
@@ -68,6 +83,16 @@ test("PR state helpers normalize GitHub state and check rollups", () => {
     "failing"
   );
   assert.equal(summarizeChecks([{ status: "IN_PROGRESS" }]).status, "pending");
+  assert.deepEqual(
+    summarizeChecks([
+      { __typename: "StatusContext", context: "gitlab/lint-and-test", state: "SUCCESS" },
+    ]),
+    { status: "passing", summary: "1 passing" }
+  );
+  assert.equal(
+    summarizeChecks([{ context: "gitlab/lint-and-test", state: "FAILURE" }]).status,
+    "failing"
+  );
 });
 
 test("PR card exposes merge readiness only for open passing clean PRs", () => {
@@ -199,6 +224,145 @@ test("GitHub merge command pins the confirmed head commit", () => {
       "--match-head-commit",
       "a".repeat(40),
     ]
+  );
+});
+
+test("commissioned GitHub reviews are API reviews pinned to the exact head", () => {
+  const head = "A".repeat(40);
+  const body = 'FINAL-REVIEW (gpt-5.6-sol): {"nonce":"n"}';
+  const request = buildExactHeadReviewRequest({
+    prUrl: "https://github.com/BelongNet/conductor-telegram/pull/69",
+    body,
+    expectedHeadSha: head,
+  });
+  assert.deepEqual(request.args, [
+    "api",
+    "repos/belongnet/conductor-telegram/pulls/69/reviews",
+    "--method",
+    "POST",
+    "--input",
+    "-",
+  ]);
+  assert.deepEqual(JSON.parse(request.stdin), {
+    event: "COMMENT",
+    commit_id: head.toLowerCase(),
+    body,
+  });
+  assert.throws(
+    () =>
+      buildExactHeadReviewRequest({
+        prUrl: "https://example.com/not-github/pull/69",
+        body,
+        expectedHeadSha: head,
+      }),
+    /canonical GitHub PR URL/
+  );
+  assert.throws(
+    () =>
+      buildExactHeadReviewRequest({
+        prUrl: "https://github.com/belongnet/conductor-telegram/pull/69",
+        body,
+        expectedHeadSha: "stale-short-sha",
+      }),
+    /full expected Git object ID/
+  );
+});
+
+test("GitLab-mirrored required checks cannot disappear from an otherwise green rollup", () => {
+  assert.deepEqual(
+    requiredChecksGate(
+      {
+        checksStatus: "passing",
+        checks: [{ name: "unit", status: "passing" }],
+      },
+      ["unit", "gitlab/lint-and-test"]
+    ),
+    {
+      passing: false,
+      missing: ["gitlab/lint-and-test"],
+      notPassing: [],
+      pending: [],
+      failed: [],
+    }
+  );
+  assert.equal(
+    requiredChecksGate(
+      {
+        checksStatus: "pending",
+        checks: [
+          { name: "unit", status: "passing" },
+          { name: "gitlab/lint-and-test", status: "pending" },
+        ],
+      },
+      ["gitlab/lint-and-test"]
+    ).passing,
+    false
+  );
+  assert.equal(
+    requiredChecksGate(
+      {
+        checksStatus: "passing",
+        checks: [{ name: "GITLAB/LINT-AND-TEST", status: "passing" }],
+      },
+      ["gitlab/lint-and-test"]
+    ).passing,
+    true
+  );
+  assert.deepEqual(
+    requiredChecksGate(
+      {
+        checksStatus: "passing",
+        checks: [
+          { name: "unit", status: "passing" },
+          { name: "unit", status: "failing" },
+        ],
+      },
+      ["unit"]
+    ),
+    {
+      passing: false,
+      missing: [],
+      notPassing: ["unit"],
+      pending: [],
+      failed: ["unit"],
+    }
+  );
+  assert.equal(
+    requiredChecksGate(
+      {
+        checksStatus: "passing",
+        checks: [
+          { name: "unit", status: "failing" },
+          { name: "unit", status: "passing" },
+        ],
+      },
+      ["unit"]
+    ).passing,
+    false,
+    "required-check aggregation must be independent of host ordering"
+  );
+  assert.equal(
+    requiredChecksGate(
+      {
+        checksStatus: "failing",
+        checks: [{ name: "optional-preview", status: "failing" }],
+      },
+      []
+    ).passing,
+    true
+  );
+  assert.equal(
+    requiredChecksGate(
+      {
+        checksStatus: "failing",
+        checks: [
+          { name: "required-unit", status: "passing" },
+          { name: "optional-preview", status: "failing" },
+        ],
+      },
+      ["required-unit"]
+    ).passing,
+    true
   );
 });
 
