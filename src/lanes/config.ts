@@ -49,7 +49,7 @@ const DeliverySchema = z.object({
     replayNotes: z.string().default(""),
   }).optional(),
   validation: StageBaseSchema.extend({
-    verification: z.string().min(1),
+    verification: z.string().trim().min(1),
   }).optional(),
 });
 

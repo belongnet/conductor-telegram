@@ -43,6 +43,16 @@ const WorkspaceSchema = z.object({
   deepLink: z.string(),
   creatorId: z.string().optional(),
   lastActivityAt: z.string().optional(),
+  state: z
+    .enum([
+      "initializing",
+      "ready",
+      "sleeping",
+      "archived",
+      "deleted",
+      "updating",
+    ])
+    .optional(),
   archivedAt: z.string().nullable().optional(),
 });
 
@@ -152,6 +162,21 @@ export type ConductorApiWorkspaceStatus = z.infer<typeof WorkspaceStatusSchema>;
 export type ConductorApiIdentity = z.infer<typeof IdentitySchema>;
 export type ConductorApiProject = z.infer<typeof ProjectSchema>;
 export type ConductorApiSqlResult = z.infer<typeof SqlResultSchema>;
+
+/**
+ * The current Cloud API exposes lifecycle state while older deployments used
+ * archivedAt. Keep both signals so archived work can never be adopted merely
+ * because one response shape omitted its timestamp.
+ */
+export function conductorWorkspaceIsArchived(
+  workspace: Pick<ConductorApiWorkspace, "state" | "archivedAt">
+): boolean {
+  return (
+    workspace.state === "archived" ||
+    workspace.state === "deleted" ||
+    Boolean(workspace.archivedAt)
+  );
+}
 
 export type ConductorCloudBackendMode = "auto" | "api" | "off";
 

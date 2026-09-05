@@ -59,6 +59,7 @@ export interface CLIFlags {
   dopplerProject?: string;
   dopplerConfig?: string;
   withUpdater?: boolean;
+  withLanes?: boolean;
 }
 
 const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {

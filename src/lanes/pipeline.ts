@@ -3,14 +3,18 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
   canMergePr,
+  githubPrIdentity,
+  refreshCommitChecks,
   refreshPrByUrl,
+  type GithubCommitChecksSnapshot,
   type GithubPrPolicySnapshot,
 } from "../bot/github.js";
-import type {
-  ConductorApiClient,
-  ConductorApiMessage,
-  ConductorApiSession,
-  ConductorApiWorkspace,
+import {
+  conductorWorkspaceIsArchived,
+  type ConductorApiClient,
+  type ConductorApiMessage,
+  type ConductorApiSession,
+  type ConductorApiWorkspace,
 } from "../integrations/conductor-api.js";
 import {
   getLaneDeliveryState,
@@ -32,6 +36,7 @@ import {
   githubPrUrlMatchesRepo,
   type LaneSnapshot,
 } from "./decide.js";
+import { rawExecutionReceipts } from "./validation-evidence.js";
 
 export type DeliveryStage =
   | "review"
@@ -52,6 +57,8 @@ export type DeliveryRun = {
   provider: string;
   model: string;
   startedAt: string;
+  nonce: string;
+  commissionedHeadSha: string;
   round?: number;
   slot?: number;
   completedAt?: string;
@@ -61,8 +68,14 @@ export type DeliveryRun = {
 
 export type LaneDeliveryState = {
   version: 1;
+  runId: string;
   laneId: string;
   prUrl: string;
+  prOwner: string;
+  prRepo: string;
+  prNumber: number;
+  headBranch: string;
+  headSha: string;
   authorProvider: string;
   authorTurnAt: string;
   stage: DeliveryStage;
@@ -85,6 +98,17 @@ export type FinalReviewMarker = {
   raw: string;
 };
 
+export type ReviewAttestationMarker = FinalReviewMarker & {
+  kind: "review" | "final";
+};
+
+export type ValidationMarker = {
+  result: "passed" | "failed";
+  model: string;
+  data: Record<string, unknown>;
+  raw: string;
+};
+
 export type PipelineWorkspaceRole =
   | { role: "author"; laneId: string; provider: string }
   | { role: "review"; laneId: string; provider: string }
@@ -99,6 +123,8 @@ export type PipelineWorkspaceRole =
   | { role: "validation"; laneId: string; provider: string };
 
 const FINAL_REVIEW_RE = /^FINAL-REVIEW \(([^)\n]+)\):\s*(\{[^\n]*\})\s*$/gim;
+const ADVERSARIAL_REVIEW_RE =
+  /^ADVERSARIAL-REVIEW \(([^)\n]+)\):\s*(\{[^\n]*\})\s*$/gim;
 const MERGED_RE =
   /MERGED BY AGENTS(?:\s*:\s*(\{[^\n]*\})|\s+([0-9a-f]{7,40}))?/gi;
 const VALIDATION_RE =
@@ -129,6 +155,29 @@ export function parseFinalReviewMarkers(text: string): FinalReviewMarker[] {
   return markers;
 }
 
+export function parseAdversarialReviewMarkers(
+  text: string
+): ReviewAttestationMarker[] {
+  const markers: ReviewAttestationMarker[] = [];
+  for (const match of text.matchAll(ADVERSARIAL_REVIEW_RE)) {
+    try {
+      const data = JSON.parse(match[2]) as Record<string, unknown>;
+      const verdict = data.verdict;
+      if (verdict !== "approve" && verdict !== "changes") continue;
+      markers.push({
+        kind: "review",
+        model: match[1].trim(),
+        verdict,
+        data,
+        raw: match[0].trim(),
+      });
+    } catch {
+      // Invalid JSON is not a commissioned attestation.
+    }
+  }
+  return markers;
+}
+
 export function parseMergedSha(text: string): string | null {
   const matches = [...text.matchAll(MERGED_RE)];
   const match = matches[matches.length - 1];
@@ -152,13 +201,22 @@ export function parseMergedSha(text: string): string | null {
 
 export function parseValidationMarker(
   text: string,
-): { result: "passed" | "failed"; model: string; raw: string } | null {
+): ValidationMarker | null {
   const matches = [...text.matchAll(VALIDATION_RE)];
   const match = matches[matches.length - 1];
   if (!match) return null;
+  let data: Record<string, unknown> = {};
+  if (match[3]) {
+    try {
+      data = JSON.parse(match[3]) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
   return {
     result: match[1].toUpperCase() === "VALIDATED" ? "passed" : "failed",
     model: match[2].trim(),
+    data,
     raw: match[0].trim(),
   };
 }
@@ -276,6 +334,8 @@ export function pipelineWorkspaceName(input: {
   lane: LaneConfig;
   role: "review" | "final" | "merge" | "validation";
   provider: string;
+  runId?: string;
+  attempt?: number;
   round?: number;
   slot?: number;
 }): string {
@@ -283,7 +343,10 @@ export function pipelineWorkspaceName(input: {
     input.role === "final"
       ? `[lane:${input.lane.id}:final:r${input.round ?? 1}:s${input.slot ?? 1}:${input.provider}]`
       : `[lane:${input.lane.id}:${input.role}:${input.provider}]`;
-  return `${token} ${input.lane.title}`;
+  const managed = input.runId
+    ? `[managed:growth][lane:${input.lane.id}][run:${input.runId}][stage:${input.role}][attempt:${input.attempt ?? input.slot ?? input.round ?? 1}]`
+    : "";
+  return `${managed}${token} ${input.lane.title}`;
 }
 
 export function isAbandonedWorkspace(name: string): boolean {
@@ -318,6 +381,11 @@ export async function runDeliveryPipeline(input: {
   notify: (text: string) => Promise<void>;
   forceMergeLaneId?: string;
   refreshPr?: (prUrl: string) => Promise<GithubPrPolicySnapshot>;
+  refreshMergedChecks?: (input: {
+    repoOwner: string;
+    repoName: string;
+    sha: string;
+  }) => Promise<GithubCommitChecksSnapshot>;
 }): Promise<void> {
   const states = new Map<string, LaneDeliveryState | null>(
     input.config.lanes.map((lane) => [
@@ -370,10 +438,32 @@ export async function runDeliveryPipeline(input: {
     if (!state && snapshot.prUrl && snapshot.lastAssistantAt) {
       const initial = deliveryStageForLane(lane);
       if (!initial) continue;
+      const policy = await (input.refreshPr ?? refreshPrByUrl)(snapshot.prUrl);
+      const identity = githubPrIdentity(policy.url);
+      if (
+        !identity ||
+        !policy.headSha ||
+        !policy.headBranch ||
+        !policy.baseBranch ||
+        !policy.prNumber ||
+        policy.repoOwner !== identity.owner ||
+        policy.repoName !== identity.repo ||
+        identity.number !== policy.prNumber ||
+        !githubPrUrlMatchesRepo(snapshot.prUrl, lane.repoUrl) ||
+        !githubPrUrlMatchesRepo(policy.url, lane.repoUrl)
+      ) {
+        continue;
+      }
       state = {
         version: 1,
+        runId: randomUUID(),
         laneId: lane.id,
-        prUrl: snapshot.prUrl,
+        prUrl: policy.url,
+        prOwner: identity.owner,
+        prRepo: identity.repo,
+        prNumber: identity.number,
+        headBranch: policy.headBranch,
+        headSha: policy.headSha,
         authorProvider:
           snapshot.assignedProvider ??
           (lane.provider === "any" ? "unknown" : lane.provider),
@@ -385,6 +475,40 @@ export async function runDeliveryPipeline(input: {
       saveState(state, states);
     }
     if (!state) continue;
+
+    if (!state.runId || !state.prOwner || !state.prRepo || !state.headSha) {
+      // Legacy local state has no commissioned-attempt identity. Leave it
+      // inert for the one-time importer instead of silently trusting it.
+      continue;
+    }
+
+    if (!state.mergedSha) {
+      const currentPolicy = await (input.refreshPr ?? refreshPrByUrl)(state.prUrl);
+      const identityStable =
+        currentPolicy.prNumber === state.prNumber &&
+        currentPolicy.repoOwner === state.prOwner &&
+        currentPolicy.repoName === state.prRepo &&
+        currentPolicy.headBranch === state.headBranch &&
+        githubPrUrlMatchesRepo(currentPolicy.url, lane.repoUrl);
+      if (!identityStable || !currentPolicy.headSha) {
+        // Repository/branch identity drift is quarantined by inaction. The
+        // durable worker reports it as a safety alert instead of guessing.
+        continue;
+      }
+      if (currentPolicy.headSha !== state.headSha) {
+        state.headSha = currentPolicy.headSha;
+        state.round += 1;
+        state.review = undefined;
+        state.finals = [];
+        state.merge = undefined;
+        state.mergeHeadSha = undefined;
+        state.feedbackSentAt = undefined;
+        state.feedbackMessageId = undefined;
+        state.stage = deliveryStageForLane(lane) ?? "review";
+        saveState(state, states);
+        continue;
+      }
+    }
 
     if (
       (state.stage === "review_fixes" || state.stage === "final_fixes") &&
@@ -430,6 +554,69 @@ export async function runDeliveryPipeline(input: {
   }
 }
 
+function prBindingMatches(
+  state: LaneDeliveryState,
+  policy: GithubPrPolicySnapshot,
+  lane: LaneConfig
+): boolean {
+  return Boolean(
+    policy.prNumber === state.prNumber &&
+      policy.repoOwner === state.prOwner &&
+      policy.repoName === state.prRepo &&
+      policy.headBranch === state.headBranch &&
+      policy.headSha === state.headSha &&
+      githubPrUrlMatchesRepo(policy.url, lane.repoUrl) &&
+      githubPrUrlMatchesRepo(state.prUrl, lane.repoUrl)
+  );
+}
+
+function markerMatchesCommission(
+  marker: FinalReviewMarker,
+  run: DeliveryRun,
+  state: LaneDeliveryState,
+  stage: "review" | "final"
+): boolean {
+  return Boolean(
+    marker.model === run.model &&
+      marker.data.nonce === run.nonce &&
+      marker.data.run === state.runId &&
+      marker.data.stage === stage &&
+      marker.data.headSha === run.commissionedHeadSha &&
+      marker.data.provider === run.provider
+  );
+}
+
+function commissionedGithubAttestation(input: {
+  policy: GithubPrPolicySnapshot;
+  state: LaneDeliveryState;
+  run: DeliveryRun;
+  stage: "review" | "final";
+}): FinalReviewMarker | null {
+  if (
+    input.policy.prNumber !== input.state.prNumber ||
+    input.policy.repoOwner !== input.state.prOwner ||
+    input.policy.repoName !== input.state.prRepo ||
+    input.policy.headBranch !== input.state.headBranch ||
+    input.policy.headSha !== input.state.headSha
+  ) {
+    return null;
+  }
+  const parser =
+    input.stage === "review"
+      ? parseAdversarialReviewMarkers
+      : parseFinalReviewMarkers;
+  const candidates = input.policy.reviews
+    .filter((review) => review.commitSha === input.state.headSha)
+    .sort((left, right) => left.submittedAt.localeCompare(right.submittedAt));
+  for (const review of candidates) {
+    const marker = parser(review.body)
+      .filter((candidate) => markerMatchesCommission(candidate, input.run, input.state, input.stage))
+      .at(-1);
+    if (marker && review.body.trimStart().startsWith(marker.raw)) return marker;
+  }
+  return null;
+}
+
 async function advanceReview(
   input: Parameters<typeof runDeliveryPipeline>[0],
   lane: LaneConfig,
@@ -457,21 +644,27 @@ async function advanceReview(
     occupied.add(state.review.provider);
     return;
   }
-  if (
-    !observation.latestAssistantAt ||
-    !/^REVIEW POSTED\s*$/im.test(observation.assistantText)
-  ) {
+  const policy = await (input.refreshPr ?? refreshPrByUrl)(state.prUrl);
+  const attestation = commissionedGithubAttestation({
+    policy,
+    state,
+    run: state.review,
+    stage: "review",
+  });
+  if (!attestation) {
     await keepRunAlive(
       input,
       lane,
       state.review,
       observation,
-      `Finish the adversarial review of ${state.prUrl} and post exactly one GitHub review.`,
+      `Finish the commissioned adversarial review of ${state.prUrl}. Post the exact nonce/run/head-bound GitHub attestation from your instructions.`,
       occupied,
     );
     return;
   }
-  state.review.completedAt = observation.latestAssistantAt;
+  state.review.verdict = attestation.verdict;
+  state.review.marker = attestation.raw;
+  state.review.completedAt = observation.latestAssistantAt ?? new Date().toISOString();
   if (!state.feedbackSentAt) {
     state.feedbackMessageId ??= randomUUID();
     saveState(state, states);
@@ -541,16 +734,20 @@ async function advanceFinals(
       occupied.add(pending.provider);
       return;
     }
-    const marker = parseFinalReviewMarkers(observation.assistantText)
-      .filter((entry) => entry.model === pending.model)
-      .at(-1);
+    const policy = await (input.refreshPr ?? refreshPrByUrl)(state.prUrl);
+    const marker = commissionedGithubAttestation({
+      policy,
+      state,
+      run: pending,
+      stage: "final",
+    });
     if (!marker) {
       await keepRunAlive(
         input,
         lane,
         pending,
         observation,
-        `Post the final GitHub review on ${state.prUrl}. Its first line must use your real model: FINAL-REVIEW (${pending.model}): {"verdict":"approve"|"changes"}.`,
+        `Post the exact commissioned FINAL-REVIEW attestation on ${state.prUrl}; preserve its run, nonce, provider, stage, and current head SHA fields.`,
         occupied,
       );
       return;
@@ -610,6 +807,7 @@ async function advanceMerge(
   }
   const policy = await (input.refreshPr ?? refreshPrByUrl)(state.prUrl);
   if (
+    !prBindingMatches(state, policy, lane) ||
     !githubPrUrlMatchesRepo(state.prUrl, lane.repoUrl) ||
     !githubPrUrlMatchesRepo(policy.url, lane.repoUrl)
   ) {
@@ -664,7 +862,8 @@ async function advanceMerge(
     return;
   }
 
-  if (!canMergePr(policy) || !hasCurrentFinalApprovals(state, policy)) {
+  const attestedApproval = hasCurrentFinalApprovals(state, policy);
+  if (!canMergePr(policy, { attestedApproval }) || !attestedApproval) {
     return;
   }
   if (!state.merge) {
@@ -701,34 +900,33 @@ export function hasCurrentFinalApprovals(
   state: LaneDeliveryState,
   policy: GithubPrPolicySnapshot,
 ): boolean {
-  if (!policy.headSha) return false;
+  if (
+    !policy.headSha ||
+    policy.headSha !== state.headSha ||
+    policy.prNumber !== state.prNumber ||
+    policy.repoOwner !== state.prOwner ||
+    policy.repoName !== state.prRepo ||
+    policy.headBranch !== state.headBranch
+  ) {
+    return false;
+  }
   const expected = state.finals
     .filter(
       (run) =>
         run.round === state.round && run.verdict === "approve" && run.marker,
-    )
-    .map((run) => run.marker!);
-  if (expected.length !== 2) return false;
-  const latest = policy.reviews
-    .filter((review) => review.commitSha === policy.headSha)
-    .filter((review) => parseFinalReviewMarkers(review.body).length > 0)
-    .sort((a, b) => a.submittedAt.localeCompare(b.submittedAt))
-    .slice(-2);
-  if (latest.length !== 2) return false;
-  const actual = latest.map((review) => {
-    const marker = parseFinalReviewMarkers(review.body).at(-1);
-    return marker?.verdict === "approve" &&
-      review.body.trimStart().startsWith(marker.raw)
-      ? marker.raw
-      : null;
+    );
+  if (expected.length !== 2 || new Set(expected.map((run) => run.provider)).size !== 2) {
+    return false;
+  }
+  return expected.every((run) => {
+    const attestation = commissionedGithubAttestation({
+      policy,
+      state,
+      run,
+      stage: "final",
+    });
+    return attestation?.verdict === "approve" && attestation.raw === run.marker;
   });
-  const actualMarkers = actual.filter(
-    (marker): marker is string => marker !== null,
-  );
-  if (actualMarkers.length !== actual.length) return false;
-  return (
-    [...actualMarkers].sort().join("\n") === [...expected].sort().join("\n")
-  );
 }
 
 async function returnMergeConflict(
@@ -816,16 +1014,40 @@ async function advanceValidation(
     return;
   }
   const marker = parseValidationMarker(observation.assistantText);
-  if (!marker || marker.model !== state.validation.model) {
+  if (
+    !marker ||
+    !validationMarkerMatches(
+      marker,
+      state.validation,
+      state,
+      lane.delivery!.validation!.verification,
+      observation.messages,
+    )
+  ) {
     await keepRunAlive(
       input,
       lane,
       state.validation,
       observation,
-      `Finish validation and comment VALIDATED (${state.validation.model}) or VALIDATION FAILED (${state.validation.model}).`,
+      `Finish validation and post the exact commissioned marker with run, nonce, provider, merged SHA, and command/probe evidence.`,
       occupied,
     );
     return;
+  }
+  if (marker.result === "passed") {
+    const checks = await (input.refreshMergedChecks ?? refreshCommitChecks)({
+      repoOwner: state.prOwner,
+      repoName: state.prRepo,
+      sha: state.mergedSha!,
+    });
+    if (
+      checks.repoOwner !== state.prOwner ||
+      checks.repoName !== state.prRepo ||
+      checks.sha !== state.mergedSha ||
+      checks.status !== "passing"
+    ) {
+      return;
+    }
   }
   state.validation.completedAt =
     observation.latestAssistantAt ?? new Date().toISOString();
@@ -843,6 +1065,48 @@ async function advanceValidation(
     `${marker.result === "passed" ? "✅" : "❌"} ${lane.id} validation ${marker.result}`,
   );
   saveState(state, states);
+}
+
+export function validationMarkerMatches(
+  marker: ValidationMarker,
+  run: DeliveryRun,
+  state: LaneDeliveryState,
+  verification?: string,
+  messages: readonly ConductorApiMessage[] = [],
+): boolean {
+  if (
+    marker.model !== run.model ||
+    marker.data.run !== state.runId ||
+    marker.data.nonce !== run.nonce ||
+    marker.data.stage !== "validation" ||
+    marker.data.mergedSha !== state.mergedSha ||
+    marker.data.headSha !== state.mergedSha ||
+    run.commissionedHeadSha !== state.mergedSha ||
+    marker.data.provider !== run.provider
+  ) {
+    return false;
+  }
+  if (!verification) return false;
+  const commands = Array.isArray(marker.data.commands)
+    ? marker.data.commands
+    : [];
+  if (commands.length !== 1 || !commands[0] || typeof commands[0] !== "object") {
+    return false;
+  }
+  const command = commands[0] as Record<string, unknown>;
+  const markerExitCode = command.exitCode ?? command.exit_code;
+  if (
+    command.command !== verification ||
+    typeof markerExitCode !== "number" ||
+    !Number.isInteger(markerExitCode)
+  ) {
+    return false;
+  }
+  const receipts = rawExecutionReceipts(messages);
+  if (receipts.length !== 1 || receipts[0]!.exit_code !== markerExitCode) {
+    return false;
+  }
+  return marker.result === "passed" ? markerExitCode === 0 : markerExitCode !== 0;
 }
 
 type EnsureRunInput = Parameters<typeof runDeliveryPipeline>[0] & {
@@ -866,63 +1130,57 @@ async function ensureRun(
     .filter((workspace) => !isAbandonedWorkspace(workspace.name))
     .filter((workspace) => workspace.name.includes(token))
     .sort(compareNewest);
-  const existing = matches.find((workspace) => !workspace.archivedAt);
+  const existing = matches.find(
+    (workspace) => !conductorWorkspaceIsArchived(workspace)
+  );
   if (!existing && matches.length > 0) return undefined;
   if (existing) {
-    const sessions = await input.client.listWorkspaceSessions(existing.id, {
-      includeArchived: true,
-    });
     const parsed = parsePipelineWorkspaceName(existing.name);
-    const provider = parsed?.provider ?? input.stage.rotation[0];
-    const session = newestSession(sessions);
-    if (input.role === "merge" || !session) {
-      const providerConfig = input.config.providers[provider];
-      if (!providerConfig) return undefined;
-      const created = await input.client.createSession({
-        workspaceId: existing.id,
-        name: `${input.role} round ${input.round ?? input.state.round}`,
-        agent: providerConfig.agent,
-        model: providerConfig.model,
-        effort: providerConfig.effort,
-      });
-      const run: DeliveryRun = {
-        role: input.role,
-        workspaceId: existing.id,
-        sessionId: created.id,
-        provider,
-        model: providerConfig.model,
-        startedAt: new Date().toISOString(),
-        round: input.round,
-        slot: input.slot,
-      };
-      await input.client.sendMessage({
-        sessionId: created.id,
-        message: renderRunPrompt(input, run),
-        messageId: randomUUID(),
-      });
-      observeLaneSession({
-        sessionId: created.id,
-        laneId: input.lane.id,
-        role: input.role,
-        lastAssistantAt: null,
-      });
-      input.occupied.add(provider);
-      return run;
-    }
-    return {
+    const selected = selectRotatedProvider({
+      rotation: input.stage.rotation,
+      exclude: input.exclude,
+      occupied: input.occupied,
+      outages: getLaneProviderOutages(),
+      now: new Date(),
+    });
+    const provider = selected ?? parsed?.provider;
+    const providerConfig = provider ? input.config.providers[provider] : undefined;
+    if (!provider || !providerConfig) return undefined;
+    const created = await input.client.createSession({
+      workspaceId: existing.id,
+      name: `${input.role} attempt ${input.slot ?? input.round ?? input.state.round}`,
+      agent: providerConfig.agent,
+      model: providerConfig.model,
+      effort: providerConfig.effort,
+    });
+    const run: DeliveryRun = {
       role: input.role,
       workspaceId: existing.id,
-      sessionId: session.id,
+      sessionId: created.id,
       provider,
-      model:
-        input.config.providers[provider]?.model ??
-        session.resolvedModel ??
-        session.model ??
-        provider,
-      startedAt: existing.createdAt,
+      model: providerConfig.model,
+      startedAt: new Date().toISOString(),
+      nonce: randomUUID(),
+      commissionedHeadSha:
+        input.role === "validation"
+          ? input.state.mergedSha!
+          : input.state.headSha,
       round: input.round,
       slot: input.slot,
     };
+    await input.client.sendMessage({
+      sessionId: created.id,
+      message: renderRunPrompt(input, run),
+      messageId: randomUUID(),
+    });
+    observeLaneSession({
+      sessionId: created.id,
+      laneId: input.lane.id,
+      role: input.role,
+      lastAssistantAt: null,
+    });
+    input.occupied.add(provider);
+    return run;
   }
 
   const provider = selectRotatedProvider({
@@ -938,6 +1196,8 @@ async function ensureRun(
     lane: input.lane,
     role: input.role,
     provider,
+    runId: input.state.runId,
+    attempt: input.slot ?? input.round ?? input.state.round,
     round: input.round,
     slot: input.slot,
   });
@@ -964,6 +1224,11 @@ async function ensureRun(
     provider,
     model: providerConfig.model,
     startedAt,
+    nonce: randomUUID(),
+    commissionedHeadSha:
+      input.role === "validation"
+        ? input.state.mergedSha!
+        : input.state.headSha,
     round: input.round,
     slot: input.slot,
   };
@@ -1016,6 +1281,10 @@ function renderRunPrompt(input: EnsureRunInput, run: DeliveryRun): string {
     replayNotes: merge?.replayNotes ?? "",
     verification: input.lane.delivery?.validation?.verification ?? "",
     mergeHeadSha: input.state.mergeHeadSha ?? "",
+    runId: input.state.runId,
+    nonce: run.nonce,
+    headSha: run.commissionedHeadSha,
+    provider: run.provider,
   };
   let rendered = template.replace(
     /\{\{([A-Za-z][A-Za-z0-9]*)\}\}/g,
@@ -1028,27 +1297,28 @@ function renderRunPrompt(input: EnsureRunInput, run: DeliveryRun): string {
 
 function invariantPrompt(input: EnsureRunInput, run: DeliveryRun): string {
   if (input.role === "review") {
-    return `Review ${input.state.prUrl} adversarially from this isolated workspace. Use GitHub to post exactly one pull-request review, then end your response with REVIEW POSTED.`;
+    return `Review ${input.state.prUrl} adversarially from this isolated workspace. Use GitHub to post exactly one pull-request review whose first line is ADVERSARIAL-REVIEW (${run.model}): {\"verdict\":\"approve\"|\"changes\",\"nonce\":\"${run.nonce}\",\"run\":\"${input.state.runId}\",\"stage\":\"review\",\"headSha\":\"${run.commissionedHeadSha}\",\"provider\":\"${run.provider}\"}. Preserve every identity field exactly. End your response with REVIEW POSTED; that transcript marker is advisory only.`;
   }
   if (input.role === "final") {
     const decidingContext =
       input.slot === 2
         ? ` You are the deciding second reviewer. The first final marker was: ${input.previousMarker ?? "missing"}.`
         : "";
-    return `Review ${input.state.prUrl} and post exactly one GitHub review whose first line is FINAL-REVIEW (${run.model}): {\"verdict\":\"approve\"|\"changes\"}. The model label must be your real configured model.${decidingContext}`;
+    return `Review ${input.state.prUrl} and post exactly one GitHub review whose first line is FINAL-REVIEW (${run.model}): {\"verdict\":\"approve\"|\"changes\",\"nonce\":\"${run.nonce}\",\"run\":\"${input.state.runId}\",\"stage\":\"final\",\"headSha\":\"${run.commissionedHeadSha}\",\"provider\":\"${run.provider}\"}. Preserve every identity field exactly; the model label must be your real configured model.${decidingContext}`;
   }
   if (input.role === "merge") {
     const merge = input.lane.delivery!.merge!;
     return `The scheduler verified that ${input.state.prUrl} is open, mergeable, passing, approved, and at exact head ${input.state.mergeHeadSha}. Recheck those conditions and merge only that head using ${merge.method}; use --match-head-commit when supported. If GitHub now reports a conflict, do not merge; report MERGE BLOCKED: conflict. Comment \"MERGED BY AGENTS\" with the full merge SHA, deploy notes \"${merge.deployNotes}\", and replay notes \"${merge.replayNotes}\". End with MERGED BY AGENTS: {\"sha\":\"<full merge sha>\"}.`;
   }
   const validation = input.lane.delivery!.validation!;
-  return `Validate the merged base containing ${input.state.mergedSha ?? "the merge"} by running: ${validation.verification}. Comment VALIDATED (${run.model}) or VALIDATION FAILED (${run.model}) on ${input.state.prUrl}. If a failure is small and safe, open a fix PR. End with the same validation marker.`;
+  return `Validate the merged base containing ${input.state.mergedSha ?? "the merge"} by executing this exact configured command once, without wrapping, chaining, prefixing, suffixing, substituting, or repeating it: ${JSON.stringify(validation.verification)}. Post a GitHub comment and end with VALIDATED (${run.model}): {\"run\":\"${input.state.runId}\",\"nonce\":\"${run.nonce}\",\"stage\":\"validation\",\"headSha\":\"${input.state.mergedSha ?? ""}\",\"mergedSha\":\"${input.state.mergedSha ?? ""}\",\"provider\":\"${run.provider}\",\"commands\":[{\"command\":${JSON.stringify(validation.verification)},\"exitCode\":0}]} or VALIDATION FAILED with the same identity fields and the real nonzero exit code. Agent prose and the marker are advisory: the scheduler requires the matching terminal Conductor command/tool event plus green CI on the merged SHA. If validation fails, open a repair PR rather than deploying directly.`;
 }
 
 type RunObservation = {
   status: "idle" | "working" | "error";
   assistantText: string;
   latestAssistantAt: string | null;
+  messages: ConductorApiMessage[];
   health: ReturnType<typeof observeLaneSession>;
 };
 
@@ -1087,7 +1357,7 @@ async function observeRun(
     lastAssistantAt: latestAssistantAt,
     rateLimitUntil,
   });
-  return { status, assistantText, latestAssistantAt, health };
+  return { status, assistantText, latestAssistantAt, messages, health };
 }
 
 async function keepRunAlive(
@@ -1156,6 +1426,10 @@ async function keepRunAlive(
     message,
     messageId: randomUUID(),
   });
+  // A queued nudge immediately consumes this provider for the remainder of
+  // the tick. Waiting for the next transcript/status poll caused same-tick
+  // over-commit when maxActive was greater than one.
+  occupied.add(run.provider);
   recordLaneSessionNudge(run.sessionId);
   recordLaneAction({
     laneId: lane.id,
@@ -1201,7 +1475,7 @@ export async function runLaneHygiene(input: {
       if (!lane) continue;
       const state = getLaneDeliveryState<LaneDeliveryState>(lane.id);
       if (!state || !shouldArchiveWorkspace(role, state)) continue;
-      if (workspace.archivedAt) continue;
+      if (conductorWorkspaceIsArchived(workspace)) continue;
       const sessions = await input.client.listWorkspaceSessions(workspace.id, {
         includeArchived: true,
       });

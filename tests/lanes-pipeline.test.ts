@@ -37,6 +37,7 @@ import {
   selectRotatedProvider,
   shouldArchiveWorkspace,
   shouldRestartDeadSession,
+  validationMarkerMatches,
   type LaneDeliveryState,
 } from "../src/lanes/pipeline.js";
 import { closeDb } from "../src/store/db.js";
@@ -82,6 +83,7 @@ test("machine-readable final, merge, and validation markers parse from fixture t
   assert.deepEqual(parseValidationMarker(transcript), {
     result: "passed",
     model: "model-c",
+    data: {},
     raw: "VALIDATED (model-c)",
   });
 });
@@ -321,6 +323,27 @@ test("fixture transcript advances review to author fixes, then starts finals aft
       }).data,
   } as unknown as ConductorApiClient;
   const author = authorSnapshot("2026-09-03T10:00:00.000Z");
+  const refreshPr = async () => {
+    const current = getLaneDeliveryState<LaneDeliveryState>("L1");
+    const review = current?.review;
+    return prPolicy({
+      reviews: review
+        ? [
+            prReview(
+              adversarialMarker(
+                review.model,
+                review.provider,
+                review.nonce,
+                current.runId,
+                current.headSha,
+              ),
+              current.headSha,
+              "2026-09-03T11:00:00.000Z",
+            ),
+          ]
+        : [],
+    });
+  };
 
   await runDeliveryPipeline({
     client,
@@ -328,6 +351,7 @@ test("fixture transcript advances review to author fixes, then starts finals aft
     snapshots: [author],
     workspaces: [],
     notify: async () => undefined,
+    refreshPr,
   });
   assert.equal(created, 1);
   assert.equal(getLaneDeliveryState<LaneDeliveryState>("L1")?.stage, "review");
@@ -340,6 +364,7 @@ test("fixture transcript advances review to author fixes, then starts finals aft
       workspace("review-workspace", "[host] [lane:L1:review:reviewer] Example"),
     ],
     notify: async () => undefined,
+    refreshPr,
   });
   const fixing = getLaneDeliveryState<LaneDeliveryState>("L1");
   assert.equal(fixing?.stage, "review_fixes");
@@ -354,6 +379,7 @@ test("fixture transcript advances review to author fixes, then starts finals aft
       workspace("review-workspace", "[host] [lane:L1:review:reviewer] Example"),
     ],
     notify: async () => undefined,
+    refreshPr,
   });
   const final = getLaneDeliveryState<LaneDeliveryState>("L1");
   assert.equal(final?.stage, "finals");
@@ -376,10 +402,12 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
         provider: "reviewer",
         model: "review-model",
         startedAt: "2026-09-03T08:00:00.000Z",
+        nonce: "nonce-final-1",
+        commissionedHeadSha: "1111111111111111111111111111111111111111",
         round: 1,
         slot: 1,
         verdict: "approve",
-        marker: 'FINAL-REVIEW (review-model): {"verdict":"approve"}',
+        marker: finalMarker("review-model", "reviewer", "nonce-final-1", "run-L2"),
         completedAt: "2026-09-03T09:00:00.000Z",
       },
       {
@@ -389,6 +417,8 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
         provider: "validator",
         model: "validation-model",
         startedAt: "2026-09-03T09:00:00.000Z",
+        nonce: "nonce-final-2",
+        commissionedHeadSha: "1111111111111111111111111111111111111111",
         round: 1,
         slot: 2,
       },
@@ -428,11 +458,28 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
           : input.sessionId === "merge-session"
             ? `MERGED BY AGENTS: {"sha":"${mergeSha}"}`
           : input.sessionId === "validation-session"
-            ? "VALIDATED (review-model)"
+            ? validationMarker(
+                getLaneDeliveryState<LaneDeliveryState>("L2")!,
+              )
             : "";
-      return text
-        ? [assistantMessage(input.sessionId, text, "2026-09-03T11:00:00.000Z")]
-        : [];
+      if (!text) return [];
+      if (input.sessionId === "validation-session") {
+        return [
+          commandReceiptMessage(input.sessionId, "npm test", 0),
+          {
+            ...assistantMessage(
+              input.sessionId,
+              text,
+              "2026-09-03T11:00:00.000Z",
+            ),
+            id: `${input.sessionId}-summary`,
+            sessionIndex: 2,
+          },
+        ];
+      }
+      return [
+        assistantMessage(input.sessionId, text, "2026-09-03T11:00:00.000Z"),
+      ];
     },
     createWorkspace: async (input: { name: string }) => {
       const isMerge = input.name.includes(":merge:");
@@ -461,17 +508,30 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
       mergeCommitSha: merged ? mergeSha : null,
       reviews: [
         prReview(
-          'FINAL-REVIEW (review-model): {"verdict":"approve"}',
+          state.finals[0].marker!,
           headSha,
           "2026-09-03T09:00:00.000Z",
         ),
         prReview(
-          'FINAL-REVIEW (validation-model): {"verdict":"approve"}',
+          finalMarker(
+            "validation-model",
+            "validator",
+            "nonce-final-2",
+            state.runId,
+            headSha,
+          ),
           headSha,
           "2026-09-03T11:00:00.000Z",
         ),
       ],
     });
+  const refreshMergedChecks = async () => ({
+    repoOwner: "example-org",
+    repoName: "example-repo",
+    sha: mergeSha,
+    status: "passing" as const,
+    summary: "2 passing",
+  });
 
   await runDeliveryPipeline({
     client,
@@ -480,6 +540,7 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
     workspaces: finalWorkspaces,
     notify: async () => undefined,
     refreshPr,
+    refreshMergedChecks,
   });
   assert.equal(getLaneDeliveryState<LaneDeliveryState>("L2")?.stage, "merge");
 
@@ -490,6 +551,7 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
     workspaces: finalWorkspaces,
     notify: async () => undefined,
     refreshPr,
+    refreshMergedChecks,
   });
   assert.equal(mergeCreated, true);
   assert.equal(
@@ -508,6 +570,7 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
     ],
     notify: async () => undefined,
     refreshPr,
+    refreshMergedChecks,
   });
   assert.equal(
     getLaneDeliveryState<LaneDeliveryState>("L2")?.stage,
@@ -524,6 +587,7 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
     ],
     notify: async () => undefined,
     refreshPr,
+    refreshMergedChecks,
   });
   const validating = getLaneDeliveryState<LaneDeliveryState>("L2");
   assert.equal(validationCreated, true);
@@ -543,6 +607,7 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
     ],
     notify: async () => undefined,
     refreshPr,
+    refreshMergedChecks,
   });
   const complete = getLaneDeliveryState<LaneDeliveryState>("L2");
   assert.equal(complete?.stage, "complete");
@@ -551,17 +616,85 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
 
 test("current final approvals must be GitHub reviews on the exact head", () => {
   const state = approvedFinalState("L3");
-  const headSha = "3333333333333333333333333333333333333333";
+  const headSha = state.headSha;
   const current = prPolicy({
     headSha,
+    reviewDecision: null,
     reviews: [
       prReview(state.finals[0].marker!, headSha, "2026-09-03T09:00:00Z"),
       prReview(state.finals[1].marker!, headSha, "2026-09-03T10:00:00Z"),
     ],
   });
   assert.equal(hasCurrentFinalApprovals(state, current), true);
+  current.headBranch = "some-other-branch";
+  assert.equal(hasCurrentFinalApprovals(state, current), false);
+  current.headBranch = state.headBranch;
   current.reviews[1].commitSha = "4444444444444444444444444444444444444444";
   assert.equal(hasCurrentFinalApprovals(state, current), false);
+});
+
+test("commissioned final attestations reject a replayed nonce", () => {
+  const state = approvedFinalState("L3-replay");
+  const replayed = state.finals[1].marker!.replace(
+    '"nonce":"nonce-final-2"',
+    '"nonce":"nonce-final-1"',
+  );
+  const policy = prPolicy({
+    headSha: state.headSha,
+    reviewDecision: null,
+    reviews: [
+      prReview(state.finals[0].marker!, state.headSha, "2026-09-03T09:00:00Z"),
+      prReview(replayed, state.headSha, "2026-09-03T10:00:00Z"),
+    ],
+  });
+  assert.equal(hasCurrentFinalApprovals(state, policy), false);
+});
+
+test("validation requires an exact terminal Conductor execution receipt", () => {
+  const state = deliveryState({
+    stage: "validation",
+    mergedSha: "2222222222222222222222222222222222222222",
+  });
+  const run = {
+    role: "validation" as const,
+    workspaceId: "validation-workspace",
+    sessionId: "validation-session",
+    provider: "reviewer",
+    model: "review-model",
+    startedAt: NOW.toISOString(),
+    nonce: "validation-nonce",
+    commissionedHeadSha: state.mergedSha!,
+  };
+  state.validation = run;
+  const marker = parseValidationMarker(
+    `VALIDATED (review-model): ${JSON.stringify({
+      run: state.runId,
+      nonce: run.nonce,
+      stage: "validation",
+      headSha: state.mergedSha,
+      mergedSha: state.mergedSha,
+      provider: run.provider,
+      commands: [{ command: "npm test", exitCode: 0 }],
+    })}`,
+  )!;
+  assert.equal(validationMarkerMatches(marker, run, state, "npm test", []), false);
+  const receipt = commandReceiptMessage(run.sessionId, "npm test", 0);
+  assert.equal(
+    validationMarkerMatches(marker, run, state, "npm test", [receipt]),
+    true,
+  );
+  const extraReceipt = commandReceiptMessage(run.sessionId, "git status", 0, 2);
+  assert.equal(
+    validationMarkerMatches(marker, run, state, "npm test", [
+      receipt,
+      extraReceipt,
+    ]),
+    false,
+  );
+  assert.equal(
+    validationMarkerMatches(marker, run, state, "npm run deploy", [receipt]),
+    false,
+  );
 });
 
 test("GitHub conflict returns the lane to its author without trusting transcript prose", async () => {
@@ -623,6 +756,8 @@ test("ordinary conflict and rebase prose cannot trigger the conflict transition"
     provider: "validator",
     model: "validation-model",
     startedAt: "2026-09-03T08:00:00.000Z",
+    nonce: "nonce-merge",
+    commissionedHeadSha: state.headSha,
   };
   setLaneDeliveryState("L6", state);
   const client = {
@@ -720,10 +855,17 @@ test("an archived matching merge workspace is not rebound or recreated", async (
 function deliveryState(
   overrides: Partial<LaneDeliveryState> = {},
 ): LaneDeliveryState {
+  const laneId = overrides.laneId ?? "L1";
   return {
     version: 1,
-    laneId: "L1",
+    runId: `run-${laneId}`,
+    laneId,
     prUrl: "https://github.com/example-org/example-repo/pull/1",
+    prOwner: "example-org",
+    prRepo: "example-repo",
+    prNumber: 1,
+    headBranch: "managed/L1",
+    headSha: "1111111111111111111111111111111111111111",
     authorProvider: "author",
     authorTurnAt: "2026-09-03T08:00:00.000Z",
     stage: "review",
@@ -731,6 +873,23 @@ function deliveryState(
     finals: [],
     ...overrides,
   };
+}
+
+function adversarialMarker(
+  model: string,
+  provider: string,
+  nonce: string,
+  run: string,
+  headSha: string,
+): string {
+  return `ADVERSARIAL-REVIEW (${model}): ${JSON.stringify({
+    verdict: "approve",
+    nonce,
+    run,
+    stage: "review",
+    headSha,
+    provider,
+  })}`;
 }
 
 function approvedFinalState(laneId: string): LaneDeliveryState {
@@ -745,10 +904,17 @@ function approvedFinalState(laneId: string): LaneDeliveryState {
         provider: "reviewer",
         model: "review-model",
         startedAt: "2026-09-03T08:00:00.000Z",
+        nonce: "nonce-final-1",
+        commissionedHeadSha: "1111111111111111111111111111111111111111",
         round: 1,
         slot: 1,
         verdict: "approve",
-        marker: 'FINAL-REVIEW (review-model): {"verdict":"approve"}',
+        marker: finalMarker(
+          "review-model",
+          "reviewer",
+          "nonce-final-1",
+          `run-${laneId}`,
+        ),
         completedAt: "2026-09-03T09:00:00.000Z",
       },
       {
@@ -758,10 +924,17 @@ function approvedFinalState(laneId: string): LaneDeliveryState {
         provider: "validator",
         model: "validation-model",
         startedAt: "2026-09-03T09:00:00.000Z",
+        nonce: "nonce-final-2",
+        commissionedHeadSha: "1111111111111111111111111111111111111111",
         round: 1,
         slot: 2,
         verdict: "approve",
-        marker: 'FINAL-REVIEW (validation-model): {"verdict":"approve"}',
+        marker: finalMarker(
+          "validation-model",
+          "validator",
+          "nonce-final-2",
+          `run-${laneId}`,
+        ),
         completedAt: "2026-09-03T10:00:00.000Z",
       },
     ],
@@ -773,9 +946,13 @@ function prPolicy(
 ): GithubPrPolicySnapshot {
   return {
     url: "https://github.com/example-org/example-repo/pull/1",
+    repoOwner: "example-org",
+    repoName: "example-repo",
     prNumber: 1,
     state: "open",
     isDraft: false,
+    headBranch: "managed/L1",
+    baseBranch: "main",
     headSha: "1111111111111111111111111111111111111111",
     reviewDecision: "APPROVED",
     mergeStateStatus: "CLEAN",
@@ -797,6 +974,36 @@ function prPolicy(
     ],
     ...overrides,
   };
+}
+
+function finalMarker(
+  model: string,
+  provider: string,
+  nonce: string,
+  run = "run-L1",
+  headSha = "1111111111111111111111111111111111111111",
+): string {
+  return `FINAL-REVIEW (${model}): ${JSON.stringify({
+    verdict: "approve",
+    nonce,
+    run,
+    stage: "final",
+    headSha,
+    provider,
+  })}`;
+}
+
+function validationMarker(state: LaneDeliveryState): string {
+  const run = state.validation!;
+  return `VALIDATED (${run.model}): ${JSON.stringify({
+    run: state.runId,
+    nonce: run.nonce,
+    stage: "validation",
+    headSha: state.mergedSha,
+    mergedSha: state.mergedSha,
+    provider: run.provider,
+    commands: [{ command: "npm test", exitCode: 0 }],
+  })}`;
 }
 
 function prReview(body: string, commitSha: string, submittedAt: string) {
@@ -890,5 +1097,27 @@ function assistantMessage(sessionId: string, text: string, receivedAt: string) {
     type: "assistant",
     content: text,
     receivedAt,
+  };
+}
+
+function commandReceiptMessage(
+  sessionId: string,
+  command: string,
+  exitCode: number,
+  sequence = 1,
+) {
+  return {
+    id: `${sessionId}-command-${sequence}`,
+    sessionId,
+    sessionIndex: sequence,
+    type: "agent",
+    content: {
+      type: "commandExecution",
+      id: `${sessionId}-execution-${sequence}`,
+      command,
+      status: exitCode === 0 ? "completed" : "failed",
+      exitCode,
+    },
+    receivedAt: "2026-09-03T10:59:00.000Z",
   };
 }

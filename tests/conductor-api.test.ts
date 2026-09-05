@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   ConductorApiClient,
   ConductorApiError,
+  conductorWorkspaceIsArchived,
   conductorApiConfigFromEnv,
 } from "../src/integrations/conductor-api.js";
 
@@ -460,6 +461,8 @@ test("org workspace listing forwards mine and name filters", async () => {
             name: "[lane:L1:primary] Example first lane",
             createdAt: "2026-09-01T00:00:00.000Z",
             deepLink: "https://conductor.build/workspace-1",
+            state: "archived",
+            archivedAt: null,
           },
         ],
         offset: 0,
@@ -477,6 +480,7 @@ test("org workspace listing forwards mine and name filters", async () => {
   });
 
   assert.equal(workspaces[0]?.id, "workspace-1");
+  assert.equal(conductorWorkspaceIsArchived(workspaces[0]!), true);
   assert.equal(new URL(urls[0]).pathname, "/v0/workspaces");
   assert.equal(new URL(urls[0]).searchParams.get("mine"), "true");
   assert.equal(new URL(urls[0]).searchParams.get("name"), "[lane:L1:");

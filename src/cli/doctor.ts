@@ -23,6 +23,11 @@ import {
   isDopplerRuntimeActive,
   resolveDopplerRuntime,
 } from "./doppler.js";
+import {
+  laneManifestPath,
+  laneManifestRevisionId,
+  loadLaneManifest,
+} from "../lanes/manifest.js";
 
 const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
@@ -353,6 +358,122 @@ export function checkDopplerRuntime(config: Config | null): CheckResult {
   }
 }
 
+/** @internal exported for doctor unit tests; not part of the public CLI API. */
+export async function checkDurableLanes(
+  config: Config | null,
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof fetch = fetch
+): Promise<CheckResult> {
+  const manifestPath = laneManifestPath(env);
+  if (!fs.existsSync(manifestPath)) {
+    return env.LANES_MANIFEST?.trim()
+      ? {
+          name: "Durable lanes",
+          ok: false,
+          detail: `configured manifest not found: ${manifestPath}`,
+          fix: "Install the versioned Manifest v2 file at LANES_MANIFEST",
+        }
+      : {
+          name: "Durable lanes",
+          ok: true,
+          detail: "disabled; no Manifest v2 installed",
+        };
+  }
+
+  let manifest;
+  try {
+    manifest = loadLaneManifest(env);
+    if (!manifest) throw new Error("manifest disappeared while reading");
+  } catch (error) {
+    return {
+      name: "Durable lanes",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+      fix: "Validate Manifest v2 and every prompt SHA-256 before cutover",
+    };
+  }
+
+  const backend = env.LANES_STATE_BACKEND?.trim().toLowerCase();
+  if (backend !== "http") {
+    return {
+      name: "Durable lanes",
+      ok: false,
+      detail: backend
+        ? `production manifest is paired with forbidden ${backend} state backend`
+        : "production manifest requires an explicit HTTP state backend",
+      fix: "Set LANES_STATE_BACKEND=http; SQLite is standalone/test only",
+    };
+  }
+
+  const baseUrl = env.COMMAND_CENTER_API_BASE_URL?.trim();
+  const apiKey =
+    env.COMMAND_CENTER_API_KEY?.trim() || env.BELONG_AGENTS_API_KEY?.trim();
+  const headlessStandby = env.LANES_SITE?.trim().toLowerCase() === "ovh";
+  const missing = [
+    !baseUrl && "COMMAND_CENTER_API_BASE_URL",
+    !apiKey && "COMMAND_CENTER_API_KEY",
+    !(env.CONDUCTOR_API_KEY?.trim() || config?.conductorApiKey) &&
+      "CONDUCTOR_API_KEY",
+    !headlessStandby &&
+      !(env.BOT_TOKEN?.trim() || config?.botToken) &&
+      "BOT_TOKEN",
+    !headlessStandby &&
+      !(env.OWNER_CHAT_ID?.trim() || config?.ownerChatId) &&
+      "OWNER_CHAT_ID",
+    !headlessStandby &&
+      !env.BELONG_HUMAN_APPROVAL_KEY?.trim() &&
+      "BELONG_HUMAN_APPROVAL_KEY",
+    manifest.lanes.some((lane) => lane.delivery_adapter.kind === "gitlab") &&
+      !env.GITLAB_TOKEN?.trim() &&
+      "GITLAB_TOKEN",
+  ].filter((value): value is string => Boolean(value));
+  if (missing.length > 0) {
+    return {
+      name: "Durable lanes",
+      ok: false,
+      detail: `Manifest v2 valid; missing runtime credential(s): ${missing.join(", ")}`,
+      fix: "Add the missing names to the configured Doppler environment, then rerun doctor",
+    };
+  }
+
+  try {
+    const response = await fetchImpl(
+      `${baseUrl!.replace(/\/+$/, "")}/api/conductor/lanes/status?since_event_seq=0`,
+      {
+        headers: { Accept: "application/json", "x-api-key": apiKey! },
+        signal: AbortSignal.timeout(10_000),
+      }
+    );
+    if (!response.ok) {
+      return {
+        name: "Durable lanes",
+        ok: false,
+        detail: `Command Center rejected the lane credential (HTTP ${response.status})`,
+        fix: "Verify Command Center health, Postgres, and COMMAND_CENTER_API_KEY",
+      };
+    }
+    const payload = (await response.json()) as {
+      controller?: { mode?: string } | null;
+    };
+    return {
+      name: "Durable lanes",
+      ok: true,
+      detail:
+        `${laneManifestRevisionId(manifest)} valid; Command Center connected; ` +
+        `mode=${payload.controller?.mode ?? "disabled"}`,
+    };
+  } catch (error) {
+    return {
+      name: "Durable lanes",
+      ok: false,
+      detail: `Command Center lane check failed closed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      fix: "Restore Command Center/Postgres connectivity before cutover",
+    };
+  }
+}
+
 
 function checkPlugin(): CheckResult {
   const pluginDir = path.join(
@@ -462,6 +583,7 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
     checkConductorSettings(),
     checkConductor072Schema(config?.conductorDbPath),
     checkDopplerRuntime(config),
+    await checkDurableLanes(config),
     await checkConductorCloudApi(config),
     await checkLaunchModels(config),
     await checkGithub(),
