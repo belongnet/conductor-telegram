@@ -3472,7 +3472,18 @@ export type LaneActionKind =
   | "create_failed"
   | "nudge_failed"
   | "prompt_failed"
-  | "create_refused";
+  | "create_refused"
+  | "restart"
+  | "restart_failed"
+  | "review_create"
+  | "review_feedback"
+  | "final_create"
+  | "final_feedback"
+  | "merge_create"
+  | "merge_feedback"
+  | "validation_create"
+  | "validation_complete"
+  | "archive";
 
 export interface LaneActionRecord {
   id: number;
@@ -3582,4 +3593,150 @@ function mapLaneActionRow(row: {
     detail: row.detail,
     createdAt: row.created_at,
   };
+}
+
+export function getLaneDeliveryState<T>(laneId: string): T | null {
+  const row = getDb()
+    .prepare("SELECT state_json FROM lane_delivery_state WHERE lane_id = ?")
+    .get(laneId) as { state_json: string } | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.state_json) as T;
+  } catch {
+    return null;
+  }
+}
+
+export function setLaneDeliveryState<T>(laneId: string, state: T): void {
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `INSERT INTO lane_delivery_state (lane_id, state_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(lane_id) DO UPDATE SET
+         state_json = excluded.state_json,
+         updated_at = excluded.updated_at`
+    )
+    .run(laneId, JSON.stringify(state), now);
+}
+
+export type LaneSessionHealth = {
+  sessionId: string;
+  laneId: string;
+  role: string;
+  lastAssistantAt: string | null;
+  unansweredNudges: number;
+  lastNudgeAt: string | null;
+  rateLimitUntil: string | null;
+};
+
+export function observeLaneSession(input: {
+  sessionId: string;
+  laneId: string;
+  role: string;
+  lastAssistantAt: string | null;
+  rateLimitUntil?: string | null;
+}): LaneSessionHealth {
+  const db = getDb();
+  const existing = getLaneSessionHealth(input.sessionId);
+  const answered =
+    input.lastAssistantAt !== null &&
+    input.lastAssistantAt !== existing?.lastAssistantAt;
+  const unansweredNudges = answered ? 0 : existing?.unansweredNudges ?? 0;
+  const rateLimitUntil = input.rateLimitUntil ?? existing?.rateLimitUntil ?? null;
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO lane_session_health
+       (session_id, lane_id, role, last_assistant_at, unanswered_nudges,
+        last_nudge_at, rate_limit_until, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       lane_id = excluded.lane_id,
+       role = excluded.role,
+       last_assistant_at = excluded.last_assistant_at,
+       unanswered_nudges = excluded.unanswered_nudges,
+       rate_limit_until = excluded.rate_limit_until,
+       updated_at = excluded.updated_at`
+  ).run(
+    input.sessionId,
+    input.laneId,
+    input.role,
+    input.lastAssistantAt,
+    unansweredNudges,
+    existing?.lastNudgeAt ?? null,
+    rateLimitUntil,
+    now
+  );
+  return {
+    sessionId: input.sessionId,
+    laneId: input.laneId,
+    role: input.role,
+    lastAssistantAt: input.lastAssistantAt,
+    unansweredNudges,
+    lastNudgeAt: existing?.lastNudgeAt ?? null,
+    rateLimitUntil,
+  };
+}
+
+export function recordLaneSessionNudge(sessionId: string): void {
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `UPDATE lane_session_health
+       SET unanswered_nudges = unanswered_nudges + 1,
+           last_nudge_at = ?, updated_at = ?
+       WHERE session_id = ?`
+    )
+    .run(now, now, sessionId);
+}
+
+export function getLaneSessionHealth(sessionId: string): LaneSessionHealth | null {
+  const row = getDb()
+    .prepare("SELECT * FROM lane_session_health WHERE session_id = ?")
+    .get(sessionId) as
+    | {
+        session_id: string;
+        lane_id: string;
+        role: string;
+        last_assistant_at: string | null;
+        unanswered_nudges: number;
+        last_nudge_at: string | null;
+        rate_limit_until: string | null;
+      }
+    | undefined;
+  return row
+    ? {
+        sessionId: row.session_id,
+        laneId: row.lane_id,
+        role: row.role,
+        lastAssistantAt: row.last_assistant_at,
+        unansweredNudges: row.unanswered_nudges,
+        lastNudgeAt: row.last_nudge_at,
+        rateLimitUntil: row.rate_limit_until,
+      }
+    : null;
+}
+
+export function setLaneProviderOutage(provider: string, until: string): void {
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `INSERT INTO lane_provider_outages (provider, unavailable_until, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(provider) DO UPDATE SET
+         unavailable_until = CASE
+           WHEN excluded.unavailable_until > unavailable_until
+             THEN excluded.unavailable_until
+           ELSE unavailable_until
+         END,
+         updated_at = excluded.updated_at`
+    )
+    .run(provider, until, now);
+}
+
+export function getLaneProviderOutages(): Map<string, string> {
+  const rows = getDb()
+    .prepare("SELECT provider, unavailable_until FROM lane_provider_outages")
+    .all() as Array<{ provider: string; unavailable_until: string }>;
+  return new Map(rows.map((row) => [row.provider, row.unavailable_until]));
 }

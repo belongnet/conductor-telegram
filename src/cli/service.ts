@@ -41,14 +41,25 @@ import {
 } from "./doppler.js";
 
 const LABEL = "net.belong.conductor-telegram";
+const LANES_LABEL = "net.belong.conductor-telegram.lanes";
 const WATCHDOG_LABEL = "net.belong.conductor-telegram.watchdog";
 const UPDATER_LABEL = "net.belong.conductor-telegram.updater";
 const STATE_DIR = path.join(os.homedir(), ".conductor-telegram");
 const LAUNCH_AGENTS_DIR = path.join(os.homedir(), "Library", "LaunchAgents");
 const PLIST_PATH = path.join(LAUNCH_AGENTS_DIR, `${LABEL}.plist`);
+const LANES_PLIST_PATH = path.join(LAUNCH_AGENTS_DIR, `${LANES_LABEL}.plist`);
 const WATCHDOG_PLIST_PATH = path.join(LAUNCH_AGENTS_DIR, `${WATCHDOG_LABEL}.plist`);
 const UPDATER_PLIST_PATH = path.join(LAUNCH_AGENTS_DIR, `${UPDATER_LABEL}.plist`);
 const BOT_LOG = path.join(STATE_DIR, "bot.log");
+const LANES_LOG = path.join(STATE_DIR, "lanes.log");
+const REQUIRED_LANE_SERVICE_SECRETS = Object.freeze([
+  "BOT_TOKEN",
+  "OWNER_CHAT_ID",
+  "CONDUCTOR_API_KEY",
+  "COMMAND_CENTER_API_BASE_URL",
+  "COMMAND_CENTER_API_KEY",
+  "BELONG_HUMAN_APPROVAL_KEY",
+]);
 const WATCHDOG_LOG = path.join(STATE_DIR, "watchdog.log");
 // scripts/gateway-update.sh caps this same file in place; its
 // CONDUCTOR_TELEGRAM_GATEWAY_LOG default must stay in sync with this path.
@@ -192,6 +203,7 @@ interface BotPlistOptions {
   doppler?: DopplerRuntime | null;
   nodePath?: string;
   cliPath?: string;
+  durableLanes?: boolean;
 }
 
 export function buildBotProgramArguments(
@@ -262,10 +274,101 @@ ${programArguments}
     <string>${pathEnv}</string>
     <key>HOME</key>
     <string>${xmlEscape(os.homedir())}</string>
+${options.durableLanes ? "    <key>LANES_STATE_BACKEND</key>\n    <string>http</string>" : ""}
   </dict>
 </dict>
 </plist>
 `;
+}
+
+export function buildLaneWorkerProgramArguments(
+  options: BotPlistOptions = {}
+): string[] {
+  const directCommand = [
+    options.nodePath ?? resolveLaunchdNodePath(),
+    options.cliPath ?? findCliEntrypoint(),
+    "lanes",
+    "worker",
+    "--no-color",
+  ];
+  const command = options.doppler
+    ? [
+        options.doppler.executable,
+        ...buildDopplerRunArgs(
+          {
+            ...options.doppler,
+            secretNames: (
+              options.doppler.secretNames ?? [...DOPPLER_RUNTIME_SECRET_NAMES]
+            ).filter((name) => name !== "BELONG_HUMAN_APPROVAL_KEY"),
+          },
+          directCommand
+        ),
+      ]
+    : directCommand;
+  // Strip even a launchd-global ambient copy before Doppler starts. Doppler's
+  // lane allowlist above cannot reintroduce the human-only approval secret.
+  return ["/usr/bin/env", "-u", "BELONG_HUMAN_APPROVAL_KEY", ...command];
+}
+
+export function buildLaneWorkerPlist(options: BotPlistOptions = {}): string {
+  const programArguments = buildLaneWorkerProgramArguments(options)
+    .map((argument) => `    <string>${xmlEscape(argument)}</string>`)
+    .join("\n");
+  const pathEnv = xmlEscape(
+    [
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin",
+      path.join(os.homedir(), ".local", "bin"),
+    ].join(":")
+  );
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LANES_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+${programArguments}
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>${xmlEscape(LANES_LOG)}</string>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(LANES_LOG)}</string>
+  <key>WorkingDirectory</key>
+  <string>${xmlEscape(STATE_DIR)}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${pathEnv}</string>
+    <key>HOME</key><string>${xmlEscape(os.homedir())}</string>
+    <key>LANES_SITE</key><string>mac</string>
+    <key>LANES_STATE_BACKEND</key><string>http</string>
+    <key>CONDUCTOR_CLOUD_BACKEND</key><string>api</string>
+    <key>CONDUCTOR_API_TIMEOUT_MS</key><string>30000</string>
+    <key>CONDUCTOR_API_MAX_RETRIES</key><string>0</string>
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+/** @internal exported for service-definition tests; not part of the CLI API. */
+export function missingLaneServiceSecrets(
+  names: ReadonlySet<string>
+): string[] {
+  return REQUIRED_LANE_SERVICE_SECRETS.filter((name) => !names.has(name));
 }
 
 function buildWatchdogPlist(): string {
@@ -546,14 +649,35 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
 
-  const botPlist = buildBotPlist({ doppler });
+  const lanesEnrolled = flags.withLanes || fs.existsSync(LANES_PLIST_PATH);
+  if (lanesEnrolled && !doppler) {
+    console.error(
+      "The durable lanes launchd job requires a configured Doppler runtime so its independent process can receive Command Center and Conductor credentials."
+    );
+    process.exit(1);
+  }
+  if (lanesEnrolled) {
+    const missingLaneSecrets = missingLaneServiceSecrets(
+      dopplerSecretNames ?? new Set<string>()
+    );
+    if (missingLaneSecrets.length > 0) {
+      console.error(
+        `The durable lanes launchd job is missing required Doppler keys: ${missingLaneSecrets.join(", ")}`
+      );
+      process.exit(1);
+    }
+  }
+  const botPlist = buildBotPlist({ doppler, durableLanes: lanesEnrolled });
   const watchdogPlist = buildWatchdogPlist();
+  const lanesPlist = lanesEnrolled ? buildLaneWorkerPlist({ doppler }) : null;
 
   writePlist(PLIST_PATH, botPlist);
   writePlist(WATCHDOG_PLIST_PATH, watchdogPlist);
+  if (lanesPlist) writePlist(LANES_PLIST_PATH, lanesPlist);
 
   console.log(`  wrote ${PLIST_PATH}`);
   console.log(`  wrote ${WATCHDOG_PLIST_PATH}`);
+  if (lanesPlist) console.log(`  wrote ${LANES_PLIST_PATH}`);
 
   // Persist before bootstrapping. A bootstrap failure exits, and leaving
   // Doppler-managed secrets in config.json while the service is already live
@@ -591,6 +715,22 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
     process.exit(1);
   }
   console.log(`  watchdog: ${watchdog.detail}`);
+
+  if (lanesPlist) {
+    if (shouldLeaveBotStopped(runningUnderUpdater(), fs.existsSync(STOP_MARKER_PATH))) {
+      const stopped = bootout(LANES_LABEL);
+      console.log(`  lanes: left stopped (${stopped.detail})`);
+    } else {
+      const lanes = bootstrap(LANES_LABEL, LANES_PLIST_PATH);
+      if (!lanes.ok) {
+        console.error(`  lanes: FAIL — ${lanes.detail}`);
+        process.exit(1);
+      }
+      console.log(`  lanes: ${lanes.detail}`);
+    }
+  } else {
+    console.log("  lanes: not enrolled (use service install --with-lanes)");
+  }
 
   if (flags.withUpdater) {
     try {
@@ -659,19 +799,22 @@ async function cmdInstall(flags: CLIFlags): Promise<void> {
   }
 
   console.log();
-  console.log("Bot will restart automatically on crash, logout, and reboot.");
+  console.log("Bot and enrolled lane worker restart automatically on crash, logout, and reboot.");
   if (flags.withUpdater) {
     console.log(
       "Gateway auto-updates from the repo's main branch within a minute of every push."
     );
   }
   console.log(`Logs: ${BOT_LOG}`);
+  if (lanesPlist) console.log(`Lane logs: ${LANES_LOG}`);
   console.log(`Run 'conductor-telegram service status' to verify.`);
 }
 
 async function cmdUninstall(): Promise<void> {
   const bot = bootout(LABEL);
   console.log(`  bot: ${bot.detail}`);
+  const lanes = bootout(LANES_LABEL);
+  console.log(`  lanes: ${lanes.detail}`);
   const watchdog = bootout(WATCHDOG_LABEL);
   console.log(`  watchdog: ${watchdog.detail}`);
   const updater = bootout(UPDATER_LABEL);
@@ -679,6 +822,7 @@ async function cmdUninstall(): Promise<void> {
 
   for (const p of [
     PLIST_PATH,
+    LANES_PLIST_PATH,
     WATCHDOG_PLIST_PATH,
     UPDATER_PLIST_PATH,
     UPDATER_SCRIPT_PATH,
@@ -714,6 +858,12 @@ async function cmdStart(): Promise<void> {
     const k = kickstart(LABEL);
     console.log(`  bot: ${k.detail}`);
   }
+  if (fs.existsSync(LANES_PLIST_PATH)) {
+    const lanes = isLoaded(LANES_LABEL)
+      ? kickstart(LANES_LABEL)
+      : bootstrap(LANES_LABEL, LANES_PLIST_PATH);
+    console.log(`  lanes: ${lanes.detail}`);
+  }
 }
 
 async function cmdStop(): Promise<void> {
@@ -721,6 +871,8 @@ async function cmdStop(): Promise<void> {
   setStopMarker();
   const bot = bootout(LABEL);
   console.log(`  bot: ${bot.detail}`);
+  const lanes = bootout(LANES_LABEL);
+  console.log(`  lanes: ${lanes.detail}`);
   if (fs.existsSync(UPDATER_PLIST_PATH)) {
     console.log("  auto-deploys will leave the bot stopped until 'service start'.");
   }
@@ -732,9 +884,11 @@ async function cmdRestart(): Promise<void> {
     // step of this same deploy, leaving the bot bootstrapped after the
     // operator's bootout. Bootout is idempotent when already down.
     const enforced = bootout(LABEL);
+    const lanes = bootout(LANES_LABEL);
     console.log(
       `  bot: left stopped, ${enforced.detail} (operator ran 'service stop'; resume with 'service start')`
     );
+    console.log(`  lanes: left stopped, ${lanes.detail}`);
     return;
   }
   clearStopMarker();
@@ -742,7 +896,14 @@ async function cmdRestart(): Promise<void> {
     const k = kickstart(LABEL, true);
     console.log(`  bot: ${k.detail}`);
   } else {
-    await cmdStart();
+    const bot = bootstrap(LABEL, PLIST_PATH);
+    console.log(`  bot: ${bot.detail}`);
+  }
+  if (fs.existsSync(LANES_PLIST_PATH)) {
+    const lanes = isLoaded(LANES_LABEL)
+      ? kickstart(LANES_LABEL, true)
+      : bootstrap(LANES_LABEL, LANES_PLIST_PATH);
+    console.log(`  lanes: ${lanes.detail}`);
   }
 }
 
@@ -753,13 +914,16 @@ async function cmdStatus(): Promise<void> {
   const { getHeartbeat } = await import("../store/queries.js");
 
   const botLoaded = isLoaded(LABEL);
+  const lanesLoaded = isLoaded(LANES_LABEL);
   const watchdogLoaded = isLoaded(WATCHDOG_LABEL);
   const updaterLoaded = isLoaded(UPDATER_LABEL);
   console.log();
   console.log(`  bot agent        ${botLoaded ? "✓ loaded" : "✗ not loaded"}`);
+  console.log(`  lanes agent      ${lanesLoaded ? "✓ loaded" : "✗ not loaded"}`);
   console.log(`  watchdog agent   ${watchdogLoaded ? "✓ loaded" : "✗ not loaded"}`);
   console.log(`  updater agent    ${updaterLoaded ? "✓ loaded" : "✗ not loaded"}`);
   console.log(`  plist (bot)      ${fs.existsSync(PLIST_PATH) ? PLIST_PATH : "not installed"}`);
+  console.log(`  plist (lanes)    ${fs.existsSync(LANES_PLIST_PATH) ? LANES_PLIST_PATH : "not installed"}`);
   console.log(`  plist (wd)       ${fs.existsSync(WATCHDOG_PLIST_PATH) ? WATCHDOG_PLIST_PATH : "not installed"}`);
   console.log(`  plist (updater)  ${fs.existsSync(UPDATER_PLIST_PATH) ? UPDATER_PLIST_PATH : "not installed"}`);
   const gatewayRev = spawnSync(
@@ -781,6 +945,7 @@ async function cmdStatus(): Promise<void> {
     );
   }
   console.log(`  log              ${BOT_LOG}`);
+  console.log(`  lanes log        ${LANES_LOG}`);
   const config = tryLoadConfig();
   if (config?.dopplerProject && config.dopplerConfig) {
     console.log("  runtime secrets  Doppler configured");

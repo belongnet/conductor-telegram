@@ -52,7 +52,9 @@
   },
   "files": [
     "dist",
-    "scripts/gateway-update.sh"
+    "scripts/gateway-update.sh",
+    "packaging",
+    "docs/lanes.manifest-v2.example.json"
   ],
   "keywords": [
     "telegram",

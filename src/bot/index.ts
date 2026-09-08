@@ -1579,14 +1579,21 @@ async function main(): Promise<void> {
 
   startSessionPoller();
   startEventPoller();
-  const lanes = startLanesScheduler({
-    notify: async (text) => {
-      const ownerChatId = getOwnerChatId();
-      if (!ownerChatId || ownerChatId === "0") return;
-      await bot.telegram.sendMessage(ownerChatId, text);
-    },
-  });
-  lanesSchedulerStop = lanes.stop;
+  // Manifest-v2 lanes run in their own fenced process. Telegram polling must
+  // never own orchestration liveness. Keep the merged #68 scheduler only for
+  // installations that have not opted into the durable state backend.
+  if (!process.env.LANES_STATE_BACKEND?.trim()) {
+    const lanes = startLanesScheduler({
+      notify: async (text) => {
+        const ownerChatId = getOwnerChatId();
+        if (!ownerChatId || ownerChatId === "0") return;
+        await bot.telegram.sendMessage(ownerChatId, text);
+      },
+    });
+    lanesSchedulerStop = lanes.stop;
+  } else {
+    lifecycleLog.info("durable lanes are supervised by the separate lanes worker");
+  }
   lifecycleLog.info(
     `connected · polling every ${POLL_INTERVAL_MS / 1000}s · v${BOT_VERSION ?? "?"} · pid ${process.pid} · boot #${bootCount}`
   );

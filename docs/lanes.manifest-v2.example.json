@@ -1,0 +1,80 @@
+{
+  "version": 2,
+  "global": {
+    "provider_capacity": {
+      "claude": 3,
+      "codex": 2,
+      "cursor": 2
+    },
+    "provider_models": {
+      "claude": "fable-5-1",
+      "codex": "gpt-5.6-sol",
+      "cursor": "grok-4.6"
+    }
+  },
+  "lanes": [
+    {
+      "id": "L1",
+      "title": "Example one-shot lane",
+      "repository": {
+        "owner": "example-org",
+        "name": "example-repo",
+        "base_branch": "main"
+      },
+      "prompt": {
+        "path": "prompts/l1.md",
+        "sha256": "df8de768d3c5d82207ffc6fe2188b5d7b36b7d00764c9370824e9242a6151398"
+      },
+      "priority": 100,
+      "preferred_providers": ["claude"],
+      "fallback_providers": ["codex", "cursor"],
+      "dependencies": [],
+      "policy": { "kind": "one_shot" },
+      "delivery_adapter": {
+        "kind": "github",
+        "required_checks": ["test"]
+      },
+      "merge_policy": {
+        "method": "squash",
+        "auto_merge": true,
+        "deploy_notes": "Observe repository-native CI only; the controller does not deploy.",
+        "replay_notes": "None."
+      },
+      "validation_profile": {
+        "commands": [["npm", "test"], ["npm", "run", "typecheck"]],
+        "probes": []
+      },
+      "managed_tags": ["managed:growth", "lane:L1"]
+    },
+    {
+      "id": "L2",
+      "title": "Example recurring dependent lane",
+      "repository": {
+        "owner": "example-org",
+        "name": "example-repo",
+        "base_branch": "main"
+      },
+      "prompt": {
+        "path": "prompts/l2.md",
+        "sha256": "80d3346ae382cbf8dfdba8fe657b99071e5867f91e69f2339d16580c8ba310ee"
+      },
+      "priority": 50,
+      "preferred_providers": ["codex"],
+      "fallback_providers": ["cursor", "claude"],
+      "dependencies": [{ "lane_id": "L1", "milestone": "merged" }],
+      "policy": { "kind": "recurring", "schedule": "daily" },
+      "delivery_adapter": { "kind": "github" },
+      "merge_policy": {
+        "method": "squash",
+        "auto_merge": true,
+        "deploy_notes": "Observe repository-native CI only; the controller does not deploy.",
+        "replay_notes": "None."
+      },
+      "validation_profile": {
+        "commands": [["npm", "test"]],
+        "probes": []
+      },
+      "managed_tags": ["managed:growth", "lane:L2"]
+    }
+  ]
+}

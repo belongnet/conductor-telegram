@@ -7,8 +7,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildBotProgramArguments,
+  buildBotPlist,
+  buildLaneWorkerPlist,
+  buildLaneWorkerProgramArguments,
   buildUpdaterPlist,
   extractGatewayOverrides,
+  missingLaneServiceSecrets,
   resolveLaunchdNodePath,
   shouldLeaveBotStopped,
 } from "../src/cli/service.js";
@@ -53,6 +57,105 @@ test("only auto-deploys defer to a standing operator stop", () => {
 test("bot program arguments default to the stable node path", () => {
   const args = buildBotProgramArguments();
   assert.equal(args[0], resolveLaunchdNodePath());
+});
+
+test("Mac lane worker is a separate HTTP-only launchd process without the human approval key", () => {
+  const argumentsList = buildLaneWorkerProgramArguments({
+    doppler: {
+      executable: "/usr/local/bin/doppler",
+      project: "belong-agents",
+      config: "prd",
+      secretNames: [
+        "COMMAND_CENTER_API_BASE_URL",
+        "COMMAND_CENTER_API_KEY",
+        "CONDUCTOR_API_KEY",
+        "BELONG_HUMAN_APPROVAL_KEY",
+      ],
+    },
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/conductor-telegram/index.js",
+  });
+  assert.ok(argumentsList.includes("lanes"));
+  assert.ok(argumentsList.includes("worker"));
+  assert.deepEqual(argumentsList.slice(0, 3), [
+    "/usr/bin/env",
+    "-u",
+    "BELONG_HUMAN_APPROVAL_KEY",
+  ]);
+  assert.equal(
+    argumentsList.filter(
+      (argument) => argument === "BELONG_HUMAN_APPROVAL_KEY"
+    ).length,
+    1,
+    "the approval key may appear only as env's removal target"
+  );
+  const plist = buildLaneWorkerPlist({
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/conductor-telegram/index.js",
+  });
+  assert.match(plist, /net\.belong\.conductor-telegram\.lanes/);
+  assert.match(plist, /<key>LANES_SITE<\/key><string>mac<\/string>/);
+  assert.match(plist, /<key>LANES_STATE_BACKEND<\/key><string>http<\/string>/);
+  assert.match(plist, /<key>CONDUCTOR_API_TIMEOUT_MS<\/key><string>30000<\/string>/);
+  assert.match(plist, /<key>CONDUCTOR_API_MAX_RETRIES<\/key><string>0<\/string>/);
+  assert.doesNotMatch(plist, /sqlite|fallback/i);
+
+  const durableBot = buildBotPlist({
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/conductor-telegram/index.js",
+    durableLanes: true,
+  });
+  assert.match(
+    durableBot,
+    /<key>LANES_STATE_BACKEND<\/key>\s*<string>http<\/string>/
+  );
+  assert.doesNotMatch(buildBotPlist(), /LANES_STATE_BACKEND/);
+});
+
+test("Mac lane enrollment requires the complete independent-process credential set", () => {
+  assert.deepEqual(
+    missingLaneServiceSecrets(
+      new Set([
+        "BOT_TOKEN",
+        "OWNER_CHAT_ID",
+        "CONDUCTOR_API_KEY",
+        "COMMAND_CENTER_API_BASE_URL",
+        "COMMAND_CENTER_API_KEY",
+      ])
+    ),
+    ["BELONG_HUMAN_APPROVAL_KEY"]
+  );
+  assert.deepEqual(
+    missingLaneServiceSecrets(
+      new Set([
+        "BOT_TOKEN",
+        "OWNER_CHAT_ID",
+        "CONDUCTOR_API_KEY",
+        "COMMAND_CENTER_API_BASE_URL",
+        "COMMAND_CENTER_API_KEY",
+        "BELONG_HUMAN_APPROVAL_KEY",
+      ])
+    ),
+    []
+  );
+});
+
+test("OVH standby systemd unit is headless and HTTP-only", () => {
+  const unit = fs.readFileSync(
+    path.join(process.cwd(), "packaging", "systemd", "conductor-telegram-lanes.service"),
+    "utf8"
+  );
+  assert.match(unit, /LANES_SITE=ovh/);
+  assert.match(unit, /LANES_STATE_BACKEND=http/);
+  assert.match(unit, /CONDUCTOR_API_TIMEOUT_MS=30000/);
+  assert.match(unit, /CONDUCTOR_API_MAX_RETRIES=0/);
+  assert.match(unit, /conductor-telegram lanes worker/);
+  assert.match(
+    unit,
+    /ExecStart=\/usr\/bin\/env -u BELONG_HUMAN_APPROVAL_KEY LANES_SITE=ovh LANES_STATE_BACKEND=http /
+  );
+  assert.match(unit, /-u BELONG_HUMAN_APPROVAL_KEY/);
+  assert.doesNotMatch(unit, /sqlite|fallback|telegram polling/i);
 });
 
 test("updater plist runs bash on the installed script copy, not the checkout", () => {

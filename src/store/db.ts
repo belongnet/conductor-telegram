@@ -166,6 +166,32 @@ const SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_lane_actions_lane_created
     ON lane_actions(lane_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS lane_delivery_state (
+    lane_id TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS lane_session_health (
+    session_id TEXT PRIMARY KEY,
+    lane_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    last_assistant_at TEXT,
+    unanswered_nudges INTEGER NOT NULL DEFAULT 0,
+    last_nudge_at TEXT,
+    rate_limit_until TEXT,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_lane_session_health_lane
+    ON lane_session_health(lane_id, role);
+
+  CREATE TABLE IF NOT EXISTS lane_provider_outages (
+    provider TEXT PRIMARY KEY,
+    unavailable_until TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `;
 
 let _db: Database.Database | null = null;
