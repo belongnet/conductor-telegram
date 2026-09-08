@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 import { HttpLaneStateStore } from "../src/lanes/state-store-http.js";
 import type {
@@ -15,6 +17,16 @@ const lease = {
   lease_token: "isolated-lease-token",
   fence: 1,
 };
+
+test("Command Center migration targets the deployed conductor lane tables", async () => {
+  const migration = await readFile(
+    path.join(process.cwd(), "docs", "lanes-command-center-postgres-migration.sql"),
+    "utf8"
+  );
+  assert.match(migration, /conductor_lane_actions/);
+  assert.match(migration, /conductor_lane_runs/);
+  assert.doesNotMatch(migration, /\blane_v2_(?:actions|runs)\b/);
+});
 
 function runRecord(rowVersion: number, ambiguousActionId: string | null): LaneRunRecord {
   return {
