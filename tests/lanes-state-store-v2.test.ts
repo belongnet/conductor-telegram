@@ -943,24 +943,30 @@ test("ambiguous external actions block retries until authoritative reconciliatio
       }),
       /ambiguous action/
     );
-    await store.finishAction(lease, ambiguous.action_id, {
+    await assert.rejects(
+      store.finishAction(lease, ambiguous.action_id, {
+        expected_action_version: ambiguous.row_version,
+        expected_run_version: run.row_version,
+        status: "failed",
+        result: { reconciled: true, found: false },
+        error: "authoritative absence",
+      }),
+      /action is already resolved/
+    );
+    run = (await store.snapshot()).runs[0];
+    assert.equal(run.ambiguous_action_id, ambiguous.action_id);
+    const reconciled = await store.finishAction(lease, ambiguous.action_id, {
       expected_action_version: ambiguous.row_version,
       expected_run_version: run.row_version,
-      status: "failed",
-      result: { reconciled: true, found: false },
-      error: "authoritative absence",
+      status: "reconciled",
+      result: {
+        reconciled: true, found: true,
+        workspace_id: "observed-workspace", workspace_name: request.workspace_name,
+        session_id: "observed-session", session_name: request.session_name,
+      },
     });
-    run = (await store.snapshot()).runs[0];
-    const retry = await store.beginAction(lease, run.run_id, {
-      action_id: "action-two",
-      deterministic_tag: "run-L1:implementation:create:v5",
-      expected_run_version: run.row_version,
-      stage: "implementation-workspace",
-      attempt_id: attempt.attempt_id,
-      action_type: "create_workspace",
-      request,
-    });
-    assert.equal(retry.status, "pending");
+    assert.equal(reconciled.status, "reconciled");
+    assert.equal((await store.snapshot()).runs[0].ambiguous_action_id, null);
   } finally {
     await store.close();
     fs.rmSync(root, { recursive: true, force: true });
