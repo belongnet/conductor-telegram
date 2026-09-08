@@ -5,8 +5,8 @@
 -- must not translate an unresolved external response into `failed`, and a
 -- finish for a different action must not clear the run's ambiguity fence.
 
-CREATE UNIQUE INDEX IF NOT EXISTS lane_v2_one_unresolved_action
-  ON lane_v2_actions (run_id, stage)
+CREATE UNIQUE INDEX IF NOT EXISTS conductor_lane_actions_one_unresolved
+  ON conductor_lane_actions (run_id, stage)
   WHERE status IN ('pending', 'ambiguous');
 
 CREATE OR REPLACE FUNCTION lane_v2_guard_ambiguous_action_transition()
@@ -23,9 +23,9 @@ END;
 $$;
 
 DROP TRIGGER IF EXISTS lane_v2_ambiguous_action_transition
-  ON lane_v2_actions;
+  ON conductor_lane_actions;
 CREATE TRIGGER lane_v2_ambiguous_action_transition
-  BEFORE UPDATE OF status ON lane_v2_actions
+  BEFORE UPDATE OF status ON conductor_lane_actions
   FOR EACH ROW
   EXECUTE FUNCTION lane_v2_guard_ambiguous_action_transition();
 
@@ -42,7 +42,7 @@ BEGIN
      AND NEW.ambiguous_action_id IS NULL
      AND NOT EXISTS (
        SELECT 1
-       FROM lane_v2_actions
+       FROM conductor_lane_actions
        WHERE action_id = OLD.ambiguous_action_id
          AND status = 'reconciled'
      ) THEN
@@ -53,8 +53,8 @@ END;
 $$;
 
 DROP TRIGGER IF EXISTS lane_v2_ambiguous_action_fence
-  ON lane_v2_runs;
+  ON conductor_lane_runs;
 CREATE TRIGGER lane_v2_ambiguous_action_fence
-  BEFORE UPDATE OF ambiguous_action_id ON lane_v2_runs
+  BEFORE UPDATE OF ambiguous_action_id ON conductor_lane_runs
   FOR EACH ROW
   EXECUTE FUNCTION lane_v2_preserve_ambiguous_action_fence();
