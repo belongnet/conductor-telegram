@@ -924,6 +924,16 @@ test("ambiguous external actions block retries until authoritative reconciliatio
       request,
     });
     run = (await store.snapshot()).runs[0];
+    const unrelated = await store.beginAction(lease, run.run_id, {
+      action_id: "action-unrelated",
+      deterministic_tag: "run-L1:implementation:notice:v1",
+      expected_run_version: run.row_version,
+      stage: "implementation-notice",
+      attempt_id: attempt.attempt_id,
+      action_type: "create_workspace",
+      request,
+    });
+    run = (await store.snapshot()).runs[0];
     const ambiguous = await store.finishAction(lease, action.action_id, {
       expected_action_version: action.row_version,
       expected_run_version: run.row_version,
@@ -931,6 +941,23 @@ test("ambiguous external actions block retries until authoritative reconciliatio
       error: "lost response",
     });
     run = (await store.snapshot()).runs[0];
+    await store.finishAction(lease, unrelated.action_id, {
+      expected_action_version: unrelated.row_version,
+      expected_run_version: run.row_version,
+      status: "succeeded",
+      result: {
+        workspace_id: "unrelated-workspace",
+        workspace_name: request.workspace_name,
+        session_id: "unrelated-session",
+        session_name: request.session_name,
+      },
+    });
+    run = (await store.snapshot()).runs[0];
+    assert.equal(
+      run.ambiguous_action_id,
+      ambiguous.action_id,
+      "an unrelated finish must not clear the ambiguous fence"
+    );
     await assert.rejects(
       store.beginAction(lease, run.run_id, {
         action_id: "action-two",

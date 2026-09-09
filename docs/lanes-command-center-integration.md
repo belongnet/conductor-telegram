@@ -15,8 +15,10 @@ rejects an `ambiguous` action being resolved as `failed` (only authoritative
 `reconciled` is accepted), and preserves `ambiguous_action_id` when an
 unrelated action finishes. The linked canary calls the same
 `/api/conductor/lanes/actions/:id/finish` HTTP endpoint against an isolated
-PostgreSQL-backed service; the companion scenario exercises the transaction
-directly, with CI supplying `TEST_POSTGRES_URL`.
+PostgreSQL-backed service. The companion PostgreSQL scenario validates the
+deployed schema, capacity, and fencing setup, with CI supplying
+`TEST_POSTGRES_URL`; retain the linked canary artifact for finish-action
+invariant evidence.
 
 Before enabling the HTTP worker, land the control-plane PR (or a newer commit
 with the same contract), run its PostgreSQL scenario, and point
