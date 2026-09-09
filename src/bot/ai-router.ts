@@ -21,6 +21,7 @@ const WHISPER_MODEL =
 const AFCONVERT_BIN =
   process.env.AFCONVERT_BIN ??
   "/usr/bin/afconvert";
+const FFMPEG_BIN = process.env.FFMPEG_BIN ?? "/usr/bin/ffmpeg";
 
 const ROUTER_MODEL = "sonnet";
 
@@ -233,7 +234,8 @@ export async function transcribeVoiceMessage(voicePath: string): Promise<string 
     console.log(`[ai-router] Voice file not found: ${voicePath}`);
     return null;
   }
-  if (!existsSync(AFCONVERT_BIN)) {
+  const converter = process.platform === "darwin" && existsSync(AFCONVERT_BIN) ? AFCONVERT_BIN : FFMPEG_BIN;
+  if (!existsSync(converter)) {
     console.log(`[ai-router] afconvert not found at ${AFCONVERT_BIN}`);
     return null;
   }
@@ -252,7 +254,9 @@ export async function transcribeVoiceMessage(voicePath: string): Promise<string 
   );
 
   try {
-    const convert = await runCommand(AFCONVERT_BIN, [
+    const convert = await runCommand(converter, converter === FFMPEG_BIN ? [
+      "-nostdin", "-y", "-i", voicePath, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", wavPath,
+    ] : [
       "-f", "WAVE",
       "-d", "LEI16@16000",
       voicePath,

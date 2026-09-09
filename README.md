@@ -4,6 +4,8 @@ Remote oversight for [Conductor](https://conductor.build) workspaces via Telegra
 
 Built by [Belong.net](https://belong.net)
 
+For an independently hosted gateway using only Conductor's native API, use the [OVH cloud-only deployment and migration guide](docs/ovh-native-gateway.md). Existing installations continue to default to hybrid mode.
+
 ## Quickstart
 
 ```bash

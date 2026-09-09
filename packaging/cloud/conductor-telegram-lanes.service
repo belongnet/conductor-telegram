@@ -1,0 +1,17 @@
+[Unit]
+Description=Independent Conductor lanes worker on OVH (pinned container)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+[Service]
+Type=simple
+EnvironmentFile=/etc/conductor-telegram/release.env
+# Keep its existing manifest, HTTP state, leases, ordering and capacity rules.
+# Keep human-approval credentials out of the worker environment.
+ExecStart=/usr/bin/docker run --rm --name conductor-telegram-lanes --pull never --no-healthcheck --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 --memory 1g --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 --tmpfs /tmp:rw,noexec,nosuid,size=128m --env-file /etc/conductor-telegram/lanes.env --env LANES_SITE=ovh --env LANES_STATE_BACKEND=http --env CONDUCTOR_CLOUD_BACKEND=api --env CONDUCTOR_API_TIMEOUT_MS=30000 --env CONDUCTOR_API_MAX_RETRIES=0 --mount type=bind,src=/etc/conductor-telegram/lanes.manifest.json,dst=/etc/conductor-telegram/lanes.manifest.json,readonly --env LANES_MANIFEST=/etc/conductor-telegram/lanes.manifest.json ${GATEWAY_IMAGE} lanes worker --no-color
+ExecStop=/usr/bin/docker stop --time 30 conductor-telegram-lanes
+Restart=always
+RestartSec=15
+TimeoutStopSec=45
+[Install]
+WantedBy=multi-user.target

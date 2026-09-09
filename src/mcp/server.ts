@@ -12,6 +12,11 @@ import {
   getWorkspaceByName,
 } from "../store/queries.js";
 
+if (process.env.TELEGRAM_BRIDGE_URL || process.env.TELEGRAM_BRIDGE_TOKEN) {
+  const { startRemoteMcp } = await import("./remote.js");
+  await startRemoteMcp();
+} else {
+
 const WORKSPACE_NAME = process.env.CONDUCTOR_WORKSPACE_NAME;
 const CONDUCTOR_REPOS_DIR =
   process.env.CONDUCTOR_REPOS_DIR ?? `${process.env.HOME}/conductor/repos`;
@@ -234,7 +239,7 @@ server.tool(
         content: [
           {
             type: "text" as const,
-            text: "Timed out waiting for human response (5 minutes). Proceeding without input.",
+            text: "No human answer received within 5 minutes. This is not approval. Wait or ask again before any action requiring that answer.",
           },
         ],
       };
@@ -278,3 +283,4 @@ main().catch((err) => {
   console.error("MCP server fatal error:", err);
   process.exit(1);
 });
+}

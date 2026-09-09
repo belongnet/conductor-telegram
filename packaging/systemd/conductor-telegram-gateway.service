@@ -1,0 +1,24 @@
+[Unit]
+Description=Conductor Telegram native cloud gateway on OVH
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/conductor-telegram/release.env
+ExecStart=/usr/bin/docker run --rm --name conductor-telegram-gateway --pull never --init --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 2g --cpus 2 --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 --tmpfs /tmp:rw,noexec,nosuid,size=512m --env-file /etc/conductor-telegram/gateway.env --mount type=bind,src=/var/lib/conductor-telegram,dst=/var/lib/conductor-telegram --publish 127.0.0.1:8787:8787 ${GATEWAY_IMAGE}
+ExecStop=/usr/bin/docker stop --time 45 conductor-telegram-gateway
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+SyslogIdentifier=conductor-telegram-gateway
+
+[Install]
+WantedBy=multi-user.target

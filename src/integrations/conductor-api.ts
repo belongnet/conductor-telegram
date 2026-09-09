@@ -41,6 +41,8 @@ const WorkspaceSchema = z.object({
   name: z.string(),
   createdAt: z.string(),
   deepLink: z.string(),
+  projectId: z.string().optional(),
+  repoUrl: z.string().optional(),
   creatorId: z.string().optional(),
   lastActivityAt: z.string().optional(),
   state: z
@@ -197,7 +199,8 @@ export class ConductorApiError extends Error {
   constructor(
     message: string,
     public readonly status: number | null = null,
-    public readonly retryable = false
+    public readonly retryable = false,
+    public readonly retryAfterMs = 0
   ) {
     super(message);
     this.name = "ConductorApiError";
@@ -229,7 +232,7 @@ export function conductorApiConfigFromEnv(
   const mode = conductorCloudBackendModeFromEnv(env);
   if (mode === "off") return null;
 
-  const apiKey = env.CONDUCTOR_API_KEY?.trim() ?? "";
+  const apiKey = env.CONDUCTOR_API_KEY?.trim() || env.CONDUCTOR_API_TOKEN?.trim() || "";
   if (!apiKey) {
     if (mode === "api") {
       throw new ConductorApiError(
@@ -403,13 +406,14 @@ export class ConductorApiClient {
     sessionId: string;
     after?: string | null;
     limit?: number;
+    offset?: number;
   }): Promise<ConductorApiMessage[]> {
     const limit = Math.max(1, Math.min(input.limit ?? PAGE_SIZE, PAGE_SIZE));
     const page = await this.request(
       "GET",
       withQuery(
         `/v0/sessions/${encodeURIComponent(input.sessionId)}/messages`,
-        { limit, after: input.after?.trim() || undefined }
+        { limit, after: input.after?.trim() || undefined, offset: input.offset }
       ),
       MessagePageSchema
     );
@@ -706,7 +710,8 @@ export class ConductorApiClient {
           const error = new ConductorApiError(
             conductorApiErrorMessage(payload, response.status),
             response.status,
-            retryable
+            retryable,
+            retryAfterHeaderMs(response.headers.get("retry-after"))
           );
           if (!retryable || attempt + 1 >= attempts) {
             throw error;
@@ -885,6 +890,12 @@ function retryDelayMs(response: Response | null, attempt: number): number {
     return Math.min(Number(retryAfter) * 1000, 5_000);
   }
   return Math.min(250 * 2 ** attempt, 2_000);
+}
+
+function retryAfterHeaderMs(value: string | null): number {
+  if (!value) return 0;
+  const milliseconds = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(milliseconds) ? Math.max(0, milliseconds) : 0;
 }
 
 function parsePositiveInteger(

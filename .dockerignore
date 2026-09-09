@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.context
+.env*
+*.db*
+.conductor-telegram
+.gstack
+**/.DS_Store
+build-*.log

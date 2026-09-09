@@ -298,6 +298,7 @@ export async function syncWorkspaceTopic(
       extra
     );
   } catch (err: any) {
+    if (/TOPIC_NOT_MODIFIED|topic.*already (?:closed|open)/i.test(String(err?.message))) return;
     if (isTopicDeletedError(err)) {
       console.log(
         `[forum] topic ${workspace.telegramThreadId} was deleted during sync, recreating`
