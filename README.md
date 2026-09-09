@@ -130,6 +130,8 @@ Copy [docs/lanes.manifest-v2.example.json](docs/lanes.manifest-v2.example.json) 
 
 Production workers require `LANES_STATE_BACKEND=http`, `COMMAND_CENTER_API_BASE_URL`, `COMMAND_CENTER_API_KEY`, `CONDUCTOR_API_KEY`, `BOT_TOKEN`, and `OWNER_CHAT_ID`. The OVH service is headless—it never polls or consumes Telegram updates—but it retains send-only credentials so the active lease holder can always emit a deduplicated safety alert. The Mac Telegram process additionally receives the separate `BELONG_HUMAN_APPROVAL_KEY`; that human key is forcibly removed from both lane-worker environments. `LANES_MANIFEST_SOURCE_REF` may carry the canonical Git revision; when omitted, both workers use the same content-addressed manifest SHA-256 rather than host-specific file paths. Add `GITLAB_TOKEN` only when a lane uses the GitLab adapter. SQLite requires both `LANES_STATE_BACKEND=sqlite` and `LANES_STANDALONE=1`; it is intended only for standalone tests and is never an HTTP fallback.
 
+The production HTTP/Postgres schema and transaction contract are maintained by the pinned Command Center implementation documented in [the lanes integration contract](docs/lanes-command-center-integration.md). Apply and verify that control-plane slice before enabling this worker; this repository does not run ad-hoc SQL against Command Center.
+
 The durable CLI is:
 
 ```bash

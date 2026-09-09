@@ -654,10 +654,17 @@ export class LaneController {
         };
       }
       await this.reconcileAction(input.lease, unresolved);
+      const afterReconciliation = await this.store.snapshot();
+      const stillUnresolved = [
+        ...afterReconciliation.ambiguous_actions,
+        ...afterReconciliation.pending_actions,
+      ].some((action) => action.action_id === unresolved.action_id);
       return {
         acted: true,
         active: true,
-        reason: `reconciled ${unresolved.action_type}`,
+        reason: stillUnresolved
+          ? `${unresolved.action_type} remains unresolved; controller ${afterReconciliation.controller?.mode}`
+          : `reconciled ${unresolved.action_type}`,
         runId: unresolved.run_id,
       };
     }
@@ -1599,26 +1606,32 @@ export class LaneController {
       if (!(error instanceof ConductorApiError && error.status === 404)) throw error;
     }
     const fresh = await this.freshRun(action.run_id);
-    const finished = await this.store.finishAction(lease, action.action_id, {
+    if (!found) {
+      // Absence, changed content, or a different PR head is not proof that
+      // the original mutation failed. Preserve the fence against retries;
+      // the HTTP ledger deliberately refuses ambiguous -> failed.
+      if (action.status === "pending") {
+        await this.store.finishAction(lease, action.action_id, {
+          expected_action_version: action.row_version,
+          expected_run_version: fresh.run.row_version,
+          status: "ambiguous",
+          result,
+          error: "authoritative reconciliation has not confirmed the exact external result",
+        });
+      }
+      await this.pauseForSafety(
+        lease,
+        await this.store.snapshot(),
+        `unconfirmed ${action.action_type} action ${action.action_id}; retain intent until exact external reconciliation`
+      );
+      return;
+    }
+    await this.store.finishAction(lease, action.action_id, {
       expected_action_version: action.row_version,
       expected_run_version: fresh.run.row_version,
-      status: found ? "reconciled" : "failed",
+      status: "reconciled",
       result,
-      error: found ? undefined : "authoritative reconciliation found no external result",
     });
-    if (
-      !found &&
-      ["create_workspace", "create_session", "send_prompt", "nudge_session"].includes(
-        action.action_type
-      )
-    ) {
-      await this.failProviderAttempt(
-        lease,
-        action.run_id,
-        action.attempt_id,
-        action.error ?? finished.error ?? "unconfirmed external provider action"
-      );
-    }
   }
 
   private async reconcileBindings(

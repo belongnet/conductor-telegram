@@ -1538,7 +1538,7 @@ export class SqliteLaneStateStore implements LaneStateStore {
         action.status !== "pending" &&
         !(
           action.status === "ambiguous" &&
-          (input.status === "reconciled" || input.status === "failed")
+          input.status === "reconciled"
         )
       ) {
         if (
@@ -1657,7 +1657,11 @@ export class SqliteLaneStateStore implements LaneStateStore {
       this.saveRun(
         {
           ...run,
-          ambiguous_action_id: input.status === "ambiguous" ? actionId : null,
+          ambiguous_action_id: input.status === "ambiguous"
+            ? actionId
+            : input.status === "reconciled" && run.ambiguous_action_id === actionId
+              ? null
+              : run.ambiguous_action_id,
           merged_sha: mergedSha,
         },
         run.row_version

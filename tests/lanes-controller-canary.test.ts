@@ -1778,16 +1778,32 @@ test("ambiguous attestation reconciliation requires the exact published body", a
         );
         await controller.tick({ lease, manifest });
         snapshot = await store.snapshot();
-        assert.equal(snapshot.ambiguous_actions.length, 0);
 
         if (scenario.tamper || scenario.changeHead) {
+          assert.equal(snapshot.ambiguous_actions.length, 1);
+          assert.equal(snapshot.controller?.mode, "paused_safety");
+          const mutations = [...github.mutations];
+          const retry = await controller.tick({ lease, manifest });
+          assert.match(retry.reason, /remains unresolved/);
+          assert.deepEqual(github.mutations, mutations);
           assert.notEqual(
             snapshot.attempts.find((attempt) => attempt.role === "review")?.status,
             "completed"
           );
           assert.equal(github.reviews.length, 1);
+          // Exact evidence can still reconcile while paused; it cannot
+          // silently resume dispatch after an operator-visible safety pause.
+          if (scenario.tamper) {
+            github.reviews[0]!.body = github.reviews[0]!.body.replace("\nbody changed after publication", "");
+          }
+          github.headSha = HEAD;
+          await controller.tick({ lease, manifest });
+          snapshot = await store.snapshot();
+          assert.equal(snapshot.ambiguous_actions.length, 0);
+          assert.equal(snapshot.controller?.mode, "paused_safety");
           return;
         }
+        assert.equal(snapshot.ambiguous_actions.length, 0);
 
         for (let tick = 0; tick < 5; tick += 1) {
           await controller.tick({ lease, manifest });
@@ -1838,6 +1854,16 @@ test("unresolved external intent takes precedence over pending controls", async 
       createdBy: "test",
     });
     await store.activateManifest(lease, "canary-v2", 1);
+    const cutover = await store.createControl({
+      control_id: "priority-cutover", idempotency_key: "priority-cutover",
+      kind: "cutover", requested_by: "human:test",
+      payload: { revision_id: "canary-v2" }, approvalKey: "separate-human-key",
+    });
+    await store.finishControl(lease, cutover.control_id, {
+      expected_version: cutover.row_version,
+      expected_controller_version: (await store.snapshot()).controller!.row_version,
+      status: "applied",
+    });
     let run = await store.createRun(lease, {
       run_id: "priority-run",
       manifest_revision_id: "canary-v2",
@@ -1966,10 +1992,13 @@ test("an ambiguous merge is never reconciled against a different head", async ()
     );
     await controller.tick({ lease, manifest });
     snapshot = await store.snapshot();
-    assert.equal(snapshot.ambiguous_actions.length, 0);
+    assert.equal(snapshot.ambiguous_actions.length, 1);
+    assert.equal(snapshot.controller?.mode, "paused_safety");
+    const mutations = [...github.mutations];
     await controller.tick({ lease, manifest });
     snapshot = await store.snapshot();
-    assert.equal(snapshot.runs[0]?.status, "quarantined");
+    assert.equal(snapshot.ambiguous_actions.length, 1);
+    assert.deepEqual(github.mutations, mutations);
     assert.equal(snapshot.runs[0]?.merged_sha, null);
   } finally {
     await store.close();
@@ -2059,6 +2088,16 @@ test("retry control creates a fresh generation for a terminal run", async () => 
       createdBy: "test",
     });
     await store.activateManifest(lease, "canary-v2", 1);
+    const cutover = await store.createControl({
+      control_id: "retry-cutover", idempotency_key: "retry-cutover",
+      kind: "cutover", requested_by: "human:test",
+      payload: { revision_id: "canary-v2" }, approvalKey: "separate-human-key",
+    });
+    await store.finishControl(lease, cutover.control_id, {
+      expected_version: cutover.row_version,
+      expected_controller_version: (await store.snapshot()).controller!.row_version,
+      status: "applied",
+    });
     let run = await store.createRun(lease, {
       run_id: "failed-canary-run",
       manifest_revision_id: "canary-v2",
