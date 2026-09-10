@@ -315,6 +315,7 @@ export class CloudEngine {
       this.store.set(`recovery-resumed:${episode}`, false);
     } else this.store.set(`recovery-providers:${episode}`, [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), state.agent])]);
     updateWorkspaceStatus(action.trackedId, "running");
+    this.store.set(`poll-after:${action.trackedId}`, 0);
     this.notify(`${row.id}:sent`, action.trackedId, `Sent to ${state.agent} (${state.model}).`, sessionId);
   }
 
@@ -465,12 +466,13 @@ export class CloudEngine {
     const states = (this.store.db.prepare("SELECT value FROM gateway_state WHERE key LIKE 'session:%' AND json_extract(value,'$.trackedId')=?")
       .all(trackedId) as Array<{value: string}>).map(row => JSON.parse(row.value) as SessionState);
     const stopped = !!this.store.get(`stop:${trackedId}`) || !!this.store.binding(trackedId)?.stopped;
+    const pendingAction = !!this.store.db.prepare("SELECT 1 FROM gateway_queue WHERE kind='cloud' AND state IN ('pending','running') AND json_extract(payload,'$.trackedId')=? LIMIT 1").get(trackedId);
     const currentWorkspace = getWorkspace(trackedId);
     if (currentWorkspace && !currentWorkspace.archivedAt && currentWorkspace.status !== "archived") {
       if (stopped) updateWorkspaceStatus(trackedId, "stopped");
-      else if (!active && states.length && states.every(s => s.terminal || s.stopped)) updateWorkspaceStatus(trackedId, "done");
+      else if (!active && !pendingAction && states.length && states.every(s => s.terminal || s.stopped)) updateWorkspaceStatus(trackedId, "done");
     }
-    const awaitingTurn = !stopped && states.some(state => !state.terminal && !state.stopped);
+    const awaitingTurn = !stopped && (pendingAction || states.some(state => !state.terminal && !state.stopped));
     this.store.set(`poll-after:${trackedId}`, Date.now() + (backlog ? 1000 : (!stopped && active) || awaitingTurn ? 15_000 : 60_000));
     this.store.set(`poll-success:${trackedId}`, Date.now());
   }

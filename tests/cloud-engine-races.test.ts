@@ -69,6 +69,26 @@ test("polling preserves a follow-up turn committed while its status read waits",
   } finally {closeDb();}
 });
 
+test("a new follow-up immediately leaves the idle polling interval", async () => {
+  const f = fixture();
+  try {
+    f.store.set(`poll-after:${f.ws.id}`, Date.now() + 60_000);
+    await f.send();
+    assert.ok(f.store.get<number>(`poll-after:${f.ws.id}`)! <= Date.now());
+  } finally {closeDb();}
+});
+
+test("a queued continuation keeps the workspace unfinished and actively polled", async () => {
+  const f = fixture();
+  try {
+    f.store.set("session:s1", {...f.store.get<any>("session:s1"), terminal: true});
+    f.engine.queue("pending-continuation", {type: "thread", trackedId: f.ws.id, prompt: "Continue the task"});
+    await f.engine.pollWorkspace(f.ws.id, f.binding);
+    assert.notEqual(getWorkspace(f.ws.id)?.status, "done");
+    assert.ok(f.store.get<number>(`poll-after:${f.ws.id}`)! <= Date.now() + 15_000);
+  } finally {closeDb();}
+});
+
 test("review completion cannot overwrite a new turn while GitHub verification waits", async () => {
   const f = fixture();
   try {
