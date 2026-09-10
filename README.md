@@ -108,6 +108,8 @@ Ways to target work from Telegram:
 
 Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
 
+In cloud-only mode, the bot can also discover Cloud workspaces created in Conductor or through another integration and attach each one to a Telegram forum topic. Set `TELEGRAM_CLOUD_SYNC_CHAT_ID` to the forum group ID. Existing transcript history is not replayed; the topic receives a connection note, the latest visible reply, and then new activity. Replies preserve the exact Conductor session and model. See the [Cloud workspace sync specification](docs/cloud-workspace-sync.md) for behavior, setup, migration, and the planned guided onboarding flow.
+
 Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.build/docs/api) when `CONDUCTOR_API_KEY` is configured. Telegram can create cloud workspaces (`/cloud`), browse projects (`/projects`), send messages, create ordinary threads, poll transcripts/status, rename workspaces and threads, search org-wide transcripts (`/fleet`), cancel sessions, and archive workspaces without writing Conductor's private database. Without an API key, cloud workspaces remain observe-only through the desktop app's local mirror.
 
 Cloud workspaces created with `/cloud` are driven entirely over the API — discovery, prompt delivery, and polling work even when the Conductor desktop app is closed or absent. Project arguments to `/cloud` and `/projects` accept a list number from `/projects`, a project id, an exact name, or a unique name prefix. When the bot itself runs inside a Conductor cloud workspace, it honors `CONDUCTOR_API_URL` and attributes its requests via an `X-Conductor-Session-Id` header taken from `CONDUCTOR_SESSION_ID` — both injected by the cloud workspace environment, not user config.
@@ -251,6 +253,8 @@ Config is stored at `~/.conductor-telegram/config.json` (created by `setup`).
 | `--doppler-project` | `CONDUCTOR_TELEGRAM_DOPPLER_PROJECT` | Doppler project used by foreground and launchd runtimes |
 | `--doppler-config` | `CONDUCTOR_TELEGRAM_DOPPLER_CONFIG` | Doppler config used by foreground and launchd runtimes |
 | | `OWNER_USER_ID` | Your Telegram user ID (required for forum mode) |
+| | `TELEGRAM_CLOUD_SYNC_CHAT_ID` | Forum group that receives Cloud workspaces created outside Telegram (cloud-only mode) |
+| | `TELEGRAM_CLOUD_SYNC_INPUT` | `commands` during gateway coexistence, or `all` for ordinary text and voice replies (default: `all`) |
 | | `CONDUCTOR_WORKSPACES_DIR` | Conductor workspaces directory |
 | | `CONDUCTOR_REPOS_DIR` | Repository directory |
 | | `CONDUCTOR_DB_PATH` | Conductor's own database path |
@@ -283,7 +287,7 @@ conductor-telegram service install \
 conductor-telegram doctor
 ```
 
-The installer verifies the persistent Doppler identity available to launchd, removes each Doppler-managed value from `config.json`, and writes a plist containing only the Doppler executable, project/config references, and an explicit allowlist of environment names—not values or a Doppler service token. The allowed names are `BOT_TOKEN`, `OWNER_CHAT_ID`, `OWNER_USER_ID`, `CONDUCTOR_API_BASE_URL`, `CONDUCTOR_API_KEY`, `CONDUCTOR_CLOUD_BACKEND`, `COMMAND_CENTER_API_BASE_URL`, `COMMAND_CENTER_API_KEY`, `BELONG_HUMAN_APPROVAL_KEY`, `GITLAB_TOKEN`, `LANES_MANIFEST`, and `LANES_MANIFEST_SOURCE_REF`. The lane worker deliberately receives every applicable value except `BELONG_HUMAN_APPROVAL_KEY`; only the Telegram process can commission human-gated controls. Use `BOT_TOKEN` exactly; `TELEGRAM_BOT_TOKEN` is not an alias.
+The installer verifies the persistent Doppler identity available to launchd, removes each Doppler-managed value from `config.json`, and writes a plist containing only the Doppler executable, project/config references, and an explicit allowlist of environment names—not values or a Doppler service token. The allowed names are `BOT_TOKEN`, `OWNER_CHAT_ID`, `OWNER_USER_ID`, `TELEGRAM_CLOUD_SYNC_CHAT_ID`, `TELEGRAM_CLOUD_SYNC_INPUT`, `CONDUCTOR_API_BASE_URL`, `CONDUCTOR_API_KEY`, `CONDUCTOR_CLOUD_BACKEND`, `COMMAND_CENTER_API_BASE_URL`, `COMMAND_CENTER_API_KEY`, `BELONG_HUMAN_APPROVAL_KEY`, `GITLAB_TOKEN`, `LANES_MANIFEST`, and `LANES_MANIFEST_SOURCE_REF`. The lane worker deliberately receives every applicable value except `BELONG_HUMAN_APPROVAL_KEY`; only the Telegram process can commission human-gated controls. Use `BOT_TOKEN` exactly; `TELEGRAM_BOT_TOKEN` is not an alias.
 
 `start`, `status`, and `doctor` automatically re-enter the configured Doppler runtime. Run `service install` again after adding a new allowed secret name. A value-only rotation needs only a service restart.
 

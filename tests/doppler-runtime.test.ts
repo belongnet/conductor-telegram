@@ -10,6 +10,7 @@ import {
   DopplerRuntimeError,
   isDopplerRuntimeActive,
   stripDopplerManagedConfig,
+  DOPPLER_RUNTIME_SECRET_NAMES,
   DOPPLER_RUNTIME_SENTINEL_ENV,
 } from "../src/cli/doppler.js";
 import {
@@ -43,6 +44,11 @@ test("Doppler runtime injects only the explicit conductor-telegram allowlist", (
   );
   assert.deepEqual(args.slice(args.indexOf("--") + 1), command);
   assert.equal(args.some((value) => value.includes("secret-value")), false);
+});
+
+test("Doppler runtime preserves the cloud workspace sync settings", () => {
+  assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("TELEGRAM_CLOUD_SYNC_CHAT_ID"), true);
+  assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("TELEGRAM_CLOUD_SYNC_INPUT"), true);
 });
 
 test("a re-exec into the Doppler runtime is detected exactly once", () => {
