@@ -655,6 +655,35 @@ test("transcript tails keep only the newest messages across pages", async () => 
   assert.equal(latest?.id, "message-5");
 });
 
+test("transcript tails seek past one hundred pages with bounded reads", async () => {
+  const calls: number[] = [];
+  const total = 15_050;
+  const fetcher = (async (url: string | URL | Request) => {
+    const parsed = new URL(String(url));
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const pageSize = Number(parsed.searchParams.get("limit") ?? 100);
+    calls.push(offset);
+    const length = Math.max(0, Math.min(pageSize, total - offset));
+    const data = Array.from({ length }, (_, index) =>
+      apiMessage(`message-${offset + index}`, offset + index, "assistant", "tail")
+    );
+    return new Response(
+      JSON.stringify({ data, offset, hasMore: offset + length < total }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const tail = await client.getSessionMessageTail("session-1", 20);
+
+  assert.deepEqual(
+    tail.map((message) => message.sessionIndex),
+    Array.from({ length: 20 }, (_, index) => total - 20 + index)
+  );
+  assert.ok(calls.length < 30, `expected a bounded tail search, received ${calls.length} pages`);
+  assert.ok(calls.some((offset) => offset > 10_000));
+});
+
 test("cloud-workspace env wires attribution and the CONDUCTOR_API_URL fallback", async () => {
   const fromEnv = conductorApiConfigFromEnv({
     CONDUCTOR_API_KEY: "secret",

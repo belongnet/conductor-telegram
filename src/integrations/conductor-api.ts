@@ -426,23 +426,75 @@ export class ConductorApiClient {
    * order. Used to re-anchor a dead poll cursor without dropping every
    * undelivered message between the dead anchor and the tail.
    */
-  getSessionMessageTail(
+  async getSessionMessageTail(
     sessionId: string,
     limit: number
   ): Promise<ConductorApiMessage[]> {
-    return this.walkPages(
-      (offset) =>
+    const keep = Math.max(1, limit);
+    const pages = new Map<
+      number,
+      { data: ConductorApiMessage[]; offset: number; hasMore: boolean }
+    >();
+    const readPage = async (pageIndex: number, pageSize: number) => {
+      const cached = pages.get(pageIndex);
+      if (cached) return cached;
+      const page = await this.request(
+        "GET",
         withQuery(`/v0/sessions/${encodeURIComponent(sessionId)}/messages`, {
           limit: PAGE_SIZE,
-          offset,
+          offset: pageIndex * pageSize,
         }),
-      MessagePageSchema,
-      "message",
-      {
-        keep: Math.max(1, limit),
-        validate: (data) => assertMessageMembership(sessionId, data),
+        MessagePageSchema
+      );
+      assertMessageMembership(sessionId, page.data);
+      pages.set(pageIndex, page);
+      return page;
+    };
+
+    const first = await readPage(0, PAGE_SIZE);
+    if (!first.hasMore || first.data.length === 0) {
+      return first.data.slice(-keep);
+    }
+
+    // Offset pagination has no total count. Seek an upper boundary
+    // exponentially, then bisect it, so a long-lived session does not need
+    // hundreds of sequential API calls just to establish its current tail.
+    const pageSize = first.data.length;
+    pages.clear();
+    pages.set(0, first);
+    let lower = 0;
+    let upper = 1;
+    let boundaryFound = false;
+    for (let probe = 0; probe < MAX_PAGES; probe += 1) {
+      const page = await readPage(upper, pageSize);
+      if (!page.hasMore || page.data.length === 0) {
+        boundaryFound = true;
+        break;
       }
-    );
+      lower = upper;
+      upper *= 2;
+    }
+    if (!boundaryFound) {
+      throw new ConductorApiError(
+        `Conductor API message tail search exceeded ${MAX_PAGES} probes`
+      );
+    }
+
+    for (let probe = 0; upper - lower > 1 && probe < MAX_PAGES; probe += 1) {
+      const middle = lower + Math.floor((upper - lower) / 2);
+      const page = await readPage(middle, pageSize);
+      if (page.data.length > 0 && page.hasMore) lower = middle;
+      else upper = middle;
+    }
+
+    const boundary = await readPage(upper, pageSize);
+    const finalPage = boundary.data.length > 0 ? upper : upper - 1;
+    const firstPage = Math.max(0, finalPage - Math.ceil(keep / pageSize));
+    const tail: ConductorApiMessage[] = [];
+    for (let pageIndex = firstPage; pageIndex <= finalPage; pageIndex += 1) {
+      tail.push(...(await readPage(pageIndex, pageSize)).data);
+    }
+    return tail.slice(-keep);
   }
 
   async getLatestSessionMessage(
