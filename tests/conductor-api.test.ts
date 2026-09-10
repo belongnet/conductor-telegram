@@ -632,7 +632,9 @@ test("transcript tails keep only the newest messages across pages", async () => 
     const parsed = new URL(String(url));
     urls.push(parsed.toString());
     const offset = Number(parsed.searchParams.get("offset") ?? 0);
-    const data = pages.flat().slice(offset, offset + Math.min(2, Number(parsed.searchParams.get("limit") ?? 100)));
+    const data = pages
+      .flat()
+      .slice(offset, offset + Math.min(2, Number(parsed.searchParams.get("limit") ?? 100)));
     return new Response(
       JSON.stringify({ data, offset, hasMore: offset + data.length < pages.flat().length }),
       { status: 200, headers: { "content-type": "application/json" } }
@@ -651,6 +653,65 @@ test("transcript tails keep only the newest messages across pages", async () => 
   // getLatestSessionMessage shares the bounded tail lookup.
   const latest = await client.getLatestSessionMessage("session-1");
   assert.equal(latest?.id, "message-5");
+});
+
+test("transcript tails seek past one hundred pages with bounded reads", async () => {
+  const calls: number[] = [];
+  const total = 15_050;
+  const fetcher = (async (url: string | URL | Request) => {
+    const parsed = new URL(String(url));
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const pageSize = Number(parsed.searchParams.get("limit") ?? 100);
+    calls.push(offset);
+    const length = Math.max(0, Math.min(pageSize, total - offset));
+    const data = Array.from({ length }, (_, index) =>
+      apiMessage(`message-${offset + index}`, offset + index, "assistant", "tail")
+    );
+    return new Response(
+      JSON.stringify({ data, offset, hasMore: offset + length < total }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const tail = await client.getSessionMessageTail("session-1", 20);
+
+  assert.deepEqual(
+    tail.map((message) => message.sessionIndex),
+    Array.from({ length: 20 }, (_, index) => total - 20 + index)
+  );
+  assert.ok(calls.length < 30, `expected a bounded tail search, received ${calls.length} pages`);
+  assert.ok(calls.some((offset) => offset > 10_000));
+});
+
+test("tail lookup handles empty, exact-page, partial-page, and capped-page transcripts", async () => {
+  for (const count of [0, 1, 2, 99, 100, 101, 199, 200, 201, 10_001]) {
+    const client = new ConductorApiClient(config(), (async (url: string | URL | Request) => {
+      const parsed = new URL(String(url));
+      const offset = Number(parsed.searchParams.get("offset") ?? 0);
+      const requested = Number(parsed.searchParams.get("limit") ?? 100);
+      const pageSize = Math.min(count === 2 ? 1 : 100, requested);
+      const length = Math.max(0, Math.min(pageSize, count - offset));
+      const data = Array.from({ length }, (_, index) =>
+        apiMessage(`message-${offset + index}`, (offset + index) * 3, "assistant", "content")
+      );
+      return new Response(
+        JSON.stringify({ data, offset, hasMore: offset + data.length < count }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }) as typeof fetch);
+
+    const tail = await client.getSessionMessageTail("session-1", 150);
+
+    assert.deepEqual(
+      tail.map((message) => message.id),
+      Array.from(
+        { length: Math.min(count, 150) },
+        (_, index) => `message-${Math.max(0, count - 150) + index}`
+      ),
+      `count=${count}`
+    );
+  }
 });
 
 test("cloud-workspace env wires attribution and the CONDUCTOR_API_URL fallback", async () => {
@@ -733,19 +794,4 @@ test("large transcript tails locate the end without walking 10000 historical row
   const tail = await client.getSessionMessageTail("session-1", 20);
   assert.deepEqual(tail.map(m => m.id), Array.from({length: 20}, (_, n) => `message-${count - 20 + n}`));
   assert.ok(requests < 40, `tail lookup took ${requests} requests`);
-});
-
-test("tail lookup handles empty, exact-page, partial-page, and capped-page transcripts", async () => {
-  for (const count of [0, 1, 2, 99, 100, 101, 199, 200, 201, 10001]) {
-    const client = new ConductorApiClient(config(), (async (url: string | URL | Request) => {
-      const parsed = new URL(String(url));
-      const offset = Number(parsed.searchParams.get("offset") ?? 0);
-      const limit = Math.min(count === 2 ? 1 : 100, Number(parsed.searchParams.get("limit") ?? 100));
-      const data = Array.from({length: Math.max(0, Math.min(limit, count - offset))}, (_, n) =>
-        apiMessage(`message-${offset+n}`, (offset+n)*3, "assistant", "content"));
-      return new Response(JSON.stringify({data,offset,hasMore:offset+data.length<count}), {status:200});
-    }) as typeof fetch);
-    const tail = await client.getSessionMessageTail("session-1", 150);
-    assert.deepEqual(tail.map(m => m.id), Array.from({length:Math.min(count,150)}, (_, n) => `message-${Math.max(0,count-150)+n}`), `count=${count}`);
-  }
 });
