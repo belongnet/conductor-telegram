@@ -76,7 +76,7 @@ export function transcriptText(message: ConductorApiMessage): string {
 }
 
 export function recoverableProviderError(detail: string): boolean {
-  return /(?:authentication|unauthorized|expired.*token|invalid.*credential|quota|rate.?limit|capacity|usage limit|hit.*limit|insufficient.*(?:credit|balance)|overloaded|disconnected|connection.*(?:closed|lost)|sandbox.*(?:stop|expired)|interrupted)/i.test(detail);
+  return /(?:authentication|unauthorized|expired.*token|invalid.*credential|quota|rate.?limit|capacity|usage limit|out of (?:usage )?credits|hit.*limit|insufficient.*(?:credit|balance)|overloaded|disconnected|connection.*(?:closed|lost)|sandbox.*(?:stop|expired)|interrupted)/i.test(detail);
 }
 
 export class CloudEngine {

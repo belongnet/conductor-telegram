@@ -483,3 +483,19 @@ test("Telegram media rate limits persist their full cooldown and native outages 
   assert.equal(f.store.row("outage")?.state, "pending");
   assert.ok(f.store.row("outage")!.available_at > Date.now() + 119_000);
 }));
+
+test("native out-of-usage-credits errors recover once after confirming an idle session", () => fixture(async f => {
+  await f.launch();
+  const sent = f.store.get<any>('session:s1').sentMessageId;
+  f.messages.push({id: 'credits-error', sessionId: 's1', sessionIndex: 1, type: 'agent', receivedAt: new Date().toISOString(),
+    content: {userMessageId: sent, rawPayload: {type: 'result', subtype: 'error_during_execution', is_error: true,
+      result: "You're out of usage credits. Switch to another model to continue."}}});
+  f.status('idle');
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>('session:s1').recoveryAttempted, true);
+  const recovery = (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='cloud'").all() as Array<{payload: string}>)
+    .map(row => JSON.parse(row.payload)).filter(action => action.recovery);
+  assert.equal(recovery.length, 1); assert.equal(recovery[0].provider.agent, 'codex');
+  assert.equal(recovery[0].previousSessionId, 's1'); assert.equal(recovery[0].previousMessageId, sent);
+  assert.deepEqual(f.counts(), {creates: 1, sends: 1}, 'the original native command was not replayed');
+}));
