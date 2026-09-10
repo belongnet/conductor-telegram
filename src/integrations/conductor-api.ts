@@ -426,23 +426,42 @@ export class ConductorApiClient {
    * order. Used to re-anchor a dead poll cursor without dropping every
    * undelivered message between the dead anchor and the tail.
    */
-  getSessionMessageTail(
+  async getSessionMessageTail(
     sessionId: string,
     limit: number
   ): Promise<ConductorApiMessage[]> {
-    return this.walkPages(
-      (offset) =>
-        withQuery(`/v0/sessions/${encodeURIComponent(sessionId)}/messages`, {
-          limit: PAGE_SIZE,
-          offset,
-        }),
-      MessagePageSchema,
-      "message",
-      {
-        keep: Math.max(1, limit),
-        validate: (data) => assertMessageMembership(sessionId, data),
-      }
-    );
+    const keep = Math.max(1, Math.floor(limit));
+    if (!Number.isSafeInteger(keep) || keep > PAGE_SIZE * MAX_PAGES) throw new ConductorApiError("Transcript tail limit is invalid");
+    const pageAt = async (offset: number, size = PAGE_SIZE) => {
+      const page = await this.request("GET", withQuery(`/v0/sessions/${encodeURIComponent(sessionId)}/messages`,
+        {limit: size, offset}), MessagePageSchema);
+      assertMessageMembership(sessionId, page.data);
+      if (page.offset !== offset) throw new ConductorApiError("Transcript tail offset mismatch");
+      return page;
+    };
+    const first = await pageAt(0);
+    if (!first.hasMore || !first.data.length) return first.data.slice(-keep);
+    // Offset is a row count, not sessionIndex (native indexes may have gaps).
+    // Exponential probing and bisection find the last page without scanning
+    // the old transcript, including histories beyond the ordinary page cap.
+    let lower = 0, upper = first.data.length, end: number | undefined;
+    let bisect = false;
+    for (let probes = 0; probes < 64; probes++) {
+      const offset = bisect ? Math.floor((lower + upper) / 2) : upper;
+      if (!Number.isSafeInteger(offset) || (bisect && upper - lower <= 1)) break;
+      const page = await pageAt(offset);
+      if (!page.data.length) { upper = offset; bisect = true; }
+      else if (!page.hasMore) { end = offset + page.data.length; break; }
+      else { lower = offset; if (!bisect) upper *= 2; }
+    }
+    if (end === undefined) throw new ConductorApiError("Transcript changed while locating its tail; retry the read");
+    const tail: ConductorApiMessage[] = [];
+    for (let offset = Math.max(0, end - keep); offset < end;) {
+      const page = await pageAt(offset, Math.min(PAGE_SIZE, end - offset));
+      if (!page.data.length) throw new ConductorApiError("Transcript changed while reading its tail; retry the read");
+      tail.push(...page.data); offset += page.data.length;
+    }
+    return tail.slice(-keep);
   }
 
   async getLatestSessionMessage(
