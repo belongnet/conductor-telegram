@@ -402,7 +402,7 @@ test("group authorization rejects impersonation, foreign chats, media, replies a
   const before = snapshot();
   const identities = [
     {name: "another group member with the owner's username", chat: -42, from: {id: 10, username: "OwnerName"}},
-    {name: "anonymous group administrator", chat: -42, from: {id: 1087968824, is_bot: true}},
+    {name: "anonymous group administrator", chat: -42, from: {id: 11, is_bot: true}},
     {name: "missing sender", chat: -42, from: undefined},
     {name: "owner in a foreign group", chat: -43, from: {id: 9}},
     {name: "owner in an unapproved private chat", chat: 9, from: {id: 9}},
