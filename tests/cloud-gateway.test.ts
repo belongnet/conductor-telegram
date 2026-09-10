@@ -537,3 +537,24 @@ test("native out-of-usage-credits errors recover once after confirming an idle s
   assert.equal(recovery[0].previousSessionId, 's1'); assert.equal(recovery[0].previousMessageId, sent);
   assert.deepEqual(f.counts(), {creates: 1, sends: 1}, 'the original native command was not replayed');
 }));
+
+test("an inaccessible selected model falls back only after its native turn stops", () => fixture(async f => {
+  await f.launch();
+  const sent = f.store.get<any>('session:s1').sentMessageId;
+  f.messages.push({id: 'model-error', sessionId: 's1', sessionIndex: 1, type: 'agent', receivedAt: new Date().toISOString(),
+    content: {userMessageId: sent, rawPayload: {type: 'result', subtype: 'error_during_execution', is_error: true,
+      result: "There's an issue with the selected model (gpt-5.6-sol). It may not exist or you may not have access to it."}}});
+  f.status('working');
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.ok(!f.store.get<any>('session:s1').recoveryAttempted, 'a working session cannot be replaced');
+  f.status('idle');
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const recovery = (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='cloud'").all() as Array<{payload: string}>)
+    .map(row => JSON.parse(row.payload)).filter(action => action.recovery);
+  assert.equal(recovery.length, 1);
+  assert.equal(recovery[0].previousSessionId, 's1');
+  assert.equal(recovery[0].previousMessageId, sent);
+  assert.equal(recovery[0].provider.agent, 'codex');
+  assert.deepEqual(f.counts(), {creates: 1, sends: 1}, 'the failed task must not be replayed');
+}));
