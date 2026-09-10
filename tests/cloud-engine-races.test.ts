@@ -136,6 +136,49 @@ test("raw assistant JSON survives transcript extraction while tool and reasoning
   }
 });
 
+test("native Conductor agent envelopes forward visible Claude and Codex text", () => {
+  const extract = (rawPayload: unknown) => transcriptText({type: "agent", content: {type: "agent", rawPayload}} as ConductorApiMessage);
+  const reply = {type: "assistant", message: {role: "assistant", content: [
+    {type: "thinking", thinking: "Private reasoning"},
+    {type: "text", text: "The attachment is ready."},
+    {type: "tool_use", name: "Bash", input: {command: "private command"}},
+  ]}};
+  assert.equal(extract(reply), "The attachment is ready.");
+  assert.equal(extract(JSON.stringify(reply)), "The attachment is ready.");
+  assert.equal(extract({event: {type: "item.completed", item: {type: "agentMessage", text: "Review finished."}}}), "Review finished.");
+  const route = '{"action":"new","projectId":"p1","prompt":"Keep the task"}';
+  assert.equal(extract({type: "assistant", message: {role: "assistant", content: [{type: "text", text: route}]}}), route);
+});
+
+test("native envelopes hide lifecycle, user, tool, and duplicated result events", () => {
+  const hidden = [
+    {type: "system", subtype: "hook_response", text: "Private hook output"},
+    {type: "user", message: {role: "user", content: [{type: "text", text: "User text"}]}},
+    {type: "result", subtype: "success", result: "Already sent in the assistant message"},
+    {event: {type: "item.completed", item: {type: "command_execution", text: "Private shell output"}}},
+    {event: {type: "item.completed", item: {type: "reasoning", text: "Private reasoning"}}},
+  ];
+  for (const rawPayload of hidden) {
+    assert.equal(transcriptText({type: "agent", content: {rawPayload}} as ConductorApiMessage), "");
+  }
+});
+
+test("an idle native reply queues its transcript and completion before advancing the cursor", async () => {
+  const f = fixture();
+  try {
+    f.api.listSessionMessages = async () => [{id: "native-reply", sessionId: "s1", type: "agent", sessionIndex: 7,
+      receivedAt: "2026-01-01T00:00:00Z", content: {type: "agent", rawPayload: {type: "assistant",
+        message: {role: "assistant", content: [{type: "text", text: "Native task finished."}]}}}}] as any;
+    await f.engine.pollWorkspace(f.ws.id, f.binding);
+    const queued = f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='telegram'").all() as Array<{payload: string}>;
+    assert.equal(queued.length, 2);
+    assert.ok(queued.some(row => JSON.parse(row.payload).payload.text === "Native task finished."));
+    assert.equal(f.store.get<any>("session:s1").terminal, true);
+    const cursor = f.store.db.prepare("SELECT last_message_id FROM thread_cursors WHERE session_id='s1'").get() as {last_message_id: string};
+    assert.equal(cursor.last_message_id, "native-reply");
+  } finally {closeDb();}
+});
+
 test("a stop during reported PR lookup remains stopped after polling finishes", async () => {
   const f = fixture();
   try {

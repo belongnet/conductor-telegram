@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ConductorApiClient, ConductorApiMessage } from "../integrations/conductor-api.js";
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
+import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
   upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
@@ -33,6 +34,19 @@ interface SessionState {
 }
 
 export function transcriptText(message: ConductorApiMessage): string {
+  // The native API wraps provider events, including hidden tool/lifecycle
+  // events, in rawPayload. Reuse the lane parser's visible-text filtering.
+  if (message.type === "agent") {
+    let content = message.content;
+    if (typeof content === "string") { try { content = JSON.parse(content); } catch {} }
+    if (content && typeof content === "object" && "rawPayload" in content) {
+      let rawPayload = content.rawPayload;
+      if (typeof rawPayload === "string") {
+        try { rawPayload = JSON.parse(rawPayload); } catch { return ""; }
+      }
+      return assistantTextFromTranscriptEvent({...message, content: {...content, rawPayload}});
+    }
+  }
   const parts: string[] = [];
   const envelope = (value: any): boolean => {
     if (Array.isArray(value)) return value.some(envelope);
