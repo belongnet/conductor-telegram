@@ -40,7 +40,7 @@ export class CloudCommands {
     if (!callback && !msg.text && !msg.caption && !attachment) return;
     const media = attachment ? { fileId: attachment.file_id, fileName: attachment.file_name ?? (msg.photo ? "photo.jpg" : "voice.ogg"), voice: !!(msg.voice || msg.audio) } : undefined;
     const reply = (text: string, suffix = "reply", markup?: unknown) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
-      { threadId, replyMarkup: markup });
+      { threadId, replyMarkup: markup, priority: 0 });
     const replyTarget = msg.reply_to_message ? getWorkspaceMessageTarget(chatId, String(msg.reply_to_message.message_id)) : undefined;
     let target = replyTarget?.workspace ?? (threadId ? getWorkspaceByThreadId(chatId, threadId) : undefined);
     if (!replyTarget && target && !this.store.binding(target.id) && threadId && getRepoTopicByThreadId(chatId, threadId)) target = undefined;
@@ -78,7 +78,7 @@ export class CloudCommands {
     if (addressedBot && addressedBot !== this.store.get<string>("telegram-bot-username")?.toLowerCase()) return;
     if (chatId === this.syncChatId && this.syncInput === "commands" && !addressedBot) {
       const username = this.store.get<string>("telegram-bot-username");
-      reply(`During migration use /send@${username} <text>. Ordinary text and voice replies are waiting for the old gateway to be disabled.`); return;
+      reply(`This gateway is awaiting cutover. Your message was not sent to Conductor.\n\nUse /send@${username} <text> in this topic. Plain text and voice replies will be enabled after the old gateway is stopped.`); return;
     }
     const command = match?.[1]?.toLowerCase();
     let args = match?.[3]?.trim() ?? "";
@@ -146,6 +146,11 @@ export class CloudCommands {
       if (candidates.length > 1) { reply("Workspace name is ambiguous. Use its workspace ID."); return; }
       if (candidates.length === 1) { target = candidates[0]; args = args.slice(head!.length).trimStart(); sessionId = undefined; }
     }
+    const historicalTarget = target && !this.store.binding(target.id) && target.conductorBackendKind !== "cloud-api" &&
+      !target.repoPath.startsWith("conductor-project:");
+    if (historicalTarget && (!command || ["threads", "stop", "archive", "rename", "renamethread", "review", "send"].includes(command) || SHORTCUTS.has(command))) {
+      reply("This is preserved historical work with no Conductor Cloud session. Use /repos, then /run <project ID> <task> to start new work. Your message was not sent."); return;
+    }
     if (command === "threads") {
       if (!target) { reply("Use /threads inside a workspace topic or reply to its message."); return; }
       const binding = this.store.binding(target.id);
@@ -183,7 +188,7 @@ export class CloudCommands {
       const projectInput = args.match(/^\S+/)?.[0];
       prompt = projectInput ? args.slice(projectInput.length).trimStart() : "";
       if (!projectInput || (!prompt && !media)) { reply("Usage: /run <project ID or name> <task>"); return; }
-      projectId = (await this.engine.catalog.resolve(projectInput)).id; target = undefined;
+      projectId = (await this.engine.catalog.resolve(projectInput)).id; target = undefined; sessionId = undefined;
     }
     const repoTopic = !target && threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
     if (repoTopic && !projectId) {

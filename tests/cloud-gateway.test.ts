@@ -68,6 +68,30 @@ test("cloud launch sends over native API without a desktop database or checkout"
   assert.equal(f.store.row("launch")?.state, "done");
 }));
 
+test("replies to migrated local history never queue cloud work against an unbound record", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET repo_path=?,status='done' WHERE id=?").run("/Users/legacy/project", f.ws.id);
+  const before = getWorkspace(f.ws.id);
+  const {linkTelegramMessage} = await import("../src/store/queries.js");
+  linkTelegramMessage("42", "90", f.ws.id, "legacy-session");
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42");
+  for (const [i, extra] of [{text: "continue"}, {text: "/send continue"}, {voice: {file_id: "voice"}}].entries()) {
+    const id=i+1;
+    f.store.ingest([{update_id: id, message: {message_id: 100+id, chat: {id: 42}, reply_to_message: {message_id: 90}, ...extra}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    assert.equal(f.store.row(`update:${id}:action`), undefined);
+    assert.equal(f.store.row(`update:${id}:media`), undefined);
+    assert.match(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.text, /historical.*\/run/is);
+  }
+  assert.deepEqual(getWorkspace(f.ws.id), before);
+  assert.deepEqual(f.counts(), {creates: 0, sends: 0});
+  f.store.ingest([{update_id: 4, message: {message_id: 104, chat: {id: 42}, reply_to_message: {message_id: 90}, text: "/run p1 Start new work"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const action=JSON.parse(f.store.row("update:4:action")!.payload);
+  assert.notEqual(action.trackedId, f.ws.id);
+  assert.equal(action.projectId, "p1");
+  assert.equal(action.sessionId, undefined);
+}));
+
 test("uncertain workspace creation is reconciled without another create", () => fixture(async f => {
   f.api.createWorkspace = async () => { throw new Error("lost receipt"); };
   await f.launch();
@@ -275,6 +299,20 @@ test("document intake keeps caption and file private, releases its reservation, 
     globalThis.fetch = previousFetch;
     if (previousToken === undefined) delete process.env.BOT_TOKEN; else process.env.BOT_TOKEN = previousToken;
   }
+}));
+
+test("human questions bypass transcript backlog and retain reply associations after restart", () => fixture(async f => {
+  enqueueText(f.store, "earlier-transcript", "42", "Background progress", {workspaceId: f.ws.id, sessionId: "s1"});
+  const receipt = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Which target?"}});
+  f.engine.events();
+  const sent: string[] = [];
+  const delivery = new TelegramDelivery(f.store, async (_method, payload) => {sent.push(payload.text); return {message_id: 101};});
+  await delivery.tick();
+  assert.match(sent[0], /Which target\?/);
+  assert.equal(f.store.row("earlier-transcript:0")?.state, "pending");
+  const restarted = new GatewayStore(f.store.db);
+  assert.equal(restarted.decisionForMessage("42", 101), receipt.decisionId);
+  assert.equal(getWorkspaceMessageTarget("42", "101")?.workspace.id, f.ws.id);
 }));
 
 test("question send failures and 429 cooldown preserve the question and reply link", () => fixture(async f => {

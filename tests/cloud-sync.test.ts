@@ -10,7 +10,7 @@ import {nativeSessionProvider} from "../src/cloud/messages.js";
 import {CloudGitHub} from "../src/cloud/catalog.js";
 import type {FileBridge} from "../src/cloud/bridge.js";
 import {ConductorApiError, type ConductorApiClient} from "../src/integrations/conductor-api.js";
-import {processQueue} from "../src/cloud/telegram.js";
+import {processQueue, enqueueText, TelegramDelivery} from "../src/cloud/telegram.js";
 
 async function fixture(run: (f: ReturnType<typeof makeFixture>) => Promise<void>) {
   closeDb(); const f = makeFixture();
@@ -164,5 +164,31 @@ test("migration group mode permits addressed commands but holds plain text and v
     await processQueue(f.store, ["update"], row => commands.handle(row));
     assert.equal(!!f.store.row(`update:${uid}:action`), uid === 4);
     assert.equal(f.store.row(`update:${uid}:media`), undefined);
+    if (uid <= 2) {
+      const notice = JSON.parse(f.store.row(`update:${uid}:reply:0`)!.payload).payload.text;
+      assert.match(notice, /awaiting cutover/i);
+      assert.match(notice, /not sent to Conductor/i);
+      assert.doesNotMatch(notice, /replies are waiting|during migration/i);
+    }
   }
+}));
+
+test("an addressed command acknowledgement precedes queued transcripts without losing their order", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  f.store.db.prepare("UPDATE gateway_queue SET state='done' WHERE kind='telegram'").run();
+  f.store.set("telegram-bot-username", "GatewayBot");
+  for (let i = 0; i < 3; i++) enqueueText(f.store, `backlog:${i}`, "-42", `Earlier transcript ${i}`, {threadId: 7, workspaceId: id, sessionId: "old"});
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9", "-42", "commands");
+  f.store.ingest([{update_id: 1, message: {message_id: 100, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/send@GatewayBot continue"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const texts: string[] = [];
+  const sender = new TelegramDelivery(f.store, async (_method, payload) => {texts.push(payload.text); return {message_id: 200 + texts.length};});
+  await sender.tick();
+  assert.deepEqual(texts, ["Queued for Conductor."]);
+  assert.equal(f.store.row("update:1:action")?.state, "pending");
+  for (let i = 0; i < 3; i++) {
+    assert.equal(f.store.row(`backlog:${i}:0`)?.state, "pending");
+    f.store.set("telegram-chat-after:-42", 0); await sender.tick();
+  }
+  assert.deepEqual(texts.slice(1), ["Earlier transcript 0", "Earlier transcript 1", "Earlier transcript 2"]);
 }));
