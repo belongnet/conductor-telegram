@@ -629,11 +629,26 @@ export async function applyLegacyImport(input: {
   if (!snapshot.manifest || snapshot.manifest.manifest_hash !== input.manifest.manifestHash) {
     throw new Error("Manifest v2 must be active before applying the legacy import");
   }
-  if (snapshot.controller?.mode === "active") {
-    throw new Error(
-      "legacy import requires the controller to remain shadow/disabled/paused until cutover"
-    );
-  }
+  // The controller mode is deliberately not constrained here.
+  //
+  // This used to throw when the mode was `active`, which deadlocked the import
+  // against the production HTTP/Postgres store: Command Center gates every lane
+  // mutation, including the createRun calls below, behind
+  // `controller.mode === "active"` and answers 409 "active cutover is required"
+  // otherwise. So one gate demanded active and the other forbade it, and the
+  // one-time import could not be applied in any mode.
+  //
+  // Isolation during the import does not come from the mode. It comes from the
+  // exclusive `growth` lease: the caller claims it before reaching this
+  // function and aborts with "controller lease is held; stop the worker before
+  // applying the one-time import" if a worker still holds it. While the
+  // importer owns that lease no worker can dispatch, which is the property the
+  // mode check was reaching for.
+  //
+  // The contradiction stayed hidden because these tests run against
+  // SqliteLaneStateStore, whose createRun has no controller-mode gate; only the
+  // HTTP path enforces it. See the regression test that pins an active-mode
+  // apply.
   const plannedActiveByProvider = new Map<ManifestProvider, number>();
   for (const planned of input.plan.lanes) {
     if (
