@@ -66,9 +66,11 @@ export class CloudCommands {
       return;
     }
     const raw = String(msg.text ?? msg.caption ?? "").trim();
-    const match = raw.match(/^\/([\w]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
+    const match = raw.match(/^\/([\w]+)(?:@(\w+))?(?:\s+([\s\S]*))?$/);
+    const addressedBot = match?.[2]?.toLowerCase();
+    if (addressedBot && addressedBot !== this.store.get<string>("telegram-bot-username")?.toLowerCase()) return;
     const command = match?.[1]?.toLowerCase();
-    let args = match?.[2]?.trim() ?? "";
+    let args = match?.[3]?.trim() ?? "";
     if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}`, {threadId, priority: 0}); return; }
     if (["help", "start", "setup"].includes(command ?? "")) { reply(HELP); return; }
     if (command === "lanes") {

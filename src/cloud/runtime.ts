@@ -57,6 +57,7 @@ export async function startCloudGateway(): Promise<void> {
   store.recover();
   store.set("conductor-user-id", identity.userId);
   store.set("telegram-bot-id", me.id);
+  store.set("telegram-bot-username", me.username);
   if (identity.organizationId) store.set("conductor-organization-id", identity.organizationId);
   store.set("projects", { at: Date.now(), projects });
   const checkLease = (): void => {

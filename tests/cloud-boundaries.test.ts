@@ -60,6 +60,36 @@ function makeFixture() {
   return {store, ws, binding, engine, api, messages, sends, router, routeRow};
 }
 
+test("cloud group commands ignore other bot mentions before routing or answering questions", () => fixture(async f => {
+  f.store.set("telegram-bot-username", "GatewayBot");
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  for (const [index, text] of ["/run@OtherBot p1 do work", "/ping@OtherBot", "/answer@OtherBot 1 yes"].entries()) {
+    const id = index + 100;
+    f.store.ingest([{update_id: id, message: {message_id: id, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text}}]);
+    await processQueue(f.store, ["update", "health-update"], row => commands.handle(row));
+  }
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind NOT IN ('update','health-update')").get() as any).n, 0);
+}));
+
+test("cloud commands accept their own mention case-insensitively and preserve arguments", () => fixture(async f => {
+  f.store.set("telegram-bot-username", "GatewayBot");
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  f.store.ingest([{update_id: 100, message: {message_id: 100, chat: {id: -42}, from: {id: 9}, message_thread_id: 7,
+    text: "/run@gAtEwAyBoT p1 Keep the exact task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const action = JSON.parse(f.store.row("update:100:action")!.payload);
+  assert.equal(action.projectId, "p1");
+  assert.equal(action.prompt, "Keep the exact task");
+  assert.equal(JSON.parse(f.store.row("update:100:reply:0")!.payload).payload.message_thread_id, 7);
+}));
+
+test("cloud addressed commands fail closed until bot identity is available", () => fixture(async f => {
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  f.store.ingest([{update_id: 100, message: {message_id: 100, chat: {id: 42}, from: {id: 9}, text: "/run@UnknownBot p1 work"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:100:action"), undefined);
+}));
+
 test("native routing preserves the request and requires owner confirmation, with duplicate callbacks deduplicated", () => fixture(async f => {
   const row = f.routeRow();
   await f.router.route(row);
