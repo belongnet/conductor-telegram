@@ -466,7 +466,9 @@ export class ConductorApiClient {
           messageId: input.messageId,
           message: input.message,
         },
-        retrySafe: true,
+        // A caller-supplied command ID is not documented as an idempotency key.
+        // Reconcile the transcript before another submission after a lost reply.
+        retrySafe: false,
       }
     );
     assertApiIdentity("message", input.messageId, result.messageId);

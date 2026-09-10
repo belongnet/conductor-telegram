@@ -179,6 +179,51 @@ test("an idle native reply queues its transcript and completion before advancing
   } finally {closeDb();}
 });
 
+test("a sleeping workspace with completed native turn evidence is not woken again", async () => {
+  const f = fixture();
+  try {
+    f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: "sleeping"});
+    f.api.listSessionMessages = async () => [
+      {id: "submitted-row", sessionId: "s1", type: "userMessage", sessionIndex: 1, receivedAt: "2026-01-01T00:00:00Z",
+        content: {id: "old", message: "Original task", turnId: "native-turn"}},
+      {id: "reply", sessionId: "s1", type: "agent", sessionIndex: 2, receivedAt: "2026-01-01T00:00:01Z",
+        content: {turnId: "native-turn", rawPayload: {type: "assistant", message: {role: "assistant", content: [{type: "text", text: "Finished"}]}}}},
+      {id: "completion", sessionId: "s1", type: "agent", sessionIndex: 3, receivedAt: "2026-01-01T00:00:02Z",
+        content: {turnId: "native-turn", rawPayload: {type: "command_lifecycle", state: "completed"}}},
+    ] as any;
+    await f.engine.pollWorkspace(f.ws.id, f.binding);
+    assert.equal(f.store.get<any>("session:s1").terminal, true);
+    assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 0);
+  } finally {closeDb();}
+});
+
+test("sleep recovery queues only one continuation while the wake is pending", async () => {
+  const f = fixture();
+  try {
+    f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: "sleeping"});
+    f.api.listSessionMessages = async () => [];
+    await f.engine.pollWorkspace(f.ws.id, f.binding);
+    const wake = f.store.db.prepare("SELECT * FROM gateway_queue WHERE kind='cloud'").get() as any;
+    assert.ok(wake);
+    await f.engine.action(wake);
+    f.store.set(`poll-after:${f.ws.id}`, 0);
+    await f.engine.pollWorkspace(f.ws.id, f.binding);
+    assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 1);
+  } finally {closeDb();}
+});
+
+test("a late reply from an older native turn cannot complete the latest task", async () => {
+  const f = fixture();
+  try {
+    f.store.set("session:s1", {...f.store.get<any>("session:s1"), turnId: "current-turn"});
+    f.api.listSessionMessages = async () => [{id: "late-old-reply", sessionId: "s1", type: "agent", sessionIndex: 5,
+      receivedAt: new Date().toISOString(), content: {turnId: "older-turn", rawPayload: {type: "assistant",
+        message: {role: "assistant", content: [{type: "text", text: "Old task finished"}]}}}}] as any;
+    await f.engine.pollWorkspace(f.ws.id, f.binding);
+    assert.equal(f.store.get<any>("session:s1").terminal, false);
+  } finally {closeDb();}
+});
+
 test("a stop during reported PR lookup remains stopped after polling finishes", async () => {
   const f = fixture();
   try {

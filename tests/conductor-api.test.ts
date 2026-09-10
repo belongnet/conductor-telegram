@@ -72,7 +72,7 @@ test("Conductor API config is opt-in, normalizes /v0, and fails closed in api mo
   );
 });
 
-test("message sends use bearer auth, a caller message id, and safe retries", async () => {
+test("message sends use bearer auth and a caller ID, returning rate limits for durable retry", async () => {
   const calls: Array<{ url: string; init: RequestInit; body: any }> = [];
   let attempt = 0;
   const fetcher = (async (
@@ -98,6 +98,9 @@ test("message sends use bearer auth, a caller message id, and safe retries", asy
   }) as typeof fetch;
 
   const client = new ConductorApiClient(config({ maxRetries: 1 }), fetcher);
+  await assert.rejects(client.sendMessage({sessionId: "session-1", message: "Implement the bounded change", messageId: "message-1"}),
+    (error: unknown) => error instanceof ConductorApiError && error.status === 429);
+  assert.equal(calls.length, 1);
   const sent = await client.sendMessage({
     sessionId: "session-1",
     message: "Implement the bounded change",
@@ -119,6 +122,19 @@ test("message sends use bearer auth, a caller message id, and safe retries", asy
     messageId: "message-1",
     message: "Implement the bounded change",
   });
+});
+
+test("message submission never retries an uncertain network or server response", async () => {
+  for (const networkFailure of [true, false]) {
+    let attempts = 0;
+    const client = new ConductorApiClient(config({maxRetries: 2}), (async () => {
+      attempts++;
+      if (networkFailure) throw new Error("response lost");
+      return new Response(JSON.stringify({userMessage: "upstream unavailable"}), {status: 503});
+    }) as typeof fetch);
+    await assert.rejects(client.sendMessage({sessionId: "s1", messageId: "command", message: "Perform a mutation"}));
+    assert.equal(attempts, 1);
+  }
 });
 
 test("workspace and session creation are not retried without documented idempotency", async () => {

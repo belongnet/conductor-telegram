@@ -3,6 +3,7 @@ import type { ConductorApiClient, ConductorApiMessage } from "../integrations/co
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
 import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
+import { findSubmittedMessage, isSubmittedMessage, messageEnvelope } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
   upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
@@ -31,6 +32,7 @@ interface SessionState {
   seenReply?: boolean; terminal?: boolean; reviewHead?: string; reviewUrl?: string;
   recoveryAttempted?: boolean; stopped?: boolean; episode?: string; taskPrompt?: string;
   reviewValid?: boolean; reviewBase?: string;
+  turnId?: string; nativeCompleted?: boolean;
 }
 
 export function transcriptText(message: ConductorApiMessage): string {
@@ -282,15 +284,19 @@ export class CloudEngine {
       payload = { messageId: deterministicUuid("telegram", row.id), message: `${action.prompt ?? ""}${files.length ? `\n\nDownload these user attachments before work:\n${files.join("\n")}` : ""}\n\n${this.bridgeInstructions()}` };
       this.store.set(`send:${row.id}`, payload);
     }
-    // Stable body and message ID make a lost response safely reconcilable.
-    let observed = false;
-    try {
-      const existing = await this.api.getMessage(payload.messageId);
-      if (existing.sessionId !== sessionId || !messageContainsExactText(existing.content, payload.message)) throw new Error("Message identity mismatch");
-      observed = true;
-    } catch (error) { if (!(error instanceof ConductorApiError) || error.status !== 404) throw error; }
+    const existing = await findSubmittedMessage(this.api, sessionId, payload.messageId);
+    if (existing && !messageContainsExactText(existing.content, payload.message)) throw new Error("Message identity mismatch");
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
-    if (!observed) { this.bridge.refreshQueuedLinks(payload.message, action.trackedId); await this.api.sendMessage({ sessionId, ...payload }); }
+    if (!existing) {
+      if (this.store.get(`send-attempted:${row.id}`)) throw new Error("Submission receipt is uncertain; no command will be replayed");
+      this.bridge.refreshQueuedLinks(payload.message, action.trackedId);
+      this.store.set(`send-attempted:${row.id}`, true);
+      try { await this.api.sendMessage({ sessionId, ...payload }); }
+      catch (error) {
+        if (error instanceof ConductorApiError && error.status === 429) this.store.set(`send-attempted:${row.id}`, false);
+        throw error;
+      }
+    }
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
     if (action.legacyRequestId) completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
     const state = this.store.get<SessionState>(`session:${sessionId}`) ?? { trackedId: action.trackedId, ...binding, role: "task" as const };
@@ -298,7 +304,8 @@ export class CloudEngine {
     const episode = action.recovery ? (action.episode ?? state.episode ?? row.id) : row.id;
     this.store.set(`session:${sessionId}`, { ...state, sentMessageId: payload.messageId, sentAt: Date.now(), terminal: false, episode,
       taskPrompt: action.recovery ? state.taskPrompt ?? action.prompt : action.prompt,
-      seenWorking: false, seenReply: false, recoveryAttempted: false });
+      seenWorking: false, seenReply: false, recoveryAttempted: false, nativeCompleted: false,
+      turnId: existing ? messageEnvelope(existing.content)?.turnId : undefined });
     if (!action.recovery) {
       this.store.set(`recovery-providers:${episode}`, [state.agent]);
       this.store.set(`recovery-resumed:${episode}`, false);
@@ -373,15 +380,30 @@ export class CloudEngine {
       // A send or stop can commit while either upstream read waits. Apply the
       // transcript to that current turn, never write back the pre-read snapshot.
       state = this.store.get<SessionState>(`session:${session.id}`);
-      const turnStart = state?.sentMessageId ? messages.findIndex(m => m.id === state!.sentMessageId) : -1;
+      const turnStart = state?.sentMessageId ? messages.findIndex(m => isSubmittedMessage(m, state!.sentMessageId!)) : -1;
+      if (state && turnStart >= 0) {
+        const turnId = messageEnvelope(messages[turnStart].content)?.turnId;
+        if (typeof turnId === "string") state.turnId = turnId;
+      }
       for (const [index, message] of messages.entries()) {
         if (cursor && message.sessionIndex <= cursor.lastForwardedRowid) continue;
         const text = transcriptText(message);
+        const envelope = message.type === "agent" ? messageEnvelope(message.content) : undefined;
+        const nativeTurn = envelope?.turnId ?? envelope?.userMessageId;
+        const currentReply = state && (typeof nativeTurn === "string"
+          ? nativeTurn === (state.turnId ?? state.sentMessageId)
+          : ((turnStart >= 0 && index > turnStart) || (turnStart < 0 && state.sentAt && Date.parse(message.receivedAt) >= state.sentAt)));
+        if (state && currentReply) {
+          if (text) state.seenReply = true;
+          const raw = messageEnvelope(envelope?.rawPayload);
+          if ((raw?.type === "command_lifecycle" && raw.state === "completed") ||
+              (raw?.type === "result" && raw.subtype === "success" && !raw.is_error)) state.nativeCompleted = true;
+        }
         this.store.db.transaction(() => {
           if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id);
+          if (state) this.store.set(`session:${session.id}`, state);
           upsertThreadCursor({ workspaceId: trackedId, sessionId: session.id, backendKind: "cloud-api", lastForwardedRowid: message.sessionIndex, lastMessageId: message.id, title: session.name });
         })();
-        if (state && text && ((turnStart >= 0 && index > turnStart) || (turnStart < 0 && state.sentAt && Date.parse(message.receivedAt) >= state.sentAt))) state.seenReply = true;
         const prUrl = text.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/)?.[0];
         if (prUrl) reportedPrUrls.add(prUrl);
       }
@@ -397,7 +419,7 @@ export class CloudEngine {
       }
       if (!state || state.terminal || state.stopped || binding.stopped || this.store.get(`stop:${trackedId}`)) continue;
       const pendingQuestion = this.store.db.prepare("SELECT 1 FROM decisions WHERE workspace_id=? AND answered_at IS NULL LIMIT 1").get(trackedId);
-      if (status.status === "idle" && messages.length < 100 && !pendingQuestion && state.seenReply && lifecycle.status !== "sleeping") {
+      if (status.status === "idle" && messages.length < 100 && !pendingQuestion && state.seenReply && (lifecycle.status !== "sleeping" || state.nativeCompleted)) {
         let staleReview = false;
         if (state.role === "review" && state.reviewUrl) {
           const current = await this.github.pr(binding.repoSlug, state.reviewUrl);
@@ -413,8 +435,16 @@ export class CloudEngine {
         const detail = status.errorMessage ?? status.lastError ?? "Unknown Conductor session error";
         if (recoverableProviderError(detail)) await this.recover(trackedId, binding, session.id, state, detail);
         else this.notify(`error:${session.id}:${state.sentMessageId}`, trackedId, `Conductor reported an error: ${detail}\nUse /send to continue after addressing it.`, session.id);
-      } else if (status.status === "idle" && lifecycle.status === "sleeping" && state.sentMessageId && !state.recoveryAttempted) {
+      } else if (status.status === "idle" && lifecycle.status === "sleeping" && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted) {
+        const wakeKey = `wake-attempted:${session.id}:${state.episode ?? state.sentMessageId}`;
+        const wakeAt = this.store.get<number>(wakeKey);
+        if (wakeAt !== undefined) {
+          if (Date.now() - wakeAt > 120_000) this.notify(`${wakeKey}:attention`, trackedId,
+            "Conductor is still sleeping after a continuation was submitted. No duplicate was sent; check the workspace before continuing.", session.id);
+          continue;
+        }
         // Wake with a continuation, not the original potentially side-effectful task.
+        this.store.set(wakeKey, Date.now());
         state.recoveryAttempted = true; this.store.set(`session:${session.id}`, state);
         this.queue(`wake:${session.id}:${state.sentMessageId}`, { type: "send", trackedId, sessionId: session.id, recovery: true, episode: state.episode,
           prompt: "The workspace slept during this task. Inspect files and transcript, preserve completed work, and continue only unfinished work. Report uncertainty before repeating side effects." });

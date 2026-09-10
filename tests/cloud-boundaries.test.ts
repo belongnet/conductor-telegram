@@ -104,6 +104,29 @@ test("native router reconciles a lost send receipt using the same message ID and
   assert.equal(f.store.row("route-job:confirm:0"), undefined);
 }));
 
+test("native routing uses the transcript row ID when submission IDs differ", () => fixture(async f => {
+  f.api.sendMessage = async input => {
+    f.sends.push(input);
+    f.messages.push({id: "transcript-command", sessionId: input.sessionId, type: "userMessage", sessionIndex: 1,
+      content: {id: input.messageId, message: input.message, turnId: input.messageId}, receivedAt: new Date().toISOString()});
+    return {messageId: input.messageId, state: "sent"};
+  };
+  f.api.listSessionMessages = async input => {
+    if (input.after && input.after !== "transcript-command") throw new ConductorApiError("Cursor message not found in this session", 404);
+    return input.after ? f.messages.slice(1) : f.messages;
+  };
+  const row = f.routeRow();
+  await f.router.route(row);
+  f.messages.push({id: "native-answer", sessionId: "router-session", type: "agent", sessionIndex: 2,
+    content: {rawPayload: {type: "assistant", message: {role: "assistant", content: [{type: "text",
+      text: JSON.stringify({action: "existing", workspaceId: f.ws.id, prompt: "Keep the request"})}]}}}});
+  // A restart may reconcile a completed reply long after the polling timeout.
+  f.store.set("router-sent:route-job", {at: Date.now() - 180_000});
+  await new CloudRouter(f.engine, "p1").route(row);
+  assert.ok(f.store.row("route-job:confirm:0"));
+  assert.equal(f.sends.length, 1);
+}));
+
 test("native router never recreates an uncertain workspace after a restart", () => fixture(async f => {
   f.store.db.prepare("DELETE FROM gateway_state WHERE key='router-binding'").run();
   let attempts = 0;

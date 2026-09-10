@@ -87,6 +87,31 @@ test("stop during creation prevents the first prompt from being sent", () => fix
   assert.equal(f.store.get(`stop:${f.ws.id}`), true);
 }));
 
+test("a lost native send receipt is reconciled through its distinct transcript row", () => fixture(async f => {
+  let sends = 0;
+  f.api.sendMessage = async input => {
+    sends++;
+    f.messages.push({id: "native-row", sessionId: input.sessionId, type: "userMessage", sessionIndex: 1,
+      content: {id: input.messageId, message: input.message}, receivedAt: new Date().toISOString()});
+    throw new Error("lost receipt");
+  };
+  await f.launch();
+  f.store.retry("launch", "reconcile", 0);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(sends, 1);
+  assert.equal(f.store.row("launch")?.state, "done");
+}));
+
+test("a missing receipt cannot replay a command whose submission was attempted", () => fixture(async f => {
+  let sends = 0;
+  f.api.sendMessage = async () => {sends++; throw new Error("lost receipt before transcript visibility");};
+  await f.launch();
+  f.store.retry("launch", "reconcile", 0);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(sends, 1);
+  assert.match(f.store.row("launch")?.error ?? "", /uncertain/);
+}));
+
 test("a lost send receipt is matched by exact multiline payload and never resent", () => fixture(async f => {
   const original = f.api.sendMessage;
   f.api.sendMessage = async (input: any) => { await original(input); throw new Error("lost receipt"); };
