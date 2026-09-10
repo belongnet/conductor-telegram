@@ -1,0 +1,5 @@
+[Unit]
+Description=Check local Conductor Telegram gateway liveness
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/conductor-telegram/scripts/cloud/watchdog.sh

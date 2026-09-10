@@ -1,0 +1,8 @@
+[Unit]
+Description=Verified Conductor Telegram database and attachment backup
+After=conductor-telegram-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec conductor-telegram-gateway bash /opt/conductor-telegram/scripts/cloud/backup.sh
+TimeoutStartSec=300

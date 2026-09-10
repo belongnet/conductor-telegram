@@ -72,7 +72,7 @@ test("Conductor API config is opt-in, normalizes /v0, and fails closed in api mo
   );
 });
 
-test("message sends use bearer auth, a caller message id, and safe retries", async () => {
+test("message sends use bearer auth and a caller ID, returning rate limits for durable retry", async () => {
   const calls: Array<{ url: string; init: RequestInit; body: any }> = [];
   let attempt = 0;
   const fetcher = (async (
@@ -98,6 +98,9 @@ test("message sends use bearer auth, a caller message id, and safe retries", asy
   }) as typeof fetch;
 
   const client = new ConductorApiClient(config({ maxRetries: 1 }), fetcher);
+  await assert.rejects(client.sendMessage({sessionId: "session-1", message: "Implement the bounded change", messageId: "message-1"}),
+    (error: unknown) => error instanceof ConductorApiError && error.status === 429);
+  assert.equal(calls.length, 1);
   const sent = await client.sendMessage({
     sessionId: "session-1",
     message: "Implement the bounded change",
@@ -119,6 +122,19 @@ test("message sends use bearer auth, a caller message id, and safe retries", asy
     messageId: "message-1",
     message: "Implement the bounded change",
   });
+});
+
+test("message submission never retries an uncertain network or server response", async () => {
+  for (const networkFailure of [true, false]) {
+    let attempts = 0;
+    const client = new ConductorApiClient(config({maxRetries: 2}), (async () => {
+      attempts++;
+      if (networkFailure) throw new Error("response lost");
+      return new Response(JSON.stringify({userMessage: "upstream unavailable"}), {status: 503});
+    }) as typeof fetch);
+    await assert.rejects(client.sendMessage({sessionId: "s1", messageId: "command", message: "Perform a mutation"}));
+    assert.equal(attempts, 1);
+  }
 });
 
 test("workspace and session creation are not retried without documented idempotency", async () => {
@@ -616,27 +632,86 @@ test("transcript tails keep only the newest messages across pages", async () => 
     const parsed = new URL(String(url));
     urls.push(parsed.toString());
     const offset = Number(parsed.searchParams.get("offset") ?? 0);
-    const index = Math.floor(offset / 2);
-    const data = pages[index] ?? [];
+    const data = pages
+      .flat()
+      .slice(offset, offset + Math.min(2, Number(parsed.searchParams.get("limit") ?? 100)));
     return new Response(
-      JSON.stringify({ data, offset, hasMore: index < pages.length - 1 }),
+      JSON.stringify({ data, offset, hasMore: offset + data.length < pages.flat().length }),
       { status: 200, headers: { "content-type": "application/json" } }
     );
   }) as typeof fetch;
   const client = new ConductorApiClient(config(), fetcher);
 
-  // The tail bound trims while walking, so a giant transcript never
-  // accumulates in memory, yet the final slice stays in transcript order.
+  // Only the requested tail is returned, in transcript order.
   const tail = await client.getSessionMessageTail("session-1", 3);
   assert.deepEqual(
     tail.map((message) => message.id),
     ["message-3", "message-4", "message-5"]
   );
-  assert.equal(urls.length, 3, "walks every page to reach the tail");
+  assert.ok(urls.length < 10, "locates the tail with bounded reads");
 
-  // getLatestSessionMessage is the keep=1 special case of the same walk.
+  // getLatestSessionMessage shares the bounded tail lookup.
   const latest = await client.getLatestSessionMessage("session-1");
   assert.equal(latest?.id, "message-5");
+});
+
+test("transcript tails seek past one hundred pages with bounded reads", async () => {
+  const calls: number[] = [];
+  const total = 15_050;
+  const fetcher = (async (url: string | URL | Request) => {
+    const parsed = new URL(String(url));
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const pageSize = Number(parsed.searchParams.get("limit") ?? 100);
+    calls.push(offset);
+    const length = Math.max(0, Math.min(pageSize, total - offset));
+    const data = Array.from({ length }, (_, index) =>
+      apiMessage(`message-${offset + index}`, offset + index, "assistant", "tail")
+    );
+    return new Response(
+      JSON.stringify({ data, offset, hasMore: offset + length < total }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+
+  const tail = await client.getSessionMessageTail("session-1", 20);
+
+  assert.deepEqual(
+    tail.map((message) => message.sessionIndex),
+    Array.from({ length: 20 }, (_, index) => total - 20 + index)
+  );
+  assert.ok(calls.length < 30, `expected a bounded tail search, received ${calls.length} pages`);
+  assert.ok(calls.some((offset) => offset > 10_000));
+});
+
+test("tail lookup handles empty, exact-page, partial-page, and capped-page transcripts", async () => {
+  for (const count of [0, 1, 2, 99, 100, 101, 199, 200, 201, 10_001]) {
+    const client = new ConductorApiClient(config(), (async (url: string | URL | Request) => {
+      const parsed = new URL(String(url));
+      const offset = Number(parsed.searchParams.get("offset") ?? 0);
+      const requested = Number(parsed.searchParams.get("limit") ?? 100);
+      const pageSize = Math.min(count === 2 ? 1 : 100, requested);
+      const length = Math.max(0, Math.min(pageSize, count - offset));
+      const data = Array.from({ length }, (_, index) =>
+        apiMessage(`message-${offset + index}`, (offset + index) * 3, "assistant", "content")
+      );
+      return new Response(
+        JSON.stringify({ data, offset, hasMore: offset + data.length < count }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }) as typeof fetch);
+
+    const tail = await client.getSessionMessageTail("session-1", 150);
+
+    assert.deepEqual(
+      tail.map((message) => message.id),
+      Array.from(
+        { length: Math.min(count, 150) },
+        (_, index) => `message-${Math.max(0, count - 150) + index}`
+      ),
+      `count=${count}`
+    );
+  }
 });
 
 test("cloud-workspace env wires attribution and the CONDUCTOR_API_URL fallback", async () => {

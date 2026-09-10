@@ -40,7 +40,8 @@
       "cli/index": "src/cli/index.ts",
       "cli/service": "src/cli/service.ts",
       "bot/index": "src/bot/index.ts",
-      "mcp/server": "src/mcp/server.ts"
+      "mcp/server": "src/mcp/server.ts",
+      "mcp/remote": "src/mcp/remote-entry.ts"
     },
     "format": [
       "esm"
@@ -54,7 +55,9 @@
     "dist",
     "scripts/gateway-update.sh",
     "packaging",
-    "docs/lanes.manifest-v2.example.json"
+    "docs/lanes.manifest-v2.example.json",
+    "scripts/cloud",
+    "docs/ovh-native-gateway.md"
   ],
   "keywords": [
     "telegram",

@@ -1774,7 +1774,7 @@ test("ambiguous attestation reconciliation requires the exact published body", a
         if (scenario.changeHead) github.headSha = UPDATED_HEAD;
 
         clock = new Date(
-          clock.getTime() + (LANE_ACTION_SETTLE_SECONDS + 1) * 1_000
+          Date.parse(snapshot.ambiguous_actions[0]!.started_at!) + (LANE_ACTION_SETTLE_SECONDS + 1) * 1_000
         );
         await controller.tick({ lease, manifest });
         snapshot = await store.snapshot();
@@ -1988,7 +1988,7 @@ test("an ambiguous merge is never reconciled against a different head", async ()
     assert.equal(snapshot.ambiguous_actions.length, 1);
     github.headSha = UPDATED_HEAD;
     clock = new Date(
-      clock.getTime() + (LANE_ACTION_SETTLE_SECONDS + 1) * 1_000
+      Date.parse(snapshot.ambiguous_actions[0]!.started_at!) + (LANE_ACTION_SETTLE_SECONDS + 1) * 1_000
     );
     await controller.tick({ lease, manifest });
     snapshot = await store.snapshot();

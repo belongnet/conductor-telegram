@@ -5,6 +5,9 @@ All notable changes to conductor-telegram are documented here.
 ## [Unreleased]
 
 ### Added
+- `TELEGRAM_RUNTIME_MODE=cloud-only` runs a continuously hosted gateway through the native Conductor API, with project-based tasks, confirmed AI routing, dedicated PR review sessions, and recoverable provider interruptions. Existing installations keep the `hybrid` default.
+- Cloud workspaces can exchange private files, report progress, and ask persistent human questions through a scoped HTTPS MCP bridge. Linux voice notes use FFmpeg and Whisper.
+- Pinned Node 22 container packaging, isolated acceptance service, separate gateway and lane supervision, health probes, verified state migration, backups, and a rollback guide support deployment on OVH.
 - A fenced Manifest v2 lane controller now runs independently from Telegram polling, stores all runtime bindings and action intents in Command Center/Postgres, supports Mac-preferred/OVH-standby leases, and fails closed rather than falling back to SQLite. It includes GitHub and GitLab delivery, current-head commissioned attestations, deterministic merged-SHA validation, provider breakers/caps, legacy adoption, safe archive batches, shadow/cutover controls, and launchd/systemd service definitions.
 - `conductor-telegram lanes worker`, `lanes status --json`, `lanes reconcile`, and `lanes import-legacy --dry-run|--apply` expose the durable controller. `doctor` verifies the manifest, prompt hashes, required credentials, and Command Center connectivity before cutover.
 - Optional config-driven Cloud lanes scheduler. When `LANES_CONFIG` or `~/.conductor-telegram/lanes.json` is present, the bot keeps at most one working lane per paid provider from an ordered queue with dependencies, nudging paused work after a gap or creating the next ready lane. `/lanes`, `/lanes run`, `/lanes pause`, and `/lanes resume` are owner-only. See `docs/lanes.example.json`.
@@ -12,6 +15,8 @@ All notable changes to conductor-telegram are documented here.
 - Lane delivery state, unanswered-nudge health, and provider outage resets are durable in SQLite. Dead agents restart in a new session inside the existing workspace, while tick hygiene safely archives completed work without recreating archived or abandoned workspaces.
 
 ### Fixed
+- Cloud Telegram updates and outgoing messages now use durable queues, ordered conversations, persistent question reply links, rate-limit backoff, and independent command and workspace polling. Startup topic maintenance no longer blocks messages.
+- Native task recovery preserves exact message identities, rechecks stop requests before new work, and avoids overwriting newer task state during polling. PR reviews remain bound to their exact commits and cannot grant merge approval.
 - Both Mac and OVH lease workers now require send-only Telegram alert credentials at startup. The OVH standby remains headless and never polls updates, but it can still deliver deduplicated safety alerts whenever it owns the controller lease.
 - Full reconciliation now audits the complete live `[managed:growth]` inventory against manifest repositories and durable bindings. Missing/ambiguous projects, duplicate managed workspaces, unknown run tags, repository drift, and archived/live state drift pause safely; a partial corrective pass remains due until the entire inventory succeeds.
 - Legacy import now renews and revalidates its 75-second fence throughout a slow authoritative rescan. Exact merged Git truth is adopted without rebinding an archived workspace, Conductor's `state: "archived"` signal is honored even when `archivedAt` is absent, and all sessions are inspected before an adoption can reserve provider capacity.
@@ -23,6 +28,9 @@ All notable changes to conductor-telegram are documented here.
 - Lanes ticks skip creation when workspace listing fails, including a partial per-project fallback outage, so an API outage cannot bill a duplicate `[lane:…]` workspace.
 - An initializing lane whose first prompt never landed is re-prompted instead of being skipped forever. A transcript fetch failure on a live `working` session keeps occupying the provider slot; an idle/unread transcript is `unknown`, not a prompt retry.
 - Lane "done" detection uses assistant text from the last idle turn, not tool/command payloads or Codex reasoning/thinking items that happen to mention a pull request.
+
+### Security
+- Updated locked production dependencies to address published advisories before the cloud gateway release.
 
 ## [0.7.0] - 2026-08-30
 

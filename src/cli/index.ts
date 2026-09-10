@@ -244,7 +244,16 @@ async function main(): Promise<void> {
       printBanner("Starting...");
 
       // Import and start the bot
-      await import("../bot/index.js");
+      if (config.runtimeMode === "cloud-only") {
+        process.env.TELEGRAM_RUNTIME_MODE = "cloud-only";
+        process.env.TELEGRAM_CLOUD_REVIEW_POLICY = config.cloudReviewPolicy ?? "disabled";
+        if (config.bridgePublicUrl) process.env.TELEGRAM_BRIDGE_PUBLIC_URL = config.bridgePublicUrl;
+        if (config.cloudRouterProjectId) process.env.TELEGRAM_CLOUD_ROUTER_PROJECT_ID = config.cloudRouterProjectId;
+        const { startCloudGateway } = await import("../cloud/runtime.js");
+        await startCloudGateway();
+      } else {
+        await import("../bot/index.js");
+      }
       break;
     }
 
@@ -256,6 +265,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
+  const message = err instanceof Error ? err.message : String(err);
+  console.error("Fatal error:", message.replace(/bot\d+:[\w-]+/g, "bot[redacted]"));
   process.exit(1);
 });

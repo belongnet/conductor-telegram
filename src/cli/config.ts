@@ -16,6 +16,10 @@ const DOPPLER_REFERENCE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const ConfigSchema = z
   .object({
     version: z.literal(1),
+    runtimeMode: z.enum(["hybrid", "cloud-only"]).default("hybrid"),
+    cloudReviewPolicy: z.enum(["disabled", "native"]).default("disabled"),
+    bridgePublicUrl: z.string().url().optional(),
+    cloudRouterProjectId: z.string().optional(),
     // Empty values are valid only for a Doppler-backed service installation.
     // The start command still fails closed unless the merged runtime config
     // supplies both values.
@@ -50,7 +54,10 @@ const ConfigSchema = z
     }
   });
 
-export type Config = z.infer<typeof ConfigSchema>;
+export type Config = Omit<z.infer<typeof ConfigSchema>, "runtimeMode" | "cloudReviewPolicy"> & {
+  runtimeMode?: "hybrid" | "cloud-only";
+  cloudReviewPolicy?: "disabled" | "native";
+};
 
 export interface CLIFlags {
   token?: string;
@@ -67,6 +74,8 @@ const DEFAULTS: Omit<Config, "botToken" | "ownerChatId"> & {
   ownerChatId: string;
 } = {
   version: 1,
+  runtimeMode: "hybrid",
+  cloudReviewPolicy: "disabled",
   botToken: "",
   ownerChatId: "",
   ownerUserId: undefined,
@@ -103,6 +112,10 @@ type EnvConfigSource = Record<string, string | undefined>;
 // Keep env-file migration and live env loading on the same key mapping.
 function configFromEnvSource(env: EnvConfigSource): Partial<Config> {
   const config: Partial<Config> = { version: 1 };
+  if (env.TELEGRAM_RUNTIME_MODE) config.runtimeMode = env.TELEGRAM_RUNTIME_MODE as Config["runtimeMode"];
+  if (env.TELEGRAM_CLOUD_REVIEW_POLICY) config.cloudReviewPolicy = env.TELEGRAM_CLOUD_REVIEW_POLICY as Config["cloudReviewPolicy"];
+  if (env.TELEGRAM_BRIDGE_PUBLIC_URL) config.bridgePublicUrl = env.TELEGRAM_BRIDGE_PUBLIC_URL;
+  if (env.TELEGRAM_CLOUD_ROUTER_PROJECT_ID) config.cloudRouterProjectId = env.TELEGRAM_CLOUD_ROUTER_PROJECT_ID;
   if (env.BOT_TOKEN) config.botToken = env.BOT_TOKEN;
   if (env.OWNER_CHAT_ID) config.ownerChatId = env.OWNER_CHAT_ID;
   if (env.OWNER_USER_ID) config.ownerUserId = env.OWNER_USER_ID;

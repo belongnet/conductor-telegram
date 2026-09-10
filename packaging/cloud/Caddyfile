@@ -1,0 +1,8 @@
+# Merge this site into the approved OVH HTTPS proxy. Do not replace other sites.
+{$TELEGRAM_BRIDGE_HOSTNAME} {
+    request_body {
+        max_size 51MB
+    }
+    reverse_proxy 127.0.0.1:8787
+    # Do not enable request URL logging: attachment queries are bearer links.
+}

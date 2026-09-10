@@ -41,6 +41,8 @@ const WorkspaceSchema = z.object({
   name: z.string(),
   createdAt: z.string(),
   deepLink: z.string(),
+  projectId: z.string().optional(),
+  repoUrl: z.string().optional(),
   creatorId: z.string().optional(),
   lastActivityAt: z.string().optional(),
   state: z
@@ -197,7 +199,8 @@ export class ConductorApiError extends Error {
   constructor(
     message: string,
     public readonly status: number | null = null,
-    public readonly retryable = false
+    public readonly retryable = false,
+    public readonly retryAfterMs = 0
   ) {
     super(message);
     this.name = "ConductorApiError";
@@ -229,7 +232,7 @@ export function conductorApiConfigFromEnv(
   const mode = conductorCloudBackendModeFromEnv(env);
   if (mode === "off") return null;
 
-  const apiKey = env.CONDUCTOR_API_KEY?.trim() ?? "";
+  const apiKey = env.CONDUCTOR_API_KEY?.trim() || env.CONDUCTOR_API_TOKEN?.trim() || "";
   if (!apiKey) {
     if (mode === "api") {
       throw new ConductorApiError(
@@ -403,13 +406,14 @@ export class ConductorApiClient {
     sessionId: string;
     after?: string | null;
     limit?: number;
+    offset?: number;
   }): Promise<ConductorApiMessage[]> {
     const limit = Math.max(1, Math.min(input.limit ?? PAGE_SIZE, PAGE_SIZE));
     const page = await this.request(
       "GET",
       withQuery(
         `/v0/sessions/${encodeURIComponent(input.sessionId)}/messages`,
-        { limit, after: input.after?.trim() || undefined }
+        { limit, after: input.after?.trim() || undefined, offset: input.offset }
       ),
       MessagePageSchema
     );
@@ -422,23 +426,76 @@ export class ConductorApiClient {
    * order. Used to re-anchor a dead poll cursor without dropping every
    * undelivered message between the dead anchor and the tail.
    */
-  getSessionMessageTail(
+  async getSessionMessageTail(
     sessionId: string,
     limit: number
   ): Promise<ConductorApiMessage[]> {
-    return this.walkPages(
-      (offset) =>
+    const keep = Math.max(1, Math.floor(limit));
+    if (!Number.isSafeInteger(keep) || keep > PAGE_SIZE * MAX_PAGES) {
+      throw new ConductorApiError("Transcript tail limit is invalid");
+    }
+    const pageAt = async (offset: number, size = PAGE_SIZE) => {
+      const page = await this.request(
+        "GET",
         withQuery(`/v0/sessions/${encodeURIComponent(sessionId)}/messages`, {
-          limit: PAGE_SIZE,
+          limit: size,
           offset,
         }),
-      MessagePageSchema,
-      "message",
-      {
-        keep: Math.max(1, limit),
-        validate: (data) => assertMessageMembership(sessionId, data),
+        MessagePageSchema
+      );
+      assertMessageMembership(sessionId, page.data);
+      if (page.offset !== offset) {
+        throw new ConductorApiError("Transcript tail offset mismatch");
       }
-    );
+      return page;
+    };
+    const first = await pageAt(0);
+    if (!first.hasMore || first.data.length === 0) {
+      return first.data.slice(-keep);
+    }
+
+    // Offset is a row count, not sessionIndex (native indexes may have gaps).
+    // Exponential probing and bisection find the last page without scanning
+    // the old transcript, including histories beyond the ordinary page cap.
+    let lower = 0;
+    let upper = first.data.length;
+    let end: number | undefined;
+    let bisect = false;
+    for (let probes = 0; probes < 64; probes += 1) {
+      const offset = bisect ? Math.floor((lower + upper) / 2) : upper;
+      if (!Number.isSafeInteger(offset) || (bisect && upper - lower <= 1)) {
+        break;
+      }
+      const page = await pageAt(offset);
+      if (page.data.length === 0) {
+        upper = offset;
+        bisect = true;
+      } else if (!page.hasMore) {
+        end = offset + page.data.length;
+        break;
+      } else {
+        lower = offset;
+        if (!bisect) upper *= 2;
+      }
+    }
+    if (end === undefined) {
+      throw new ConductorApiError(
+        "Transcript changed while locating its tail; retry the read"
+      );
+    }
+
+    const tail: ConductorApiMessage[] = [];
+    for (let offset = Math.max(0, end - keep); offset < end; ) {
+      const page = await pageAt(offset, Math.min(PAGE_SIZE, end - offset));
+      if (page.data.length === 0) {
+        throw new ConductorApiError(
+          "Transcript changed while reading its tail; retry the read"
+        );
+      }
+      tail.push(...page.data);
+      offset += page.data.length;
+    }
+    return tail.slice(-keep);
   }
 
   async getLatestSessionMessage(
@@ -462,7 +519,9 @@ export class ConductorApiClient {
           messageId: input.messageId,
           message: input.message,
         },
-        retrySafe: true,
+        // A caller-supplied command ID is not documented as an idempotency key.
+        // Reconcile the transcript before another submission after a lost reply.
+        retrySafe: false,
       }
     );
     assertApiIdentity("message", input.messageId, result.messageId);
@@ -706,7 +765,8 @@ export class ConductorApiClient {
           const error = new ConductorApiError(
             conductorApiErrorMessage(payload, response.status),
             response.status,
-            retryable
+            retryable,
+            retryAfterHeaderMs(response.headers.get("retry-after"))
           );
           if (!retryable || attempt + 1 >= attempts) {
             throw error;
@@ -885,6 +945,12 @@ function retryDelayMs(response: Response | null, attempt: number): number {
     return Math.min(Number(retryAfter) * 1000, 5_000);
   }
   return Math.min(250 * 2 ** attempt, 2_000);
+}
+
+function retryAfterHeaderMs(value: string | null): number {
+  if (!value) return 0;
+  const milliseconds = /^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : Date.parse(value) - Date.now();
+  return Number.isFinite(milliseconds) ? Math.max(0, milliseconds) : 0;
 }
 
 function parsePositiveInteger(

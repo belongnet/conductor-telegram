@@ -574,7 +574,10 @@ export async function runDoctor(flags: CLIFlags): Promise<void> {
 
   console.log();
 
-  const checks: CheckResult[] = [
+  const checks: CheckResult[] = config?.runtimeMode === "cloud-only" ? [
+    checkNode(), checkConfig(true), checkDatabase(config.dbPath),
+    ...await (await import("../cloud/preflight.js")).cloudPreflight(config),
+  ] : [
     checkNode(),
     checkConfig(config !== null),
     await checkBotToken(config?.botToken),
