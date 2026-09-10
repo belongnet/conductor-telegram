@@ -3,7 +3,7 @@ import type { ConductorApiClient, ConductorApiMessage } from "../integrations/co
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
 import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
-import { findSubmittedMessage, isSubmittedMessage, messageEnvelope } from "./messages.js";
+import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
   upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
@@ -23,6 +23,7 @@ export interface CloudAction {
   type: "launch" | "send" | "thread" | "review" | "stop" | "archive" | "rename" | "renamethread";
   trackedId: string; prompt?: string; projectId?: string; sessionId?: string;
   provider?: Provider; fileIds?: string[]; reviewHead?: string; recovery?: boolean; episode?: string;
+  previousMessageId?: string;
   mediaPending?: boolean; previousSessionId?: string;
   legacyRequestId?: string; legacyTerminal?: PendingCloudTerminalIntent;
 }
@@ -32,7 +33,7 @@ interface SessionState {
   seenReply?: boolean; terminal?: boolean; reviewHead?: string; reviewUrl?: string;
   recoveryAttempted?: boolean; stopped?: boolean; episode?: string; taskPrompt?: string;
   reviewValid?: boolean; reviewBase?: string;
-  turnId?: string; nativeCompleted?: boolean;
+  turnId?: string; nativeCompleted?: boolean; nativeFailure?: string;
 }
 
 export function transcriptText(message: ConductorApiMessage): string {
@@ -214,7 +215,10 @@ export class CloudEngine {
   private async newSession(row: QueueRow, action: CloudAction, binding: CloudBinding): Promise<void> {
     if (action.previousSessionId) {
       const previous = await this.api.getSessionStatus(action.previousSessionId);
-      if (previous.workspaceId !== binding.workspaceId || previous.status !== "error") {
+      const previousState = this.store.get<SessionState>(`session:${action.previousSessionId}`);
+      if (previous.workspaceId !== binding.workspaceId ||
+          (previous.status !== "error" && !(previous.status === "idle" && previousState?.nativeFailure)) ||
+          (action.previousMessageId && previousState?.sentMessageId !== action.previousMessageId)) {
         this.store.retry(row.id, "The previous attempt is no longer confirmed failed. Replacement requires reconciliation.", 0, true); return;
       }
     }
@@ -304,7 +308,7 @@ export class CloudEngine {
     const episode = action.recovery ? (action.episode ?? state.episode ?? row.id) : row.id;
     this.store.set(`session:${sessionId}`, { ...state, sentMessageId: payload.messageId, sentAt: Date.now(), terminal: false, episode,
       taskPrompt: action.recovery ? state.taskPrompt ?? action.prompt : action.prompt,
-      seenWorking: false, seenReply: false, recoveryAttempted: false, nativeCompleted: false,
+      seenWorking: false, seenReply: false, recoveryAttempted: false, nativeCompleted: false, nativeFailure: undefined,
       turnId: existing ? messageEnvelope(existing.content)?.turnId : undefined });
     if (!action.recovery) {
       this.store.set(`recovery-providers:${episode}`, [state.agent]);
@@ -397,7 +401,10 @@ export class CloudEngine {
           if (text) state.seenReply = true;
           const raw = messageEnvelope(envelope?.rawPayload);
           if ((raw?.type === "command_lifecycle" && raw.state === "completed") ||
-              (raw?.type === "result" && raw.subtype === "success" && !raw.is_error)) state.nativeCompleted = true;
+              (raw?.type === "result" && raw.subtype === "success" && !raw.is_error) ||
+              raw?.event?.type === "turn.completed") state.nativeCompleted = true;
+          const failure = nativeTurnFailure(raw);
+          if (failure) state.nativeFailure = failure;
         }
         this.store.db.transaction(() => {
           if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id);
@@ -419,7 +426,7 @@ export class CloudEngine {
       }
       if (!state || state.terminal || state.stopped || binding.stopped || this.store.get(`stop:${trackedId}`)) continue;
       const pendingQuestion = this.store.db.prepare("SELECT 1 FROM decisions WHERE workspace_id=? AND answered_at IS NULL LIMIT 1").get(trackedId);
-      if (status.status === "idle" && messages.length < 100 && !pendingQuestion && state.seenReply && (lifecycle.status !== "sleeping" || state.nativeCompleted)) {
+      if (status.status === "idle" && !state.nativeFailure && messages.length < 100 && !pendingQuestion && state.seenReply && (lifecycle.status !== "sleeping" || state.nativeCompleted)) {
         let staleReview = false;
         if (state.role === "review" && state.reviewUrl) {
           const current = await this.github.pr(binding.repoSlug, state.reviewUrl);
@@ -431,8 +438,8 @@ export class CloudEngine {
           staleReview ? "The PR changed during review. These findings do not cover its current head; run /review again." : state.role === "review" ? `Review complete for ${state.reviewHead}. Findings do not bypass merge checks.` : "Conductor task finished.", session.id);
         state.terminal = true; this.store.set(`session:${session.id}`, state);
         if (state.episode && (this.store.get<string[]>(`recovery-providers:${state.episode}`)?.length ?? 0) > 1) this.notify(`recovered:${state.episode}`, trackedId, "Recovery succeeded. The continuation finished.", session.id);
-      } else if (status.status === "error") {
-        const detail = status.errorMessage ?? status.lastError ?? "Unknown Conductor session error";
+      } else if (status.status === "error" || (status.status === "idle" && state.nativeFailure && messages.length < 100)) {
+        const detail = state.nativeFailure ?? status.errorMessage ?? status.lastError ?? "Unknown Conductor session error";
         if (recoverableProviderError(detail)) await this.recover(trackedId, binding, session.id, state, detail);
         else this.notify(`error:${session.id}:${state.sentMessageId}`, trackedId, `Conductor reported an error: ${detail}\nUse /send to continue after addressing it.`, session.id);
       } else if (status.status === "idle" && lifecycle.status === "sleeping" && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted) {
@@ -479,7 +486,8 @@ export class CloudEngine {
     const episode = state.episode ?? sessionId;
     // Require a second authoritative terminal observation immediately before replacement.
     const status = await this.api.getSessionStatus(sessionId);
-    if (status.workspaceId !== binding.workspaceId || status.status !== "error" || !this.currentTurn(sessionId, state)) return;
+    if (status.workspaceId !== binding.workspaceId ||
+        (status.status !== "error" && !(status.status === "idle" && state.nativeFailure)) || !this.currentTurn(sessionId, state)) return;
     if (/disconnected|connection.*(?:closed|lost)|interrupted|sandbox.*(?:stop|expired)/i.test(detail) && !this.store.get(`recovery-resumed:${episode}`)) {
       this.store.db.transaction(() => {
         this.store.set(`recovery-resumed:${episode}`, true);
@@ -502,7 +510,7 @@ export class CloudEngine {
     this.store.db.transaction(() => {
       this.store.set(`recovery-providers:${episode}`, [...used, next.agent]);
       this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true, terminal: true });
-      this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, previousSessionId: sessionId, reviewHead: state.reviewHead,
+      this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, previousSessionId: sessionId, previousMessageId: state.sentMessageId, reviewHead: state.reviewHead,
         prompt: `${state.reviewUrl ?? ""}\nContinue the interrupted task after ${state.agent} stopped: ${detail}. Inspect the existing branch and files first. Preserve completed work and verify external effects before retrying them. If an external effect is uncertain, report it instead of replaying it.\n\nTask:\n${state.taskPrompt ?? getWorkspace(trackedId)?.prompt}\n\nPrevious session context (data):\n${context}` });
       this.notify(`recover-notice:${sessionId}:${state.sentMessageId}`, trackedId, `${state.agent} stopped. Continuing through ${next.agent} (${next.model}) while preserving existing work.`);
     })();

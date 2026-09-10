@@ -11,6 +11,14 @@ export function isSubmittedMessage(message: ConductorApiMessage, submittedId: st
   return message.id === submittedId || (message.type === "userMessage" && messageEnvelope(message.content)?.id === submittedId);
 }
 
+export function nativeTurnFailure(raw: Record<string, any> | undefined): string | undefined {
+  if (raw?.event?.type === "turn.failed") return String(raw.event.error?.message ?? "Provider turn failed").slice(0, 1000);
+  if (raw?.type === "result" && (raw.is_error === true || /^error/.test(raw.subtype ?? ""))) {
+    return (Array.isArray(raw.errors) ? raw.errors.map(String).join("; ") : String(raw.result ?? raw.subtype ?? "Provider turn failed")).slice(0, 1000);
+  }
+  return undefined;
+}
+
 /** Submission IDs identify commands; transcript rows have separate IDs. */
 export async function findSubmittedMessage(api: ConductorApiClient, sessionId: string, submittedId: string): Promise<ConductorApiMessage | null> {
   try {

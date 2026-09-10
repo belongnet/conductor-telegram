@@ -112,6 +112,46 @@ test("a missing receipt cannot replay a command whose submission was attempted",
   assert.match(f.store.row("launch")?.error ?? "", /uncertain/);
 }));
 
+test("native turn failure with an idle session recovers only after terminal confirmation", () => fixture(async f => {
+  await f.launch();
+  const state = f.store.get<any>("session:s1");
+  f.messages.push({id: "failed-turn", sessionId: "s1", type: "agent", sessionIndex: 2, receivedAt: new Date().toISOString(),
+    content: {turnId: state.sentMessageId, rawPayload: {event: {type: "turn.failed", error: {message: "Selected model is at capacity", codexErrorInfo: "serverOverloaded"}}}}});
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const row = f.store.db.prepare("SELECT * FROM gateway_queue WHERE id LIKE 'recover:%'").get() as any;
+  assert.ok(row);
+  assert.equal(JSON.parse(row.payload).previousMessageId, state.sentMessageId);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.sessions.length, 2);
+  assert.equal(f.store.row(row.id)?.state, "done");
+}));
+
+test("a native failed turn cannot trigger replacement after the session starts working again", () => fixture(async f => {
+  await f.launch();
+  const state = f.store.get<any>("session:s1");
+  f.messages.push({id: "failed-turn", sessionId: "s1", type: "agent", sessionIndex: 2, receivedAt: new Date().toISOString(),
+    content: {turnId: state.sentMessageId, rawPayload: {event: {type: "turn.failed", error: {message: "Selected model is at capacity"}}}}});
+  let reads = 0;
+  f.api.getSessionStatus = async sessionId => ({workspaceId: "w1", sessionId, status: ++reads === 1 ? "idle" : "working", errorMessage: ""});
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.sessions.length, 1);
+  assert.equal(f.store.db.prepare("SELECT id FROM gateway_queue WHERE id LIKE 'recover:%'").get(), undefined);
+}));
+
+test("an older failed turn cannot replace a newly submitted turn", () => fixture(async f => {
+  await f.launch();
+  const state = f.store.get<any>("session:s1");
+  f.messages.push({id: "failed-turn", sessionId: "s1", type: "agent", sessionIndex: 2, receivedAt: new Date().toISOString(),
+    content: {turnId: state.sentMessageId, rawPayload: {event: {type: "turn.failed", error: {message: "Selected model is at capacity"}}}}});
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const recovery = f.store.db.prepare("SELECT * FROM gateway_queue WHERE id LIKE 'recover:%'").get() as any;
+  assert.ok(recovery);
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), sentMessageId: "new-command", nativeFailure: undefined});
+  await f.engine.action(recovery);
+  assert.equal(f.sessions.length, 1);
+  assert.equal(f.store.row(recovery.id)?.state, "blocked");
+}));
+
 test("a lost send receipt is matched by exact multiline payload and never resent", () => fixture(async f => {
   const original = f.api.sendMessage;
   f.api.sendMessage = async (input: any) => { await original(input); throw new Error("lost receipt"); };
