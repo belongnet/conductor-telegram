@@ -381,6 +381,116 @@ test("native commands acknowledge and queue work; owner checks prevent outsider 
   assert.equal(JSON.parse(f.store.row("update:2:action")!.payload).prompt, "task\n  preserve formatting");
 }));
 
+test("group authorization rejects impersonation, foreign chats, media, replies and control buttons before side effects", () => fixture(async f => {
+  await f.launch();
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 7);
+  const decision = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Approve?", options: ["Yes", "No"]}}).decisionId!;
+  f.store.linkDecision("-42", 100, decision);
+  f.store.set("route:access-test", {chatId: "-42", action: {type: "stop", trackedId: f.ws.id}});
+  f.store.set("thread:access-test", {trackedId: f.ws.id, sessionId: "other-session"});
+  let externalCalls = 0;
+  const unexpectedCall = async () => {externalCalls++; throw new Error("Unauthorized request reached an external API");};
+  for (const key of Object.keys(f.api)) (f.api as any)[key] = unexpectedCall;
+  const commands = new CloudCommands(f.store, f.engine, unexpectedCall, "-42", "9", "-42");
+  const snapshot = () => ({
+    workspace: getWorkspace(f.ws.id), decision: getDecision(decision), bindings: f.store.bindings(),
+    state: f.store.db.prepare("SELECT * FROM gateway_state WHERE key != 'telegram-offset' ORDER BY key").all(),
+    queue: f.store.db.prepare("SELECT * FROM gateway_queue WHERE kind NOT IN ('update','health-update') ORDER BY id").all(),
+    links: f.store.db.prepare("SELECT * FROM telegram_message_links ORDER BY chat_id,telegram_message_id").all(),
+  });
+  const before = snapshot();
+  const identities = [
+    {name: "another group member with the owner's username", chat: -42, from: {id: 10, username: "OwnerName"}},
+    {name: "anonymous group administrator", chat: -42, from: {id: 1087968824, is_bot: true}},
+    {name: "missing sender", chat: -42, from: undefined},
+    {name: "owner in a foreign group", chat: -43, from: {id: 9}},
+    {name: "owner in an unapproved private chat", chat: 9, from: {id: 9}},
+  ];
+  const payloads: Record<string, unknown>[] = [
+    ...["/run p1 deploy", "/send deploy", "/stop", "/archive", "/review https://github.com/org/repo/pull/1",
+      "/threads", "/threads new deploy", "/rename changed", "/renamethread changed", "/repos", "/fleet", "/lanes",
+      "/sync", "/status", "/decisions", "/ping", "/setup", `/answer ${decision} Yes`, "deploy now"].map(text => ({text})),
+    {text: "Yes", reply_to_message: {message_id: 100}},
+    {voice: {file_id: "voice"}, reply_to_message: {message_id: 100}},
+    {audio: {file_id: "audio"}}, {photo: [{file_id: "photo"}]}, {document: {file_id: "document"}, caption: "/send deploy"},
+  ];
+  let updateId = 0;
+  async function rejected(update: Record<string, unknown>, label: string) {
+    const id = ++updateId;
+    f.store.ingest([{update_id: id, ...update}]);
+    await processQueue(f.store, ["update", "health-update"], row => commands.handle(row));
+    assert.equal(f.store.row(`update:${id}`)?.state, "done", label);
+    assert.equal(externalCalls, 0, label);
+    assert.deepEqual(snapshot(), before, label);
+  }
+  for (const identity of identities) {
+    for (const payload of payloads) await rejected({message: {message_id: 200 + updateId, chat: {id: identity.chat},
+      from: identity.from, message_thread_id: 7, ...payload}}, identity.name);
+    for (const data of [`decision:${decision}:0`, "route:access-test", "thread:access-test"]) {
+      await rejected({callback_query: {id: `callback-${updateId}`, from: identity.from, data,
+        message: {message_id: 100, chat: {id: identity.chat}, from: {id: 99, is_bot: true}, message_thread_id: 7}}}, `${identity.name}: ${data}`);
+    }
+  }
+  // The original message may be from the owner; only the person clicking can authorize a callback.
+  await rejected({callback_query: {id: "foreign-click", from: {id: 10}, data: `decision:${decision}:0`,
+    message: {message_id: 100, chat: {id: -42}, from: {id: 9}, message_thread_id: 7}}}, "foreign click on owner's message");
+
+  f.store.ingest([{update_id: ++updateId, message: {message_id: 500, chat: {id: -42}, from: {id: 9, username: "ChangedName"},
+    message_thread_id: 7, text: "/send continue"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row(`update:${updateId}:action`)!.payload).trackedId, f.ws.id);
+  f.store.ingest([{update_id: ++updateId, callback_query: {id: "owner-click", from: {id: 9}, data: `decision:${decision}:0`,
+    message: {message_id: 100, chat: {id: -42}, from: {id: 99, is_bot: true}, message_thread_id: 7}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(getDecision(decision)?.answer, "Yes");
+  assert.equal(externalCalls, 0, "authorized commands queue work without doing network work during ingestion");
+}));
+
+test("HTTP bridge credentials cannot answer approvals, impersonate workspaces or bypass revocation", () => fixture(async f => {
+  const other = createWorkspace({name: "other", prompt: "Other task", repoPath: "conductor-project:p1", telegramChatId: "42"});
+  const credential = f.bridge.issueCredential(f.ws.id);
+  const own = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Own question?"}}).decisionId!;
+  const foreign = f.bridge.event(other.id, {id: randomUUID(), type: "human_request", payload: {question: "Private question?"}}).decisionId!;
+  const file = f.bridge.save(other.id, "private.txt", Buffer.from("private contents"));
+  const server = startBridge(f.bridge, 0); await once(server, "listening");
+  try {
+    const origin = `http://127.0.0.1:${(server.address() as any).port}`;
+    const request = (route: string, method = "GET", body?: unknown, token = credential) => fetch(`${origin}${route}`, {
+      method, headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json"},
+      ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+    });
+    for (const token of ["", "invalid"]) {
+      for (const route of ["/v1/decisions", "/v1/client", "/v1/bootstrap"]) {
+        assert.equal((await request(route, "GET", undefined, token)).status, 401);
+      }
+      assert.equal((await request("/v1/events", "POST", {}, token)).status, 401);
+      assert.equal((await request("/v1/attachments", "POST", {}, token)).status, 401);
+    }
+    const listed = await (await request(`/v1/decisions?workspaceId=${other.id}`)).json() as any;
+    assert.deepEqual(listed.decisions.map((d: any) => d.id), [own]);
+    assert.equal((await request(`/v1/decisions/${foreign}`)).status, 404);
+    assert.equal((await request(`/v1/decisions/${own}`, "POST", {answer: "Yes"})).status, 404);
+    assert.equal((await request(`/v1/attachments/${file}`, "POST", {})).status, 400);
+    assert.equal((await request(`/v1/attachments/${file}?token=invalid`)).status, 404);
+    const event = {id: randomUUID(), type: "human_request", payload: {question: "Forged question?"}};
+    for (const forged of [{...event, workspaceId: other.id}, {...event, type: "run"},
+      {...event, type: "decision", payload: {id: own, answer: "Yes"}},
+      {...event, type: "artifact", payload: {type: "file", url: `attachment:${file}`, description: "Foreign file"}}]) {
+      assert.equal((await request("/v1/events", "POST", forged)).status, 400);
+    }
+    assert.equal(getDecision(own)?.answer, null);
+    assert.equal(getDecision(foreign)?.answer, null);
+    assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM decisions").get() as any).n, 2);
+    f.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(f.ws.id);
+    assert.equal((await request("/v1/decisions")).status, 401);
+    const replacement = f.bridge.issueCredential(f.ws.id);
+    assert.equal((await request("/v1/decisions", "GET", undefined, replacement)).status, 200);
+    f.store.db.prepare("UPDATE workspaces SET archived_at=datetime('now') WHERE id=?").run(f.ws.id);
+    assert.equal((await request("/v1/decisions", "GET", undefined, replacement)).status, 401);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+}));
+
 test("gateway lease prevents concurrent pollers and permits takeover only after expiry", () => fixture(async f => {
   assert.equal(acquireGatewayLease(f.store, "one", 1000), true);
   assert.equal(acquireGatewayLease(f.store, "two", 2000), false);
