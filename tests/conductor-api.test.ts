@@ -632,25 +632,25 @@ test("transcript tails keep only the newest messages across pages", async () => 
     const parsed = new URL(String(url));
     urls.push(parsed.toString());
     const offset = Number(parsed.searchParams.get("offset") ?? 0);
-    const index = Math.floor(offset / 2);
-    const data = pages[index] ?? [];
+    const data = pages
+      .flat()
+      .slice(offset, offset + Math.min(2, Number(parsed.searchParams.get("limit") ?? 100)));
     return new Response(
-      JSON.stringify({ data, offset, hasMore: index < pages.length - 1 }),
+      JSON.stringify({ data, offset, hasMore: offset + data.length < pages.flat().length }),
       { status: 200, headers: { "content-type": "application/json" } }
     );
   }) as typeof fetch;
   const client = new ConductorApiClient(config(), fetcher);
 
-  // The tail bound trims while walking, so a giant transcript never
-  // accumulates in memory, yet the final slice stays in transcript order.
+  // Only the requested tail is returned, in transcript order.
   const tail = await client.getSessionMessageTail("session-1", 3);
   assert.deepEqual(
     tail.map((message) => message.id),
     ["message-3", "message-4", "message-5"]
   );
-  assert.equal(urls.length, 3, "walks every page to reach the tail");
+  assert.ok(urls.length < 10, "locates the tail with bounded reads");
 
-  // getLatestSessionMessage is the keep=1 special case of the same walk.
+  // getLatestSessionMessage shares the bounded tail lookup.
   const latest = await client.getLatestSessionMessage("session-1");
   assert.equal(latest?.id, "message-5");
 });
@@ -682,6 +682,36 @@ test("transcript tails seek past one hundred pages with bounded reads", async ()
   );
   assert.ok(calls.length < 30, `expected a bounded tail search, received ${calls.length} pages`);
   assert.ok(calls.some((offset) => offset > 10_000));
+});
+
+test("tail lookup handles empty, exact-page, partial-page, and capped-page transcripts", async () => {
+  for (const count of [0, 1, 2, 99, 100, 101, 199, 200, 201, 10_001]) {
+    const client = new ConductorApiClient(config(), (async (url: string | URL | Request) => {
+      const parsed = new URL(String(url));
+      const offset = Number(parsed.searchParams.get("offset") ?? 0);
+      const requested = Number(parsed.searchParams.get("limit") ?? 100);
+      const pageSize = Math.min(count === 2 ? 1 : 100, requested);
+      const length = Math.max(0, Math.min(pageSize, count - offset));
+      const data = Array.from({ length }, (_, index) =>
+        apiMessage(`message-${offset + index}`, (offset + index) * 3, "assistant", "content")
+      );
+      return new Response(
+        JSON.stringify({ data, offset, hasMore: offset + data.length < count }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }) as typeof fetch);
+
+    const tail = await client.getSessionMessageTail("session-1", 150);
+
+    assert.deepEqual(
+      tail.map((message) => message.id),
+      Array.from(
+        { length: Math.min(count, 150) },
+        (_, index) => `message-${Math.max(0, count - 150) + index}`
+      ),
+      `count=${count}`
+    );
+  }
 });
 
 test("cloud-workspace env wires attribution and the CONDUCTOR_API_URL fallback", async () => {

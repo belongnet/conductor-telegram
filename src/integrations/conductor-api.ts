@@ -430,69 +430,70 @@ export class ConductorApiClient {
     sessionId: string,
     limit: number
   ): Promise<ConductorApiMessage[]> {
-    const keep = Math.max(1, limit);
-    const pages = new Map<
-      number,
-      { data: ConductorApiMessage[]; offset: number; hasMore: boolean }
-    >();
-    const readPage = async (pageIndex: number, pageSize: number) => {
-      const cached = pages.get(pageIndex);
-      if (cached) return cached;
+    const keep = Math.max(1, Math.floor(limit));
+    if (!Number.isSafeInteger(keep) || keep > PAGE_SIZE * MAX_PAGES) {
+      throw new ConductorApiError("Transcript tail limit is invalid");
+    }
+    const pageAt = async (offset: number, size = PAGE_SIZE) => {
       const page = await this.request(
         "GET",
         withQuery(`/v0/sessions/${encodeURIComponent(sessionId)}/messages`, {
-          limit: PAGE_SIZE,
-          offset: pageIndex * pageSize,
+          limit: size,
+          offset,
         }),
         MessagePageSchema
       );
       assertMessageMembership(sessionId, page.data);
-      pages.set(pageIndex, page);
+      if (page.offset !== offset) {
+        throw new ConductorApiError("Transcript tail offset mismatch");
+      }
       return page;
     };
-
-    const first = await readPage(0, PAGE_SIZE);
+    const first = await pageAt(0);
     if (!first.hasMore || first.data.length === 0) {
       return first.data.slice(-keep);
     }
 
-    // Offset pagination has no total count. Seek an upper boundary
-    // exponentially, then bisect it, so a long-lived session does not need
-    // hundreds of sequential API calls just to establish its current tail.
-    const pageSize = first.data.length;
-    pages.clear();
-    pages.set(0, first);
+    // Offset is a row count, not sessionIndex (native indexes may have gaps).
+    // Exponential probing and bisection find the last page without scanning
+    // the old transcript, including histories beyond the ordinary page cap.
     let lower = 0;
-    let upper = 1;
-    let boundaryFound = false;
-    for (let probe = 0; probe < MAX_PAGES; probe += 1) {
-      const page = await readPage(upper, pageSize);
-      if (!page.hasMore || page.data.length === 0) {
-        boundaryFound = true;
+    let upper = first.data.length;
+    let end: number | undefined;
+    let bisect = false;
+    for (let probes = 0; probes < 64; probes += 1) {
+      const offset = bisect ? Math.floor((lower + upper) / 2) : upper;
+      if (!Number.isSafeInteger(offset) || (bisect && upper - lower <= 1)) {
         break;
       }
-      lower = upper;
-      upper *= 2;
+      const page = await pageAt(offset);
+      if (page.data.length === 0) {
+        upper = offset;
+        bisect = true;
+      } else if (!page.hasMore) {
+        end = offset + page.data.length;
+        break;
+      } else {
+        lower = offset;
+        if (!bisect) upper *= 2;
+      }
     }
-    if (!boundaryFound) {
+    if (end === undefined) {
       throw new ConductorApiError(
-        `Conductor API message tail search exceeded ${MAX_PAGES} probes`
+        "Transcript changed while locating its tail; retry the read"
       );
     }
 
-    for (let probe = 0; upper - lower > 1 && probe < MAX_PAGES; probe += 1) {
-      const middle = lower + Math.floor((upper - lower) / 2);
-      const page = await readPage(middle, pageSize);
-      if (page.data.length > 0 && page.hasMore) lower = middle;
-      else upper = middle;
-    }
-
-    const boundary = await readPage(upper, pageSize);
-    const finalPage = boundary.data.length > 0 ? upper : upper - 1;
-    const firstPage = Math.max(0, finalPage - Math.ceil(keep / pageSize));
     const tail: ConductorApiMessage[] = [];
-    for (let pageIndex = firstPage; pageIndex <= finalPage; pageIndex += 1) {
-      tail.push(...(await readPage(pageIndex, pageSize)).data);
+    for (let offset = Math.max(0, end - keep); offset < end; ) {
+      const page = await pageAt(offset, Math.min(PAGE_SIZE, end - offset));
+      if (page.data.length === 0) {
+        throw new ConductorApiError(
+          "Transcript changed while reading its tail; retry the read"
+        );
+      }
+      tail.push(...page.data);
+      offset += page.data.length;
     }
     return tail.slice(-keep);
   }
