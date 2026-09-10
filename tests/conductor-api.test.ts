@@ -564,6 +564,22 @@ test("workspace create accepts the cursor agent", async () => {
   });
 });
 
+test("native stop and archive controls submit the required JSON object", async () => {
+  const calls: string[] = [];
+  const client = new ConductorApiClient(config(), (async (url, init) => {
+    // The live API rejects an empty request body with HTTP 400.
+    if (init?.body !== "{}") return new Response(JSON.stringify({userMessage: "JSON body required"}), {status: 400});
+    const path = new URL(String(url)).pathname;
+    calls.push(path);
+    const status = path.endsWith("/cancel") ? "idle" : "archived";
+    return new Response(JSON.stringify({workspaceId: "w1", sessionId: "s1", status, canceledQueuedMessages: 0}), {status: 200});
+  }) as typeof fetch);
+  assert.equal((await client.cancelSession("s1")).status, "idle");
+  assert.equal((await client.archiveSession("s1")).status, "archived");
+  assert.equal((await client.archiveWorkspace("w1")).status, "archived");
+  assert.deepEqual(calls, ["/v0/sessions/s1/cancel", "/v0/sessions/s1/archive", "/v0/workspaces/w1/archive"]);
+});
+
 test("project workspace listing paginates against the project path", async () => {
   const urls: string[] = [];
   const workspace = (id: string, name: string) => ({
