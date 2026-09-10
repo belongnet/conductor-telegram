@@ -30,10 +30,12 @@ Conductor workspace renames update the topic name. Archived or deleted workspace
 
 `TELEGRAM_CLOUD_SYNC_INPUT` controls input from the sync group:
 
-- `commands` accepts only slash commands explicitly addressed to this bot, plus callbacks on this bot's buttons. It holds ordinary text and voice. Use this while another gateway still reads the group.
+- `commands` accepts only slash commands explicitly addressed to this bot, plus callbacks on this bot's buttons. Ordinary text and voice are not submitted or queued for later execution. Use this while another gateway still reads the group.
 - `all` accepts owner text, media, voice, and commands in attached topics. This is the default for a single active gateway.
 
 The setting cannot prevent another Telegram bot from processing a group message. During coexistence, operators should use only commands addressed to the new bot. Before switching to `all`, stop the previous consumer and verify it remains stopped. Then restart the new gateway, run `/sync@YourBot`, and test one reply to a forwarded message.
+
+Commands-only mode is a cutover gate, not a running migration job. The gateway tells the sender when a message was not submitted. After cutover, check whether the previous bot already acted before resending anything. Command responses and human questions take priority over queued transcript updates while retaining Telegram rate-limit backoff and transcript order.
 
 ## Public guided setup
 

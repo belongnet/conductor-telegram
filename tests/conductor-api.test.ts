@@ -564,6 +564,22 @@ test("workspace create accepts the cursor agent", async () => {
   });
 });
 
+test("native stop and archive controls submit the required JSON object", async () => {
+  const calls: string[] = [];
+  const client = new ConductorApiClient(config(), (async (url, init) => {
+    // The live API rejects an empty request body with HTTP 400.
+    if (init?.body !== "{}") return new Response(JSON.stringify({userMessage: "JSON body required"}), {status: 400});
+    const path = new URL(String(url)).pathname;
+    calls.push(path);
+    const status = path.endsWith("/cancel") ? "idle" : "archived";
+    return new Response(JSON.stringify({workspaceId: "w1", sessionId: "s1", status, canceledQueuedMessages: 0}), {status: 200});
+  }) as typeof fetch);
+  assert.equal((await client.cancelSession("s1")).status, "idle");
+  assert.equal((await client.archiveSession("s1")).status, "archived");
+  assert.equal((await client.archiveWorkspace("w1")).status, "archived");
+  assert.deepEqual(calls, ["/v0/sessions/s1/cancel", "/v0/sessions/s1/archive", "/v0/workspaces/w1/archive"]);
+});
+
 test("project workspace listing paginates against the project path", async () => {
   const urls: string[] = [];
   const workspace = (id: string, name: string) => ({
@@ -778,3 +794,20 @@ function apiMessage(
     receivedAt: "2026-07-28T12:00:00.000Z",
   };
 }
+
+test("large transcript tails locate the end without walking 10000 historical rows", async () => {
+  let requests = 0;
+  const count = 50037;
+  const client = new ConductorApiClient(config(), (async (url: string | URL | Request) => {
+    requests++;
+    const parsed = new URL(String(url));
+    const offset = Number(parsed.searchParams.get("offset") ?? 0);
+    const limit = Number(parsed.searchParams.get("limit") ?? 100);
+    const data = Array.from({length: Math.max(0, Math.min(limit, count - offset))}, (_, n) =>
+      apiMessage(`message-${offset + n}`, (offset + n) * 3, "assistant", "content"));
+    return new Response(JSON.stringify({data, offset, hasMore: offset + data.length < count}), {status: 200});
+  }) as typeof fetch);
+  const tail = await client.getSessionMessageTail("session-1", 20);
+  assert.deepEqual(tail.map(m => m.id), Array.from({length: 20}, (_, n) => `message-${count - 20 + n}`));
+  assert.ok(requests < 40, `tail lookup took ${requests} requests`);
+});

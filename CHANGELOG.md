@@ -32,6 +32,18 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.8.1] - 2026-09-10
+
+### Fixed
+- Command replies and human questions reach Telegram ahead of transcript backlogs while preserving rate-limit backoff and transcript order.
+- Tasks recover after provider credits run out or a selected model is unavailable, once the previous run is confirmed stopped.
+- Native Stop and Archive controls send the JSON body required by Conductor instead of failing with HTTP 400.
+- Replies to preserved local history explain how to start a cloud task. Explicit new tasks no longer inherit an unrelated historical session.
+- Messages received before cutover clearly say they were not submitted; they are not silently queued for later execution.
+
+### Security
+- Regression checks cover Telegram owner impersonation, foreign chats, unauthorized buttons and media, cross-workspace file and decision access, forged approvals, and revoked bridge credentials.
+
 ## [0.7.0] - 2026-08-30
 
 ### Added

@@ -68,6 +68,30 @@ test("cloud launch sends over native API without a desktop database or checkout"
   assert.equal(f.store.row("launch")?.state, "done");
 }));
 
+test("replies to migrated local history never queue cloud work against an unbound record", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET repo_path=?,status='done' WHERE id=?").run("/Users/legacy/project", f.ws.id);
+  const before = getWorkspace(f.ws.id);
+  const {linkTelegramMessage} = await import("../src/store/queries.js");
+  linkTelegramMessage("42", "90", f.ws.id, "legacy-session");
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42");
+  for (const [i, extra] of [{text: "continue"}, {text: "/send continue"}, {voice: {file_id: "voice"}}].entries()) {
+    const id=i+1;
+    f.store.ingest([{update_id: id, message: {message_id: 100+id, chat: {id: 42}, reply_to_message: {message_id: 90}, ...extra}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    assert.equal(f.store.row(`update:${id}:action`), undefined);
+    assert.equal(f.store.row(`update:${id}:media`), undefined);
+    assert.match(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.text, /historical.*\/run/is);
+  }
+  assert.deepEqual(getWorkspace(f.ws.id), before);
+  assert.deepEqual(f.counts(), {creates: 0, sends: 0});
+  f.store.ingest([{update_id: 4, message: {message_id: 104, chat: {id: 42}, reply_to_message: {message_id: 90}, text: "/run p1 Start new work"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const action=JSON.parse(f.store.row("update:4:action")!.payload);
+  assert.notEqual(action.trackedId, f.ws.id);
+  assert.equal(action.projectId, "p1");
+  assert.equal(action.sessionId, undefined);
+}));
+
 test("uncertain workspace creation is reconciled without another create", () => fixture(async f => {
   f.api.createWorkspace = async () => { throw new Error("lost receipt"); };
   await f.launch();
@@ -277,6 +301,20 @@ test("document intake keeps caption and file private, releases its reservation, 
   }
 }));
 
+test("human questions bypass transcript backlog and retain reply associations after restart", () => fixture(async f => {
+  enqueueText(f.store, "earlier-transcript", "42", "Background progress", {workspaceId: f.ws.id, sessionId: "s1"});
+  const receipt = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Which target?"}});
+  f.engine.events();
+  const sent: string[] = [];
+  const delivery = new TelegramDelivery(f.store, async (_method, payload) => {sent.push(payload.text); return {message_id: 101};});
+  await delivery.tick();
+  assert.match(sent[0], /Which target\?/);
+  assert.equal(f.store.row("earlier-transcript:0")?.state, "pending");
+  const restarted = new GatewayStore(f.store.db);
+  assert.equal(restarted.decisionForMessage("42", 101), receipt.decisionId);
+  assert.equal(getWorkspaceMessageTarget("42", "101")?.workspace.id, f.ws.id);
+}));
+
 test("question send failures and 429 cooldown preserve the question and reply link", () => fixture(async f => {
   const receipt = f.bridge.event(f.ws.id, { id: randomUUID(), type: "human_request", payload: { question: "Continue?", options: ["Yes", "No"] } });
   f.engine.events();
@@ -341,6 +379,116 @@ test("native commands acknowledge and queue work; owner checks prevent outsider 
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 1);
   assert.equal(f.counts().creates, 0);
   assert.equal(JSON.parse(f.store.row("update:2:action")!.payload).prompt, "task\n  preserve formatting");
+}));
+
+test("group authorization rejects impersonation, foreign chats, media, replies and control buttons before side effects", () => fixture(async f => {
+  await f.launch();
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 7);
+  const decision = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Approve?", options: ["Yes", "No"]}}).decisionId!;
+  f.store.linkDecision("-42", 100, decision);
+  f.store.set("route:access-test", {chatId: "-42", action: {type: "stop", trackedId: f.ws.id}});
+  f.store.set("thread:access-test", {trackedId: f.ws.id, sessionId: "other-session"});
+  let externalCalls = 0;
+  const unexpectedCall = async () => {externalCalls++; throw new Error("Unauthorized request reached an external API");};
+  for (const key of Object.keys(f.api)) (f.api as any)[key] = unexpectedCall;
+  const commands = new CloudCommands(f.store, f.engine, unexpectedCall, "-42", "9", "-42");
+  const snapshot = () => ({
+    workspace: getWorkspace(f.ws.id), decision: getDecision(decision), bindings: f.store.bindings(),
+    state: f.store.db.prepare("SELECT * FROM gateway_state WHERE key != 'telegram-offset' ORDER BY key").all(),
+    queue: f.store.db.prepare("SELECT * FROM gateway_queue WHERE kind NOT IN ('update','health-update') ORDER BY id").all(),
+    links: f.store.db.prepare("SELECT * FROM telegram_message_links ORDER BY chat_id,telegram_message_id").all(),
+  });
+  const before = snapshot();
+  const identities = [
+    {name: "another group member with the owner's username", chat: -42, from: {id: 10, username: "OwnerName"}},
+    {name: "anonymous group administrator", chat: -42, from: {id: 11, is_bot: true}},
+    {name: "missing sender", chat: -42, from: undefined},
+    {name: "owner in a foreign group", chat: -43, from: {id: 9}},
+    {name: "owner in an unapproved private chat", chat: 9, from: {id: 9}},
+  ];
+  const payloads: Record<string, unknown>[] = [
+    ...["/run p1 deploy", "/send deploy", "/stop", "/archive", "/review https://github.com/org/repo/pull/1",
+      "/threads", "/threads new deploy", "/rename changed", "/renamethread changed", "/repos", "/fleet", "/lanes",
+      "/sync", "/status", "/decisions", "/ping", "/setup", `/answer ${decision} Yes`, "deploy now"].map(text => ({text})),
+    {text: "Yes", reply_to_message: {message_id: 100}},
+    {voice: {file_id: "voice"}, reply_to_message: {message_id: 100}},
+    {audio: {file_id: "audio"}}, {photo: [{file_id: "photo"}]}, {document: {file_id: "document"}, caption: "/send deploy"},
+  ];
+  let updateId = 0;
+  async function rejected(update: Record<string, unknown>, label: string) {
+    const id = ++updateId;
+    f.store.ingest([{update_id: id, ...update}]);
+    await processQueue(f.store, ["update", "health-update"], row => commands.handle(row));
+    assert.equal(f.store.row(`update:${id}`)?.state, "done", label);
+    assert.equal(externalCalls, 0, label);
+    assert.deepEqual(snapshot(), before, label);
+  }
+  for (const identity of identities) {
+    for (const payload of payloads) await rejected({message: {message_id: 200 + updateId, chat: {id: identity.chat},
+      from: identity.from, message_thread_id: 7, ...payload}}, identity.name);
+    for (const data of [`decision:${decision}:0`, "route:access-test", "thread:access-test"]) {
+      await rejected({callback_query: {id: `callback-${updateId}`, from: identity.from, data,
+        message: {message_id: 100, chat: {id: identity.chat}, from: {id: 99, is_bot: true}, message_thread_id: 7}}}, `${identity.name}: ${data}`);
+    }
+  }
+  // The original message may be from the owner; only the person clicking can authorize a callback.
+  await rejected({callback_query: {id: "foreign-click", from: {id: 10}, data: `decision:${decision}:0`,
+    message: {message_id: 100, chat: {id: -42}, from: {id: 9}, message_thread_id: 7}}}, "foreign click on owner's message");
+
+  f.store.ingest([{update_id: ++updateId, message: {message_id: 500, chat: {id: -42}, from: {id: 9, username: "ChangedName"},
+    message_thread_id: 7, text: "/send continue"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row(`update:${updateId}:action`)!.payload).trackedId, f.ws.id);
+  f.store.ingest([{update_id: ++updateId, callback_query: {id: "owner-click", from: {id: 9}, data: `decision:${decision}:0`,
+    message: {message_id: 100, chat: {id: -42}, from: {id: 99, is_bot: true}, message_thread_id: 7}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(getDecision(decision)?.answer, "Yes");
+  assert.equal(externalCalls, 0, "authorized commands queue work without doing network work during ingestion");
+}));
+
+test("HTTP bridge credentials cannot answer approvals, impersonate workspaces or bypass revocation", () => fixture(async f => {
+  const other = createWorkspace({name: "other", prompt: "Other task", repoPath: "conductor-project:p1", telegramChatId: "42"});
+  const credential = f.bridge.issueCredential(f.ws.id);
+  const own = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Own question?"}}).decisionId!;
+  const foreign = f.bridge.event(other.id, {id: randomUUID(), type: "human_request", payload: {question: "Private question?"}}).decisionId!;
+  const file = f.bridge.save(other.id, "private.txt", Buffer.from("private contents"));
+  const server = startBridge(f.bridge, 0); await once(server, "listening");
+  try {
+    const origin = `http://127.0.0.1:${(server.address() as any).port}`;
+    const request = (route: string, method = "GET", body?: unknown, token = credential) => fetch(`${origin}${route}`, {
+      method, headers: {Authorization: `Bearer ${token}`, "Content-Type": "application/json"},
+      ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+    });
+    for (const token of ["", "invalid"]) {
+      for (const route of ["/v1/decisions", "/v1/client", "/v1/bootstrap"]) {
+        assert.equal((await request(route, "GET", undefined, token)).status, 401);
+      }
+      assert.equal((await request("/v1/events", "POST", {}, token)).status, 401);
+      assert.equal((await request("/v1/attachments", "POST", {}, token)).status, 401);
+    }
+    const listed = await (await request(`/v1/decisions?workspaceId=${other.id}`)).json() as any;
+    assert.deepEqual(listed.decisions.map((d: any) => d.id), [own]);
+    assert.equal((await request(`/v1/decisions/${foreign}`)).status, 404);
+    assert.equal((await request(`/v1/decisions/${own}`, "POST", {answer: "Yes"})).status, 404);
+    assert.equal((await request(`/v1/attachments/${file}`, "POST", {})).status, 400);
+    assert.equal((await request(`/v1/attachments/${file}?token=invalid`)).status, 404);
+    const event = {id: randomUUID(), type: "human_request", payload: {question: "Forged question?"}};
+    for (const forged of [{...event, workspaceId: other.id}, {...event, type: "run"},
+      {...event, type: "decision", payload: {id: own, answer: "Yes"}},
+      {...event, type: "artifact", payload: {type: "file", url: `attachment:${file}`, description: "Foreign file"}}]) {
+      assert.equal((await request("/v1/events", "POST", forged)).status, 400);
+    }
+    assert.equal(getDecision(own)?.answer, null);
+    assert.equal(getDecision(foreign)?.answer, null);
+    assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM decisions").get() as any).n, 2);
+    f.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(f.ws.id);
+    assert.equal((await request("/v1/decisions")).status, 401);
+    const replacement = f.bridge.issueCredential(f.ws.id);
+    assert.equal((await request("/v1/decisions", "GET", undefined, replacement)).status, 200);
+    f.store.db.prepare("UPDATE workspaces SET archived_at=datetime('now') WHERE id=?").run(f.ws.id);
+    assert.equal((await request("/v1/decisions", "GET", undefined, replacement)).status, 401);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 }));
 
 test("gateway lease prevents concurrent pollers and permits takeover only after expiry", () => fixture(async f => {
@@ -482,4 +630,41 @@ test("Telegram media rate limits persist their full cooldown and native outages 
   }
   assert.equal(f.store.row("outage")?.state, "pending");
   assert.ok(f.store.row("outage")!.available_at > Date.now() + 119_000);
+}));
+
+test("native out-of-usage-credits errors recover once after confirming an idle session", () => fixture(async f => {
+  await f.launch();
+  const sent = f.store.get<any>('session:s1').sentMessageId;
+  f.messages.push({id: 'credits-error', sessionId: 's1', sessionIndex: 1, type: 'agent', receivedAt: new Date().toISOString(),
+    content: {userMessageId: sent, rawPayload: {type: 'result', subtype: 'error_during_execution', is_error: true,
+      result: "You're out of usage credits. Switch to another model to continue."}}});
+  f.status('idle');
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>('session:s1').recoveryAttempted, true);
+  const recovery = (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='cloud'").all() as Array<{payload: string}>)
+    .map(row => JSON.parse(row.payload)).filter(action => action.recovery);
+  assert.equal(recovery.length, 1); assert.equal(recovery[0].provider.agent, 'codex');
+  assert.equal(recovery[0].previousSessionId, 's1'); assert.equal(recovery[0].previousMessageId, sent);
+  assert.deepEqual(f.counts(), {creates: 1, sends: 1}, 'the original native command was not replayed');
+}));
+
+test("an inaccessible selected model falls back only after its native turn stops", () => fixture(async f => {
+  await f.launch();
+  const sent = f.store.get<any>('session:s1').sentMessageId;
+  f.messages.push({id: 'model-error', sessionId: 's1', sessionIndex: 1, type: 'agent', receivedAt: new Date().toISOString(),
+    content: {userMessageId: sent, rawPayload: {type: 'result', subtype: 'error_during_execution', is_error: true,
+      result: "There's an issue with the selected model (gpt-5.6-sol). It may not exist or you may not have access to it."}}});
+  f.status('working');
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.ok(!f.store.get<any>('session:s1').recoveryAttempted, 'a working session cannot be replaced');
+  f.status('idle');
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const recovery = (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='cloud'").all() as Array<{payload: string}>)
+    .map(row => JSON.parse(row.payload)).filter(action => action.recovery);
+  assert.equal(recovery.length, 1);
+  assert.equal(recovery[0].previousSessionId, 's1');
+  assert.equal(recovery[0].previousMessageId, sent);
+  assert.equal(recovery[0].provider.agent, 'codex');
+  assert.deepEqual(f.counts(), {creates: 1, sends: 1}, 'the failed task must not be replayed');
 }));

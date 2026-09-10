@@ -580,7 +580,7 @@ export class ConductorApiClient {
       "POST",
       `/v0/sessions/${encodeURIComponent(sessionId)}/cancel`,
       SessionCancelSchema,
-      { retrySafe: true }
+      { body: {}, retrySafe: true }
     );
     assertApiIdentity("session", sessionId, result.sessionId);
     return result;
@@ -593,7 +593,7 @@ export class ConductorApiClient {
       "POST",
       `/v0/sessions/${encodeURIComponent(sessionId)}/archive`,
       SessionArchiveSchema,
-      { retrySafe: true }
+      { body: {}, retrySafe: true }
     );
     assertApiIdentity("session", sessionId, result.sessionId);
     return result;
@@ -606,7 +606,7 @@ export class ConductorApiClient {
       "POST",
       `/v0/workspaces/${encodeURIComponent(workspaceId)}/archive`,
       WorkspaceArchiveSchema,
-      { retrySafe: true }
+      { body: {}, retrySafe: true }
     );
     assertApiIdentity("workspace", workspaceId, result.workspaceId);
     return result;
