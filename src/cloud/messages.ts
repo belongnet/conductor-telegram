@@ -1,3 +1,5 @@
+import type {ConductorApiSession} from "../integrations/conductor-api.js";
+import type {Provider} from "./engine.js";
 import { ConductorApiError, type ConductorApiClient, type ConductorApiMessage } from "../integrations/conductor-api.js";
 
 export function messageEnvelope(content: unknown): Record<string, any> | undefined {
@@ -38,4 +40,15 @@ export async function findSubmittedMessage(api: ConductorApiClient, sessionId: s
     if (page.length < 100) return null;
   }
   throw new Error("Message reconciliation exceeded its transcript limit; refusing an uncertain replay");
+}
+
+/** Preserve native session settings; unknown models never authorize a guessed provider. */
+export function nativeSessionProvider(session: ConductorApiSession): Provider {
+  const model = session.model ?? session.resolvedModel ?? "";
+  const resolved = (session.resolvedModel ?? model).toLowerCase();
+  const agent = /^(gpt|o\d|codex)([-_.]|$)/.test(resolved) ? "codex"
+    : /(^|[-_.])(claude|opus|sonnet|haiku|fable)([-_.]|$)/.test(resolved) ? "claude"
+    : /^grok[-_.]/.test(resolved) ? "cursor" : undefined;
+  if (!agent || !model) throw new Error("Native session model is unavailable or unsupported; select a supported session with /threads.");
+  return {agent, model, effort: session.effort ?? "high"};
 }

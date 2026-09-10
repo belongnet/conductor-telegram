@@ -9,10 +9,11 @@ import { enqueueTelegram, enqueueText, type TelegramCall } from "./telegram.js";
 import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
+import {nativeSessionProvider} from "./messages.js";
 import type { Workspace } from "../types/index.js";
 
 const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "office_hours", "design_review", "gstack", "skill"]);
-const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/send [workspace] <message> — follow up\n/review [PR URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
+const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
 
 interface MediaJob {
   action?: CloudAction; decisionId?: number; chatId: string; threadId?: number; text?: string;
@@ -21,17 +22,22 @@ interface MediaJob {
 
 export class CloudCommands {
   constructor(readonly store: GatewayStore, readonly engine: CloudEngine, readonly telegram: TelegramCall,
-    readonly ownerChatId: string, readonly ownerUserId?: string) {}
+    readonly ownerChatId: string, readonly ownerUserId?: string, readonly syncChatId?: string,
+    readonly syncInput: "all" | "commands" = "all") {}
 
   async handle(row: QueueRow): Promise<void> {
     const update = JSON.parse(row.payload);
     const callback = update.callback_query;
     const msg = update.message ?? callback?.message;
     const from = callback?.from ?? msg?.from;
-    if (!msg || String(msg.chat?.id) !== this.ownerChatId || (this.ownerUserId && String(from?.id) !== this.ownerUserId)) return;
+    if (!msg || (this.ownerUserId && String(from?.id) !== this.ownerUserId)) return;
+    const syncedTarget = this.syncChatId && String(msg.chat?.id) === this.syncChatId && msg.message_thread_id
+      ? getWorkspaceByThreadId(this.syncChatId, msg.message_thread_id) : undefined;
+    if (String(msg.chat?.id) !== this.ownerChatId && !(this.ownerUserId && syncedTarget && this.store.get(`cloud-synced:${syncedTarget.id}`))) return;
     const chatId = String(msg.chat.id);
     const threadId = msg.message_thread_id;
     const attachment = msg.voice ?? msg.audio ?? msg.document ?? msg.photo?.at(-1);
+    if (!callback && !msg.text && !msg.caption && !attachment) return;
     const media = attachment ? { fileId: attachment.file_id, fileName: attachment.file_name ?? (msg.photo ? "photo.jpg" : "voice.ogg"), voice: !!(msg.voice || msg.audio) } : undefined;
     const reply = (text: string, suffix = "reply", markup?: unknown) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
       { threadId, replyMarkup: markup });
@@ -54,7 +60,8 @@ export class CloudCommands {
         const selection = this.store.get<{ trackedId: string; sessionId: string }>(data);
         const binding = selection && this.store.binding(selection.trackedId);
         if (!selection || !binding || getWorkspace(selection.trackedId)?.telegramChatId !== chatId) return;
-        this.store.bind(selection.trackedId, { ...binding, sessionId: selection.sessionId }); reply("Active thread updated."); return;
+        const provider = binding.synced ? nativeSessionProvider(await this.engine.api.getSession(selection.sessionId)) : undefined;
+        this.store.bind(selection.trackedId, { ...binding, ...provider, sessionId: selection.sessionId }); reply("Active thread updated."); return;
       }
       if (data.startsWith("route:")) {
         const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob }>(data);
@@ -69,9 +76,18 @@ export class CloudCommands {
     const match = raw.match(/^\/([\w]+)(?:@(\w+))?(?:\s+([\s\S]*))?$/);
     const addressedBot = match?.[2]?.toLowerCase();
     if (addressedBot && addressedBot !== this.store.get<string>("telegram-bot-username")?.toLowerCase()) return;
+    if (chatId === this.syncChatId && this.syncInput === "commands" && !addressedBot) {
+      const username = this.store.get<string>("telegram-bot-username");
+      reply(`During migration use /send@${username} <text>. Ordinary text and voice replies are waiting for the old gateway to be disabled.`); return;
+    }
     const command = match?.[1]?.toLowerCase();
     let args = match?.[3]?.trim() ?? "";
     if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}`, {threadId, priority: 0}); return; }
+    if (command === "sync") {
+      if (!this.syncChatId) { reply("Cloud workspace sync needs TELEGRAM_CLOUD_SYNC_CHAT_ID set to a forum group."); return; }
+      this.store.set("cloud-sync-after", 0);
+      reply("Cloud workspace sync requested. Existing workspace topics will be reused."); return;
+    }
     if (["help", "start", "setup"].includes(command ?? "")) { reply(HELP); return; }
     if (command === "lanes") {
       if (process.env.LANES_STATE_BACKEND !== "http") { reply("The independent lanes worker needs its HTTP state connection configured."); return; }

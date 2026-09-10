@@ -144,8 +144,12 @@ export function gatewayHealth(store: GatewayStore, now = Date.now()): { ready: b
   const recent = store.db.prepare("SELECT id,completed_at-created_at AS latency FROM gateway_queue WHERE kind='telegram' AND state='done' AND completed_at>? AND (id LIKE 'update:%:reply:%' OR id LIKE 'transcript:%') ORDER BY latency")
     .all(now - 24 * 3600_000) as Array<{id: string; latency: number}>;
   const latency = (prefix: string) => { const values = recent.filter(row => row.id.startsWith(prefix)).map(row => row.latency); return {samples: values.length, p95QueueMs: values.length ? values[Math.min(values.length - 1, Math.floor(values.length * 0.95))] : null}; };
-  const ready = ingress < 90_000 && poll < 120_000 && !stalledWorkspaces && delivery.blocked === 0 && delivery.oldestMs < 300_000;
+  const syncEnabled = store.get("cloud-sync-enabled");
+  const syncStatus = store.get<{at: number; failures: number}>("cloud-sync-status");
+  const syncHealthy = !syncEnabled || (!!syncStatus && syncStatus.failures === 0 && now - syncStatus.at < 180_000);
+  const ready = ingress < 90_000 && poll < 120_000 && !stalledWorkspaces && delivery.blocked === 0 && delivery.oldestMs < 300_000 && syncHealthy;
   return { ready, checks: { ingestionAgeMs: ingress, cloudPollAgeMs: poll, delivery,
+    ...(syncEnabled ? {workspaceSync: syncStatus ?? {pending: true}} : {}),
     stalledWorkspaces, acknowledgements: latency("update:"), transcriptDelivery: latency("transcript:") } };
 }
 

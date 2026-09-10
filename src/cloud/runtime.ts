@@ -13,6 +13,7 @@ import { enqueueText, ingestTelegram, pause, QueueDispatcher, TelegramDelivery, 
 import { CloudRouter } from "./router.js";
 import { CloudPoller } from "./poller.js";
 import {restoreLegacyOperations} from "./legacy.js";
+import {CloudWorkspaceSync} from "./sync.js";
 
 export function acquireGatewayLease(store: GatewayStore, owner: string, now = Date.now()): boolean {
   return store.db.transaction(() => {
@@ -39,6 +40,15 @@ export async function startCloudGateway(): Promise<void> {
     signal: AbortSignal.timeout(method === "getUpdates" ? 40_000 : method === "sendDocument" ? 60_000 : 10_000),
   });
   const me = await rawCall("getMe", {});
+  const syncChatId = process.env.TELEGRAM_CLOUD_SYNC_CHAT_ID;
+  const syncInput = process.env.TELEGRAM_CLOUD_SYNC_INPUT ?? "all";
+  if (!["all", "commands"].includes(syncInput)) throw new Error("TELEGRAM_CLOUD_SYNC_INPUT must be all or commands");
+  if (syncChatId) {
+    if (!/^-[1-9]\d*$/.test(syncChatId) || !process.env.OWNER_USER_ID) throw new Error("Cloud sync requires a forum group ID and OWNER_USER_ID");
+    const chat = await rawCall("getChat", {chat_id: syncChatId});
+    const member = await rawCall("getChatMember", {chat_id: syncChatId, user_id: me.id});
+    if (!chat.is_forum || member.status !== "administrator" || !member.can_manage_topics) throw new Error("Cloud sync bot requires Manage Topics permission in its forum group");
+  }
   const webhook = await rawCall("getWebhookInfo", {});
   if (webhook.url) throw new Error("A Telegram webhook is active; remove it during the controlled cutover before starting this poller");
   const db = getDb();
@@ -95,7 +105,10 @@ export async function startCloudGateway(): Promise<void> {
   const engine = new CloudEngine(store, fencedApi, bridge, github, [primary, ...DEFAULT_PROVIDERS.filter(p => p.agent !== primary.agent && enabled.includes(p.agent))], process.env.TELEGRAM_CLOUD_REVIEW_POLICY === "native",
     {agent: reviewAgent as Provider["agent"] | undefined, model: process.env.TELEGRAM_REVIEW_MODEL});
   restoreLegacyOperations(engine);
-  const commands = new CloudCommands(store, engine, call, ownerChatId, process.env.OWNER_USER_ID);
+  const commands = new CloudCommands(store, engine, call, ownerChatId, process.env.OWNER_USER_ID, syncChatId, syncInput as "all" | "commands");
+  const sync = syncChatId ? new CloudWorkspaceSync(engine, syncChatId) : undefined;
+  store.set("cloud-sync-input", syncInput);
+  store.set("cloud-sync-enabled", !!sync);
   const delivery = new TelegramDelivery(store, call);
   const router = new CloudRouter(engine, process.env.TELEGRAM_CLOUD_ROUTER_PROJECT_ID);
   const poller = new CloudPoller(engine);
@@ -142,12 +155,13 @@ export async function startCloudGateway(): Promise<void> {
       loop("delivery", 100, () => delivery.tick()),
       loop("events", 1000, () => { engine.events(); reportBlocked(); }),
       loop("cloud-poller", 1000, () => poller.tick()),
+      loop("cloud-sync", 1000, () => sync?.tick()),
       loop("cloud-access", 60_000, async () => { await fencedApi.getIdentity(); store.set("cloud-access-last-success", Date.now()); }),
       loop("retention", 3600_000, () => bridge.prune()),
     ]);
   } finally {
     abort.abort(); server.close();
-    await Promise.all([poller.settled(), ...Object.values(dispatchers).map(worker => worker.settled())]);
+    await Promise.all([poller.settled(), sync?.settled(), ...Object.values(dispatchers).map(worker => worker.settled())]);
     // Leave the lease to expire: outstanding upstream calls can still be settling.
   }
 }

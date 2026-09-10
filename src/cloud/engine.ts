@@ -3,7 +3,7 @@ import type { ConductorApiClient, ConductorApiMessage } from "../integrations/co
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
 import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
-import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure } from "./messages.js";
+import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
   upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
@@ -151,7 +151,11 @@ export class CloudEngine {
       this.notify(`${row.id}:done`, ws.id, "Cloud thread renamed."); return;
     }
     if (action.type === "review" && !this.nativeReviews) throw new Error("Native cloud reviews are disabled. Set TELEGRAM_CLOUD_REVIEW_POLICY=native.");
-    if (action.type === "thread" || action.type === "review") return this.newSession(row, action, binding);
+    if (action.type === "thread" || action.type === "review") {
+      const author = action.type === "review" && binding.synced
+        ? nativeSessionProvider(await this.api.getSession(action.sessionId ?? binding.sessionId!)) : undefined;
+      return this.newSession(row, action, {...binding, ...author});
+    }
     const sessionId = action.sessionId ?? binding.sessionId;
     if (!sessionId) throw new Error("Cloud workspace has no active session");
     const actual = await this.api.getSessionStatus(sessionId);
@@ -269,6 +273,7 @@ export class CloudEngine {
   }
 
   private async send(row: QueueRow, action: CloudAction, binding: CloudBinding, sessionId: string): Promise<void> {
+    const nativeProvider = binding.synced ? nativeSessionProvider(await this.api.getSession(sessionId)) : undefined;
     if (action.legacyRequestId) {
       const gate = pendingCloudMessageCanSend(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
       if (gate === "mismatch") throw new Error("Legacy pending message identity mismatch; reconcile before retrying");
@@ -303,7 +308,7 @@ export class CloudEngine {
     }
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
     if (action.legacyRequestId) completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
-    const state = this.store.get<SessionState>(`session:${sessionId}`) ?? { trackedId: action.trackedId, ...binding, role: "task" as const };
+    const state = {...(this.store.get<SessionState>(`session:${sessionId}`) ?? { trackedId: action.trackedId, ...binding, role: "task" as const }), ...nativeProvider};
     if (state.sentMessageId === payload.messageId) return;
     const episode = action.recovery ? (action.episode ?? state.episode ?? row.id) : row.id;
     this.store.set(`session:${sessionId}`, { ...state, sentMessageId: payload.messageId, sentAt: Date.now(), terminal: false, episode,
@@ -360,6 +365,12 @@ export class CloudEngine {
       let state = this.store.get<SessionState>(`session:${session.id}`);
       if (!state) {
         // Observe existing threads without assigning them an inferred provider/recovery policy.
+        if (binding.synced && !getThreadCursor(trackedId, session.id)) {
+          // Discovery already anchored the old threads. A newly added native
+          // thread must forward its first reply, including session index zero.
+          upsertThreadCursor({workspaceId: trackedId, sessionId: session.id, backendKind: "cloud-api",
+            lastForwardedRowid: -1, lastMessageId: null, title: session.name});
+        }
         const latest = !getThreadCursor(trackedId, session.id) ? await this.api.getLatestSessionMessage(session.id) : null;
         if (latest) upsertThreadCursor({ workspaceId: trackedId, sessionId: session.id,
           backendKind: "cloud-api", lastForwardedRowid: latest.sessionIndex, lastMessageId: latest.id, title: session.name });
@@ -470,6 +481,7 @@ export class CloudEngine {
     const currentWorkspace = getWorkspace(trackedId);
     if (currentWorkspace && !currentWorkspace.archivedAt && currentWorkspace.status !== "archived") {
       if (stopped) updateWorkspaceStatus(trackedId, "stopped");
+      else if (binding.synced && !pendingAction && !states.length) updateWorkspaceStatus(trackedId, active ? "running" : "done");
       else if (!active && !pendingAction && states.length && states.every(s => s.terminal || s.stopped)) updateWorkspaceStatus(trackedId, "done");
     }
     const awaitingTurn = !stopped && (pendingAction || states.some(state => !state.terminal && !state.stopped));

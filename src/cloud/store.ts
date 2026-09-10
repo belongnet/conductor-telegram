@@ -28,6 +28,7 @@ export interface CloudBinding {
   model: string;
   effort: string;
   stopped: boolean;
+  synced?: boolean;
 }
 
 /** Additive gateway state; never replaces the existing workspace/history tables. */
