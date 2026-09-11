@@ -11,7 +11,7 @@ import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
 import { CloudGitHub } from "../src/cloud/catalog.js";
-import { enqueueTelegram, enqueueText, TelegramDelivery, processQueue } from "../src/cloud/telegram.js";
+import { enqueueTelegram, enqueueText, TelegramDelivery, processQueue, ingestTelegram } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
 import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
 import { readWorkspaceArtifact } from "../src/mcp/remote.js";
@@ -1065,4 +1065,16 @@ test("a repo topic an earlier release pinned to a workspace goes back to launchi
     reply_to_message: {message_id: 500}, text: "keep going"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   assert.equal(JSON.parse(f.store.row("update:2:action")!.payload).trackedId, f.ws.id);
+}));
+
+test("a stop signal ends ingestion cleanly instead of failing the whole service", () => fixture(async f => {
+  const abort = new AbortController();
+  // The live gateway fences every write on its lease and throws once the abort fires.
+  f.store.assertWriter = () => { if (abort.signal.aborted) throw new Error("Gateway lease lost"); };
+  let polls = 0;
+  const call = async (): Promise<any> => { polls++; abort.abort(); throw new Error("Gateway lease lost"); };
+  // Recording why ingestion stopped must not itself throw out of the handler.
+  await ingestTelegram(f.store, call, abort.signal);
+  assert.equal(polls, 1);
+  assert.equal(f.store.get("ingestion-error"), undefined);
 }));
