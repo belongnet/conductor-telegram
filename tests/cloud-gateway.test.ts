@@ -203,6 +203,84 @@ test("idle before the prompt executes is not completion; replies are durably que
   assert.equal(getWorkspace(f.ws.id)?.status, "done");
 }));
 
+test("agent replies render Telegram rich text before durable delivery", () => fixture(async f => {
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 7);
+  f.messages.push({id: "rich-reply", sessionId: "s1", type: "assistant", sessionIndex: 1,
+    receivedAt: new Date().toISOString(), content: [
+      "**What works instead.**", "", "```", "POST /api/tasks { task_type, priority }", "```", "",
+      "Use `incident_response` with *care* and ~~old routing~~.",
+      "[API docs](https://example.com/api?a=1&b=2)", "Literal <tag> & data.",
+    ].join("\n")});
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const job = JSON.parse(f.store.row("transcript:s1:rich-reply:0")!.payload);
+  assert.equal(job.payload.text, [
+    "<b>What works instead.</b>", "", "<pre>POST /api/tasks { task_type, priority }</pre>", "",
+    "Use <code>incident_response</code> with <i>care</i> and <s>old routing</s>.",
+    '<a href="https://example.com/api?a=1&amp;b=2">API docs</a>', "Literal &lt;tag&gt; &amp; data.",
+  ].join("\n"));
+  assert.equal(job.payload.parse_mode, "HTML");
+  assert.equal(job.payload.message_thread_id, 7);
+  assert.equal(job.workspaceId, f.ws.id);
+  assert.equal(job.sessionId, "s1");
+  assert.equal(getThreadCursor(f.ws.id, "s1")?.lastMessageId, "rich-reply");
+}));
+
+test("agent questions, status reports, and artifacts render rich text with answer buttons", () => fixture(async f => {
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 7);
+  const receipt = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request",
+    payload: {question: "**Continue?** Inspect `task_id` first.", options: ["Yes", "No"]}});
+  const status = f.bridge.event(f.ws.id, {id: randomUUID(), type: "status",
+    payload: {status: "running", message: "**Checking** `task_id`"}});
+  const artifact = f.bridge.event(f.ws.id, {id: randomUUID(), type: "artifact",
+    payload: {type: "pr", url: "https://github.com/example/project/pull/1", description: "**Review** `change`"}});
+  f.engine.events();
+  const question = JSON.parse(f.store.row(`decision:${receipt.decisionId}:0`)!.payload);
+  assert.match(question.payload.text, /<b>Continue\?<\/b> Inspect <code>task_id<\/code> first\./);
+  assert.equal(question.payload.message_thread_id, 7);
+  assert.equal(question.decisionId, receipt.decisionId);
+  assert.deepEqual(question.payload.reply_markup.inline_keyboard, [
+    [{text: "Yes", callback_data: `decision:${receipt.decisionId}:0`}],
+    [{text: "No", callback_data: `decision:${receipt.decisionId}:1`}],
+  ]);
+  assert.equal(JSON.parse(f.store.row(`event:${status.eventId}:0`)!.payload).payload.text,
+    "running: <b>Checking</b> <code>task_id</code>");
+  assert.equal(JSON.parse(f.store.row(`event:${artifact.eventId}:0`)!.payload).payload.text,
+    "<b>Review</b> <code>change</code>\nhttps://github.com/example/project/pull/1");
+}));
+
+test("long formatted questions retain every chunk and put buttons on the last message", () => fixture(async f => {
+  await f.launch();
+  const question = `**${"q".repeat(3996)}**`;
+  const receipt = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request",
+    payload: {question, options: ["Continue", "Stop"]}});
+  f.engine.events();
+  const rows = f.store.db.prepare("SELECT id,payload FROM gateway_queue WHERE id LIKE ? ORDER BY rowid")
+    .all(`decision:${receipt.decisionId}:%`) as Array<{id: string; payload: string}>;
+  assert.equal(rows.length, 2);
+  const jobs = rows.map(row => JSON.parse(row.payload));
+  assert.equal(jobs.map(job => job.payload.text.replace(/<\/?b>/g, "")).join(""),
+    `workspace needs your input:\n\n${"q".repeat(3996)}`);
+  for (const [i, job] of jobs.entries()) {
+    assert.equal(rows[i].id, `decision:${receipt.decisionId}:${i}`);
+    assert.equal(job.decisionId, receipt.decisionId);
+    assert.equal(job.workspaceId, f.ws.id);
+    assert.equal(job.payload.parse_mode, "HTML");
+    assert.equal(!!job.payload.reply_markup, i === jobs.length - 1);
+    assert.match(job.payload.text, /<b>q+<\/b>$/);
+  }
+  f.engine.events();
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE ?")
+    .get(`decision:${receipt.decisionId}:%`) as {n: number}).n, 2, "recovery does not duplicate chunks");
+}));
+
+test("control text keeps literal Markdown and escaped HTML", () => fixture(async f => {
+  enqueueText(f.store, "control", "42", "**literal** `id` <project> & status");
+  assert.equal(JSON.parse(f.store.row("control:0")!.payload).payload.text,
+    "**literal** `id` &lt;project&gt; &amp; status");
+}));
+
 test("quota failure queues one fallback; an API outage never launches a replacement", () => fixture(async f => {
   await f.launch(); f.status("error");
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
@@ -607,8 +685,9 @@ test("an unavailable provider rejected before launch is skipped without an uncer
   assert.deepEqual(f.store.get("recovery-providers:launch"), ["claude", "codex"]);
 }));
 
-test("partial multi-message delivery resumes without repeating recorded receipts", () => fixture(async f => {
-  enqueueText(f.store, "long", "42", "hello ".repeat(1200));
+for (const markdown of [false, true]) test(`partial ${markdown ? "rich" : "plain"} multi-message delivery resumes without repeating recorded receipts`, () => fixture(async f => {
+  const text = "hello ".repeat(1200);
+  enqueueText(f.store, "long", "42", markdown ? `**${text}**` : text, {markdown});
   let attempts = 0; const sent: string[] = [];
   const sender = new TelegramDelivery(f.store, async (_method, payload) => {
     attempts++; if (attempts === 2) throw new Error("network down"); sent.push(payload.text); return {message_id: attempts};
@@ -616,7 +695,8 @@ test("partial multi-message delivery resumes without repeating recorded receipts
   await sender.tick(); f.store.set("telegram-chat-after:42", 0); await sender.tick();
   f.store.recover(); f.store.set("telegram-not-before", 0); f.store.retry("long:1", "restored", 0);
   await sender.tick(); assert.equal(sent.length, 2); assert.equal(attempts, 3);
-  assert.equal(sent.join(""), "hello ".repeat(1200));
+  if (markdown) for (const chunk of sent) assert.match(chunk, /^<b>[\s\S]*<\/b>$/);
+  assert.equal(sent.join("").replace(/<\/?b>/g, ""), text);
 }));
 
 test("historical unanswered questions are retained without reopening archived work", () => fixture(async f => {

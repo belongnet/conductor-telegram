@@ -189,8 +189,18 @@ export function markdownToTelegramHtml(md: string): string {
   // 7. Links  [text](url)
   s = s.replace(
     /\[(.+?)\]\((.+?)\)/g,
-    (_m, label: string, href: string) =>
-      `<a href="${href.replace(/"/g, "&quot;")}">${label}</a>`
+    (_m, label: string, href: string) => {
+      // Agent replies also link local checkout paths. Keep those readable;
+      // Telegram cannot turn a local path into a usable inline link.
+      try {
+        if (!["http:", "https:", "tg:", "mailto:"].includes(new URL(href).protocol)) {
+          return `${label} (${href})`;
+        }
+      } catch {
+        return `${label} (${href})`;
+      }
+      return `<a href="${href.replace(/"/g, "&quot;")}">${label}</a>`;
+    }
   );
 
   // 8. Headings  # … → bold line
@@ -200,6 +210,74 @@ export function markdownToTelegramHtml(md: string): string {
   s = s.replace(/\x00(\d+)\x00/g, (_m, idx: string) => placeholders[Number(idx)]);
 
   return s;
+}
+
+/**
+ * Split rendered HTML, closing/reopening formatting at message boundaries.
+ * Telegram limits text after entity parsing; use UTF-16 length conservatively
+ * and keep HTML entities and Unicode code points intact.
+ * Accepts only the tags emitted by markdownToTelegramHtml.
+ */
+export function splitTelegramHtml(html: string, maxLength = 3900): string[] {
+  if (!Number.isInteger(maxLength) || maxLength < 2 || maxLength > TELEGRAM_MAX_TEXT) {
+    throw new RangeError("Invalid Telegram message length");
+  }
+  const chunks: string[] = [];
+  const stack: Array<{ name: string; open: string }> = [];
+  let rendered: typeof stack = [];
+  let current = "", length = 0;
+  const closingTags = () => rendered.map(tag => `</${tag.name}>`).reverse().join("");
+  for (const [token] of html.matchAll(/<[^>]*>|&(?:amp|lt|gt|quot);|[\s\S]/gu)) {
+    if (token.startsWith("<")) {
+      const tag = token.match(/^<(\/?)(b|i|s|pre|code|a)(?: href="[^"<>]*")?>$/);
+      if (!tag) throw new Error("Unsupported Telegram HTML tag");
+      const [, close, name] = tag;
+      if (close) {
+        if (stack.pop()?.name !== name) throw new Error("Unbalanced Telegram HTML");
+      } else {
+        // Code contents are escaped by the converter, and links cannot nest.
+        if (stack.some(tag => ["pre", "code"].includes(tag.name)) ||
+            (name === "a" && stack.some(tag => tag.name === "a"))) {
+          throw new Error("Unsupported Telegram HTML nesting");
+        }
+        stack.push({name, open: token});
+      }
+      continue;
+    }
+    const size = token.startsWith("&") && token.endsWith(";") ? 1 : token.length;
+    if (length + size > maxLength) {
+      chunks.push(current + closingTags());
+      current = "";
+      rendered = [];
+      length = 0;
+    }
+    // Telegram code/pre cannot overlap emphasis or links. Keep link targets
+    // clickable; otherwise temporarily close emphasis around code.
+    const code = stack.findIndex(tag => ["pre", "code"].includes(tag.name));
+    const desired = code < 0 ? stack : stack.some(tag => tag.name === "a")
+      ? stack.filter(tag => !["pre", "code"].includes(tag.name)) : stack.slice(code);
+    let shared = 0;
+    while (shared < rendered.length && rendered[shared] === desired[shared]) shared++;
+    current += rendered.slice(shared).reverse().map(tag => `</${tag.name}>`).join("");
+    current += desired.slice(shared).map(tag => tag.open).join("");
+    rendered = [...desired];
+    current += token;
+    length += size;
+  }
+  if (stack.length) throw new Error("Unclosed Telegram HTML tag");
+  if (length) chunks.push(current + closingTags());
+  return chunks;
+}
+
+/** Render the whole reply before splitting so Markdown delimiters stay paired. */
+export function markdownToTelegramChunks(md: string): string[] {
+  try {
+    const chunks = splitTelegramHtml(markdownToTelegramHtml(md));
+    if (chunks.length) return chunks;
+  } catch {
+    // Incomplete or unsupported Markdown must not block delivery of the reply.
+  }
+  return splitTelegramHtml(escHtml(md || "(empty message)"));
 }
 
 // ── Status formatting ────────────────────────────────────────
