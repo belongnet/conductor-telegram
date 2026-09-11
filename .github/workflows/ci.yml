@@ -30,6 +30,29 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  docs-version:
+    name: Landing page states the released version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      # The landing page states the version in the hero badge and in the sample
+      # terminal transcript. Both drifted seven minor releases behind VERSION
+      # before anyone noticed, so a release that forgets them fails here instead.
+      # Matched exactly, not by scanning for any vN.N.N: the page also quotes a
+      # Node version, which is not this package's version and must not gate it.
+      - name: Both versions the landing page claims match VERSION
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          missing=""
+          grep -qF "<span class=\"hero-badge\">v$version / MIT" docs/index.html || missing="hero badge"
+          grep -qF "<span class=\"a\">conductor-telegram</span> v$version" docs/index.html || missing="$missing sample terminal"
+          if [ -n "$missing" ]; then
+            echo "docs/index.html does not state v$version in: $missing" >&2
+            grep -nE 'hero-badge|conductor-telegram</span> v' docs/index.html >&2
+            exit 1
+          fi
+
   deploy-script:
     name: Gateway scripts on macOS (bash 3.2 + BSD userland)
     runs-on: macos-latest
