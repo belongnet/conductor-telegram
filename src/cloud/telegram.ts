@@ -1,7 +1,7 @@
 import type { GatewayStore, QueueRow } from "./store.js";
 import { linkTelegramMessage, updateWorkspaceThreadId, getWorkspace } from "../store/queries.js";
 import { createReadStream } from "node:fs";
-import { escHtml } from "../bot/format.js";
+import { escHtml, markdownToTelegramChunks } from "../bot/format.js";
 import {ConductorApiError} from "../integrations/conductor-api.js";
 
 export type TelegramCall = (method: string, payload: Record<string, any>) => Promise<any>;
@@ -43,19 +43,24 @@ export function enqueueTelegram(store: GatewayStore, id: string, job: TelegramJo
   store.enqueue("telegram", `${p.chat_id}:${p.message_thread_id ?? 0}${topicOperation ? ":topics" : priority === 0 ? ":control" : ""}`, job, id, priority);
 }
 
-/** Chunk raw text before HTML escaping so no entity/tag is split and no text is lost. */
+/** Agent Markdown is rendered before splitting; control messages stay literal. */
 export function enqueueText(store: GatewayStore, id: string, chatId: string, text: string,
-  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number } = {}): void {
-  const chunks: string[] = []; let current = "", escapedSize = 0;
-  for (const character of text || "(empty message)") {
-    const length = escHtml(character).length;
-    if (escapedSize + length > 3900) { chunks.push(current); current = ""; escapedSize = 0; }
-    current += character; escapedSize += length;
+  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean } = {}): void {
+  const chunks: string[] = [];
+  if (options.markdown) {
+    chunks.push(...markdownToTelegramChunks(text));
+  } else {
+    let current = "";
+    for (const character of text || "(empty message)") {
+      const escaped = escHtml(character);
+      if (current.length + escaped.length > 3900) { chunks.push(current); current = ""; }
+      current += escaped;
+    }
+    if (current) chunks.push(current);
   }
-  if (current) chunks.push(current);
   chunks.forEach((chunk, i) => enqueueTelegram(store, `${id}:${i}`, {
     method: "sendMessage",
-    payload: { chat_id: chatId, text: escHtml(chunk), parse_mode: "HTML",
+    payload: { chat_id: chatId, text: chunk, parse_mode: "HTML",
       ...(options.threadId ? { message_thread_id: options.threadId } : {}),
       ...(i === chunks.length - 1 && options.replyMarkup ? { reply_markup: options.replyMarkup } : {}) },
     workspaceId: options.workspaceId, sessionId: options.sessionId, decisionId: options.decisionId,

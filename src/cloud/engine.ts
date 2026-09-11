@@ -88,10 +88,10 @@ export class CloudEngine {
     this.catalog = new ProjectCatalog(api, store);
   }
 
-  notify(id: string, trackedId: string, text: string, sessionId?: string): void {
+  notify(id: string, trackedId: string, text: string, sessionId?: string, markdown = false): void {
     const ws = getWorkspace(trackedId);
     if (ws) enqueueText(this.store, id, ws.telegramChatId, text, { workspaceId: trackedId, sessionId,
-      threadId: ws.telegramThreadId });
+      threadId: ws.telegramThreadId, markdown });
   }
 
   queue(id: string, action: CloudAction): void {
@@ -420,7 +420,7 @@ export class CloudEngine {
           if (failure) state.nativeFailure = failure;
         }
         this.store.db.transaction(() => {
-          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id);
+          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id, true);
           if (state) this.store.set(`session:${session.id}`, state);
           upsertThreadCursor({ workspaceId: trackedId, sessionId: session.id, backendKind: "cloud-api", lastForwardedRowid: message.sessionIndex, lastMessageId: message.id, title: session.name });
         })();
@@ -539,7 +539,7 @@ export class CloudEngine {
       const ws = getWorkspace(decision.workspace_id); if (!ws) continue;
       const options = JSON.parse(decision.options ?? "[]") as string[];
       enqueueText(this.store, `decision:${decision.id}`, ws.telegramChatId, `${ws.conductorWorkspaceName ?? ws.name} needs your input:\n\n${decision.question}`, {
-        workspaceId: ws.id, threadId: ws.telegramThreadId, decisionId: decision.id, priority: 0,
+        workspaceId: ws.id, threadId: ws.telegramThreadId, decisionId: decision.id, priority: 0, markdown: true,
         replyMarkup: options.length ? {inline_keyboard: options.map((option, i) => [{text: option, callback_data: `decision:${decision.id}:${i}`}])} : undefined,
       });
     }
@@ -552,13 +552,13 @@ export class CloudEngine {
           if (event.type === "human_request") {
             const decision = getDecision(payload.decisionId);
             if (decision && !decision.answeredAt && !ws.archivedAt && !["done", "stopped", "failed", "archived"].includes(ws.status)) enqueueText(this.store, `decision:${decision.id}`, ws.telegramChatId, `${ws.conductorWorkspaceName ?? ws.name} needs your input:\n\n${payload.question}`, {
-              workspaceId: ws.id, threadId: ws.telegramThreadId, decisionId: payload.decisionId, priority: 0,
+              workspaceId: ws.id, threadId: ws.telegramThreadId, decisionId: payload.decisionId, priority: 0, markdown: true,
               replyMarkup: payload.options?.length ? { inline_keyboard: payload.options.map((option: string, i: number) => [{ text: option, callback_data: `decision:${payload.decisionId}:${i}` }]) } : undefined });
           } else if (event.type === "artifact" && payload.type === "file" && payload.url.startsWith("attachment:")) {
             const file = this.bridge.file(payload.url.slice(11), ws.id);
             if (file) enqueueTelegram(this.store, `event:${event.id}`, { method: "sendDocument", workspaceId: ws.id, filePath: file.path,
               payload: { chat_id: ws.telegramChatId, ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}), filename: file.name, caption: payload.description.slice(0, 1000) } });
-          } else if (event.type !== "human_response") this.notify(`event:${event.id}`, ws.id, event.type === "status" ? `${payload.status}: ${payload.message}` : `${payload.description}\n${payload.url}`);
+          } else if (event.type !== "human_response") this.notify(`event:${event.id}`, ws.id, event.type === "status" ? `${payload.status}: ${payload.message}` : `${payload.description}\n${payload.url}`, undefined, true);
         }
         this.store.set("event-cursor", event.id);
       })();

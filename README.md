@@ -32,6 +32,8 @@ That's it. The setup wizard walks you through Telegram bot creation, configurati
 
 The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 15 seconds, forwarding agent messages to Telegram. When an agent uses the MCP server to ask a question, the bot surfaces it as an interactive Telegram message with buttons or free-form reply.
 
+In cloud-only mode, agent replies, questions, progress reports, and artifact links render Markdown as Telegram rich text, including bold, italics, strikethrough, inline code, code blocks, and clickable web links. Long replies keep their formatting across messages; answer buttons appear on the last message of a long question. Local file links remain readable as a label and path, and formatting that cannot be rendered safely falls back to literal text.
+
 ## Architecture
 
 ```

@@ -32,6 +32,12 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.9.2] - 2026-09-11
+
+### Fixed
+- Cloud agent replies, questions, and progress reports now display Telegram bold, italics, links, inline code, and code blocks instead of raw Markdown markers. Long replies retain their formatting across messages, and answer buttons stay on the final message.
+- Local file references remain readable, and malformed formatting falls back to escaped text so the reply can still be delivered.
+
 ## [0.9.1] - 2026-09-11
 
 ### Fixed
