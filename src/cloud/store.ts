@@ -44,6 +44,8 @@ export class GatewayStore {
         created_at INTEGER NOT NULL, completed_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS gateway_queue_pending ON gateway_queue(state, available_at, priority, created_at);
+      -- claim() fences each conversation with a correlated NOT EXISTS on exactly these columns.
+      CREATE INDEX IF NOT EXISTS gateway_queue_conversation ON gateway_queue(conversation, kind, state);
       CREATE TABLE IF NOT EXISTS gateway_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS gateway_decision_links (
         chat_id TEXT NOT NULL, message_id TEXT NOT NULL, decision_id INTEGER NOT NULL,
@@ -76,6 +78,11 @@ export class GatewayStore {
     this.assertWriter?.();
     this.db.prepare("INSERT INTO gateway_state VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
       .run(key, JSON.stringify(value));
+  }
+
+  clear(key: string): void {
+    this.assertWriter?.();
+    this.db.prepare("DELETE FROM gateway_state WHERE key = ?").run(key);
   }
 
   enqueue(kind: string, conversation: string, payload: unknown, id: string = randomUUID(), priority = 10): string {

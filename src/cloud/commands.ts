@@ -10,10 +10,41 @@ import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMess
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
 import {nativeSessionProvider} from "./messages.js";
-import type { Workspace } from "../types/index.js";
+import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
+import type { ConductorApiProject } from "../integrations/conductor-api.js";
+import type { RepoTopic } from "../types/index.js";
+
+/** Telegram stamps `date` in seconds; one pasted list lands inside this window. */
+const BURST_SECONDS = 2;
+const ALBUM_MS = 600_000;
+
+/** This list drives DELETEs, so it can only ever name buttons, whatever is in the row. */
+const offeredKeys = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((key): key is string => typeof key === "string" && key.startsWith("bindtopic:")) : [];
+
+const topicProjectKey = (chatId: string, threadId: number): string => `repo-topic-project:${chatId}:${threadId}`;
+const topicNoticeKey = (chatId: string, threadId: number): string => `repo-topic-notice:${chatId}:${threadId}`;
+const topicOfferKey = (chatId: string, threadId: number): string => `repo-topic-offer:${chatId}:${threadId}`;
+
+/** A repo topic's own repository identity: the project's name, or the repository name in its remote. */
+function matchesRepoName(project: ConductorApiProject, name: string): boolean {
+  return project.name.toLowerCase() === name ||
+    (repositoryRemoteIdentity(project.gitRemote) ?? "").split("/").pop() === name;
+}
+
+/** A project name is free text; the owner needs the repository it actually points at. */
+function projectLabel(project: ConductorApiProject): string {
+  const identity = repositoryRemoteIdentity(project.gitRemote);
+  return `${project.name} · ${identity ? identity.split("/").slice(1).join("/") : project.id}`.slice(0, 60);
+}
+
+export function repoTopicCandidates(repoName: string, projects: ConductorApiProject[]): ConductorApiProject[] {
+  const name = repoName.trim().toLowerCase();
+  return name ? projects.filter(project => matchesRepoName(project, name)) : [];
+}
 
 const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "office_hours", "design_review", "gstack", "skill"]);
-const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
+const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
 
 interface MediaJob {
   action?: CloudAction; decisionId?: number; chatId: string; threadId?: number; text?: string;
@@ -43,11 +74,17 @@ export class CloudCommands {
       { threadId, replyMarkup: markup, priority: 0 });
     const replyTarget = msg.reply_to_message ? getWorkspaceMessageTarget(chatId, String(msg.reply_to_message.message_id)) : undefined;
     let target = replyTarget?.workspace ?? (threadId ? getWorkspaceByThreadId(chatId, threadId) : undefined);
-    if (!replyTarget && target && !this.store.binding(target.id) && threadId && getRepoTopicByThreadId(chatId, threadId)) target = undefined;
+    // A repo topic is a launch pad, never a workspace's own topic, including for a workspace an
+    // earlier release pinned to one. Reply to its message, or use its workspace ID, to follow up.
+    if (!replyTarget && target && threadId && getRepoTopicByThreadId(chatId, threadId)) target = undefined;
     let sessionId = replyTarget?.sessionId ?? undefined;
     if (callback) {
-      enqueueTelegram(this.store, `${row.id}:answer`, { method: "answerCallbackQuery", payload: { callback_query_id: callback.id } }, 0);
       const data = String(callback.data ?? "");
+      const answer = (text?: string) => enqueueTelegram(this.store, `${row.id}:answer`,
+        { method: "answerCallbackQuery", payload: { callback_query_id: callback.id, ...(text ? { text } : {}) } }, 0);
+      // Telegram strips message_thread_id from an inaccessible message, so a bindtopic tap that
+      // cannot be placed answers in the toast rather than in whatever topic a reply would land in.
+      if (!data.startsWith("bindtopic:")) answer();
       const decisionMatch = data.match(/^decision:(\d+):(\d+)$/);
       if (decisionMatch) {
         const decision = getDecision(Number(decisionMatch[1]));
@@ -62,6 +99,17 @@ export class CloudCommands {
         if (!selection || !binding || getWorkspace(selection.trackedId)?.telegramChatId !== chatId) return;
         const provider = binding.synced ? nativeSessionProvider(await this.engine.api.getSession(selection.sessionId)) : undefined;
         this.store.bind(selection.trackedId, { ...binding, ...provider, sessionId: selection.sessionId }); reply("Active thread updated."); return;
+      }
+      if (data.startsWith("bindtopic:")) {
+        // Answering an offer, or making a new one, deletes the buttons it retires. A tap on one is
+        // scrollback: it must neither re-point the topic nor leave the owner wondering what happened.
+        const selection = this.store.get<{ chatId: string; threadId: number; projectId: string; projectLabel: string }>(data);
+        if (!selection || selection.chatId !== chatId || selection.threadId !== threadId) {
+          answer("That choice is no longer on the table. Use /link to see where this topic routes."); return;
+        }
+        answer();
+        this.linkRepoTopic(chatId, threadId!, selection.projectId);
+        reply(`Linked to ${selection.projectLabel}. Send a message here to start a new workspace in it.`); return;
       }
       if (data.startsWith("route:")) {
         const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob }>(data);
@@ -107,6 +155,24 @@ export class CloudCommands {
     if (["projects", "repos"].includes(command ?? "")) {
       const projects = await this.engine.catalog.projects(true);
       reply(projects.map((p, i) => `${i + 1}. ${p.name}\n${p.id}\n${p.gitRemote}`).join("\n\n") || "No Conductor projects are available."); return;
+    }
+    if (command === "link") {
+      const topic = threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
+      if (!topic) { reply("Use /link inside a repository topic."); return; }
+      const current = this.store.get<string>(topicProjectKey(chatId, threadId!));
+      // Fetched before the branch on purpose: a catalog outage must retry this update rather than
+      // reach the catch below and answer `/link <project>` with an API error.
+      const catalog = await this.engine.catalog.projects();
+      if (!args) {
+        // An explicit ask, so it neither joins a burst nor claims one from a message behind it.
+        const linkedTo = catalog.find(p => p.id === current);
+        this.offerRepoTopicProject({ repoTopic: topic, chatId, threadId: threadId!, projects: catalog, reply, current,
+          lead: `${topic.repoName} routes to ${linkedTo ? projectLabel(linkedTo) : current ? `${current}, which this catalog does not list` : "no project yet"}.` }); return;
+      }
+      let project: ConductorApiProject;
+      try { project = await this.engine.catalog.resolve(args); } catch (error) { reply(error instanceof Error ? error.message : "Repository unavailable"); return; }
+      this.linkRepoTopic(chatId, threadId!, project.id);
+      reply(`${topic.repoName} routes to ${projectLabel(project)}. Send a message here to start a new workspace in it.`); return;
     }
     if (["workspaces", "status", "prs", "ship_status"].includes(command ?? "")) {
       const rows = getAllWorkspacesForChat(chatId, -1);
@@ -183,18 +249,52 @@ export class CloudCommands {
     if (command && !["run", "cloud"].includes(command)) { reply(`Unknown command /${command}.\n\n${HELP}`); return; }
 
     let projectId: string | undefined;
+    let chosen: ConductorApiProject | undefined;
     let prompt = command ? args : raw;
     if (["run", "cloud"].includes(command ?? "")) {
       const projectInput = args.match(/^\S+/)?.[0];
       prompt = projectInput ? args.slice(projectInput.length).trimStart() : "";
       if (!projectInput || (!prompt && !media)) { reply("Usage: /run <project ID or name> <task>"); return; }
-      projectId = (await this.engine.catalog.resolve(projectInput)).id; target = undefined; sessionId = undefined;
+      try { chosen = await this.engine.catalog.resolve(projectInput); }
+      catch (error) { reply(error instanceof Error ? error.message : "Repository unavailable"); return; }
+      projectId = chosen.id; target = undefined; sessionId = undefined;
     }
     const repoTopic = !target && threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
-    if (repoTopic && !projectId) {
-      // Migration stores verified identities; basenames from old Mac paths never authorize a match.
-      projectId = this.store.get<string>(`repo-topic-project:${chatId}:${threadId}`);
-      if (!projectId) { reply("This repository topic needs a verified Conductor project mapping. Use /run <project ID> meanwhile."); return; }
+    let linked = "";
+    if (repoTopic) {
+      const key = topicProjectKey(chatId, threadId!);
+      const stored = this.store.get<string>(key);
+      const projects = await this.engine.catalog.projects();
+      const current = stored ? projects.find(p => p.id === stored) : undefined;
+      // Telegram delivers an album as one update per file, with the caption on only one of them.
+      const albumKey = msg.media_group_id ? `repo-topic-album:${chatId}:${threadId}:${msg.media_group_id}` : undefined;
+      const album = !chosen && albumKey ? this.store.get<{ projectId: string; at: number }>(albumKey) : undefined;
+      if (album && Date.now() - album.at >= ALBUM_MS) this.store.clear(albumKey!);
+      const carried = album && Date.now() - album.at < ALBUM_MS ? projects.find(p => p.id === album.projectId) : undefined;
+      if (chosen || carried) {
+        const one = (chosen ?? carried)!;
+        // /run and /cloud name a project for one task. They adopt an unlinked topic, and
+        // never silently re-point a linked one; /link is the only way to change it.
+        if (chosen && albumKey) this.store.set(albumKey, { projectId: chosen.id, at: Date.now() });
+        projectId = one.id;
+        if (!current) { this.linkRepoTopic(chatId, threadId!, one.id); linked = `\n\n${repoTopic.repoName} now routes to ${projectLabel(one)}. Use /link to change it.`; }
+        else if (current.id !== one.id) linked = `\n\nThis one is a one-off in ${projectLabel(one)}. ${repoTopic.repoName} still routes to ${projectLabel(current)}. Use /link to change it.`;
+      } else if (current) projectId = current.id;
+      else if (stored) {
+        // A catalog read can be stale or partial, so a link the owner confirmed is never deleted
+        // on its absence, and never silently replaced. Ask until the catalog agrees or /link re-points it.
+        this.offerRepoTopicProject({ repoTopic, chatId, threadId: threadId!, projects, reply, burst: true, at: Number(msg.date) || 0, current: stored,
+          lead: `${repoTopic.repoName} is linked to a Conductor project this catalog does not list, so nothing sent here reaches Conductor yet.` }); return;
+      } else {
+        const candidates = repoTopicCandidates(repoTopic.repoName, projects);
+        // One repository identity routes on its own. Anything ambiguous asks instead of guessing.
+        if (candidates.length !== 1) {
+          this.offerRepoTopicProject({ repoTopic, chatId, threadId: threadId!, projects, reply, burst: true, at: Number(msg.date) || 0,
+            lead: `${repoTopic.repoName} does not match exactly one Conductor project, so nothing sent here reaches Conductor yet.` }); return;
+        }
+        this.linkRepoTopic(chatId, threadId!, candidates[0].id); projectId = candidates[0].id;
+        linked = `\n\n${repoTopic.repoName} now routes to ${projectLabel(candidates[0])}. Use /link to change it.`;
+      }
     }
     if (!target && !projectId) {
       if (media?.voice) {
@@ -211,7 +311,8 @@ export class CloudCommands {
       if (!target) this.store.db.transaction(() => {
         target = createWorkspace({ name: prompt.slice(0, 70) || "Telegram task", prompt, repoPath: `conductor-project:${projectId}`, telegramChatId: chatId });
         this.store.set(`update-workspace:${row.id}`, target.id);
-        if (threadId) updateWorkspaceThreadId(target.id, threadId);
+        // A repo topic launches work; it never becomes the workspace's own topic.
+        if (threadId && !repoTopic) updateWorkspaceThreadId(target.id, threadId);
       })();
     }
     if (!target) throw new Error("Could not create workspace record");
@@ -220,7 +321,50 @@ export class CloudCommands {
     if (media) {
       this.prepareMedia(row.id, action, { ...media, chatId, threadId });
     } else this.engine.queue(`${row.id}:action`, action);
-    reply(media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.");
+    reply((media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked);
+  }
+
+  /** One authorization, recorded once: the topic's project, with its notice and offer retired together. */
+  private linkRepoTopic(chatId: string, threadId: number, projectId: string): void {
+    this.store.db.transaction(() => {
+      for (const key of offeredKeys(this.store.get(topicOfferKey(chatId, threadId)))) this.store.clear(key);
+      this.store.clear(topicOfferKey(chatId, threadId));
+      this.store.clear(topicNoticeKey(chatId, threadId));
+      this.store.set(topicProjectKey(chatId, threadId), projectId);
+    })();
+  }
+
+  /** Ambiguous repo topics ask once per burst; a later attempt is always answered. */
+  private offerRepoTopicProject(input: { repoTopic: RepoTopic; chatId: string; threadId: number;
+    projects: ConductorApiProject[]; reply: (text: string, suffix?: string, markup?: unknown) => void;
+    lead: string; at?: number; burst?: boolean; current?: string }): void {
+    const { repoTopic, chatId, threadId, projects, reply, lead, at, burst, current } = input;
+    const noticeKey = topicNoticeKey(chatId, threadId);
+    const notice = burst ? this.store.get<number>(noticeKey) : undefined;
+    // A pasted list is several messages Telegram stamped at the same moment, however they end up
+    // batched. Anything the owner typed afterwards has a later stamp and is always answered, and a
+    // message with no stamp is answered too: silence is never the response to a real message.
+    if (notice && at && at >= notice && at - notice <= BURST_SECONDS) return;
+    const name = repoTopic.repoName.trim().toLowerCase();
+    const rank = (p: ConductorApiProject): number => p.id === current ? -1
+      : name && matchesRepoName(p, name) ? 0 : name && p.name.toLowerCase().includes(name) ? 1 : 2;
+    const candidates = projects.map(project => ({ project, rank: rank(project) }))
+      .sort((a, b) => a.rank - b.rank || a.project.name.localeCompare(b.project.name)).slice(0, 4);
+    this.store.db.transaction(() => {
+      if (burst) this.store.set(noticeKey, at ?? 0);
+      // A button dropped from this offer must stop working, not merely stop being listed.
+      for (const stale of offeredKeys(this.store.get(topicOfferKey(chatId, threadId)))) this.store.clear(stale);
+      const keyboard = candidates.map(({ project }) => {
+        const key = `bindtopic:${createHash("sha256").update(`${chatId}:${threadId}:${project.id}`).digest("hex").slice(0, 32)}`;
+        this.store.set(key, { chatId, threadId, projectId: project.id, projectLabel: projectLabel(project) });
+        return [{ text: `${project.id === current ? "● " : ""}${projectLabel(project)}`, callback_data: key }];
+      });
+      this.store.set(topicOfferKey(chatId, threadId), keyboard.map(([button]) => button.callback_data));
+      reply(`${lead}\n\n` +
+        (keyboard.length ? "Pick its project below, or use /link <project ID>." : "Use /projects, then /link <project ID>.") +
+        "\nOnce linked, plain messages here start new workspaces.",
+        "bindtopic", keyboard.length ? { inline_keyboard: keyboard } : undefined);
+    })();
   }
 
   private prepareMedia(id: string, action: CloudAction, media: MediaJob): void {

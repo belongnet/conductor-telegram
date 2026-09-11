@@ -6,14 +6,14 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { getDb, closeDb } from "../src/store/db.js";
-import { createWorkspace, getWorkspace, getDecision, answerDecision, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId } from "../src/store/queries.js";
+import { createWorkspace, getWorkspace, getDecision, answerDecision, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId, upsertRepoTopic, linkTelegramMessage } from "../src/store/queries.js";
 import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
 import { CloudGitHub } from "../src/cloud/catalog.js";
 import { enqueueTelegram, enqueueText, TelegramDelivery, processQueue } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
-import { CloudCommands } from "../src/cloud/commands.js";
+import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
 import { readWorkspaceArtifact } from "../src/mcp/remote.js";
 import { acquireGatewayLease } from "../src/cloud/runtime.js";
 import {CloudPoller} from "../src/cloud/poller.js";
@@ -58,6 +58,13 @@ function createFixture() {
   async function launch() { engine.queue("launch", { type: "launch", trackedId: ws.id, projectId: "p1", prompt: "Fix\nthe bug" }); await processQueue(store, ["cloud"], r => engine.action(r)); }
   return { dir, store, ws, bridge, api, engine, messages, sessions, launch, counts: () => ({ creates, sends }),
     status: (value: typeof sessionStatus, detail = errorMessage) => { sessionStatus = value; errorMessage = detail; store.set(`poll-after:${ws.id}`, 0); } };
+}
+
+/** Every repo-topic test needs the same forum group, the topic row, and owner-scoped commands. */
+function repoTopic(f: ReturnType<typeof createFixture>, repoName: string, threadId = 5): CloudCommands {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  upsertRepoTopic({chatId: "-42", repoPath: `/Users/legacy/repos/${repoName}`, repoName, telegramThreadId: threadId});
+  return new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
 }
 
 test("cloud launch sends over native API without a desktop database or checkout", () => fixture(async f => {
@@ -389,6 +396,7 @@ test("group authorization rejects impersonation, foreign chats, media, replies a
   f.store.linkDecision("-42", 100, decision);
   f.store.set("route:access-test", {chatId: "-42", action: {type: "stop", trackedId: f.ws.id}});
   f.store.set("thread:access-test", {trackedId: f.ws.id, sessionId: "other-session"});
+  f.store.set("bindtopic:access-test", {chatId: "-42", threadId: 7, projectId: "p1", projectName: "repo"});
   let externalCalls = 0;
   const unexpectedCall = async () => {externalCalls++; throw new Error("Unauthorized request reached an external API");};
   for (const key of Object.keys(f.api)) (f.api as any)[key] = unexpectedCall;
@@ -408,7 +416,7 @@ test("group authorization rejects impersonation, foreign chats, media, replies a
     {name: "owner in an unapproved private chat", chat: 9, from: {id: 9}},
   ];
   const payloads: Record<string, unknown>[] = [
-    ...["/run p1 deploy", "/send deploy", "/stop", "/archive", "/review https://github.com/org/repo/pull/1",
+    ...["/run p1 deploy", "/link", "/link repo", "/send deploy", "/stop", "/archive", "/review https://github.com/org/repo/pull/1",
       "/threads", "/threads new deploy", "/rename changed", "/renamethread changed", "/repos", "/fleet", "/lanes",
       "/sync", "/status", "/decisions", "/ping", "/setup", `/answer ${decision} Yes`, "deploy now"].map(text => ({text})),
     {text: "Yes", reply_to_message: {message_id: 100}},
@@ -427,7 +435,7 @@ test("group authorization rejects impersonation, foreign chats, media, replies a
   for (const identity of identities) {
     for (const payload of payloads) await rejected({message: {message_id: 200 + updateId, chat: {id: identity.chat},
       from: identity.from, message_thread_id: 7, ...payload}}, identity.name);
-    for (const data of [`decision:${decision}:0`, "route:access-test", "thread:access-test"]) {
+    for (const data of [`decision:${decision}:0`, "route:access-test", "thread:access-test", "bindtopic:access-test"]) {
       await rejected({callback_query: {id: `callback-${updateId}`, from: identity.from, data,
         message: {message_id: 100, chat: {id: identity.chat}, from: {id: 99, is_bot: true}, message_thread_id: 7}}}, `${identity.name}: ${data}`);
     }
@@ -667,4 +675,394 @@ test("an inaccessible selected model falls back only after its native turn stops
   assert.equal(recovery[0].previousMessageId, sent);
   assert.equal(recovery[0].provider.agent, 'codex');
   assert.deepEqual(f.counts(), {creates: 1, sends: 1}, 'the failed task must not be replayed');
+}));
+
+test("a repo topic routes itself to the one project matching its repository name", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
+    {id: "p2", name: "Long Events", gitRemote: "git@github.com:org/long-events.git"},
+  ];
+  f.api.getWorkspace = async () => ({id: "w1", name: "workspace", repoUrl: "https://github.com/org/long-events", deepLink: "conductor://w1"});
+  const commands = repoTopic(f, "long-events");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship the calendar"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  // The remote's repository name authorizes the match; the project's own name never has to agree.
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  const action = JSON.parse(f.store.row("update:1:action")!.payload);
+  assert.equal(action.type, "launch"); assert.equal(action.projectId, "p2");
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
+  const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
+  assert.match(ack, /Task received and queued/); assert.match(ack, /now routes to Long Events/);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.counts().creates, 1);
+  assert.equal(JSON.parse(f.store.row(`create-topic:${action.trackedId}`)!.payload).payload.message_thread_id, undefined);
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "second task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const second = JSON.parse(f.store.row("update:2:action")!.payload);
+  assert.equal(second.projectId, "p2"); assert.notEqual(second.trackedId, action.trackedId);
+  assert.doesNotMatch(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /now routes to/);
+}));
+
+test("an ambiguous repo topic asks once per burst, answers a later attempt, and links on confirmation", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+  ];
+  const commands = repoTopic(f, "api");
+  const inThread = () => (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='telegram'").all() as any[])
+    .map(row => JSON.parse(row.payload)).filter(job => job.method === "sendMessage" && job.payload.message_thread_id === 5);
+  const pasted = [1, 2, 3].map(n => ({update_id: n, message: {message_id: 100 + n, chat: {id: -42}, from: {id: 9},
+    message_thread_id: 5, date: 1_700_000_000, text: `part ${n} of one pasted list`}}));
+  f.store.ingest(pasted);
+  // One conversation is claimed in order, so this is three separately handled updates.
+  for (const _ of pasted) await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:3")?.state, "done");
+  assert.equal(inThread().length, 1);
+  assert.match(inThread()[0].payload.text, /does not match exactly one Conductor project/);
+  assert.match(inThread()[0].payload.text, /nothing sent here reaches Conductor yet/);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 0);
+  const buttons = inThread()[0].payload.reply_markup.inline_keyboard.map((row: any[]) => row[0]);
+  assert.deepEqual(buttons.map((b: any) => b.text), ["api \u00b7 org/api", "partner-api \u00b7 partner/api"]);
+
+  // The rest of that paste lands in the next getUpdates batch; Telegram's send time still pairs it.
+  f.store.ingest([{update_id: 4, message: {message_id: 104, chat: {id: -42}, from: {id: 9}, message_thread_id: 5,
+    date: 1_700_000_001, text: "the tail of that same paste"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(inThread().length, 1);
+
+  // A later attempt is a new message, so silence is never the answer to one.
+  f.store.ingest([{update_id: 5, message: {message_id: 105, chat: {id: -42}, from: {id: 9}, message_thread_id: 5,
+    date: 1_700_000_030, text: "try again"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(inThread().length, 2);
+
+  // A backlog drained in one batch is many messages, not one burst: each is answered.
+  f.store.ingest([6, 7].map(n => ({update_id: n, message: {message_id: 100 + n, chat: {id: -42}, from: {id: 9},
+    message_thread_id: 5, date: 1_700_000_000 + n * 600, text: `queued while the gateway was down ${n}`}})));
+  for (const _ of [6, 7]) await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(inThread().length, 4);
+
+  f.store.ingest([{update_id: 8, callback_query: {id: "tap", from: {id: 9}, data: buttons[1].callback_data,
+    message: {message_id: 200, chat: {id: -42}, message_thread_id: 5}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  f.store.ingest([{update_id: 9, message: {message_id: 109, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row("update:9:action")!.payload).projectId, "p2");
+}));
+
+test("an explicit /run links its repo topic so later plain messages launch without a command", () => fixture(async f => {
+  const commands = repoTopic(f, "other", 6);
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 6, text: "/run p1 first task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:6"), "p1");
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 6, text: "second task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const action = JSON.parse(f.store.row("update:2:action")!.payload);
+  assert.equal(action.type, "launch"); assert.equal(action.projectId, "p1");
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
+  assert.notEqual(action.trackedId, JSON.parse(f.store.row("update:1:action")!.payload).trackedId);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='telegram' AND payload LIKE '%reaches Conductor yet%'").get() as any).n, 0);
+}));
+
+test("/link corrects an automatic repo topic route and rejects an unknown project", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
+    {id: "p2", name: "other", gitRemote: "git@github.com:org/other.git"},
+  ];
+  const commands = repoTopic(f, "repo");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "first task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p1");
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link nope"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p1");
+  assert.match(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /Repository unavailable or ambiguous/);
+  f.store.ingest([{update_id: 3, message: {message_id: 103, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link other"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  f.store.ingest([{update_id: 4, message: {message_id: 104, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const picker = JSON.parse(f.store.row("update:4:bindtopic:0")!.payload).payload;
+  assert.deepEqual(picker.reply_markup.inline_keyboard.map((row: any[]) => row[0].text), ["\u25cf other \u00b7 org/other", "repo \u00b7 org/repo"]);
+  // An explicit /link reports where the topic points; it never claims a message was dropped.
+  assert.match(picker.text, /repo routes to other \u00b7 org\/other/);
+  assert.doesNotMatch(picker.text, /reaches Conductor yet/);
+  f.store.ingest([{update_id: 5, message: {message_id: 105, chat: {id: -42}, from: {id: 9}, text: "/link repo"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.match(JSON.parse(f.store.row("update:5:reply:0")!.payload).payload.text, /inside a repository topic/);
+}));
+
+test("repo topic matching accepts a whole repository name and never a partial one", () => {
+  const projects = [
+    {id: "p1", name: "Long Events", gitRemote: "git@github.com:org/long-events.git"},
+    {id: "p2", name: "long-events-admin", gitRemote: "https://github.com/org/long-events-admin"},
+    {id: "p3", name: "api", gitRemote: "ssh://git@github.com/org/api.git"},
+    {id: "p4", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+    {id: "p5", name: "broken", gitRemote: "not a remote"},
+  ];
+  const ids = (name: string) => repoTopicCandidates(name, projects as any).map(p => p.id);
+  assert.deepEqual(ids("long-events"), ["p1"]);
+  assert.deepEqual(ids("LONG-EVENTS"), ["p1"]);
+  assert.deepEqual(ids("Long Events"), ["p1"]);
+  // Two repositories share a name, so the topic has no single identity to route on.
+  assert.deepEqual(ids("api"), ["p3", "p4"]);
+  // A prefix, a suffix and an empty name are never a match.
+  assert.deepEqual(ids("long"), []);
+  assert.deepEqual(ids("events"), []);
+  assert.deepEqual(ids("  "), []);
+  assert.deepEqual(ids("not a remote"), []);
+});
+
+test("a repo topic with nothing to offer asks for /link without an empty keyboard and forwards nothing", () => fixture(async f => {
+  f.api.listProjects = async () => [];
+  const commands = repoTopic(f, "orphan");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5,
+    photo: [{file_id: "thumb"}, {file_id: "full"}], caption: "fix this screenshot"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const notice = JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload;
+  assert.match(notice.text, /nothing sent here reaches Conductor yet/);
+  assert.match(notice.text, /Use \/projects, then \/link/);
+  // An empty catalog has nothing to pick, so Telegram must not be sent a keyboard with no buttons.
+  assert.equal(notice.reply_markup, undefined);
+  // An attachment nobody can route is never uploaded or queued against a guessed project.
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind IN ('cloud','media')").get() as any).n, 0);
+  assert.equal(f.store.get("repo-topic-project:-42:5"), undefined);
+}));
+
+test("an ambiguous repo topic ranks related projects first and offers at most four", () => fixture(async f => {
+  f.api.listProjects = async () => ["api-tools", "my-api-service", "alpha", "beta", "delta", "gamma"]
+    .map((name, i) => ({id: `a${i}`, name, gitRemote: `git@github.com:org/${name}.git`}));
+  const commands = repoTopic(f, "api");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const notice = JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload;
+  // Projects whose name contains the repository sort above unrelated ones, and a long catalog is truncated.
+  assert.deepEqual(notice.reply_markup.inline_keyboard.map((row: any[]) => row[0].text),
+    ["api-tools \u00b7 org/api-tools", "my-api-service \u00b7 org/my-api-service", "alpha \u00b7 org/alpha", "beta \u00b7 org/beta"]);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 0);
+}));
+
+test("a photo in a repo topic auto-links, launches its own workspace, and leaves the repo topic free", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
+    {id: "p2", name: "Screens", gitRemote: "git@github.com:org/screens.git"},
+  ];
+  const commands = repoTopic(f, "screens");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5,
+    photo: [{file_id: "thumb"}, {file_id: "full"}]}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  const action = JSON.parse(f.store.row("update:1:action")!.payload);
+  assert.equal(action.type, "launch"); assert.equal(action.projectId, "p2"); assert.equal(action.mediaPending, true);
+  assert.equal(JSON.parse(f.store.row("update:1:media")!.payload).fileId, "full");
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
+  const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
+  assert.match(ack, /Attachment received/); assert.match(ack, /now routes to Screens/);
+}));
+
+test("a topic link tap from another topic or an expired button changes nothing", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+  ];
+  const commands = repoTopic(f, "api");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const data = JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload.reply_markup.inline_keyboard[0][0].callback_data;
+  // A button belongs to the topic it was offered in; the same owner tapping it elsewhere links nothing.
+  f.store.ingest([{update_id: 2, callback_query: {id: "elsewhere", from: {id: 9}, data,
+    message: {message_id: 200, chat: {id: -42}, message_thread_id: 6}}}]);
+  f.store.ingest([{update_id: 3, callback_query: {id: "expired", from: {id: 9}, data: "bindtopic:expired",
+    message: {message_id: 201, chat: {id: -42}, message_thread_id: 5}}}]);
+  for (const _ of [2, 3]) await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), undefined);
+  assert.equal(f.store.get("repo-topic-project:-42:6"), undefined);
+  assert.equal(f.store.row("update:2:reply:0"), undefined);
+  // A dead button inside the topic says so; one aimed at another topic is not this topic's business.
+  assert.match(JSON.parse(f.store.row("update:3:answer")!.payload).payload.text, /no longer on the table/);
+  // Every tap is still acknowledged, so Telegram never leaves a spinner behind.
+  assert.ok(f.store.row("update:2:answer")); assert.ok(f.store.row("update:3:answer"));
+  f.store.ingest([{update_id: 4, callback_query: {id: "real", from: {id: 9}, data,
+    message: {message_id: 202, chat: {id: -42}, message_thread_id: 5}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p1");
+  // Answering retires the whole offer: its buttons and its burst notice both go.
+  assert.equal(f.store.get("repo-topic-notice:-42:5"), undefined);
+  assert.equal(f.store.get("repo-topic-offer:-42:5"), undefined);
+  assert.equal(f.store.get(data), undefined);
+}));
+
+test("a catalog outage retries the repo topic message instead of dropping or guessing it", () => fixture(async f => {
+  f.api.listProjects = async () => { throw new Error("catalog unavailable"); };
+  const commands = repoTopic(f, "repo");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:1")?.state, "pending");
+  assert.match(f.store.row("update:1")?.error ?? "", /catalog unavailable/);
+  assert.equal(f.store.get("repo-topic-project:-42:5"), undefined);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 0);
+  // The failure must not count as the burst's one answer, or the retry would be silent.
+  f.api.listProjects = async () => [{id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"}];
+  f.store.retry("update:1", "retry", 0);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p1");
+  assert.equal(JSON.parse(f.store.row("update:1:action")!.payload).projectId, "p1");
+}));
+
+test("a one-off /run in a linked repo topic stays a one-off and says where the topic still routes", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
+    {id: "p2", name: "other", gitRemote: "git@github.com:org/other.git"},
+  ];
+  const commands = repoTopic(f, "repo");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link other"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  for (const [i, text] of ["/run p1 one off", "/cloud p1 another one off"].entries()) {
+    const id = i + 2;
+    f.store.ingest([{update_id: id, message: {message_id: 100 + id, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    assert.equal(JSON.parse(f.store.row(`update:${id}:action`)!.payload).projectId, "p1", text);
+    assert.match(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.text, /one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/, text);
+    // Naming a project for one task must never silently re-point every later message.
+    assert.equal(f.store.get("repo-topic-project:-42:5"), "p2", text);
+  }
+  f.store.ingest([{update_id: 4, message: {message_id: 104, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "plain follow-up"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row("update:4:action")!.payload).projectId, "p2");
+}));
+
+test("a repo topic whose project the catalog stops listing asks again and keeps its link", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+  ];
+  const commands = repoTopic(f, "api");
+  f.store.set("repo-topic-project:-42:5", "p-deleted");
+  const before = (f.store.db.prepare("SELECT count(*) AS n FROM workspaces").get() as any).n;
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:1:action"), undefined);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM workspaces").get() as any).n, before);
+  // A stale or partial catalog read never deletes a link the owner confirmed, and never replaces it.
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p-deleted");
+  assert.match(JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload.text, /this catalog does not list/);
+}));
+
+test("a voice note in an unlinked repo topic is answered, never transcribed into a guess", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+  ];
+  const commands = repoTopic(f, "api");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, voice: {file_id: "v1"}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind IN ('media','cloud')").get() as any).n, 0);
+  assert.match(JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload.text, /nothing sent here reaches Conductor yet/);
+}));
+
+test("a button from an offer the owner already answered cannot re-point the topic later", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+  ];
+  const commands = repoTopic(f, "api");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const stale = JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload.reply_markup.inline_keyboard[0][0].callback_data;
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link partner-api"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  // Scrollback is not a control surface: the superseded button reports itself instead of rebinding.
+  f.store.ingest([{update_id: 3, callback_query: {id: "stale", from: {id: 9}, data: stale,
+    message: {message_id: 200, chat: {id: -42}, message_thread_id: 5}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  assert.match(JSON.parse(f.store.row("update:3:answer")!.payload).payload.text, /no longer on the table/);
+}));
+
+test("a message queued behind /link is answered instead of swallowed by its picker", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+  ];
+  const commands = repoTopic(f, "api");
+  // Both arrive in one batch, as they do after a restart or a Telegram backoff.
+  f.store.ingest([1, 2].map(n => ({update_id: n, message: {message_id: 100 + n, chat: {id: -42}, from: {id: 9},
+    message_thread_id: 5, date: 1_700_000_000, text: n === 1 ? "/link" : "ship the release notes"}})));
+  for (const _ of [1, 2]) await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.match(JSON.parse(f.store.row("update:1:bindtopic:0")!.payload).payload.text, /routes to no project yet/);
+  assert.match(JSON.parse(f.store.row("update:2:bindtopic:0")!.payload).payload.text, /nothing sent here reaches Conductor yet/);
+}));
+
+test("a button dropped from a later offer stops working instead of re-pointing the topic", () => fixture(async f => {
+  let catalog = [
+    {id: "p1", name: "api", gitRemote: "git@github.com:org/api.git"},
+    {id: "p2", name: "partner-api", gitRemote: "git@github.com:partner/api.git"},
+    {id: "p3", name: "charlie", gitRemote: "git@github.com:org/charlie.git"},
+    {id: "p4", name: "delta", gitRemote: "git@github.com:org/delta.git"},
+  ];
+  f.api.listProjects = async () => catalog;
+  const commands = repoTopic(f, "api");
+  const buttons = (id: number) => JSON.parse(f.store.row(`update:${id}:bindtopic:0`)!.payload)
+    .payload.reply_markup.inline_keyboard.map((row: any[]) => row[0]);
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, date: 1_700_000_000, text: "ship it"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const dropped = buttons(1).find((b: any) => b.text.startsWith("delta")).callback_data;
+  // A new project outranks delta alphabetically, so the next offer of four drops its button.
+  catalog = [...catalog, {id: "p5", name: "aardvark", gitRemote: "git@github.com:org/aardvark.git"}];
+  f.store.clear("projects");
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, date: 1_700_000_060, text: "try again"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.ok(!buttons(2).some((b: any) => b.text.startsWith("delta")));
+  assert.equal(f.store.get(dropped), undefined);
+  f.store.ingest([{update_id: 3, callback_query: {id: "stale", from: {id: 9}, data: dropped,
+    message: {message_id: 200, chat: {id: -42}, message_thread_id: 5}}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), undefined);
+  assert.match(JSON.parse(f.store.row("update:3:answer")!.payload).payload.text, /no longer on the table/);
+}));
+
+test("every photo of an album follows the one-off project named in its caption", () => fixture(async f => {
+  f.api.listProjects = async () => [
+    {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
+    {id: "p2", name: "other", gitRemote: "git@github.com:org/other.git"},
+  ];
+  const commands = repoTopic(f, "repo");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link other"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+  // Telegram delivers an album as one update per photo, with the caption on only the first.
+  f.store.ingest([2, 3].map(n => ({update_id: n, message: {message_id: 100 + n, chat: {id: -42}, from: {id: 9},
+    message_thread_id: 5, media_group_id: "album-1", photo: [{file_id: `photo-${n}`}],
+    ...(n === 2 ? {caption: "/run p1 fix these two screens"} : {})}})));
+  for (const _ of [2, 3]) await processQueue(f.store, ["update"], row => commands.handle(row));
+  for (const id of [2, 3]) {
+    assert.equal(JSON.parse(f.store.row(`update:${id}:action`)!.payload).projectId, "p1", `update ${id}`);
+    assert.match(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.text, /one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/, `update ${id}`);
+  }
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
+}));
+
+test("a repo topic an earlier release pinned to a workspace goes back to launching new work", () => fixture(async f => {
+  f.api.listProjects = async () => [{id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"}];
+  const commands = repoTopic(f, "repo");
+  // v0.8.1 pinned the workspace it launched to the repo topic's own thread.
+  updateWorkspaceThreadId(f.ws.id, 5);
+  await f.launch();
+  assert.ok(f.store.binding(f.ws.id));
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "start something new"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const action = JSON.parse(f.store.row("update:1:action")!.payload);
+  assert.equal(action.type, "launch");
+  assert.notEqual(action.trackedId, f.ws.id);
+  assert.equal(action.projectId, "p1");
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
+  // Following up on the pinned workspace still works by replying to one of its messages.
+  linkTelegramMessage("-42", "500", f.ws.id, "s1");
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5,
+    reply_to_message: {message_id: 500}, text: "keep going"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row("update:2:action")!.payload).trackedId, f.ws.id);
 }));

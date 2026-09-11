@@ -32,6 +32,22 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.9.0] - 2026-09-11
+
+### Added
+- Repository topics route themselves. A topic's repository name is matched whole against Conductor project names and against the repository name in each project's remote; a single match links the topic, and every later message there starts a new workspace in it. No match, or more than one, shows a ranked picker instead, and nothing reaches Conductor until the project is confirmed.
+- `/link` shows which Conductor project a repository topic routes to, and changes it. `/link <project>` sets it directly; `/link` on its own reopens the picker with the current project marked.
+- Every message that names a project now names the repository it points at, so a route to the wrong repository is visible the first time it happens.
+
+### Changed
+- `/run` and `/cloud` inside a repository topic name a project for that one task. They adopt a topic that is not linked yet and say so, and never re-point a topic that already is; `/link` is the only way to change that.
+- A workspace launched from a repository topic gets its own topic, so the repository topic stays a launch pad instead of becoming that workspace's thread.
+
+### Fixed
+- A repository topic the migration could not map is no longer a dead end that refuses every message. The advice it gave, `/run <project ID>`, never recorded the mapping, so the refusal repeated forever.
+- One pasted list that Telegram splits into several messages is answered once rather than once per message, and a message sent later is always answered.
+- A link whose project a catalog read stops listing is kept rather than deleted, and asks again instead of launching work that would strand a workspace.
+- A repository topic that an earlier release pinned to a workspace launches new work again; follow-ups to that workspace still work by replying to one of its messages.
 ## [0.8.2] - 2026-09-10
 
 ### Fixed

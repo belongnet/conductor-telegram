@@ -51,6 +51,16 @@ src/
 │   ├── format.ts      # Markdown→HTML, styled buttons, escaping
 │   ├── forum.ts       # Forum topic lifecycle
 │   └── callback-server.ts  # Webhook/callback handling
+├── cloud/             # Cloud-only gateway (TELEGRAM_RUNTIME_MODE=cloud-only)
+│   ├── runtime.ts     # Gateway startup, lease, and worker wiring
+│   ├── commands.ts    # Commands, repo topic routing, and callbacks
+│   ├── engine.ts      # Workspace launch, delivery, provider recovery
+│   ├── catalog.ts     # Conductor project catalog lookups
+│   ├── sync.ts        # Discovery of Cloud workspaces created elsewhere
+│   ├── poller.ts      # Independent session pollers
+│   ├── telegram.ts    # Durable outbound Telegram queue and sender
+│   ├── bridge.ts      # Scoped HTTPS file/MCP bridge and health probes
+│   └── store.ts       # Additive gateway queue and state tables
 ├── mcp/               # MCP server (runs inside workspaces)
 │   └── server.ts      # report_status, report_artifact, request_human
 ├── store/             # Database layer
@@ -79,6 +89,7 @@ src/
 | `/run` | `/run <repo> <prompt>` | Start a Cloud-first workspace with a local fallback |
 | `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
 | `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
+| `/link` | `/link [project]` (inside a repo topic, cloud-only mode) | Show or change the Conductor project a repo topic routes to |
 | `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
 | `/lanes` | `/lanes [pause\|resume\|retry\|provider-disable\|archive-approval\|shadow\|cutover\|rollback]` | Durable lane status and audited controls when Manifest v2 is configured; legacy scheduler controls otherwise |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
@@ -103,7 +114,7 @@ Ways to target work from Telegram:
 
 1. **Reply** to any forwarded workspace message with text, media, `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut. If that message came from a specific Conductor thread, the reply goes back to that exact thread.
 2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically. Plain messages go to the workspace's active Conductor thread.
-3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message.
+3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message. In cloud-only mode the topic routes itself: its repository name is matched against the Conductor project catalog by project name or by the repository name in each project's remote, and a single match is recorded so every later message in that topic goes straight there. No match or more than one match asks with a picker instead of guessing, and says plainly that the message was not sent. Every message that names a project names the repository it points at, so a wrong route is visible the first time it happens. Use `/link` to see or change where a topic routes. The launched workspace still gets its own topic; the repo topic stays a launch pad.
 4. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
 
 Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
@@ -114,7 +125,7 @@ Conductor Cloud workspaces use [Conductor's official API](https://www.conductor.
 
 Cloud workspaces created with `/cloud` are driven entirely over the API — discovery, prompt delivery, and polling work even when the Conductor desktop app is closed or absent. Project arguments to `/cloud` and `/projects` accept a list number from `/projects`, a project id, an exact name, or a unique name prefix. When the bot itself runs inside a Conductor cloud workspace, it honors `CONDUCTOR_API_URL` and attributes its requests via an `X-Conductor-Session-Id` header taken from `CONDUCTOR_SESSION_ID` — both injected by the cloud workspace environment, not user config.
 
-Repo-targeted Telegram launches are Cloud-first. `/run`, repo-topic messages, and AI-routed new tasks use Cloud automatically when `CONDUCTOR_API_KEY` is configured and exactly one Cloud project matches the local repository's `origin` URL (SSH and HTTPS forms are treated as the same repository). Missing or ambiguous origins always fall back locally; automatic routing never guesses from a project name or remote basename. The bot states when it falls back to a local workspace because Cloud is unconfigured, project lookup failed, no project matched, or Telegram attachments require the local file bridge. `/cloud` remains available when you want to choose a Cloud project explicitly.
+Repo-targeted Telegram launches are Cloud-first. `/run`, repo-topic messages, and AI-routed new tasks use Cloud automatically when `CONDUCTOR_API_KEY` is configured and exactly one Cloud project matches the local repository's `origin` URL (SSH and HTTPS forms are treated as the same repository). Missing or ambiguous origins always fall back locally; in that hybrid mode automatic routing never guesses from a project name or remote basename. The cloud-only gateway has no local checkout to read an `origin` from, so repo topics there route on the topic's own repository name instead, matched whole against project names and against the repository name in each project's remote, and ask whenever that is not unique. `/run` and `/cloud` name a project for a single task there: they adopt an unlinked topic and say so, and never re-point a topic that is already linked. `/link` is the one way to change it. The bot states when it falls back to a local workspace because Cloud is unconfigured, project lookup failed, no project matched, or Telegram attachments require the local file bridge. `/cloud` remains available when you want to choose a Cloud project explicitly.
 
 If a local prompt later fails because its CLI login disappeared, the bot can take the same Telegram workspace over through Cloud. Automatic replay is limited to launcher-confirmed startup authentication failures before any assistant or tool activity. The worktree must be clean and its exact commit must already exist on an `origin` branch; the bot rechecks that branch after Cloud provisioning and before it sends work. Because the public Cloud API does not expose the provisioned checkout SHA, the handoff carries the expected SHA and tells the Cloud agent to verify HEAD before any side effect. Dirty files, unpushed commits, and partially executed prompts are never silently replayed. The Cloud binding and first prompt are persisted as a recoverable pending launch before delivery; later overlapping requests use a durable, ordered outbox with stable message identities. Stop intent and uncertain cleanup also survive restarts, so a canceled pending launch cannot be replayed later. A Stop or Archive the API rejects is retried across restarts, but only until it is clearly hopeless: because a pending terminal request blocks later sends, one that cannot succeed is retired with an explanatory message rather than gating the workspace forever. Restricted read-only reviews remain local until the public Cloud API exposes equivalent permission-policy enforcement.
 
