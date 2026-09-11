@@ -1020,6 +1020,106 @@ test("legacy apply is idempotent and separates merged Git truth from archive tru
   }
 });
 
+test("legacy apply succeeds after cutover, when the controller is active", async () => {
+  // Regression: applyLegacyImport used to refuse an active controller, while
+  // Command Center refuses every lane mutation unless the controller IS active
+  // ("active cutover is required", 409). The one-time import was therefore
+  // impossible to apply against the production store in any mode. Isolation
+  // comes from the exclusive growth lease this test holds, not from the mode.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lane-import-active-"));
+  const store = new SqliteLaneStateStore(path.join(root, "state.db"));
+  const value = manifest();
+  try {
+    const lease = await store.claimLease({
+      ownerId: "mac:legacy-import",
+      ownerSite: "mac",
+      leaseSeconds: 75,
+    });
+    assert.ok(lease);
+    const staged = await store.stageManifest(lease, {
+      revisionId: "legacy-import-v2",
+      sourceRef: "test:legacy-queue",
+      manifest: value,
+      createdBy: "test",
+    });
+    await store.activateManifest(
+      lease,
+      "legacy-import-v2",
+      Number(staged.row_version)
+    );
+
+    // Drive the controller to `active` exactly as a cutover does in production.
+    const control = await store.createControl({
+      control_id: "control-cutover-1",
+      idempotency_key: "control-cutover-1",
+      kind: "cutover",
+      requested_by: "test",
+      payload: { revision_id: "legacy-import-v2" },
+      approvalKey: "human",
+    });
+    const beforeCutover = await store.snapshot();
+    await store.finishControl(lease, control.control_id, {
+      expected_version: Number(control.row_version),
+      expected_controller_version: Number(beforeCutover.controller!.row_version),
+      status: "applied",
+    });
+    const active = await store.snapshot();
+    assert.equal(active.controller!.mode, "active", "cutover must precede the import");
+
+    const mergedPr: GithubPrPolicySnapshot = {
+      url: PR,
+      repoOwner: "example-org",
+      repoName: "example-repo",
+      prNumber: 7,
+      state: "merged",
+      isDraft: false,
+      headBranch: "managed/l1b",
+      baseBranch: "main",
+      headSha: HEAD,
+      reviewDecision: null,
+      mergeStateStatus: "CLEAN",
+      mergeable: "MERGEABLE",
+      checksStatus: "passing",
+      checksSummary: "green",
+      mergeCommitSha: "c".repeat(40),
+      reviews: [],
+    };
+    const plan: LegacyImportPlan = {
+      source: "/tmp/legacy-queue.json",
+      ignoredWatchEntries: 0,
+      duplicateLaneIds: [],
+      duplicateWorkspaceIds: [],
+      duplicatePrUrls: [],
+      lanes: [
+        {
+          laneId: "L1b",
+          disposition: "adopt",
+          reason: "exact merged Git truth; all legacy workspace candidates are archived",
+          provider: "claude",
+          workspace: null,
+          pr: mergedPr,
+          legacyVerified: false,
+          gitTruthVerified: true,
+          candidates: [],
+        },
+      ],
+    };
+
+    assert.deepEqual(await applyLegacyImport({ plan, manifest: value, store, lease }), {
+      imported: 1,
+      quarantined: 0,
+      skipped: 0,
+    });
+    const snapshot = await store.snapshot();
+    const adopted = snapshot.runs.find((run) => run.lane_id === "L1b")!;
+    assert.equal(adopted.merged_sha, mergedPr.mergeCommitSha);
+    assert.equal(snapshot.controller!.mode, "active", "import must not change the mode");
+  } finally {
+    await store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy apply durably reserves a verified working session without replaying its prompt", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lane-import-working-"));
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
