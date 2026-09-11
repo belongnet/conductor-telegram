@@ -129,7 +129,9 @@ export async function ingestTelegram(store: GatewayStore, call: TelegramCall, si
       store.set("ingestion-last-success", Date.now());
     } catch (error) {
       const failure = telegramFailure(error);
-      store.set("ingestion-error", failure.description);
+      // A shutdown aborts every fenced write at once, so recording why ingestion stopped
+      // would itself throw, out of the handler, and turn a clean stop into a failure.
+      if (!signal.aborted) store.set("ingestion-error", failure.description);
       // A second poller must be contained rather than repeatedly stealing the token.
       if (failure.conflict || failure.permanent) throw new Error(failure.description);
       await pause(failure.delayMs, signal);

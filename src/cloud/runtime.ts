@@ -60,8 +60,10 @@ export async function startCloudGateway(): Promise<void> {
   if (recordedOrganization && identity.organizationId && recordedOrganization !== identity.organizationId) throw new Error("Conductor organization differs from this gateway's persisted identity");
   const abort = new AbortController();
   const owner = randomUUID();
-  process.once("SIGINT", () => abort.abort());
-  process.once("SIGTERM", () => abort.abort());
+  let requested = false;
+  const shutdown = (): void => { requested = true; abort.abort(); };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
   while (!abort.signal.aborted && !acquireGatewayLease(store, owner)) await pause(1000, abort.signal);
   if (abort.signal.aborted) return;
   store.recover();
@@ -126,6 +128,7 @@ export async function startCloudGateway(): Promise<void> {
     while (!abort.signal.aborted) {
       try { checkLease(); await fn(); }
       catch (error) {
+        if (abort.signal.aborted) break;
         store.set(`loop-error:${name}`, { at: Date.now(), message: error instanceof Error ? error.message.replace(/bot\d+:[\w-]+/g, "bot[redacted]") : "Loop failed" });
         console.error(`[${name}] operation failed; details are in the private gateway state`);
       }
@@ -159,6 +162,10 @@ export async function startCloudGateway(): Promise<void> {
       loop("cloud-access", 60_000, async () => { await fencedApi.getIdentity(); store.set("cloud-access-last-success", Date.now()); }),
       loop("retention", 3600_000, () => bridge.prune()),
     ]);
+  } catch (error) {
+    // An operator asked this process to stop. Whichever fenced call lost the race to the
+    // abort reports a lost lease, and that must not be reported as a service failure.
+    if (!requested) throw error;
   } finally {
     abort.abort(); server.close();
     await Promise.all([poller.settled(), sync?.settled(), ...Object.values(dispatchers).map(worker => worker.settled())]);

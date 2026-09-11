@@ -32,6 +32,11 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.9.1] - 2026-09-11
+
+### Fixed
+- Stopping the cloud gateway is no longer reported as a service failure. A shutdown aborts every lease-fenced write at once, so the handler recording why ingestion stopped threw out of its own `catch`, surfacing a clean `systemctl restart` as `Fatal error: Gateway lease lost` plus a systemd `FAILURE` line on every deploy. Diagnostics are skipped once a stop is under way, and a stop the operator asked for now exits clean whichever fenced call loses the race.
+
 ## [0.9.0] - 2026-09-11
 
 ### Added
