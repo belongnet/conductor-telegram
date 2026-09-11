@@ -48,6 +48,21 @@ All notable changes to conductor-telegram are documented here.
 - One pasted list that Telegram splits into several messages is answered once rather than once per message, and a message sent later is always answered.
 - A link whose project a catalog read stops listing is kept rather than deleted, and asks again instead of launching work that would strand a workspace.
 - A repository topic that an earlier release pinned to a workspace launches new work again; follow-ups to that workspace still work by replying to one of its messages.
+## [0.8.2] - 2026-09-10
+
+### Fixed
+
+- The one-time legacy import can be applied again. `applyLegacyImport` refused to
+  run while the controller was `active`, but Command Center gates every lane
+  mutation, including the `createRun` calls the import makes, behind
+  `controller.mode === "active"` and answers 409 `active cutover is required`
+  otherwise. The two conditions could not both hold, so the import was
+  impossible to apply against the production HTTP/Postgres store in any mode.
+  Isolation during the import comes from the exclusive `growth` lease the caller
+  already claims, not from the controller mode, so the mode check is removed and
+  a regression test pins an active-mode apply. The contradiction was invisible to
+  the existing tests because `SqliteLaneStateStore.createRun` has no
+  controller-mode gate; only the HTTP path enforces one.
 
 ## [0.8.1] - 2026-09-10
 
