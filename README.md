@@ -51,6 +51,16 @@ src/
 │   ├── format.ts      # Markdown→HTML, styled buttons, escaping
 │   ├── forum.ts       # Forum topic lifecycle
 │   └── callback-server.ts  # Webhook/callback handling
+├── cloud/             # Cloud-only gateway (TELEGRAM_RUNTIME_MODE=cloud-only)
+│   ├── runtime.ts     # Gateway startup, lease, and worker wiring
+│   ├── commands.ts    # Commands, repo topic routing, and callbacks
+│   ├── engine.ts      # Workspace launch, delivery, provider recovery
+│   ├── catalog.ts     # Conductor project catalog lookups
+│   ├── sync.ts        # Discovery of Cloud workspaces created elsewhere
+│   ├── poller.ts      # Independent session pollers
+│   ├── telegram.ts    # Durable outbound Telegram queue and sender
+│   ├── bridge.ts      # Scoped HTTPS file/MCP bridge and health probes
+│   └── store.ts       # Additive gateway queue and state tables
 ├── mcp/               # MCP server (runs inside workspaces)
 │   └── server.ts      # report_status, report_artifact, request_human
 ├── store/             # Database layer
@@ -79,7 +89,7 @@ src/
 | `/run` | `/run <repo> <prompt>` | Start a Cloud-first workspace with a local fallback |
 | `/cloud` | `/cloud <project> <prompt>` | Start a ☁️ Conductor Cloud workspace via the API (no local checkout needed) |
 | `/projects` | `/projects [name]` | List cloud projects, or one project's recent workspaces |
-| `/link` | `/link [project]` (inside a repo topic) | Show or change the Conductor project a repo topic routes to |
+| `/link` | `/link [project]` (inside a repo topic, cloud-only mode) | Show or change the Conductor project a repo topic routes to |
 | `/fleet` | `/fleet [hours]` | Org-wide cloud activity report from transcript search (default 24h, max 168) |
 | `/lanes` | `/lanes [pause\|resume\|retry\|provider-disable\|archive-approval\|shadow\|cutover\|rollback]` | Durable lane status and audited controls when Manifest v2 is configured; legacy scheduler controls otherwise |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
