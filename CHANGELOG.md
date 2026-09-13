@@ -32,6 +32,15 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.10.0] - 2026-09-13
+
+### Changed
+- A cloud task now keeps one status message per turn. The acknowledgement is sent silently and then edited in place through "Sent to claude (…)" and "Conductor task finished.", so the agent's replies are the only messages that ring. Stop, archive, rename, and provider-fallback notices update the same card, and the workspace-created and sync connection notes are silent too. If the card cannot be edited, its text is delivered as a silent message instead.
+- Agents are told about the Telegram MCP tools only when their workspace holds a bridge credential. Workspaces discovered from Conductor never receive one, so their prompts now say that replies are forwarded to Telegram and ask the agent to answer inline, instead of prompting it to report that MCP tools are missing.
+
+### Fixed
+- A message sent to a sleeping cloud workspace no longer triggers an immediate "the workspace slept during this task" continuation. The gateway treated Conductor's own wake-up delay as an interrupted task, sending a second prompt and a duplicate "Sent to …" notice within seconds. A continuation now waits for evidence that the turn had started, or for five minutes of silence.
+
 ## [0.9.2] - 2026-09-11
 
 ### Fixed
