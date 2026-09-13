@@ -34,6 +34,8 @@ The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 
 
 In cloud-only mode, agent replies, questions, progress reports, and artifact links render Markdown as Telegram rich text, including bold, italics, strikethrough, inline code, code blocks, and clickable web links. Long replies keep their formatting across messages; answer buttons appear on the last message of a long question. Local file links remain readable as a label and path, and formatting that cannot be rendered safely falls back to literal text.
 
+Each message you send in a cloud topic gets one status card. The acknowledgement arrives silently and is edited in place as the task is handed to the agent and when it finishes, so only the agent's replies notify you. Agents in workspaces the gateway created are told about the Telegram MCP tools; agents in workspaces discovered from Conductor are asked to answer inline instead.
+
 ## Architecture
 
 ```
