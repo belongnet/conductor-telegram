@@ -70,8 +70,11 @@ export class CloudCommands {
     const attachment = msg.voice ?? msg.audio ?? msg.document ?? msg.photo?.at(-1);
     if (!callback && !msg.text && !msg.caption && !attachment) return;
     const media = attachment ? { fileId: attachment.file_id, fileName: attachment.file_name ?? (msg.photo ? "photo.jpg" : "voice.ogg"), voice: !!(msg.voice || msg.audio) } : undefined;
+    // A direct reply answers the owner's own message, so it never needs to ring. The acknowledgement doubles as the
+    // turn's status card: actions carry its row id so later states edit it instead of posting again.
     const reply = (text: string, suffix = "reply", markup?: unknown) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
-      { threadId, replyMarkup: markup, priority: 0 });
+      { threadId, replyMarkup: markup, priority: 0, silent: true });
+    const statusId = `${row.id}:reply:0`;
     const replyTarget = msg.reply_to_message ? getWorkspaceMessageTarget(chatId, String(msg.reply_to_message.message_id)) : undefined;
     let target = replyTarget?.workspace ?? (threadId ? getWorkspaceByThreadId(chatId, threadId) : undefined);
     // A repo topic is a launch pad, never a workspace's own topic, including for a workspace an
@@ -114,9 +117,8 @@ export class CloudCommands {
       if (data.startsWith("route:")) {
         const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob }>(data);
         if (!proposed || proposed.chatId !== chatId) return;
-        if (proposed.media) this.prepareMedia(`${data}:confirmed`, proposed.action, proposed.media);
-        else this.engine.queue(`${data}:confirmed:action`, proposed.action);
-        reply("Confirmed. Task queued."); return;
+        const action = { ...proposed.action, statusId };
+        this.enqueueTurn(reply, "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`); return;
       }
       return;
     }
@@ -130,7 +132,7 @@ export class CloudCommands {
     }
     const command = match?.[1]?.toLowerCase();
     let args = match?.[3]?.trim() ?? "";
-    if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}`, {threadId, priority: 0}); return; }
+    if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}`, {threadId, priority: 0, silent: true}); return; }
     if (command === "sync") {
       if (!this.syncChatId) { reply("Cloud workspace sync needs TELEGRAM_CLOUD_SYNC_CHAT_ID set to a forum group."); return; }
       this.store.set("cloud-sync-after", 0);
@@ -222,10 +224,9 @@ export class CloudCommands {
       const binding = this.store.binding(target.id);
       if (!binding) { reply("This is historical local work. Start a cloud task with /run first."); return; }
       if (args.startsWith("new ") || (args === "new" && media)) {
-        const action: CloudAction = { type: "thread", trackedId: target.id, prompt: args.slice(4) };
-        if (media) this.prepareMedia(row.id, action, {...media, chatId, threadId});
-        else this.engine.queue(`${row.id}:thread`, action);
-        reply("New thread queued."); return;
+        const action: CloudAction = { type: "thread", trackedId: target.id, prompt: args.slice(4), statusId };
+        this.enqueueTurn(reply, "New thread queued.", `${row.id}:thread`, action,
+          media ? {...media, chatId, threadId} : undefined, row.id); return;
       }
       const sessions = await this.engine.api.listWorkspaceSessions(binding.workspaceId);
       const keyboard = sessions.map(s => {
@@ -241,10 +242,9 @@ export class CloudCommands {
       const type = SHORTCUTS.has(command!) ? "send" : command as CloudAction["type"];
       const prompt = SHORTCUTS.has(command!) ? `Use /${command === "skill" ? args : command!.replace(/_/g, "-")} ${command === "skill" ? "" : args}` : args;
       if (["send", "rename", "renamethread"].includes(type) && !prompt && !(type === "send" && media)) { reply("Please include a message or name."); return; }
-      const action: CloudAction = { type, trackedId: target.id, sessionId, prompt };
-      if (["send", "review"].includes(type) && media) this.prepareMedia(row.id, action, { ...media, chatId, threadId });
-      else this.engine.queue(`${row.id}:action`, action);
-      reply(["stop", "archive"].includes(type) ? "Stop requested. Confirming with Conductor." : "Queued for Conductor."); return;
+      const action: CloudAction = { type, trackedId: target.id, sessionId, prompt, statusId };
+      this.enqueueTurn(reply, ["stop", "archive"].includes(type) ? "Stop requested. Confirming with Conductor." : "Queued for Conductor.",
+        `${row.id}:action`, action, ["send", "review"].includes(type) && media ? { ...media, chatId, threadId } : undefined, row.id); return;
     }
     if (command && !["run", "cloud"].includes(command)) { reply(`Unknown command /${command}.\n\n${HELP}`); return; }
 
@@ -317,11 +317,19 @@ export class CloudCommands {
     }
     if (!target) throw new Error("Could not create workspace record");
     linkTelegramMessage(chatId, String(msg.message_id), target.id, sessionId);
-    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt };
-    if (media) {
-      this.prepareMedia(row.id, action, { ...media, chatId, threadId });
-    } else this.engine.queue(`${row.id}:action`, action);
-    reply((media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked);
+    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt, statusId };
+    this.enqueueTurn(reply, (media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked,
+      `${row.id}:action`, action, media ? { ...media, chatId, threadId } : undefined, row.id);
+  }
+
+  /** The status-card anchor and the work it represents become durable in one commit, anchor first. */
+  private enqueueTurn(reply: (text: string, suffix?: string, markup?: unknown) => void, acknowledgement: string,
+    actionId: string, action: CloudAction, media?: MediaJob, mediaReservationId = actionId.replace(/:action$/, "")): void {
+    this.store.db.transaction(() => {
+      reply(acknowledgement);
+      if (media) this.prepareMedia(mediaReservationId, action, media);
+      else this.engine.queue(actionId, action);
+    })();
   }
 
   /** One authorization, recorded once: the topic's project, with its notice and offer retired together. */

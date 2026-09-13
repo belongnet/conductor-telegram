@@ -11,7 +11,7 @@ import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
 import { CloudGitHub } from "../src/cloud/catalog.js";
-import { enqueueTelegram, enqueueText, TelegramDelivery, processQueue, ingestTelegram } from "../src/cloud/telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, TelegramDelivery, processQueue, ingestTelegram } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
 import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
 import { readWorkspaceArtifact } from "../src/mcp/remote.js";
@@ -40,6 +40,7 @@ function createFixture() {
     getWorkspaceStatus: async () => ({ workspaceId: "w1", status: "ready" }),
     listProjectWorkspaces: async () => [],
     listWorkspaceSessions: async () => sessions,
+    getSession: async (id: string) => ({...sessions.find(session => session.id === id), model: "fable-5-1"}),
     createSession: async (input: any) => { const session = { id: `s${sessions.length + 1}`, name: input.name, deepLink: "conductor://session" }; sessions.push(session); return session; },
     getSessionStatus: async (sessionId: string) => ({ workspaceId: "w1", sessionId, status: sessionStatus, errorMessage }),
     getMessage: async (id: string) => { const message = messages.find(m => m.id === id); if (!message) throw new ConductorApiError("Not found", 404); return message; },
@@ -73,6 +74,8 @@ test("cloud launch sends over native API without a desktop database or checkout"
   assert.equal(f.store.binding(f.ws.id)?.repoSlug, "org/repo");
   assert.equal(getWorkspace(f.ws.id)?.conductorBackendKind, "cloud-api");
   assert.equal(f.store.row("launch")?.state, "done");
+  assert.equal(JSON.parse(f.store.row("launch:created:0")!.payload).payload.disable_notification, true);
+  assert.equal(JSON.parse(f.store.row("launch:sent:0")!.payload).payload.disable_notification, true);
 }));
 
 test("replies to migrated local history never queue cloud work against an unbound record", () => fixture(async f => {
@@ -127,10 +130,21 @@ test("a lost native send receipt is reconciled through its distinct transcript r
     throw new Error("lost receipt");
   };
   await f.launch();
+  f.store.bind(f.ws.id, {...f.store.binding(f.ws.id)!, synced: true});
+  const getMessage = f.api.getMessage;
+  f.api.getMessage = async id => {
+    const message = await getMessage(id);
+    f.status("working");
+    return message;
+  };
+  f.status("idle");
   f.store.retry("launch", "reconcile", 0);
   await processQueue(f.store, ["cloud"], r => f.engine.action(r));
   assert.equal(sends, 1);
   assert.equal(f.store.row("launch")?.state, "done");
+  assert.equal(f.store.get<any>("session:s1").awaitingWorkingEdge, true, "a reconciled submission remains fenced if work starts after preflight");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, false, "the older working state is not credited to the reconciled turn");
 }));
 
 test("a missing receipt cannot replay a command whose submission was attempted", () => fixture(async f => {
@@ -282,10 +296,16 @@ test("control text keeps literal Markdown and escaped HTML", () => fixture(async
 }));
 
 test("quota failure queues one fallback; an API outage never launches a replacement", () => fixture(async f => {
-  await f.launch(); f.status("error");
+  await f.launch();
+  enqueueText(f.store, "quota-ack", "42", "Task received and queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "quota-ack:0"});
+  f.status("error");
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   const rows = f.store.db.prepare("SELECT * FROM gateway_queue WHERE id LIKE 'recover:%'").all();
   assert.equal(rows.length, 1);
+  const notice = JSON.parse(f.store.row(`recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`)!.payload);
+  assert.equal(notice.method, "editMessageText");
+  assert.equal(notice.statusOf, "quota-ack:0", "provider fallback updates the existing turn card");
   f.status("error"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'recover:%'").get() as any).n, 1);
   f.api.getSessionStatus = async () => { throw new Error("API offline"); };
@@ -295,11 +315,44 @@ test("quota failure queues one fallback; an API outage never launches a replacem
 }));
 
 test("transient disconnect attempts same-session continuation before provider replacement", () => fixture(async f => {
-  await f.launch(); f.status("error", "connection lost");
+  await f.launch();
+  enqueueText(f.store, "disconnect-ack", "42", "Task received and queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "disconnect-ack:0"});
+  f.status("error", "connection lost");
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal(f.store.get("recovery-resumed:launch"), true);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'resume:%'").get() as any).n, 1);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'recover:%'").get() as any).n, 0);
+  const notice = JSON.parse(f.store.row(`resume-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`)!.payload);
+  assert.equal(notice.method, "editMessageText");
+  assert.equal(notice.statusOf, "disconnect-ack:0", "same-provider recovery updates the existing turn card");
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const continuationRow = f.store.db.prepare("SELECT payload FROM gateway_queue WHERE id LIKE 'resume:%:sent'").get() as {payload: string};
+  const continuation = JSON.parse(continuationRow.payload);
+  assert.equal(continuation.method, "editMessageText");
+  assert.equal(continuation.statusOf, "disconnect-ack:0", "the resumed send keeps using the original card");
+}));
+
+test("provider recovery continues and completes on the original turn card", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "recovery-ack", "42", "Task received and queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "recovery-ack:0"});
+  f.status("error");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const recovery = f.store.db.prepare("SELECT id FROM gateway_queue WHERE id LIKE 'recover:%'").get() as {id: string};
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const continuation = JSON.parse(f.store.row(`${recovery.id}:sent`)!.payload);
+  assert.equal(continuation.method, "editMessageText");
+  assert.equal(continuation.statusOf, "recovery-ack:0");
+  const sessionId = f.sessions.at(-1).id as string;
+  const state = f.store.get<any>(`session:${sessionId}`);
+  f.messages.push({id: "recovered-answer", sessionId, type: "assistant", content: "Recovered result.",
+    sessionIndex: f.messages.length, receivedAt: new Date().toISOString()});
+  f.status("idle"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const complete = JSON.parse(f.store.row(`complete:${sessionId}:${state.sentMessageId}`)!.payload);
+  assert.equal(complete.method, "editMessageText");
+  assert.equal(complete.statusOf, "recovery-ack:0");
+  assert.equal(complete.payload.text, "Conductor task finished after recovery.");
 }));
 
 test("PR review records exact head, uses a separate session, and detects later changes", () => fixture(async f => {
@@ -324,9 +377,13 @@ test("PR review records exact head, uses a separate session, and detects later c
   assert.deepEqual(mergeEvidence(), beforeReview, "Review completion must not create merge authorization or approve a human decision");
 }));
 
-test("sleep during an unfinished task queues one same-session continuation and preserves explicit stop", () => fixture(async f => {
+test("sleep during a running task queues one same-session continuation and preserves explicit stop", () => fixture(async f => {
   await f.launch();
-  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: "sleeping"});
+  let lifecycle = "ready";
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: lifecycle});
+  f.status("working"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, true);
+  lifecycle = "sleeping"; f.status("idle");
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   const wakes = () => f.store.db.prepare("SELECT * FROM gateway_queue WHERE id LIKE 'wake:%'").all() as any[];
   assert.equal(wakes().length, 1);
@@ -345,6 +402,304 @@ test("sleep during an unfinished task queues one same-session continuation and p
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   await processQueue(f.store, ["cloud"], r => f.engine.action(r));
   assert.equal(f.counts().sends, 2);
+}));
+
+test("queued follow-ups cannot inherit the prior turn's working status as start evidence", () => fixture(async f => {
+  await f.launch();
+  let lifecycle = "ready";
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: lifecycle});
+  f.status("working"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  f.engine.queue("follow-up", {type: "send", trackedId: f.ws.id, prompt: "Second turn"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.get<any>("session:s1").awaitingWorkingEdge, true);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, false, "the session was already busy before this turn");
+  f.engine.queue("second-follow-up", {type: "send", trackedId: f.ws.id, prompt: "Third turn"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.get<any>("session:s1").awaitingWorkingEdge, true, "another queued turn preserves the pending edge");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, false);
+  lifecycle = "sleeping"; f.status("idle");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const wakes = () => (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'wake:%'").get() as any).n;
+  assert.equal(wakes(), 0, "a fresh queued turn is left for Conductor to wake");
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), sentAt: Date.now() - 6 * 60_000});
+  f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(wakes(), 1, "a silent turn is continued after the grace window");
+}));
+
+test("a turn that starts between polls cannot lend its working state to a queued follow-up", () => fixture(async f => {
+  await f.launch();
+  let lifecycle = "ready";
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: lifecycle});
+  f.status("working");
+  f.engine.queue("follow-up", {type: "send", trackedId: f.ws.id, prompt: "Second turn"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.get<any>("session:s1").awaitingWorkingEdge, true, "submission observes that the prior turn is already working");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, false, "the old working state is not credited to the follow-up");
+  lifecycle = "sleeping"; f.status("idle");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const wakes = () => (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'wake:%'").get() as any).n;
+  assert.equal(wakes(), 0);
+}));
+
+test("a queued follow-up in an established managed session closes the status-check-to-submit race", () => fixture(async f => {
+  await f.launch();
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), terminal: true});
+  let lifecycle = "ready";
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: lifecycle});
+  const send = f.api.sendMessage;
+  f.api.sendMessage = async input => {
+    const receipt = await send(input);
+    f.status("working");
+    return {...receipt, state: "queued"};
+  };
+  f.status("idle");
+  f.engine.queue("racing-follow-up", {type: "send", trackedId: f.ws.id, prompt: "Second turn"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.get<any>("session:s1").awaitingWorkingEdge, true, "the queued receipt fences work that began after the preflight");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, false);
+  lifecycle = "sleeping"; f.status("idle");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const wakes = (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'wake:%'").get() as any).n;
+  assert.equal(wakes, 0, "the prior turn cannot trigger a duplicate continuation for the queued follow-up");
+}));
+
+test("a first queued prompt in a gateway-created session can use its own working state", () => fixture(async f => {
+  const send = f.api.sendMessage;
+  f.api.sendMessage = async input => {
+    const receipt = await send(input);
+    f.status("working");
+    return {...receipt, state: "queued"};
+  };
+  await f.launch();
+  assert.equal(f.store.get<any>("session:s1").awaitingWorkingEdge, false, "there is no prior turn to fence in a new managed session");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.get<any>("session:s1").seenWorking, true, "the first prompt's observed work remains usable recovery evidence");
+}));
+
+test("a workspace still asleep when a message arrives is left for Conductor to wake", () => fixture(async f => {
+  await f.launch();
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: "sleeping"});
+  const wakes = () => (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'wake:%'").get() as any).n;
+  for (let i = 0; i < 2; i++) { f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!); }
+  assert.equal(wakes(), 0);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'wake-attempted:%'").get() as any).n, 0);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.deepEqual(f.counts(), {creates: 1, sends: 1}, "no continuation may follow the real message while Conductor is still waking up");
+  // A turn that stays silent well past any wake-up window is still continued.
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), sentAt: Date.now() - 6 * 60_000});
+  f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(wakes(), 1);
+}));
+
+test("a retried native send recreates a status edit lost after its state was persisted", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "retry-ack", "42", "Task received and queued.", {silent: true});
+  f.engine.queue("retry-turn", {type: "send", trackedId: f.ws.id, prompt: "Second turn", statusId: "retry-ack:0"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.ok(f.store.row("retry-turn:sent"));
+  f.store.db.prepare("DELETE FROM gateway_queue WHERE id=?").run("retry-turn:sent");
+  f.store.retry("retry-turn", "simulated restart after send state", 0);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const recreated = JSON.parse(f.store.row("retry-turn:sent")!.payload);
+  assert.equal(recreated.method, "editMessageText");
+  assert.equal(recreated.statusOf, "retry-ack:0");
+  assert.deepEqual(f.counts(), {creates: 1, sends: 2}, "the native message is not submitted twice");
+}));
+
+test("a user turn edits its acknowledgement instead of posting sent and finished messages", () => fixture(async f => {
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 7);
+  f.store.db.prepare("UPDATE gateway_queue SET state='done' WHERE kind='telegram'").run();
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  f.store.ingest([{update_id: 1, message: {message_id: 100, chat: {id: 42}, from: {id: 9}, message_thread_id: 7, text: "what is the status?"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row("update:1:action")!.payload).statusId, "update:1:reply:0");
+  const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload);
+  assert.equal(ack.payload.disable_notification, true);
+  assert.match(ack.payload.text, /Task received and queued/);
+  const queued = f.store.db.prepare("SELECT id,rowid FROM gateway_queue WHERE id IN (?,?) ORDER BY rowid")
+    .all("update:1:reply:0", "update:1:action") as Array<{id: string; rowid: number}>;
+  assert.deepEqual(queued.map(item => item.id), ["update:1:reply:0", "update:1:action"], "the durable card anchor is inserted before its action");
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  const sent = JSON.parse(f.store.row("update:1:action:sent")!.payload);
+  assert.equal(sent.method, "editMessageText"); assert.equal(sent.statusOf, "update:1:reply:0");
+  assert.equal(f.store.row("update:1:action:sent:0"), undefined, "the receipt is an edit of the card, not a new message");
+  assert.equal(f.store.row("update:1:action:sent")!.conversation, f.store.row("update:1:reply:0")!.conversation, "the edit shares the card's delivery lane");
+  const calls: Array<{method: string; payload: any}> = [];
+  const delivery = new TelegramDelivery(f.store, async (method, payload) => { calls.push({method, payload}); return {message_id: 501}; });
+  const deliver = async () => { f.store.set("telegram-chat-after:42", 0); await delivery.tick(); };
+  await deliver(); await deliver();
+  assert.deepEqual(calls.map(c => c.method), ["sendMessage", "editMessageText"]);
+  assert.equal(calls[1].payload.message_id, 501);
+  assert.equal(calls[1].payload.message_thread_id, undefined);
+  assert.equal(calls[1].payload.text, "Sent to claude (fable-5-1).");
+  assert.equal(getWorkspaceMessageTarget("42", "501")?.workspace.id, f.ws.id, "replying to the card targets the session");
+  f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  f.messages.push({id: "answer", sessionId: "s1", type: "assistant", content: "All green.", sessionIndex: f.messages.length, receivedAt: new Date().toISOString()});
+  f.status("idle"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const complete = JSON.parse(f.store.row(`complete:s1:${f.store.get<any>("session:s1").sentMessageId}`)!.payload);
+  assert.equal(complete.method, "editMessageText"); assert.equal(complete.statusOf, "update:1:reply:0");
+  await deliver(); await deliver();
+  assert.deepEqual(calls.slice(2).map(c => [c.method, c.payload.text, c.payload.disable_notification]),
+    [["editMessageText", "Conductor task finished.", undefined], ["sendMessage", "All green.", undefined]], "only the agent's reply rings");
+}));
+
+test("a status-card acknowledgement rolls back when its action cannot be reserved", () => fixture(async f => {
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 7);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  f.engine.queue = () => { throw new Error("simulated action reservation failure"); };
+  f.store.ingest([{update_id: 1, message: {message_id: 100, chat: {id: 42}, from: {id: 9}, message_thread_id: 7, text: "continue"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:1:reply:0"), undefined, "the card cannot commit without its action");
+  assert.equal(f.store.row("update:1:action"), undefined);
+  assert.equal(f.store.row("update:1")?.state, "pending", "the owner update remains retryable as one unit");
+}));
+
+for (const [type, expected] of [
+  ["stop", "All cloud threads stopped."],
+  ["archive", "Cloud workspace archived."],
+  ["rename", "Cloud workspace renamed."],
+  ["renamethread", "Cloud thread renamed."],
+] as const) test(`${type} completion edits the turn acknowledgement`, () => fixture(async f => {
+  await f.launch();
+  (f.api as any).renameWorkspace = async () => ({});
+  (f.api as any).renameSession = async () => ({});
+  enqueueText(f.store, `${type}-ack`, "42", "Queued for Conductor.", {silent: true});
+  f.engine.queue(`${type}-action`, {type, trackedId: f.ws.id, sessionId: "s1", prompt: "renamed", statusId: `${type}-ack:0`});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const completion = JSON.parse(f.store.row(`${type}-action:done`)!.payload);
+  assert.equal(completion.method, "editMessageText");
+  assert.equal(completion.statusOf, `${type}-ack:0`);
+  assert.equal(completion.payload.text, expected);
+}));
+
+test("thread and command actions carry their own silent acknowledgement as the status card", () => fixture(async f => {
+  await f.launch(); updateWorkspaceThreadId(f.ws.id, 7);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  for (const [id, text, rowId] of [[20, "/threads new investigate", "update:20:thread"], [21, "/rename renamed", "update:21:action"]] as const) {
+    f.store.ingest([{update_id: id, message: {message_id: id, chat: {id: 42}, from: {id: 9}, message_thread_id: 7, text}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    assert.equal(JSON.parse(f.store.row(rowId)!.payload).statusId, `update:${id}:reply:0`);
+    assert.equal(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.disable_notification, true);
+  }
+}));
+
+test("status edits wait behind a paced acknowledgement in the same lane", () => fixture(async f => {
+  enqueueText(f.store, "ack", "42", "Task received and queued.", {threadId: 7, priority: 0, silent: true});
+  enqueueStatus(f.store, "ack-sent", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  assert.equal(f.store.row("ack-sent")!.conversation, f.store.row("ack:0")!.conversation);
+  const calls: string[] = [];
+  const delivery = new TelegramDelivery(f.store, async method => { calls.push(method); return {message_id: 9}; });
+  const now = Date.now();
+  f.store.set("telegram-chat-after:42", now + 1000);
+  await delivery.tick(now); await delivery.tick(now);
+  assert.deepEqual(calls, []);
+  assert.equal(f.store.row("ack:0")!.error, "paced");
+  assert.equal(f.store.row("ack-sent")!.attempts, 0, "a paced acknowledgement still fences its edit");
+  await delivery.tick(now + 2000);
+  assert.deepEqual(calls, ["sendMessage"]);
+  await delivery.tick(Date.now() + 5000);
+  assert.deepEqual(calls, ["sendMessage", "editMessageText"]);
+  assert.equal(f.store.row("ack-sent")!.state, "done");
+}));
+
+test("a status edit whose acknowledgement is gone becomes a silent message", () => fixture(async f => {
+  updateWorkspaceThreadId(f.ws.id, 7);
+  const calls: Array<{method: string; payload: any}> = [];
+  let editError: unknown;
+  const delivery = new TelegramDelivery(f.store, async (method, payload) => {
+    calls.push({method, payload});
+    if (method === "editMessageText" && editError) throw editError;
+    return {message_id: 700};
+  });
+  const deliver = async () => { f.store.set("telegram-chat-after:42", 0); await delivery.tick(); };
+  // Deleted by the user after delivery.
+  enqueueText(f.store, "ack", "42", "Task received and queued.", {threadId: 7, priority: 0, silent: true});
+  enqueueStatus(f.store, "ack-sent", {anchorId: "ack:0", chatId: "42", workspaceId: f.ws.id, sessionId: "s1", text: "Sent to claude (fable-5-1)."});
+  editError = {response: {error_code: 400, description: "Bad Request: message to edit not found"}};
+  await deliver(); await deliver();
+  assert.equal(f.store.row("ack-sent")!.state, "pending");
+  assert.equal(JSON.parse(f.store.row("ack-sent")!.payload).method, "sendMessage", "the durable row itself becomes a message");
+  await deliver();
+  const fallback = calls.at(-1)!;
+  assert.equal(fallback.method, "sendMessage");
+  assert.equal(fallback.payload.disable_notification, true);
+  assert.equal(fallback.payload.message_id, undefined);
+  assert.equal(fallback.payload.message_thread_id, 7, "the fallback is routed like any workspace message");
+  assert.equal(fallback.payload.text, "Sent to claude (fable-5-1).");
+  assert.equal(f.store.row("ack-sent")!.state, "done");
+  // Never delivered at all, or never queued.
+  enqueueText(f.store, "blocked-ack", "42", "Queued for Conductor.", {threadId: 7, priority: 0, silent: true});
+  f.store.retry("blocked-ack:0", "Bad Request: chat not found", 0, true);
+  enqueueStatus(f.store, "blocked-sent", {anchorId: "blocked-ack:0", chatId: "42", workspaceId: f.ws.id, text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "orphan-sent", {anchorId: "missing-ack:0", chatId: "42", workspaceId: f.ws.id, text: "Conductor task finished."});
+  for (let i = 0; i < 4; i++) await deliver();
+  assert.deepEqual(calls.filter(c => c.method === "sendMessage").map(c => c.payload.text).slice(-2), ["Sent to claude (fable-5-1).", "Conductor task finished."]);
+  assert.equal(f.store.row("blocked-sent")!.state, "done"); assert.equal(f.store.row("orphan-sent")!.state, "done");
+  assert.equal(f.store.get("telegram-not-before"), undefined, "an uneditable card never pauses delivery");
+}));
+
+test("identical status text counts as delivered and later states supersede undelivered ones", () => fixture(async f => {
+  enqueueText(f.store, "ack", "42", "Task received and queued.", {threadId: 7, priority: 0, silent: true});
+  enqueueStatus(f.store, "first", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "second", {anchorId: "ack:0", chatId: "42", workspaceId: f.ws.id, sessionId: "s1", text: "Conductor task finished."});
+  assert.equal(f.store.row("first")!.state, "done");
+  assert.deepEqual(JSON.parse(f.store.row("first")!.result!), {supersededBy: "second"});
+  const calls: string[] = [];
+  const delivery = new TelegramDelivery(f.store, async method => {
+    calls.push(method);
+    if (method === "editMessageText") throw {response: {error_code: 400, description: "Bad Request: message is not modified"}};
+    return {message_id: 11};
+  });
+  for (let i = 0; i < 2; i++) { f.store.set("telegram-chat-after:42", 0); await delivery.tick(); }
+  assert.deepEqual(calls, ["sendMessage", "editMessageText"]);
+  assert.equal(f.store.row("second")!.state, "done");
+  assert.equal(JSON.parse(f.store.row("second")!.payload).method, "editMessageText");
+  assert.equal(getWorkspaceMessageTarget("42", "11")?.workspace.id, f.ws.id, "an idempotent retry restores reply routing");
+  assert.equal(f.store.get("telegram-not-before"), undefined);
+}));
+
+test("re-enqueueing the same status id is an idempotent no-op", () => fixture(async f => {
+  enqueueText(f.store, "ack", "42", "Task received and queued.", {silent: true});
+  enqueueStatus(f.store, "same", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  const original = f.store.row("same")!.payload;
+  enqueueStatus(f.store, "same", {anchorId: "ack:0", chatId: "42", text: "A conflicting retry."});
+  assert.equal(f.store.row("same")!.payload, original);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id=?").get("same") as {n: number}).n, 1);
+}));
+
+test("status replacement rolls back supersession when the new edit cannot be queued", () => fixture(async f => {
+  enqueueText(f.store, "ack", "42", "Task received and queued.", {silent: true});
+  enqueueStatus(f.store, "first", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  f.store.db.exec(`CREATE TRIGGER fail_replacement BEFORE INSERT ON gateway_queue
+    WHEN NEW.id='second' BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END`);
+  assert.throws(() => enqueueStatus(f.store, "second", {anchorId: "ack:0", chatId: "42", text: "Conductor task finished."}),
+    /simulated insert failure/);
+  assert.equal(f.store.row("first")!.state, "pending", "the prior status remains deliverable after rollback");
+  assert.equal(f.store.row("second"), undefined);
+}));
+
+test("launched workspaces get MCP bridge instructions; workspaces without a credential are told to answer inline", () => fixture(async f => {
+  await f.launch();
+  assert.match(f.messages[0].content, /conductor-telegram-mcp tools/);
+  assert.doesNotMatch(f.messages[0].content, /forwarded to Telegram/);
+  f.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(f.ws.id);
+  f.engine.queue("follow-up", {type: "send", trackedId: f.ws.id, prompt: "Next step"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.messages.length, 2);
+  assert.match(f.messages[1].content, /^Next step\n\nYour replies in this session are forwarded to Telegram/);
+  assert.doesNotMatch(f.messages[1].content, /TELEGRAM_BRIDGE|report_status|refresh_attachment/);
+  const sent = JSON.parse(f.store.row("follow-up:sent:0")!.payload);
+  assert.equal(sent.method, "sendMessage"); assert.equal(sent.payload.disable_notification, true, "a turn without a card reports silently");
+  const fileId = f.bridge.save(f.ws.id, "evidence.txt", Buffer.from("proof"));
+  f.engine.queue("file-follow-up", {type: "send", trackedId: f.ws.id, prompt: "Inspect this", fileIds: [fileId]});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.match(f.messages[2].content, /Attachment links expire after 15 minutes; download them first\./);
 }));
 
 test("document intake keeps caption and file private, releases its reservation, and deduplicates on retry", () => fixture(async f => {
@@ -601,7 +956,7 @@ test("ping is ingested independently of a stalled conversation", () => fixture(a
   const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42");
   await processQueue(f.store, ["health-update"], row => commands.handle(row));
   assert.equal(f.store.row("update:2")?.state, "done");
-  assert.ok(f.store.row("update:2:reply:0"));
+  assert.equal(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.disable_notification, true);
 }));
 
 test("queued expired attachment links renew without changing the message payload", () => fixture(async f => {
@@ -679,7 +1034,12 @@ test("fallback rechecks the previous session and refuses a cancellation race", (
 test("an unavailable provider rejected before launch is skipped without an uncertain replay", () => fixture(async f => {
   const original = f.api.createWorkspace; let attempts = 0;
   f.api.createWorkspace = async () => {if (++attempts === 1) throw new ConductorApiError("Provider model unavailable", 400); return original();};
-  await f.launch(); f.store.retry("launch", "eligible fallback", 0);
+  enqueueText(f.store, "provider-ack", "42", "Task received and queued.", {silent: true});
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix\nthe bug", statusId: "provider-ack:0"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const rejected = JSON.parse(f.store.row("provider-rejected:launch:claude")!.payload);
+  assert.equal(rejected.method, "editMessageText"); assert.equal(rejected.statusOf, "provider-ack:0");
+  f.store.retry("launch", "eligible fallback", 0);
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   assert.equal(f.store.binding(f.ws.id)?.agent, "codex"); assert.equal(f.counts().sends, 1);
   assert.deepEqual(f.store.get("recovery-providers:launch"), ["claude", "codex"]);

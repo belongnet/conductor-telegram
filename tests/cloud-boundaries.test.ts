@@ -108,6 +108,7 @@ test("native routing preserves the request and requires owner confirmation, with
   const actions = f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='cloud'").all() as any[];
   assert.equal(actions.length, 1);
   assert.equal(JSON.parse(actions[0].payload).prompt, "Keep\n  the original request");
+  assert.equal(JSON.parse(actions[0].payload).statusId, "update:2:reply:0", "the confirming tap's acknowledgement is the turn's status card");
   assert.equal(f.sends.length, 1, "only the classifier prompt was sent");
 }));
 
@@ -176,6 +177,8 @@ test("legacy message adoption preserves native identity and exact bytes across r
   assert.deepEqual(f.sends[0], {sessionId: "s1", messageId: "legacy-native-message", message: "Original\n  pending bytes"});
   assert.equal(getPendingCloudMessages(f.ws.id).length, 0);
   assert.equal(f.store.row(`legacy-message:${f.ws.id}:legacy-request`)?.state, "done");
+  const receipt = JSON.parse(f.store.row(`legacy-message:${f.ws.id}:legacy-request:sent:0`)!.payload);
+  assert.equal(receipt.method, "sendMessage"); assert.equal(receipt.payload.disable_notification, true, "an adopted message has no card, so its receipt is a silent message");
 }));
 
 test("unresolved legacy creation is retained and fences new task replay", () => fixture(async f => {

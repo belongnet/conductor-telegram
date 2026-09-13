@@ -11,7 +11,7 @@ import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, g
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
 import { FileBridge } from "./bridge.js";
 import { CloudGitHub, ProjectCatalog } from "./catalog.js";
-import { enqueueTelegram, enqueueText } from "./telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus } from "./telegram.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
 export const DEFAULT_PROVIDERS: Provider[] = [
@@ -26,15 +26,19 @@ export interface CloudAction {
   previousMessageId?: string;
   mediaPending?: boolean; previousSessionId?: string;
   legacyRequestId?: string; legacyTerminal?: PendingCloudTerminalIntent;
+  /** Queue row id of the acknowledgement that serves as this turn's status card. */
+  statusId?: string;
 }
 interface SessionState {
   trackedId: string; agent: Provider["agent"]; model: string; effort: string;
   role: "task" | "review"; sentMessageId?: string; sentAt?: number; seenWorking?: boolean;
-  seenReply?: boolean; terminal?: boolean; reviewHead?: string; reviewUrl?: string;
+  seenReply?: boolean; awaitingWorkingEdge?: boolean; terminal?: boolean; reviewHead?: string; reviewUrl?: string;
   recoveryAttempted?: boolean; stopped?: boolean; episode?: string; taskPrompt?: string;
   reviewValid?: boolean; reviewBase?: string;
-  turnId?: string; nativeCompleted?: boolean; nativeFailure?: string;
+  turnId?: string; nativeCompleted?: boolean; nativeFailure?: string; statusId?: string;
 }
+/** A message to a sleeping workspace is queued and wakes it; only after this long is silence a stalled turn. */
+const WAKE_GRACE_MS = 300_000;
 
 export function transcriptText(message: ConductorApiMessage): string {
   // The native API wraps provider events, including hidden tool/lifecycle
@@ -88,10 +92,18 @@ export class CloudEngine {
     this.catalog = new ProjectCatalog(api, store);
   }
 
-  notify(id: string, trackedId: string, text: string, sessionId?: string, markdown = false): void {
+  notify(id: string, trackedId: string, text: string, sessionId?: string, options: { markdown?: boolean; silent?: boolean } = {}): void {
     const ws = getWorkspace(trackedId);
     if (ws) enqueueText(this.store, id, ws.telegramChatId, text, { workspaceId: trackedId, sessionId,
-      threadId: ws.telegramThreadId, markdown });
+      threadId: ws.telegramThreadId, ...options });
+  }
+
+  /** Turn status is written onto the acknowledgement card; a turn without one gets a silent message. */
+  private status(id: string, trackedId: string, anchorId: string | undefined, text: string, sessionId?: string): void {
+    const ws = getWorkspace(trackedId);
+    if (!ws) return;
+    if (anchorId && this.store.row(anchorId)) enqueueStatus(this.store, id, { anchorId, chatId: ws.telegramChatId, workspaceId: trackedId, sessionId, text });
+    else this.notify(id, trackedId, text, sessionId, { silent: true });
   }
 
   queue(id: string, action: CloudAction): void {
@@ -111,7 +123,7 @@ export class CloudEngine {
     const ws = getWorkspace(action.trackedId);
     if (!ws) throw new Error("Tracked workspace no longer exists");
     if (this.store.get(`stop:${ws.id}`) && !["stop", "archive"].includes(action.type)) {
-      this.notify(`${row.id}:stopped`, ws.id, "The task was stopped; queued work was not replayed."); return;
+      this.status(`${row.id}:stopped`, ws.id, action.statusId, "The task was stopped; queued work was not replayed."); return;
     }
     if (action.mediaPending) {
       const media = this.store.row(row.id.replace(/:action$/, ":media"));
@@ -136,7 +148,7 @@ export class CloudEngine {
         this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(ws.id);
       }
       if (action.legacyTerminal) completePendingCloudTerminalIntent(ws.id, action.legacyTerminal);
-      this.notify(`${row.id}:done`, ws.id, action.type === "archive" ? "Cloud workspace archived." : "All cloud threads stopped.");
+      this.status(`${row.id}:done`, ws.id, action.statusId, action.type === "archive" ? "Cloud workspace archived." : "All cloud threads stopped.");
       return;
     }
     if (action.type === "rename") {
@@ -145,11 +157,11 @@ export class CloudEngine {
       this.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(action.prompt, action.prompt, ws.id);
       if (ws.telegramThreadId) enqueueTelegram(this.store, `topic:${row.id}`, {method: "editForumTopic", workspaceId: ws.id,
         payload: {chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId, name: (action.prompt ?? "").slice(0,128)}}, 20);
-      this.notify(`${row.id}:done`, ws.id, "Cloud workspace renamed."); return;
+      this.status(`${row.id}:done`, ws.id, action.statusId, "Cloud workspace renamed."); return;
     }
     if (action.type === "renamethread") {
       await this.api.renameSession(action.sessionId ?? binding.sessionId!, action.prompt ?? "");
-      this.notify(`${row.id}:done`, ws.id, "Cloud thread renamed."); return;
+      this.status(`${row.id}:done`, ws.id, action.statusId, "Cloud thread renamed."); return;
     }
     if (action.type === "review" && !this.nativeReviews) throw new Error("Native cloud reviews are disabled. Set TELEGRAM_CLOUD_REVIEW_POLICY=native.");
     if (action.type === "thread" || action.type === "review") {
@@ -161,7 +173,7 @@ export class CloudEngine {
     if (!sessionId) throw new Error("Cloud workspace has no active session");
     const actual = await this.api.getSessionStatus(sessionId);
     if (actual.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
-    await this.send(row, action, binding, sessionId);
+    await this.send(row, action, binding, sessionId, actual.status === "working");
   }
 
   private async launch(row: QueueRow, action: CloudAction): Promise<void> {
@@ -206,7 +218,7 @@ export class CloudEngine {
         this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(remote.name, ws.id);
         this.store.set(`session:${created.sessionId}`, { trackedId: ws.id, ...provider, role: "task" } satisfies SessionState);
       })();
-      this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${created.deepLink}`);
+      this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${created.deepLink}`, undefined, { silent: true });
     }
     if (this.store.get(`stop:${ws.id}`)) { this.queue(`stop-created:${row.id}`, { type: "stop", trackedId: ws.id }); return; }
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
@@ -214,7 +226,9 @@ export class CloudEngine {
       this.store.retry(row.id, "Waiting for cloud provisioning", 5000); return;
     }
     if (["archived", "deleted"].includes(lifecycle.status)) throw new Error("Cloud workspace is archived or deleted");
-    await this.send(row, action, binding, binding.sessionId!);
+    const session = await this.api.getSessionStatus(binding.sessionId!);
+    if (session.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    await this.send(row, action, binding, binding.sessionId!, session.status === "working");
   }
 
   private async newSession(row: QueueRow, action: CloudAction, binding: CloudBinding): Promise<void> {
@@ -270,10 +284,12 @@ export class CloudEngine {
     const prompt = review
       ? `Review ${review.url} at exact head ${review.head}, base ${review.base}. Verify these commits before reviewing; report a changed head instead of claiming completion. Report findings only. Do not edit files, push, approve, merge, or deploy. This session has normal Conductor permissions; these are review instructions.\n\n${action.prompt ?? ""}`
       : action.prompt ?? "";
-    await this.send(row, { ...action, prompt }, binding, sessionId);
+    const session = await this.api.getSessionStatus(sessionId);
+    if (session.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    await this.send(row, { ...action, prompt }, binding, sessionId, session.status === "working");
   }
 
-  private async send(row: QueueRow, action: CloudAction, binding: CloudBinding, sessionId: string): Promise<void> {
+  private async send(row: QueueRow, action: CloudAction, binding: CloudBinding, sessionId: string, sessionWasWorking: boolean): Promise<void> {
     const nativeProvider = binding.synced ? nativeSessionProvider(await this.api.getSession(sessionId)) : undefined;
     if (action.legacyRequestId) {
       const gate = pendingCloudMessageCanSend(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
@@ -291,17 +307,22 @@ export class CloudEngine {
         if (!file) throw new Error("Attachment missing from this workspace");
         return `${file.name} (attachment ID ${id}): ${this.bridge.link(id, action.trackedId)}`;
       });
-      payload = { messageId: deterministicUuid("telegram", row.id), message: `${action.prompt ?? ""}${files.length ? `\n\nDownload these user attachments before work:\n${files.join("\n")}` : ""}\n\n${this.bridgeInstructions()}` };
+      const bridged = !!this.store.db.prepare("SELECT 1 FROM gateway_credentials WHERE workspace_id=? AND revoked=0 LIMIT 1").get(action.trackedId);
+      payload = { messageId: deterministicUuid("telegram", row.id), message: `${action.prompt ?? ""}${files.length ? `\n\nDownload these user attachments before work:\n${files.join("\n")}${bridged ? "" : "\nAttachment links expire after 15 minutes; download them first."}` : ""}\n\n${this.bridgeInstructions(bridged)}` };
       this.store.set(`send:${row.id}`, payload);
     }
     const existing = await findSubmittedMessage(this.api, sessionId, payload.messageId);
     if (existing && !messageContainsExactText(existing.content, payload.message)) throw new Error("Message identity mismatch");
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
+    let submissionQueued = false;
     if (!existing) {
       if (this.store.get(`send-attempted:${row.id}`)) throw new Error("Submission receipt is uncertain; no command will be replayed");
       this.bridge.refreshQueuedLinks(payload.message, action.trackedId);
       this.store.set(`send-attempted:${row.id}`, true);
-      try { await this.api.sendMessage({ sessionId, ...payload }); }
+      try {
+        const receipt = await this.api.sendMessage({ sessionId, ...payload });
+        submissionQueued = receipt.state === "queued";
+      }
       catch (error) {
         if (error instanceof ConductorApiError && error.status === 429) this.store.set(`send-attempted:${row.id}`, false);
         throw error;
@@ -310,11 +331,29 @@ export class CloudEngine {
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
     if (action.legacyRequestId) completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
     const state = {...(this.store.get<SessionState>(`session:${sessionId}`) ?? { trackedId: action.trackedId, ...binding, role: "task" as const }), ...nativeProvider};
-    if (state.sentMessageId === payload.messageId) return;
+    // A continuation keeps writing to the card of the turn it continues.
+    const statusId = action.recovery ? action.statusId ?? state.statusId : action.statusId;
+    if (state.sentMessageId === payload.messageId) {
+      // The send state and status row are separate durable writes. Recreate the deterministic edit
+      // after a restart in the narrow window between them; enqueueStatus makes this idempotent.
+      this.status(`${row.id}:sent`, action.trackedId, statusId,
+        action.recovery ? `Continuing in ${state.agent} (${state.model}).` : `Sent to ${state.agent} (${state.model}).`, sessionId);
+      return;
+    }
     const episode = action.recovery ? (action.episode ?? state.episode ?? row.id) : row.id;
-    this.store.set(`session:${sessionId}`, { ...state, sentMessageId: payload.messageId, sentAt: Date.now(), terminal: false, episode,
+    const priorTurnPending = !!state.sentMessageId && state.sentMessageId !== payload.messageId && !state.terminal;
+    const reconciledSubmission = !!existing && state.sentMessageId !== payload.messageId;
+    // A synced or previously used session can receive work outside this gateway, so an asynchronous
+    // or reconciled submission is conservatively fenced. Only the first prompt in a newly created
+    // session has no possible predecessor and may use its next working observation immediately.
+    const sharedSessionSubmission = (submissionQueued || reconciledSubmission) &&
+      (!!binding.synced || !!state.sentMessageId);
+    this.store.set(`session:${sessionId}`, { ...state, sentMessageId: payload.messageId, sentAt: Date.now(), terminal: false, episode, statusId,
       taskPrompt: action.recovery ? state.taskPrompt ?? action.prompt : action.prompt,
-      seenWorking: false, seenReply: false, recoveryAttempted: false, nativeCompleted: false, nativeFailure: undefined,
+      seenWorking: false, seenReply: false,
+      awaitingWorkingEdge: sessionWasWorking || sharedSessionSubmission || priorTurnPending ||
+        (!state.terminal && (!!state.awaitingWorkingEdge || !!state.seenWorking)),
+      recoveryAttempted: false, nativeCompleted: false, nativeFailure: undefined,
       turnId: existing ? messageEnvelope(existing.content)?.turnId : undefined });
     if (!action.recovery) {
       this.store.set(`recovery-providers:${episode}`, [state.agent]);
@@ -322,10 +361,12 @@ export class CloudEngine {
     } else this.store.set(`recovery-providers:${episode}`, [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), state.agent])]);
     updateWorkspaceStatus(action.trackedId, "running");
     this.store.set(`poll-after:${action.trackedId}`, 0);
-    this.notify(`${row.id}:sent`, action.trackedId, `Sent to ${state.agent} (${state.model}).`, sessionId);
+    this.status(`${row.id}:sent`, action.trackedId, statusId, action.recovery ? `Continuing in ${state.agent} (${state.model}).` : `Sent to ${state.agent} (${state.model}).`, sessionId);
   }
 
-  private bridgeInstructions(): string {
+  /** Only a workspace this gateway created holds a bridge credential; any other agent is told to answer inline. */
+  private bridgeInstructions(bridged: boolean): string {
+    if (!bridged) return "Your replies in this session are forwarded to Telegram. Ask questions in your reply and wait for the user; do not treat a missing answer as approval. Report PR URLs explicitly. Preserve existing work when continuing an interrupted task.";
     return "For Telegram oversight use the conductor-telegram-mcp tools report_status, report_artifact and request_human when installed. The tools use TELEGRAM_BRIDGE_URL and TELEGRAM_BRIDGE_TOKEN from your environment; never print these values. If an attachment link has expired, use refresh_attachment with its ID. After a restart or lost question receipt, use list_human_decisions and read_human_decision before asking again; verify the answer applies to the current task. If tools are unavailable, ask questions in your response and wait for the user. Do not treat a missing answer as approval. Report PR URLs explicitly. Preserve existing work when continuing an interrupted task.";
   }
 
@@ -342,7 +383,7 @@ export class CloudEngine {
       if (next) {
         this.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify({...action, provider: next, episode, recovery: true}), row.id);
         this.store.retry(row.id, `${provider.agent} unavailable; trying ${next.agent}`, 1000);
-        this.notify(`provider-rejected:${row.id}:${provider.agent}`, action.trackedId, `${provider.agent} rejected the run before it started. Trying ${next.agent} (${next.model}).`);
+        this.status(`provider-rejected:${row.id}:${provider.agent}`, action.trackedId, action.statusId, `${provider.agent} rejected the run before it started. Trying ${next.agent} (${next.model}).`);
       } else this.store.retry(row.id, "All configured providers rejected this run before execution. Check provider credentials and model availability.", 0, true);
     })();
     return true;
@@ -420,14 +461,19 @@ export class CloudEngine {
           if (failure) state.nativeFailure = failure;
         }
         this.store.db.transaction(() => {
-          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id, true);
+          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id, { markdown: true });
           if (state) this.store.set(`session:${session.id}`, state);
           upsertThreadCursor({ workspaceId: trackedId, sessionId: session.id, backendKind: "cloud-api", lastForwardedRowid: message.sessionIndex, lastMessageId: message.id, title: session.name });
         })();
         const prUrl = text.match(/https:\/\/github\.com\/[^\s)]+\/pull\/\d+/)?.[0];
         if (prUrl) reportedPrUrls.add(prUrl);
       }
-      if (status.status === "working") { active = true; if (state) state.seenWorking = true; }
+      if (status.status === "working") {
+        active = true;
+        // Session status is not turn-scoped. If a follow-up was submitted while the prior turn was
+        // already working, require an idle edge or current-turn output before treating it as started.
+        if (state && !state.awaitingWorkingEdge) state.seenWorking = true;
+      } else if (state) state.awaitingWorkingEdge = false;
       if (state) this.store.set(`session:${session.id}`, state);
       if (state?.role === "review" && state.terminal && state.reviewValid && state.reviewUrl) {
         const current = await this.github.pr(binding.repoSlug, state.reviewUrl);
@@ -447,15 +493,20 @@ export class CloudEngine {
           staleReview = current.head !== state.reviewHead || !!(state.reviewBase && current.base !== state.reviewBase);
           state.reviewValid = !staleReview;
         }
-        this.notify(`complete:${session.id}:${state.sentMessageId}`, trackedId,
-          staleReview ? "The PR changed during review. These findings do not cover its current head; run /review again." : state.role === "review" ? `Review complete for ${state.reviewHead}. Findings do not bypass merge checks.` : "Conductor task finished.", session.id);
+        const recovered = !!state.episode && (this.store.get<string[]>(`recovery-providers:${state.episode}`)?.length ?? 0) > 1;
+        // A changed head invalidates findings the user may already be reading, so it interrupts; every other outcome is the card's final state.
+        if (staleReview) this.notify(`complete:${session.id}:${state.sentMessageId}`, trackedId, "The PR changed during review. These findings do not cover its current head; run /review again.", session.id);
+        else this.status(`complete:${session.id}:${state.sentMessageId}`, trackedId, state.statusId, state.role === "review"
+          ? `Review complete for ${state.reviewHead}. Findings do not bypass merge checks.` : recovered ? "Conductor task finished after recovery." : "Conductor task finished.", session.id);
         state.terminal = true; this.store.set(`session:${session.id}`, state);
-        if (state.episode && (this.store.get<string[]>(`recovery-providers:${state.episode}`)?.length ?? 0) > 1) this.notify(`recovered:${state.episode}`, trackedId, "Recovery succeeded. The continuation finished.", session.id);
       } else if (status.status === "error" || (status.status === "idle" && state.nativeFailure && messages.length < 100)) {
         const detail = state.nativeFailure ?? status.errorMessage ?? status.lastError ?? "Unknown Conductor session error";
         if (recoverableProviderError(detail)) await this.recover(trackedId, binding, session.id, state, detail);
         else this.notify(`error:${session.id}:${state.sentMessageId}`, trackedId, `Conductor reported an error: ${detail}\nUse /send to continue after addressing it.`, session.id);
-      } else if (status.status === "idle" && lifecycle.status === "sleeping" && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted) {
+      } else if (status.status === "idle" && lifecycle.status === "sleeping" && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted &&
+          // Conductor queues a message to a sleeping workspace and wakes it itself. Only a turn seen running, or one
+          // that already produced output, can have slept mid-task; a younger silent turn is still waiting to wake.
+          (state.seenWorking || state.seenReply || Date.now() - (state.sentAt ?? 0) > WAKE_GRACE_MS)) {
         const wakeKey = `wake-attempted:${session.id}:${state.episode ?? state.sentMessageId}`;
         const wakeAt = this.store.get<number>(wakeKey);
         if (wakeAt !== undefined) {
@@ -509,7 +560,8 @@ export class CloudEngine {
         this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true });
         this.queue(`resume:${sessionId}:${state.sentMessageId}`, { type: "send", trackedId, sessionId, recovery: true, episode,
           prompt: "Your previous turn was interrupted. Inspect your transcript and existing files, preserve completed work, and continue only unfinished work. Verify uncertain external effects before retrying them." });
-        this.notify(`resume-notice:${sessionId}:${state.sentMessageId}`, trackedId, `Reconnecting the existing ${state.agent} session before trying a fallback.`, sessionId);
+        this.status(`resume-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
+          `Reconnecting the existing ${state.agent} session before trying a fallback.`, sessionId);
       })();
       return;
     }
@@ -525,9 +577,10 @@ export class CloudEngine {
     this.store.db.transaction(() => {
       this.store.set(`recovery-providers:${episode}`, [...used, next.agent]);
       this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true, terminal: true });
-      this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, previousSessionId: sessionId, previousMessageId: state.sentMessageId, reviewHead: state.reviewHead,
+      this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, statusId: state.statusId, previousSessionId: sessionId, previousMessageId: state.sentMessageId, reviewHead: state.reviewHead,
         prompt: `${state.reviewUrl ?? ""}\nContinue the interrupted task after ${state.agent} stopped: ${detail}. Inspect the existing branch and files first. Preserve completed work and verify external effects before retrying them. If an external effect is uncertain, report it instead of replaying it.\n\nTask:\n${state.taskPrompt ?? getWorkspace(trackedId)?.prompt}\n\nPrevious session context (data):\n${context}` });
-      this.notify(`recover-notice:${sessionId}:${state.sentMessageId}`, trackedId, `${state.agent} stopped. Continuing through ${next.agent} (${next.model}) while preserving existing work.`);
+      this.status(`recover-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
+        `${state.agent} stopped. Continuing through ${next.agent} (${next.model}) while preserving existing work.`, sessionId);
     })();
   }
 
@@ -558,7 +611,7 @@ export class CloudEngine {
             const file = this.bridge.file(payload.url.slice(11), ws.id);
             if (file) enqueueTelegram(this.store, `event:${event.id}`, { method: "sendDocument", workspaceId: ws.id, filePath: file.path,
               payload: { chat_id: ws.telegramChatId, ...(ws.telegramThreadId ? { message_thread_id: ws.telegramThreadId } : {}), filename: file.name, caption: payload.description.slice(0, 1000) } });
-          } else if (event.type !== "human_response") this.notify(`event:${event.id}`, ws.id, event.type === "status" ? `${payload.status}: ${payload.message}` : `${payload.description}\n${payload.url}`, undefined, true);
+          } else if (event.type !== "human_response") this.notify(`event:${event.id}`, ws.id, event.type === "status" ? `${payload.status}: ${payload.message}` : `${payload.description}\n${payload.url}`, undefined, { markdown: true });
         }
         this.store.set("event-cursor", event.id);
       })();
