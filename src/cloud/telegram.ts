@@ -12,7 +12,11 @@ export interface TelegramJob {
   sessionId?: string;
   decisionId?: number;
   filePath?: string;
+  /** Queue row id of the delivered message this edit targets; resolved at delivery time. */
+  statusOf?: string;
 }
+/** An edit waits this long for its acknowledgement before it is delivered as a message instead. */
+const STATUS_ANCHOR_WAIT_MS = 300_000;
 
 export function telegramFailure(error: unknown): { delayMs: number; permanent: boolean; unchanged: boolean; conflict: boolean; description: string } {
   const e = error as any;
@@ -45,7 +49,7 @@ export function enqueueTelegram(store: GatewayStore, id: string, job: TelegramJo
 
 /** Agent Markdown is rendered before splitting; control messages stay literal. */
 export function enqueueText(store: GatewayStore, id: string, chatId: string, text: string,
-  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean } = {}): void {
+  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean; silent?: boolean } = {}): void {
   const chunks: string[] = [];
   if (options.markdown) {
     chunks.push(...markdownToTelegramChunks(text));
@@ -62,9 +66,40 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
     method: "sendMessage",
     payload: { chat_id: chatId, text: chunk, parse_mode: "HTML",
       ...(options.threadId ? { message_thread_id: options.threadId } : {}),
+      ...(options.silent ? { disable_notification: true } : {}),
       ...(i === chunks.length - 1 && options.replyMarkup ? { reply_markup: options.replyMarkup } : {}) },
     workspaceId: options.workspaceId, sessionId: options.sessionId, decisionId: options.decisionId,
   }, options.priority));
+}
+
+/**
+ * A turn has one status card: its acknowledgement, edited in place. The edit is queued in the
+ * acknowledgement's own delivery lane, so the per-lane FIFO delivers the card before any edit of
+ * it, across pacing retries and restarts alike. A newer state replaces an undelivered older one.
+ */
+export function enqueueStatus(store: GatewayStore, id: string,
+  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string }): void {
+  store.db.transaction(() => {
+    if (store.row(id)) return;
+    store.assertWriter?.();
+    const anchor = store.row(input.anchorId);
+    const chatId = anchor ? (JSON.parse(anchor.payload) as TelegramJob).payload.chat_id ?? input.chatId : input.chatId;
+    const pending = store.db.prepare("SELECT id FROM gateway_queue WHERE kind='telegram' AND state='pending' AND json_extract(payload,'$.statusOf')=?")
+      .all(input.anchorId) as Array<{ id: string }>;
+    for (const prior of pending) store.finish(prior.id, { supersededBy: id });
+    const job: TelegramJob = { method: "editMessageText", statusOf: input.anchorId, workspaceId: input.workspaceId, sessionId: input.sessionId,
+      payload: { chat_id: chatId, text: escHtml(input.text), parse_mode: "HTML" } };
+    store.enqueue("telegram", anchor?.conversation ?? `${chatId}:0:control`, job, id, 0);
+  })();
+}
+
+/** A card that cannot be edited still reports its state: the same text as a silent message, routed like any other. */
+function asMessage(job: TelegramJob): TelegramJob {
+  const payload: Record<string, any> = { ...job.payload, disable_notification: true };
+  delete payload.message_id;
+  const message: TelegramJob = { ...job, method: "sendMessage", payload };
+  delete message.statusOf;
+  return message;
 }
 
 /** Single paced sender; receipts and routing links commit in the same SQLite transaction. */
@@ -79,9 +114,17 @@ export class TelegramDelivery {
     const chatKey = `telegram-chat-after:${job.payload.chat_id}`;
     const wait = (this.store.get<number>(chatKey) ?? 0) - now;
     if (wait > 0) { this.store.retry(row.id, "paced", wait); return; }
+    if (job.statusOf) {
+      const anchor = this.store.row(job.statusOf);
+      const receipt = anchor?.state === "done" && anchor.result ? JSON.parse(anchor.result) : undefined;
+      if (receipt?.message_id) job.payload.message_id = receipt.message_id;
+      else if (anchor && ["pending", "running"].includes(anchor.state) && now - row.created_at < STATUS_ANCHOR_WAIT_MS) {
+        this.store.retry(row.id, "Waiting for the acknowledgement", 1000); return;
+      } else { this.fallback(row, job, "The acknowledgement was not delivered"); return; }
+    }
     try {
       const payload = { ...job.payload };
-      if (job.workspaceId && !/ForumTopic/.test(job.method)) {
+      if (job.workspaceId && job.method !== "editMessageText" && !/ForumTopic/.test(job.method)) {
         const workspace = getWorkspace(job.workspaceId);
         if (job.decisionId && (workspace?.archivedAt || ["done", "stopped", "failed", "archived"].includes(workspace?.status ?? ""))) {
           this.store.finish(row.id, {suppressed: "Question belongs to terminal work; retained in decision history"}); return;
@@ -104,7 +147,18 @@ export class TelegramDelivery {
       })();
     } catch (error) {
       const failure = telegramFailure(error);
-      if (failure.unchanged) { this.store.finish(row.id, true); return; }
+      if (failure.unchanged) {
+        this.store.db.transaction(() => {
+          this.store.finish(row.id, true);
+          // Telegram returns an error rather than the edited Message when the prior attempt already
+          // applied the same text. Restore the reply association from the resolved anchor receipt.
+          if (job.payload.message_id && job.workspaceId) linkTelegramMessage(String(job.payload.chat_id),
+            String(job.payload.message_id), job.workspaceId, job.sessionId);
+        })();
+        return;
+      }
+      // The card was deleted or cannot be edited; its state still has to reach the topic.
+      if (job.method === "editMessageText" && failure.permanent) { this.fallback(row, job, failure.description); return; }
       if (/message thread not found|message_thread_not_found|topic_deleted|TOPIC_CLOSED/i.test(failure.description) && job.workspaceId) {
         // Recover through the same durable topic-operation queue. Do not leak into General.
         const ws = getWorkspace(job.workspaceId);
@@ -121,6 +175,13 @@ export class TelegramDelivery {
       this.store.retry(row.id, failure.description, failure.delayMs, failure.permanent);
       if (!failure.permanent) this.store.set("telegram-not-before", Date.now() + failure.delayMs);
     }
+  }
+
+  /** Rewrite the durable row so a restart delivers the message, not another doomed edit. */
+  private fallback(row: QueueRow, job: TelegramJob, reason: string): void {
+    this.store.assertWriter?.();
+    this.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify(asMessage(job)), row.id);
+    this.store.retry(row.id, reason, 0);
   }
 }
 

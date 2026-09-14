@@ -55,6 +55,8 @@ test("discovery attaches one topic per native workspace without sending or repla
   assert.equal(f.store.bindings().length, 1);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'create-topic:%'").get() as {n: number}).n, 1);
   assert.equal(f.sends.length, 0);
+  assert.equal(JSON.parse(f.store.row("sync-intro:native-1:0")!.payload).payload.disable_notification, true);
+  assert.equal(JSON.parse(f.store.row("sync-snapshot:native-1:0")!.payload).payload.disable_notification, true);
 }));
 
 test("new messages in an initially empty native session forward and replies retain that exact session after restart", () => fixture(async f => {
@@ -71,6 +73,11 @@ test("new messages in an initially empty native session forward and replies reta
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   assert.equal(f.sends.length, 1); assert.equal(f.sends[0].sessionId, "old");
   assert.match(f.sends[0].message, /^Continue this thread/);
+  // A discovered workspace holds no bridge credential, so its agent answers inline instead of looking for MCP tools.
+  assert.match(f.sends[0].message, /forwarded to Telegram/);
+  assert.doesNotMatch(f.sends[0].message, /conductor-telegram-mcp|TELEGRAM_BRIDGE/);
+  assert.equal(JSON.parse(f.store.row("update:1:action")!.payload).statusId, "update:1:reply:0");
+  assert.equal(JSON.parse(f.store.row("update:1:action:sent")!.payload).method, "editMessageText");
   assert.equal(f.store.get<any>("session:old")?.agent, "claude", "replies use the target session's model, not the default thread's model");
 }));
 
@@ -185,6 +192,7 @@ test("an addressed command acknowledgement precedes queued transcripts without l
   const sender = new TelegramDelivery(f.store, async (_method, payload) => {texts.push(payload.text); return {message_id: 200 + texts.length};});
   await sender.tick();
   assert.deepEqual(texts, ["Queued for Conductor."]);
+  assert.equal(JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.disable_notification, true);
   assert.equal(f.store.row("update:1:action")?.state, "pending");
   for (let i = 0; i < 3; i++) {
     assert.equal(f.store.row(`backlog:${i}:0`)?.state, "pending");

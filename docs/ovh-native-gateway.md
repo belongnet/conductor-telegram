@@ -4,7 +4,7 @@
 
 The gateway keeps the existing history database and adds durable input, output, native identity, file, and recovery tables. Incoming updates and the next Telegram offset commit together. Work is ordered within each conversation; media and native execution run separately. `/ping` has an independent read-only path. Four independent workers poll active cloud sessions every 15 seconds and idle sessions every 60 seconds, including workspaces beyond the old 100-record limit.
 
-Telegram 429 responses persist `retry_after` across restarts. Command responses and human questions take priority over queued transcript updates while preserving transcript order. Messages take priority over topic edits, redundant edits coalesce, unchanged topics succeed, and deleted topics are recreated. Questions acquire a durable `(chat ID, message ID)` association when delivery commits. Delivery receipts prevent replay of recorded chunks. Telegram does not offer client message IDs: a send accepted by Telegram whose response is lost can be duplicated on retry. Native Conductor sends retain the original message ID and exact text, allowing reconciliation without repeating work.
+Telegram 429 responses persist `retry_after` across restarts. Command responses and human questions take priority over queued transcript updates while preserving transcript order. Each owner turn that queues or controls work starts with one silent acknowledgement that becomes its status card; submission, recovery, completion, stop, archive, and rename states edit that card in place. If the card cannot be edited, the same state is sent silently instead. Messages take priority over topic edits, redundant edits coalesce, unchanged topics succeed, and deleted topics are recreated. Questions acquire a durable `(chat ID, message ID)` association when delivery commits. Delivery receipts prevent replay of recorded chunks. Telegram does not offer client message IDs: a send accepted by Telegram whose response is lost can be duplicated on retry. Native Conductor sends retain the original message ID and exact text, allowing reconciliation without repeating work.
 
 ## Existing cloud workspaces and topic replies
 
@@ -52,7 +52,7 @@ If durable lanes are already enabled, retain their manifest and HTTP state and u
 
 ## Cloud MCP setup
 
-The cloud workspace receives only `TELEGRAM_BRIDGE_URL`, a scoped `TELEGRAM_BRIDGE_TOKEN`, and its tracked workspace ID. In Conductor's organization cloud setup command, run this after the normal repository setup:
+A cloud workspace created by the gateway receives only `TELEGRAM_BRIDGE_URL`, a scoped `TELEGRAM_BRIDGE_TOKEN`, and its tracked workspace ID. A workspace discovered from Conductor receives no bridge credential or MCP bootstrap; its agent is told to answer inline, and the gateway forwards those replies from the Conductor transcript. In Conductor's organization cloud setup command, run this after the normal repository setup:
 
 ```sh
 node --input-type=module <<'JS'
