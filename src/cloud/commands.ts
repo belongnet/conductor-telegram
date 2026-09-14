@@ -94,11 +94,36 @@ export class CloudCommands {
         reply(decision.answeredAt ? "This question was already answered." : `Answer recorded: ${choice}`); return;
       }
       if (data.startsWith("thread:")) {
-        const selection = this.store.get<{ trackedId: string; sessionId: string }>(data);
+        const selection = this.store.get<{ trackedId: string; sessionId: string; pendingActionId?: string }>(data);
         const binding = selection && this.store.binding(selection.trackedId);
         if (!selection || !binding || getWorkspace(selection.trackedId)?.telegramChatId !== chatId) return;
-        const provider = binding.synced ? nativeSessionProvider(await this.engine.api.getSession(selection.sessionId)) : undefined;
-        this.store.bind(selection.trackedId, { ...binding, ...provider, sessionId: selection.sessionId }); reply("Active thread updated."); return;
+        const pending = selection.pendingActionId ? this.store.row(selection.pendingActionId) : undefined;
+        const action = pending ? JSON.parse(pending.payload) as CloudAction : undefined;
+        const selectedActionId = selection.pendingActionId ? `${selection.pendingActionId}:selected` : undefined;
+        if (selectedActionId && this.store.get(selectedActionId)) { reply("This message already has a thread selection."); return; }
+        if (selection.pendingActionId && (!action || action.trackedId !== selection.trackedId || action.type !== "send")) {
+          reply("This saved message is no longer available. Send it again or use /threads."); return;
+        }
+        if (this.store.get(`stop:${selection.trackedId}`) || getWorkspace(selection.trackedId)?.archivedAt) {
+          reply("This workspace was stopped. The saved message was not sent."); return;
+        }
+        const status = await this.engine.api.getSessionStatus(selection.sessionId);
+        if (status.workspaceId !== binding.workspaceId) throw new Error("Selected thread belongs to another workspace");
+        const session = await this.engine.api.getSession(selection.sessionId);
+        if (session.archivedAt) { reply("That thread was archived. Select a visible thread with /threads."); return; }
+        const provider = binding.synced ? nativeSessionProvider(session) : undefined;
+        this.store.db.transaction(() => {
+          if (selectedActionId && this.store.get(selectedActionId)) return;
+          if (this.store.get(`stop:${selection.trackedId}`) || getWorkspace(selection.trackedId)?.archivedAt) return;
+          this.store.bind(selection.trackedId, { ...this.store.binding(selection.trackedId)!, ...provider, sessionId: selection.sessionId });
+          this.store.set(`selected-thread:${selection.trackedId}`, selection.sessionId);
+          if (selectedActionId && action) {
+            this.store.set(selectedActionId, selection.sessionId);
+            this.engine.queue(selectedActionId, {...action, sessionId: selection.sessionId});
+          }
+          reply(`Telegram now targets ${session.name ?? "Untitled"} (${session.model ?? session.resolvedModel ?? "unknown model"}).${action ? " Your saved message is queued." : ""}`);
+        })();
+        return;
       }
       if (data.startsWith("bindtopic:")) {
         // Answering an offer, or making a new one, deletes the buttons it retires. A tap on one is
@@ -227,13 +252,13 @@ export class CloudCommands {
         else this.engine.queue(`${row.id}:thread`, action);
         reply("New thread queued."); return;
       }
-      const sessions = await this.engine.api.listWorkspaceSessions(binding.workspaceId);
+      const sessions = (await this.engine.api.listWorkspaceSessions(binding.workspaceId)).filter(s => !s.archivedAt);
       const keyboard = sessions.map(s => {
         const key = `thread:${createHash("sha256").update(`${target!.id}:${s.id}`).digest("hex").slice(0, 32)}`;
         this.store.set(key, { trackedId: target!.id, sessionId: s.id });
-        return [{ text: `${s.id === binding.sessionId ? "● " : ""}${s.name ?? s.id}`, callback_data: key }];
+        return [{ text: `${s.id === this.store.get(`selected-thread:${target!.id}`) ? "● " : ""}${s.name ?? "Untitled"} · ${s.model ?? s.resolvedModel ?? "Unknown model"}`, callback_data: key }];
       });
-      reply("Select the active thread, or /threads new <prompt>.", "threads", { inline_keyboard: keyboard }); return;
+      reply("Select the thread for Telegram replies, or /threads new <prompt>. This selection is separate from the tab open in Conductor.", "threads", keyboard.length ? { inline_keyboard: keyboard } : undefined); return;
     }
     if (command === "skills") { reply("Skills: ship, qa, investigate, retro, health, checkpoint, document_release, office_hours, design_review. Use /skill <name> [instructions] in a workspace topic."); return; }
     if (["stop", "archive", "rename", "renamethread", "review", "send"].includes(command ?? "") || SHORTCUTS.has(command ?? "")) {
@@ -241,7 +266,7 @@ export class CloudCommands {
       const type = SHORTCUTS.has(command!) ? "send" : command as CloudAction["type"];
       const prompt = SHORTCUTS.has(command!) ? `Use /${command === "skill" ? args : command!.replace(/_/g, "-")} ${command === "skill" ? "" : args}` : args;
       if (["send", "rename", "renamethread"].includes(type) && !prompt && !(type === "send" && media)) { reply("Please include a message or name."); return; }
-      const action: CloudAction = { type, trackedId: target.id, sessionId, prompt };
+      const action: CloudAction = { type, trackedId: target.id, sessionId, prompt, telegramMessageId: String(msg.message_id) };
       if (["send", "review"].includes(type) && media) this.prepareMedia(row.id, action, { ...media, chatId, threadId });
       else this.engine.queue(`${row.id}:action`, action);
       reply(["stop", "archive"].includes(type) ? "Stop requested. Confirming with Conductor." : "Queued for Conductor."); return;
@@ -317,7 +342,7 @@ export class CloudCommands {
     }
     if (!target) throw new Error("Could not create workspace record");
     linkTelegramMessage(chatId, String(msg.message_id), target.id, sessionId);
-    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt };
+    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt, telegramMessageId: String(msg.message_id) };
     if (media) {
       this.prepareMedia(row.id, action, { ...media, chatId, threadId });
     } else this.engine.queue(`${row.id}:action`, action);
@@ -370,7 +395,8 @@ export class CloudCommands {
   private prepareMedia(id: string, action: CloudAction, media: MediaJob): void {
     this.store.db.transaction(() => {
       this.engine.queue(`${id}:action`, { ...action, mediaPending: true });
-      this.store.enqueue("media", `${media.chatId}:${media.threadId ?? 0}`, { ...media, action }, `${id}:media`);
+      const reserved = JSON.parse(this.store.row(`${id}:action`)!.payload) as CloudAction;
+      this.store.enqueue("media", `${media.chatId}:${media.threadId ?? 0}`, { ...media, action: reserved }, `${id}:media`);
     })();
   }
 

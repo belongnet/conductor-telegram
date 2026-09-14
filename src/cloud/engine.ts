@@ -5,7 +5,7 @@ import { deterministicUuid } from "../lanes/controller-policy.js";
 import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
 import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
-import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
+import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision, linkTelegramMessage,
   upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
   completePendingCloudMessageDelivery, completePendingCloudTerminalIntent, type PendingCloudTerminalIntent } from "../store/queries.js";
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
@@ -22,6 +22,7 @@ export const DEFAULT_PROVIDERS: Provider[] = [
 export interface CloudAction {
   type: "launch" | "send" | "thread" | "review" | "stop" | "archive" | "rename" | "renamethread";
   trackedId: string; prompt?: string; projectId?: string; sessionId?: string;
+  telegramMessageId?: string;
   provider?: Provider; fileIds?: string[]; reviewHead?: string; recovery?: boolean; episode?: string;
   previousMessageId?: string;
   mediaPending?: boolean; previousSessionId?: string;
@@ -95,6 +96,12 @@ export class CloudEngine {
   }
 
   queue(id: string, action: CloudAction): void {
+    // Freeze an explicit Telegram selection before media preparation or queue delays.
+    const binding = this.store.binding(action.trackedId);
+    const selected = this.store.get<string>(`selected-thread:${action.trackedId}`);
+    if (action.type === "send" && !action.sessionId && selected && selected === binding?.sessionId) {
+      action = {...action, sessionId: selected};
+    }
     // Stop fences are synchronous, ahead of any already-running network request.
     if (action.type === "stop" || action.type === "archive") {
       const binding = this.store.binding(action.trackedId);
@@ -157,11 +164,49 @@ export class CloudEngine {
         ? nativeSessionProvider(await this.api.getSession(action.sessionId ?? binding.sessionId!)) : undefined;
       return this.newSession(row, action, {...binding, ...author});
     }
-    const sessionId = action.sessionId ?? binding.sessionId;
-    if (!sessionId) throw new Error("Cloud workspace has no active session");
+    const sessionId = await this.sendTarget(row, action, binding);
+    if (sessionId === null) return; // The durable action is waiting for a thread choice.
     const actual = await this.api.getSessionStatus(sessionId);
     if (actual.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
     await this.send(row, action, binding, sessionId);
+  }
+
+  private async sendTarget(row: QueueRow, action: CloudAction, binding: CloudBinding): Promise<string | null> {
+    // Once offered, only the chosen continuation may submit this message, including after a crash.
+    if (this.store.get<string | null>(`${row.id}:selected`) !== undefined) return null;
+    if (action.sessionId) return action.sessionId;
+    let sessionId = binding.sessionId;
+    if (binding.synced) {
+      // Pre-upgrade sends without a frozen target must never be replayed into a newly chosen thread.
+      if (this.store.get(`send-attempted:${row.id}`)) throw new Error("Submission has no recorded thread. Reconcile the existing receipt before retrying.");
+      const sessions = (await this.api.listWorkspaceSessions(binding.workspaceId)).filter(s => !s.archivedAt);
+      const selected = this.store.get<string>(`selected-thread:${action.trackedId}`);
+      if (!selected || selected !== binding.sessionId || !sessions.some(s => s.id === selected)) {
+        if (!sessions.length) throw new Error("No visible Conductor threads remain in this workspace.");
+        if (sessions.length > 1) {
+          const ws = getWorkspace(action.trackedId)!;
+          this.store.db.transaction(() => {
+            this.store.set(`${row.id}:selected`, null);
+            const keyboard = sessions.map(session => {
+              const key = `thread:${createHash("sha256").update(`${row.id}:${session.id}`).digest("hex").slice(0, 32)}`;
+              this.store.set(key, {trackedId: action.trackedId, sessionId: session.id, pendingActionId: row.id});
+              return [{text: `${session.name ?? "Untitled"} · ${session.model ?? session.resolvedModel ?? "Unknown model"}`, callback_data: key}];
+            });
+            enqueueText(this.store, `${row.id}:choose-thread`, ws.telegramChatId,
+              `Choose the Conductor thread for this message. This topic contains multiple threads; the tab open on your Mac is not shared with Telegram. Your message is saved and has not been sent.\n\n${(action.prompt ?? "Attachment").slice(0, 500)}`,
+              {workspaceId: ws.id, threadId: ws.telegramThreadId, priority: 0, replyMarkup: {inline_keyboard: keyboard}});
+          })();
+          return null;
+        }
+        sessionId = sessions[0].id;
+      }
+    }
+    if (!sessionId) throw new Error("Cloud workspace has no active session");
+    // A retry must reconcile the same native transcript even if /threads changes meanwhile.
+    action.sessionId = sessionId;
+    this.store.assertWriter?.();
+    this.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify(action), row.id);
+    return sessionId;
   }
 
   private async launch(row: QueueRow, action: CloudAction): Promise<void> {
@@ -265,7 +310,10 @@ export class CloudEngine {
       this.store.set(`created-session:${row.id}`, sessionId);
       this.store.set(`session:${sessionId}`, { trackedId: action.trackedId, ...provider, role: action.type === "review" ? "review" : "task",
         ...(review ? { reviewHead: review.head, reviewUrl: review.url, reviewBase: review.base, reviewValid: false } : {}) } satisfies SessionState);
-      if (action.type !== "review") this.store.bind(action.trackedId, { ...this.store.binding(action.trackedId)!, sessionId, ...provider });
+      if (action.type !== "review") {
+        this.store.bind(action.trackedId, { ...this.store.binding(action.trackedId)!, sessionId, ...provider });
+        this.store.set(`selected-thread:${action.trackedId}`, sessionId);
+      }
     }
     const prompt = review
       ? `Review ${review.url} at exact head ${review.head}, base ${review.base}. Verify these commits before reviewing; report a changed head instead of claiming completion. Report findings only. Do not edit files, push, approve, merge, or deploy. This session has normal Conductor permissions; these are review instructions.\n\n${action.prompt ?? ""}`
@@ -274,7 +322,9 @@ export class CloudEngine {
   }
 
   private async send(row: QueueRow, action: CloudAction, binding: CloudBinding, sessionId: string): Promise<void> {
-    const nativeProvider = binding.synced ? nativeSessionProvider(await this.api.getSession(sessionId)) : undefined;
+    const nativeSession = binding.synced ? await this.api.getSession(sessionId) : undefined;
+    if (nativeSession?.archivedAt) throw new Error("This Conductor thread was archived. Select a visible thread with /threads.");
+    const nativeProvider = nativeSession ? nativeSessionProvider(nativeSession) : undefined;
     if (action.legacyRequestId) {
       const gate = pendingCloudMessageCanSend(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
       if (gate === "mismatch") throw new Error("Legacy pending message identity mismatch; reconcile before retrying");
@@ -309,6 +359,10 @@ export class CloudEngine {
     }
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
     if (action.legacyRequestId) completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
+    if (action.telegramMessageId) {
+      const ws = getWorkspace(action.trackedId)!;
+      linkTelegramMessage(ws.telegramChatId, action.telegramMessageId, action.trackedId, sessionId);
+    }
     const state = {...(this.store.get<SessionState>(`session:${sessionId}`) ?? { trackedId: action.trackedId, ...binding, role: "task" as const }), ...nativeProvider};
     if (state.sentMessageId === payload.messageId) return;
     const episode = action.recovery ? (action.episode ?? state.episode ?? row.id) : row.id;
@@ -322,7 +376,9 @@ export class CloudEngine {
     } else this.store.set(`recovery-providers:${episode}`, [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), state.agent])]);
     updateWorkspaceStatus(action.trackedId, "running");
     this.store.set(`poll-after:${action.trackedId}`, 0);
-    this.notify(`${row.id}:sent`, action.trackedId, `Sent to ${state.agent} (${state.model}).`, sessionId);
+    const threadLink = nativeSession
+      ? `\n${nativeSession.deepLink ?? `conductor://workspace?id=${encodeURIComponent(binding.workspaceId)}&session=${encodeURIComponent(sessionId)}`}` : "";
+    this.notify(`${row.id}:sent`, action.trackedId, `Sent to ${nativeSession?.name ?? state.agent} (${state.model}).${threadLink}`, sessionId);
   }
 
   private bridgeInstructions(): string {

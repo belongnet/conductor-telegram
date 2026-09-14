@@ -15,12 +15,14 @@ Every minute, and whenever the owner runs `/sync`, the gateway reads the operato
 For each newly attached workspace, the gateway:
 
 1. Creates one forum topic, or reuses the persisted topic after a restart.
-2. Selects the working or most recently updated Conductor session as the default.
+2. Selects the working or most recently updated Conductor session for the initial context snapshot.
 3. Records cursors at the existing transcript tail so history is not replayed.
 4. Posts a connection note and the latest visible reply as context.
 5. Forwards subsequent activity from every session into the same topic.
 
-A reply to a forwarded Telegram message returns to that message's exact Conductor session. A plain topic message uses the selected session. `/threads` changes the selected session, and the gateway retains that session's native provider, model, and effort. Unsupported or unavailable model metadata is rejected instead of replaced with a guessed default.
+A reply to a forwarded Telegram message returns to that message's exact Conductor session. In a synced workspace with multiple threads, a plain topic message waits for an explicit thread choice; the picker names each thread and its model, preserves the message and prepared attachments, and submits them once after selection. That choice becomes the topic's Telegram default. `/threads` changes it. A workspace with just one visible thread needs no choice. Pre-existing automatically discovered defaults are not treated as explicit selections.
+
+Telegram's selection is separate from the tab open in the Conductor app: the Cloud API does not expose that tab. The send receipt names the actual thread and model and includes its Conductor deep link, where both the user message and agent response are recorded. Queued messages keep their selected thread across retries and later `/threads` changes. The gateway retains the session's native provider, model, and effort; unsupported or unavailable metadata is rejected instead of replaced with a guessed default.
 
 Discovery is read-only in Conductor: it does not create, wake, stop, archive, or send work. Text, documents, photos, and transcribed voice become work only after an authenticated owner sends them in a topic that this gateway explicitly attached. Telegram topic service messages never become prompts.
 

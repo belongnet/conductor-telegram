@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {getDb, closeDb} from "../src/store/db.js";
-import {getWorkspace, getThreadCursor, updateWorkspaceThreadId, linkTelegramMessage} from "../src/store/queries.js";
+import {getWorkspace, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId, linkTelegramMessage} from "../src/store/queries.js";
 import {GatewayStore} from "../src/cloud/store.js";
 import {CloudEngine} from "../src/cloud/engine.js";
 import {CloudCommands} from "../src/cloud/commands.js";
@@ -72,6 +72,152 @@ test("new messages in an initially empty native session forward and replies reta
   assert.equal(f.sends.length, 1); assert.equal(f.sends[0].sessionId, "old");
   assert.match(f.sends[0].message, /^Continue this thread/);
   assert.equal(f.store.get<any>("session:old")?.agent, "claude", "replies use the target session's model, not the default thread's model");
+}));
+
+test("plain replies never use a discovered default when multiple native threads exist", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  // Discovery chose Codex. The user is looking at the Fable thread in Conductor.
+  f.store.ingest([{update_id: 10, message: {message_id: 10, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "go"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.sends.length, 0, "no prompt may reach the old default before a thread is chosen");
+  const offer = JSON.parse(f.store.row("update:10:action:choose-thread:0")!.payload).payload;
+  assert.match(offer.text, /choose.*thread/i);
+  const buttons = offer.reply_markup.inline_keyboard.flat();
+  const fable = buttons.find((b: any) => b.text.includes("fable-5-1"));
+  assert.ok(fable, "same-named threads must be distinguishable by model");
+  const click = (updateId: number, data: string) => {
+    f.store.ingest([{update_id: updateId, callback_query: {id: String(updateId), from: {id: 9}, data,
+      message: {message_id: 20, chat: {id: -42}, message_thread_id: 7}}}]);
+    return processQueue(f.store, ["update"], row => f.commands().handle(row));
+  };
+  // New commands/store instances exercise persistence across restarts.
+  await click(11, fable.callback_data);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.sends[0].sessionId, "old");
+  assert.match(f.sends[0].message, /^go\n/);
+  assert.equal(f.store.binding(id)!.model, "fable-5-1");
+  const receipt = JSON.parse(f.store.row("update:10:action:selected:sent:0")!.payload);
+  assert.equal(receipt.sessionId, "old");
+  assert.match(receipt.payload.text, /Earlier.*fable-5-1/);
+  assert.match(receipt.payload.text, /workspace\?id=native-1&amp;session=old/);
+  assert.equal(getWorkspaceMessageTarget("-42", "10")?.sessionId, "old", "replies to the user's own message retain its actual thread");
+  await click(12, buttons.find((b: any) => b !== fable).callback_data);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  await f.engine.action(f.store.row("update:10:action")!);
+  assert.equal(f.sends.length, 1, "a second choice must not replay work or change the selected thread");
+  assert.equal(f.store.binding(id)!.sessionId, "old");
+}));
+
+async function tapThread(f: ReturnType<typeof makeFixture>, data: string, updateId = 50): Promise<void> {
+  f.store.ingest([{update_id: updateId, callback_query: {id: String(updateId), from: {id: 9}, data,
+    message: {message_id: 20, chat: {id: -42}, message_thread_id: 7}}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+}
+
+test("explicit thread selection survives queue delays, model refresh and retries", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  f.store.ingest([{update_id: 1, message: {message_id: 1, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/threads"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  const keyboard = JSON.parse(f.store.row("update:1:threads:0")!.payload).payload.reply_markup.inline_keyboard.flat();
+  assert.ok(keyboard.every((b: any) => !b.text.startsWith("●")), "discovery is not an explicit selection");
+  await tapThread(f, keyboard.find((b: any) => b.text.includes("fable")).callback_data);
+  f.engine.queue("pinned", {type: "send", trackedId: id, prompt: "preserve me"});
+  await tapThread(f, keyboard.find((b: any) => b.text.includes("gpt")).callback_data, 51);
+  f.sessions[0].model = "fable-5-1-1m";
+  f.sessions[0].deepLink = "conductor://workspace?id=native-1&session=old";
+  const send = f.api.sendMessage;
+  let attemptedSession: string | undefined;
+  f.api.sendMessage = async input => {attemptedSession = input.sessionId; throw new ConductorApiError("Wait", 429);};
+  await assert.rejects(f.engine.action(f.store.row("pinned")!), /Wait/);
+  assert.equal(attemptedSession, "old");
+  f.api.sendMessage = send;
+  await f.engine.action(f.store.row("pinned")!);
+  assert.equal(f.sends[0].sessionId, "old");
+  assert.equal(f.store.get<any>("session:old").model, "fable-5-1-1m", "use current native model, never the stale binding or a global default");
+  assert.equal(f.store.row("pinned:choose-thread:0"), undefined);
+  assert.match(JSON.parse(f.store.row("pinned:sent:0")!.payload).payload.text, /workspace\?id=native-1&amp;session=old/);
+}));
+
+test("one visible native thread routes directly and a later thread does not redirect retries", () => fixture(async f => {
+  f.sessions.splice(1);
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  f.engine.queue("single", {type: "send", trackedId: id, prompt: "one thread"});
+  const send = f.api.sendMessage;
+  f.api.sendMessage = async () => {throw new ConductorApiError("Wait", 429);};
+  await assert.rejects(f.engine.action(f.store.row("single")!), /Wait/);
+  assert.equal(JSON.parse(f.store.row("single")!.payload).sessionId, "old");
+  f.sessions.push({id: "later", model: "gpt-6-astra"});
+  f.store.bind(id, {...f.store.binding(id)!, sessionId: "later"});
+  f.api.sendMessage = send;
+  await f.engine.action(f.store.row("single")!);
+  assert.equal(f.sends[0].sessionId, "old");
+}));
+
+test("thread choices preserve prepared attachments and cannot send after stop", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  Object.assign(f.engine.bridge, {file: () => ({name: "screenshot.png"}), link: () => "https://bridge.test/file"});
+  f.engine.queue("attached", {type: "send", trackedId: id, prompt: "Read this\n  exact spacing", fileIds: ["image-1"]});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const keyboard = JSON.parse(f.store.row("attached:choose-thread:0")!.payload).payload.reply_markup.inline_keyboard.flat();
+  await tapThread(f, keyboard[0].callback_data);
+  assert.deepEqual(JSON.parse(f.store.row("attached:selected")!.payload).fileIds, ["image-1"]);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.match(f.sends[0].message, /^Read this\n  exact spacing\n/);
+  assert.match(f.sends[0].message, /screenshot.png \(attachment ID image-1\): https:\/\/bridge.test\/file/);
+
+  f.store.clear(`selected-thread:${id}`);
+  f.engine.queue("stopped-choice", {type: "send", trackedId: id, prompt: "must not run"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const stopKey = JSON.parse(f.store.row("stopped-choice:choose-thread:0")!.payload).payload.reply_markup.inline_keyboard[0][0].callback_data;
+  f.engine.queue("stop", {type: "stop", trackedId: id});
+  await tapThread(f, stopKey, 51);
+  assert.equal(f.store.row("stopped-choice:selected"), undefined);
+  assert.equal(f.sends.length, 1);
+}));
+
+test("media preparation retains the thread selected when the attachment arrived", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  f.store.bind(id, {...f.store.binding(id)!, sessionId: "old"});
+  f.store.set(`selected-thread:${id}`, "old");
+  Object.assign(f.engine.bridge, {save: () => "image-1", file: () => ({name: "photo.png"}), link: () => "https://bridge.test/file"});
+  const previousFetch = globalThis.fetch, previousToken = process.env.BOT_TOKEN;
+  globalThis.fetch = async () => new Response("image bytes");
+  process.env.BOT_TOKEN = "test-placeholder";
+  try {
+    const commands = new CloudCommands(f.store, f.engine, async () => ({file_path: "photo.png", file_size: 11}), "42", "9", "-42");
+    f.store.ingest([{update_id: 1, message: {message_id: 1, chat: {id: -42}, from: {id: 9}, message_thread_id: 7,
+      caption: "inspect", document: {file_id: "photo", file_name: "photo.png"}}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    f.store.bind(id, {...f.store.binding(id)!, sessionId: "recent"});
+    f.store.set(`selected-thread:${id}`, "recent");
+    await processQueue(f.store, ["media"], row => commands.media(row));
+    assert.equal(JSON.parse(f.store.row("update:1:action")!.payload).sessionId, "old");
+    await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+    assert.equal(f.sends[0].sessionId, "old");
+    assert.match(f.sends[0].message, /photo.png/);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.BOT_TOKEN; else process.env.BOT_TOKEN = previousToken;
+  }
+}));
+
+test("stale and foreign thread buttons cannot rebind or dispatch the saved message", () => fixture(async f => {
+  await f.sync.sync(); const [{id, binding}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  f.engine.queue("stale-choice", {type: "send", trackedId: id, prompt: "hold this"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const key = JSON.parse(f.store.row("stale-choice:choose-thread:0")!.payload).payload.reply_markup.inline_keyboard[0][0].callback_data;
+  f.sessions[0].archivedAt = "2026-01-03T00:00:00Z";
+  await tapThread(f, key);
+  assert.equal(f.store.row("stale-choice:selected"), undefined);
+  assert.equal(f.store.binding(id)!.sessionId, binding.sessionId);
+  delete f.sessions[0].archivedAt;
+  f.api.getSessionStatus = async sid => ({sessionId: sid, workspaceId: "foreign", status: "idle", updatedAt: "2026-01-03T00:00:00Z"});
+  await tapThread(f, key, 51);
+  assert.equal(f.store.row("stale-choice:selected"), undefined);
+  assert.equal(f.store.binding(id)!.sessionId, binding.sessionId);
+  assert.equal(f.sends.length, 0);
 }));
 
 test("sync group access is limited to the owner and explicitly synced topics; service events never become tasks", () => fixture(async f => {
