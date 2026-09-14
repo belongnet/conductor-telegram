@@ -17,10 +17,12 @@ For each newly attached workspace, the gateway:
 1. Creates one forum topic, or reuses the persisted topic after a restart.
 2. Selects the working or most recently updated Conductor session as the default.
 3. Records cursors at the existing transcript tail so history is not replayed.
-4. Posts a connection note and the latest visible reply as context.
+4. Silently posts a connection note and the latest visible reply as context.
 5. Forwards subsequent activity from every session into the same topic.
 
 A reply to a forwarded Telegram message returns to that message's exact Conductor session. A plain topic message uses the selected session. `/threads` changes the selected session, and the gateway retains that session's native provider, model, and effort. Unsupported or unavailable model metadata is rejected instead of replaced with a guessed default.
+
+Discovered workspaces do not receive an MCP bridge credential. Their agents are told to answer inline, and those replies reach Telegram through normal transcript forwarding. Workspaces created by the gateway keep the MCP bridge tools for explicit progress, artifact, and human-decision reporting.
 
 Discovery is read-only in Conductor: it does not create, wake, stop, archive, or send work. Text, documents, photos, and transcribed voice become work only after an authenticated owner sends them in a topic that this gateway explicitly attached. Telegram topic service messages never become prompts.
 
