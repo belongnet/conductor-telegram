@@ -12,6 +12,7 @@ import {
   getSessionMessagesAfter,
   getWorkspaceDir,
   getWorkspaceSessionInfo,
+  getCloudWorkspaceSessionInfo,
   isConductorWorkspaceVisible,
   isKnownCliAuthenticationFailure,
   isRemoteConductorWorkspace,
@@ -3187,7 +3188,30 @@ async function executeRouteResult(
     `[ai-router] decision: action=${result.action} repo=${result.repoName ?? "-"} workspaceId=${result.workspaceId ?? "-"} prompt=${promptPreview}`
   );
 
-  const plan = resolveRouteExecutionPlan(chatId, result);
+  let plan = resolveRouteExecutionPlan(chatId, result);
+  if (plan.kind === "existing" && plan.workspace.conductorBackendKind === "cloud-api") {
+    // The local bot row can outlive a Cloud workspace. Before honoring an
+    // inferred existing route, verify the remote binding; otherwise a fresh
+    // task gets sent to an archived/deleted workspace and is never replayed.
+    const cloudInfo = await getCloudWorkspaceSessionInfo(
+      plan.workspace.conductorWorkspaceName ?? plan.workspace.name,
+      plan.workspace.repoPath,
+      plan.workspace,
+      { includeMetadata: false }
+    );
+    if (!cloudInfo || !isConductorWorkspaceVisible(cloudInfo)) {
+      const staleWorkspaceId = plan.workspace.id;
+      updateWorkspaceStatus(staleWorkspaceId, "archived");
+      plan = {
+        kind: "new",
+        repoName: path.basename(plan.workspace.repoPath),
+        existingRejection: "cloud workspace is archived or deleted",
+      };
+      console.log(
+        `[ai-router] stale cloud workspace ${staleWorkspaceId} rejected; creating a fresh workspace`
+      );
+    }
+  }
   if ("existingRejection" in plan && plan.existingRejection) {
     console.log(
       `[ai-router] existing rejected (${plan.existingRejection}); falling back to new`
