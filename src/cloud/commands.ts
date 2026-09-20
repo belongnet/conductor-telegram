@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import type { GatewayStore, QueueRow } from "./store.js";
 import { CloudEngine, type CloudAction, type Provider } from "./engine.js";
 import { gatewayHealth } from "./bridge.js";
-import { enqueueTelegram, enqueueText, type TelegramCall } from "./telegram.js";
+import { enqueueTelegram, enqueueText, TerminalError, type TelegramCall } from "./telegram.js";
 import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
@@ -49,6 +49,8 @@ const HELP = "/projects or /repos — list Conductor repositories\n/run <project
 interface MediaJob {
   action?: CloudAction; decisionId?: number; chatId: string; threadId?: number; text?: string;
   fileId: string; fileName: string; voice: boolean;
+  /** The acknowledgement that serves as this job's status card, so a failure lands on it. */
+  statusId?: string;
 }
 
 export class CloudCommands {
@@ -298,11 +300,11 @@ export class CloudCommands {
     }
     if (!target && !projectId) {
       if (media?.voice) {
-        this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId }, `${row.id}:media`);
+        this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId, statusId }, `${row.id}:media`);
         reply("Voice note received. Transcribing it before target confirmation."); return;
       }
       if (!prompt) { reply("Choose a workspace topic or /run <project> before sending attachments."); return; }
-      this.store.enqueue("route", "native-router", { text: prompt, chatId, threadId, ...(media ? {media: {...media, chatId, threadId}} : {}) }, `${row.id}:route`);
+      this.store.enqueue("route", "native-router", { text: prompt, chatId, threadId, statusId, ...(media ? {media: {...media, chatId, threadId}} : {}) }, `${row.id}:route`);
       reply("Finding a target. I’ll ask you to confirm it before starting work."); return;
     }
     if (!target) {
@@ -388,36 +390,36 @@ export class CloudCommands {
     const job = JSON.parse(row.payload) as MediaJob;
     if (job.action && this.store.get(`stop:${job.action.trackedId}`)) return;
     const info = await this.telegram("getFile", { file_id: job.fileId });
-    if (!info.file_path || info.file_size > 50 * 1024 * 1024) throw new Error("Telegram file unavailable or too large");
+    if (!info.file_path || info.file_size > 50 * 1024 * 1024) throw new TerminalError("Telegram file unavailable or too large");
     const token = process.env.BOT_TOKEN;
-    if (!token) throw new Error("Telegram credentials missing");
+    if (!token) throw new TerminalError("Telegram credentials missing");
     const response = await fetch(`https://api.telegram.org/file/bot${token}/${info.file_path}`, { signal: AbortSignal.timeout(60_000), redirect: "error" });
     if (!response.ok) throw new Error(`Telegram file download failed (${response.status})`);
     const chunks: Uint8Array[] = []; let size = 0;
-    for await (const chunk of response.body as any) { size += chunk.length; if (size > 50 * 1024 * 1024) throw new Error("Attachment too large"); chunks.push(chunk); }
+    for await (const chunk of response.body as any) { size += chunk.length; if (size > 50 * 1024 * 1024) throw new TerminalError("Attachment too large"); chunks.push(chunk); }
     const bytes = Buffer.concat(chunks);
     if (job.voice) {
       const local = path.join(tmpdir(), `ct-voice-${createHash("sha256").update(row.id).digest("hex")}`);
       writeFileSync(local, bytes, { mode: 0o600 });
       try {
         const transcript = await transcribeVoiceMessage(local);
-        if (!transcript) throw new Error("Voice transcription failed. Please retry or send text.");
+        if (!transcript) throw new TerminalError("Voice transcription failed. Please retry or send text.");
         if (job.action) job.action.prompt = [job.action.prompt, transcript].filter(Boolean).join("\n\n");
         else job.text = [job.text, transcript].filter(Boolean).join("\n\n");
       } finally { unlinkSync(local); }
     } else {
-      if (!job.action) throw new Error("Choose a workspace before sending this file");
+      if (!job.action) throw new TerminalError("Choose a workspace before sending this file");
       let id = this.store.get<string>(`media-file:${row.id}`);
       if (!id) { id = this.engine.bridge.save(job.action.trackedId, job.fileName, bytes); this.store.set(`media-file:${row.id}`, id); }
       job.action.fileIds = [id];
     }
     if (!job.action) {
-      this.store.enqueue("route", "native-router", { text: job.text, chatId: job.chatId, threadId: job.threadId }, `${row.id}:route`);
+      this.store.enqueue("route", "native-router", { text: job.text, chatId: job.chatId, threadId: job.threadId, statusId: job.statusId }, `${row.id}:route`);
       return;
     }
     if (job.decisionId) {
       const decision = getDecision(job.decisionId);
-      if (!decision || decision.workspaceId !== job.action.trackedId) throw new Error("Question workspace mismatch");
+      if (!decision || decision.workspaceId !== job.action.trackedId) throw new TerminalError("Question workspace mismatch");
       const files = (job.action.fileIds ?? []).map(id => `Attachment ${id}: ${this.engine.bridge.link(id, job.action!.trackedId)}`);
       if (!decision.answeredAt) answerDecision(job.decisionId, [job.action.prompt, ...files].filter(Boolean).join("\n"));
       enqueueText(this.store, `${row.id}:answered`, job.chatId, "Answer recorded.", { threadId: job.threadId }); return;

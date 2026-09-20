@@ -11,7 +11,7 @@ import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
 import { CloudGitHub } from "../src/cloud/catalog.js";
-import { enqueueTelegram, enqueueText, enqueueStatus, TelegramDelivery, processQueue, ingestTelegram } from "../src/cloud/telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, TelegramDelivery, processQueue, ingestTelegram, reportBlocked, safeDetail, ATTENTION_AFTER_MS } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
 import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
 import { readWorkspaceArtifact } from "../src/mcp/remote.js";
@@ -1518,3 +1518,141 @@ test("a stop signal ends ingestion cleanly instead of failing the whole service"
   assert.equal(polls, 1);
   assert.equal(f.store.get("ingestion-error"), undefined);
 }));
+
+/** A session that Conductor reports under another workspace: the same answer on every attempt. */
+const foreignSession = (async (sessionId: string) => ({workspaceId: "other", sessionId, status: "idle"})) as any;
+
+test("a deterministic failure blocks on the first attempt and lands on the turn's card", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {priority: 0, silent: true});
+  f.api.getSessionStatus = foreignSession;
+  f.engine.queue("doomed", {type: "send", trackedId: f.ws.id, prompt: "next", statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row("doomed")!.state, "blocked");
+  assert.equal(f.store.row("doomed")!.attempts, 1);
+  assert.equal(f.store.get("queue-failures:doomed"), undefined, "a terminal failure is not a counted retry");
+  reportBlocked(f.store, "42");
+  const card = JSON.parse(f.store.row("blocked-card:doomed")!.payload);
+  assert.equal(card.method, "editMessageText");
+  assert.equal(card.statusOf, "cmd:reply:0");
+  assert.equal(card.payload.text, "Not done: Session belongs to another cloud workspace");
+  assert.equal(f.store.row("blocked:doomed:0"), undefined, "a card the owner is watching does not also ring");
+  const rows = () => (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue").get() as any).n;
+  const before = rows(); reportBlocked(f.store, "42");
+  assert.equal(rows(), before, "blocked work is reported once");
+}));
+
+test("a failure that surfaces after the owner stopped watching also rings", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {priority: 0, silent: true});
+  f.store.db.prepare("UPDATE gateway_queue SET created_at=? WHERE id='cmd:reply:0'").run(Date.now() - ATTENTION_AFTER_MS - 1000);
+  f.api.getSessionStatus = foreignSession;
+  f.engine.queue("late", {type: "send", trackedId: f.ws.id, prompt: "next", statusId: "cmd:reply:0"});
+  f.engine.queue("bare", {type: "send", trackedId: f.ws.id, prompt: "no card"});
+  for (let i = 0; i < 2; i++) await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  reportBlocked(f.store, "42");
+  assert.ok(f.store.row("blocked-card:late"));
+  assert.match(JSON.parse(f.store.row("blocked:late:0")!.payload).payload.text, /^Operation needs attention: Session belongs/);
+  assert.equal(f.store.row("blocked-card:bare"), undefined);
+  assert.match(JSON.parse(f.store.row("blocked:bare:0")!.payload).payload.text, /^Operation needs attention: Session belongs/);
+}));
+
+test("a blocked row whose tracked workspace is gone still reaches the owner", () => fixture(async f => {
+  f.store.enqueue("cloud", "ghost", {type: "send", trackedId: "ghost", prompt: "x"}, "ghost-row");
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row("ghost-row")!.state, "blocked");
+  assert.equal(f.store.row("ghost-row")!.attempts, 1);
+  reportBlocked(f.store, "42");
+  const notice = JSON.parse(f.store.row("blocked:ghost-row:0")!.payload).payload;
+  assert.equal(notice.chat_id, "42");
+  assert.match(notice.text, /^Telegram operation needs attention: This workspace.+record no longer exists.+\/run/);
+}));
+
+test("blocked gateway rows answer in the chat that asked, and a raw update reports to the owner", () => fixture(async f => {
+  f.store.enqueue("route", "native-router", {text: "hi", chatId: "-42", threadId: 9}, "r:route");
+  f.store.retry("r:route", "Routing failed", 0, true);
+  f.store.enqueue("update", "-7:0", {update_id: 1, message: {chat: {id: -7}, message_thread_id: 3, text: "x"}}, "update:1");
+  f.store.retry("update:1", "Handler failed", 0, true);
+  reportBlocked(f.store, "42");
+  const route = JSON.parse(f.store.row("blocked:r:route:0")!.payload).payload;
+  assert.equal(route.chat_id, "-42"); assert.equal(route.message_thread_id, 9);
+  const update = JSON.parse(f.store.row("blocked:update:1:0")!.payload).payload;
+  assert.equal(update.chat_id, "42"); assert.equal(update.message_thread_id, undefined);
+}));
+
+test("a workspace Conductor deletes during provisioning fails the launch once, with Conductor's reason", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  let statusReads = 0;
+  f.api.getWorkspaceStatus = (async () => { statusReads++; return {workspaceId: "w1", status: "deleted",
+    errorMessage: "Failed to create workspace branch conductor/x: fatal: https://deploy:ghp_abcdefghij123456@github.com/org/repo\n\t.conductor/settings.local.toml"}; }) as any;
+  await f.launch();
+  const row = f.store.row("launch")!;
+  assert.equal(row.state, "blocked"); assert.equal(row.attempts, 1);
+  assert.match(row.error!, /^Conductor could not create the workspace: Failed to create workspace branch.+settings\.local\.toml$/);
+  assert.doesNotMatch(row.error!, /ghp_|deploy:/, "relayed git output is scrubbed");
+  const ws = getWorkspace(f.ws.id)!;
+  assert.equal(ws.status, "failed"); assert.ok(ws.archivedAt);
+  assert.equal((f.store.db.prepare("SELECT revoked FROM gateway_credentials WHERE workspace_id=?").get(f.ws.id) as any).revoked, 1);
+  // Telegram had not opened the topic yet: it is cancelled with everything waiting for it, rather than left to hold the lane.
+  assert.equal(f.store.row(`create-topic:${f.ws.id}`)!.state, "done");
+  assert.equal(f.store.row("launch:created:0")!.state, "done");
+  assert.equal(f.store.row(`retire-topic:${f.ws.id}`), undefined);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(statusReads, 1, "a retired workspace is no longer polled");
+}));
+
+test("a workspace that disappears later is retired, and only a topic this gateway opened is closed", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 77);
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: "archived"})) as any;
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(getWorkspace(f.ws.id)!.status, "archived");
+  const close = f.store.row(`retire-topic:${f.ws.id}`)!;
+  assert.equal(JSON.parse(close.payload).method, "closeForumTopic");
+  assert.equal(close.conversation, "-42:77", "queued behind the notices already owed to the topic");
+  const notice = f.store.row(`unavailable:${f.ws.id}:0`)!;
+  assert.equal(notice.conversation, close.conversation);
+  assert.match(JSON.parse(notice.payload).payload.text, /no longer available\. Its history is retained/);
+}));
+
+test("an adopted topic is never closed when its workspace is retired", () => fixture(async f => {
+  await f.launch();
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 77);
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: "deleted", errorMessage: "quota exceeded"})) as any;
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(getWorkspace(f.ws.id)!.status, "failed");
+  assert.equal(f.store.row(`retire-topic:${f.ws.id}`), undefined);
+  assert.match(JSON.parse(f.store.row(`unavailable:${f.ws.id}:0`)!.payload).payload.text, /no longer available: quota exceeded\./);
+}));
+
+test("a message for a retired workspace's closed topic is dropped instead of blocking delivery", () => fixture(async f => {
+  updateWorkspaceThreadId(f.ws.id, 7);
+  f.store.db.prepare("UPDATE workspaces SET status='archived',archived_at=datetime('now') WHERE id=?").run(f.ws.id);
+  enqueueText(f.store, "late", "42", "late notice", {workspaceId: f.ws.id, threadId: 7});
+  const delivery = new TelegramDelivery(f.store, async () => { throw {response: {error_code: 400, description: "Bad Request: TOPIC_CLOSED"}}; });
+  await delivery.tick();
+  assert.equal(f.store.row("late:0")!.state, "done");
+  assert.match(f.store.row("late:0")!.result!, /suppressed/);
+  assert.equal(f.store.backlog().blocked, 0);
+}));
+
+test("a topic that opens after its workspace was retired is closed again", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42',status='failed',archived_at=datetime('now') WHERE id=?").run(f.ws.id);
+  enqueueTelegram(f.store, `create-topic:${f.ws.id}`, {method: "createForumTopic", workspaceId: f.ws.id, payload: {chat_id: "-42", name: "task"}}, 0);
+  const delivery = new TelegramDelivery(f.store, async () => ({message_thread_id: 88}));
+  await delivery.tick();
+  const close = JSON.parse(f.store.row(`retire-topic:${f.ws.id}`)!.payload);
+  assert.equal(close.method, "closeForumTopic");
+  assert.equal(close.payload.message_thread_id, 88);
+}));
+
+test("relayed upstream detail is scrubbed and bounded", () => {
+  assert.equal(safeDetail("fatal: https://user:pw@github.com/org/repo\n\tnot found"), "fatal: https://github.com/org/repo not found");
+  assert.doesNotMatch(safeDetail("token ghp_abcdefgh12345678 and github_pat_11ABCDEFG0abcdefgh and bot123456:AAH-xyz_1"), /ghp_|github_pat_|AAH/);
+  assert.equal(safeDetail("x".repeat(400)).length, 300);
+  assert.equal(safeDetail(undefined), "");
+});

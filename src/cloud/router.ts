@@ -3,13 +3,15 @@ import { z } from "zod";
 import type { CloudEngine } from "./engine.js";
 import { transcriptText } from "./engine.js";
 import type { QueueRow } from "./store.js";
-import { enqueueText } from "./telegram.js";
+import { enqueueText, TerminalError } from "./telegram.js";
 import { createWorkspace, getAllWorkspacesForChat } from "../store/queries.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { messageContainsExactText } from "./engine.js";
 import { findSubmittedMessage } from "./messages.js";
 
+/** Every routing failure ends with the two ways that never need the router. */
+const ROUTING_HINT = "Use /run <project> <task> or reply in a workspace topic.";
 const RouteSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("new"), projectId: z.string(), prompt: z.string().min(1) }),
   z.object({ action: z.literal("existing"), workspaceId: z.string(), prompt: z.string().min(1) }),
@@ -32,10 +34,10 @@ export class CloudRouter {
     if (!binding) {
       const name = `telegram-routing-${store.get<number>("telegram-bot-id") ?? "unconfigured"}`;
       const candidates = (await this.engine.api.listProjectWorkspaces(project.id)).filter(w => w.name === name && w.creatorId === store.get("conductor-user-id") && !["archived", "deleted"].includes(w.state ?? ""));
-      if (candidates.length > 1) throw new Error("Multiple router workspaces exist; explicit reconciliation required");
+      if (candidates.length > 1) throw new TerminalError(`Multiple router workspaces exist; explicit reconciliation required. ${ROUTING_HINT}`);
       if (candidates.length === 1) {
         const sessions = await this.engine.api.listWorkspaceSessions(candidates[0].id);
-        if (sessions.length !== 1) throw new Error("Router session identity is ambiguous");
+        if (sessions.length !== 1) throw new TerminalError(`Router session identity is ambiguous. ${ROUTING_HINT}`);
         binding = { workspaceId: candidates[0].id, sessionId: sessions[0].id };
       } else {
         if (store.get("router-create-attempted")) throw new Error("Router creation receipt uncertain; will not create a duplicate");
@@ -58,7 +60,7 @@ export class CloudRouter {
         store.set(`router-prompt:${row.id}`, prompt);
       }
       const existing = await findSubmittedMessage(this.engine.api, binding.sessionId, messageId);
-      if (existing && !messageContainsExactText(existing.content, prompt)) throw new Error("Router message identity mismatch");
+      if (existing && !messageContainsExactText(existing.content, prompt)) throw new TerminalError(`Router message identity mismatch. ${ROUTING_HINT}`);
       if (!existing) {
         if (store.get(`router-send-attempted:${row.id}`)) throw new Error("Router submission receipt is uncertain; no command will be replayed");
         store.set(`router-send-attempted:${row.id}`, true);
@@ -86,7 +88,7 @@ export class CloudRouter {
     const anchor = await findSubmittedMessage(this.engine.api, binding.sessionId, messageId);
     if (!anchor) { await waitForReply(); return; }
     const prompt = store.get<string>(`router-prompt:${row.id}`)!;
-    if (!messageContainsExactText(anchor.content, prompt)) throw new Error("Router message identity mismatch");
+    if (!messageContainsExactText(anchor.content, prompt)) throw new TerminalError(`Router message identity mismatch. ${ROUTING_HINT}`);
     const messages = await this.engine.api.listSessionMessages({ sessionId: binding.sessionId, after: anchor.id, limit: 100 });
     const text = messages.map(transcriptText).filter(Boolean).at(-1);
     if (!text) { await waitForReply(); return; }
@@ -94,14 +96,14 @@ export class CloudRouter {
     store.db.transaction(() => {
       if (result.action === "new") {
         const project = projects.find(p => p.id === result.projectId);
-        if (!project) throw new Error("Router returned an unknown project");
+        if (!project) throw new TerminalError(`Router returned an unknown project. ${ROUTING_HINT}`);
         const ws = createWorkspace({ name: input.text.slice(0, 70), prompt: input.text, repoPath: `conductor-project:${project.id}`, telegramChatId: input.chatId });
         store.set(key, { chatId: input.chatId, media: input.media, action: { type: "launch", trackedId: ws.id, projectId: project.id, prompt: input.text } });
         enqueueText(store, `${row.id}:confirm`, input.chatId, `Start this task in ${project.name}?\n\n${input.text}`, { threadId: input.threadId,
           replyMarkup: { inline_keyboard: [[{ text: "Confirm", callback_data: key }]] } });
       } else {
         const ws = workspaces.find(w => w.id === result.workspaceId);
-        if (!ws) throw new Error("Router returned a workspace outside this chat");
+        if (!ws) throw new TerminalError(`Router returned a workspace outside this chat. ${ROUTING_HINT}`);
         store.set(key, { chatId: input.chatId, media: input.media, action: { type: "send", trackedId: ws.id, prompt: input.text } });
         enqueueText(store, `${row.id}:confirm`, input.chatId, `Send this to ${ws.name}?\n\n${input.text}`, { threadId: input.threadId,
           replyMarkup: { inline_keyboard: [[{ text: "Confirm", callback_data: key }]] } });

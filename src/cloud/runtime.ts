@@ -9,7 +9,7 @@ import { FileBridge, startBridge } from "./bridge.js";
 import { CloudEngine, DEFAULT_PROVIDERS, type Provider } from "./engine.js";
 import { CloudGitHub } from "./catalog.js";
 import { CloudCommands } from "./commands.js";
-import { enqueueText, ingestTelegram, pause, QueueDispatcher, TelegramDelivery, type TelegramCall } from "./telegram.js";
+import { ingestTelegram, pause, QueueDispatcher, reportBlocked, TelegramDelivery, type TelegramCall } from "./telegram.js";
 import { CloudRouter } from "./router.js";
 import { CloudPoller } from "./poller.js";
 import {restoreLegacyOperations} from "./legacy.js";
@@ -135,17 +135,6 @@ export async function startCloudGateway(): Promise<void> {
       await pause(ms, abort.signal);
     }
   };
-  const reportBlocked = () => {
-    const rows = db.prepare("SELECT id,kind,conversation,error,payload FROM gateway_queue WHERE state='blocked' AND kind!='telegram'").all() as any[];
-    for (const row of rows) {
-      if (store.get(`blocked-notified:${row.id}`)) continue;
-      const payload = JSON.parse(row.payload);
-      const trackedId = payload.trackedId ?? payload.action?.trackedId;
-      if (trackedId) engine.notify(`blocked:${row.id}`, trackedId, `Operation needs attention: ${row.error}`);
-      else enqueueText(store, `blocked:${row.id}`, ownerChatId, `Telegram operation needs attention: ${row.error}`);
-      store.set(`blocked-notified:${row.id}`, true);
-    }
-  };
   try {
     await Promise.all([
       ingestTelegram(store, call, abort.signal).catch(error => { abort.abort(); throw error; }),
@@ -156,7 +145,7 @@ export async function startCloudGateway(): Promise<void> {
       loop("media", 500, () => dispatchers.media.tick()),
       loop("router", 1000, () => dispatchers.router.tick()),
       loop("delivery", 100, () => delivery.tick()),
-      loop("events", 1000, () => { engine.events(); reportBlocked(); }),
+      loop("events", 1000, () => { engine.events(); reportBlocked(store, ownerChatId); }),
       loop("cloud-poller", 1000, () => poller.tick()),
       loop("cloud-sync", 1000, () => sync?.tick()),
       loop("cloud-access", 60_000, async () => { await fencedApi.getIdentity(); store.set("cloud-access-last-success", Date.now()); }),

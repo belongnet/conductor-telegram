@@ -6,12 +6,12 @@ import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
 import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
-  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
+  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend, getRepoTopicByThreadId,
   completePendingCloudMessageDelivery, completePendingCloudTerminalIntent, type PendingCloudTerminalIntent } from "../store/queries.js";
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
 import { FileBridge } from "./bridge.js";
 import { CloudGitHub, ProjectCatalog } from "./catalog.js";
-import { enqueueTelegram, enqueueText, enqueueStatus } from "./telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, TerminalError, safeDetail } from "./telegram.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
 export const DEFAULT_PROVIDERS: Provider[] = [
@@ -121,7 +121,7 @@ export class CloudEngine {
   async action(row: QueueRow): Promise<void> {
     const action = JSON.parse(row.payload) as CloudAction;
     const ws = getWorkspace(action.trackedId);
-    if (!ws) throw new Error("Tracked workspace no longer exists");
+    if (!ws) throw new TerminalError("This workspace's record no longer exists. Start again with /run <project> <task>.");
     if (this.store.get(`stop:${ws.id}`) && !["stop", "archive"].includes(action.type)) {
       this.status(`${row.id}:stopped`, ws.id, action.statusId, "The task was stopped; queued work was not replayed."); return;
     }
@@ -131,7 +131,7 @@ export class CloudEngine {
     }
     if (action.type === "launch") return this.launch(row, action);
     const binding = this.store.binding(ws.id);
-    if (!binding) throw new Error("This historical workspace has no verified cloud binding. Start a new task using /run <project>.");
+    if (!binding) throw new TerminalError("This historical workspace has no verified cloud binding. Start a new task using /run <project>.");
     if (action.type === "stop" || action.type === "archive") {
       // Include in-flight creations discovered after a lost response.
       const sessions = await this.api.listWorkspaceSessions(binding.workspaceId);
@@ -163,16 +163,16 @@ export class CloudEngine {
       await this.api.renameSession(action.sessionId ?? binding.sessionId!, action.prompt ?? "");
       this.status(`${row.id}:done`, ws.id, action.statusId, "Cloud thread renamed."); return;
     }
-    if (action.type === "review" && !this.nativeReviews) throw new Error("Native cloud reviews are disabled. Set TELEGRAM_CLOUD_REVIEW_POLICY=native.");
+    if (action.type === "review" && !this.nativeReviews) throw new TerminalError("Native cloud reviews are disabled. Set TELEGRAM_CLOUD_REVIEW_POLICY=native.");
     if (action.type === "thread" || action.type === "review") {
       const author = action.type === "review" && binding.synced
         ? nativeSessionProvider(await this.api.getSession(action.sessionId ?? binding.sessionId!)) : undefined;
       return this.newSession(row, action, {...binding, ...author});
     }
     const sessionId = action.sessionId ?? binding.sessionId;
-    if (!sessionId) throw new Error("Cloud workspace has no active session");
+    if (!sessionId) throw new TerminalError("This workspace has no active thread. Pick one with /threads.");
     const actual = await this.api.getSessionStatus(sessionId);
-    if (actual.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    if (actual.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, action, binding, sessionId, actual.status === "working");
   }
 
@@ -183,7 +183,10 @@ export class CloudEngine {
       enqueueTelegram(this.store, `create-topic:${ws.id}`, { method: "createForumTopic", workspaceId: ws.id,
         payload: { chat_id: ws.telegramChatId, name: ws.name.slice(0, 128) } }, 0);
     }
-    const project = await this.catalog.resolve(action.projectId ?? "");
+    // An unknown or ambiguous project is the same answer on every attempt. An API failure is not, and keeps its own retry policy.
+    const project = await this.catalog.resolve(action.projectId ?? "").catch(error => {
+      throw error instanceof ConductorApiError ? error : new TerminalError(error instanceof Error ? error.message : "Repository unavailable");
+    });
     if (this.store.get(`stop:${ws.id}`)) return;
     const provider = action.provider ?? this.providers[0];
     let binding = this.store.binding(ws.id);
@@ -208,7 +211,7 @@ export class CloudEngine {
         catch (error) { if (this.providerRejected(row, action, provider, error)) return; throw error; }
       }
       const remote = await this.api.getWorkspace(created.workspaceId);
-      if (remote.repoUrl && repositoryRemoteIdentity(remote.repoUrl) !== repositoryRemoteIdentity(project.gitRemote)) throw new Error("Created workspace repository identity mismatch");
+      if (remote.repoUrl && repositoryRemoteIdentity(remote.repoUrl) !== repositoryRemoteIdentity(project.gitRemote)) throw new TerminalError("Created workspace repository identity mismatch");
       binding = { workspaceId: created.workspaceId, projectId: project.id, repoUrl: project.gitRemote,
         repoSlug: (repositoryRemoteIdentity(project.gitRemote) ?? "").replace(/^github.com\//, ""), branch: null, prUrl: null,
         sessionId: created.sessionId, ...provider, stopped: false };
@@ -223,12 +226,48 @@ export class CloudEngine {
     if (this.store.get(`stop:${ws.id}`)) { this.queue(`stop-created:${row.id}`, { type: "stop", trackedId: ws.id }); return; }
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
     if (lifecycle.status === "initializing" || lifecycle.status === "updating") {
+      this.status(`${row.id}:provisioning`, ws.id, action.statusId, "Conductor is preparing the workspace.");
       this.store.retry(row.id, "Waiting for cloud provisioning", 5000); return;
     }
-    if (["archived", "deleted"].includes(lifecycle.status)) throw new Error("Cloud workspace is archived or deleted");
+    if (["archived", "deleted"].includes(lifecycle.status)) {
+      // Conductor destroyed the workspace while provisioning. It will be the same on every attempt, and
+      // Conductor's own reason is the only useful thing to tell the owner.
+      const detail = safeDetail(lifecycle.errorMessage);
+      this.retire(ws.id, "failed");
+      throw new TerminalError(detail ? `Conductor could not create the workspace: ${detail}` : `Conductor could not create the workspace. It was ${lifecycle.status} while provisioning.`);
+    }
     const session = await this.api.getSessionStatus(binding.sessionId!);
-    if (session.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    if (session.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, action, binding, binding.sessionId!, session.status === "working");
+  }
+
+  /** A Conductor workspace that is gone stops being polled and stops owning its topic. Its history stays. */
+  private retire(trackedId: string, status: "failed" | "archived"): void {
+    const ws = getWorkspace(trackedId);
+    if (!ws || ws.archivedAt) return;
+    this.store.assertWriter?.();
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(trackedId);
+      // archived_at is what ends polling and frees the topic: a later message there is routed as a fresh request.
+      this.store.db.prepare("UPDATE workspaces SET status=?,archived_at=? WHERE id=?").run(status, new Date().toISOString(), trackedId);
+      // Only a topic this gateway opened for the workspace is touched, never an adopted or repository topic, and never by deletion.
+      const opened = this.store.row(`create-topic:${trackedId}`);
+      if (!opened) return;
+      if (ws.telegramThreadId) {
+        if (getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) return;
+        // The close joins the topic's own message lane, so notices already queued for it are delivered first.
+        this.store.enqueue("telegram", `${ws.telegramChatId}:${ws.telegramThreadId}`, { method: "closeForumTopic", workspaceId: trackedId,
+          payload: { chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId } }, `retire-topic:${trackedId}`, 20);
+      } else if (opened.state === "pending") {
+        // Conductor can destroy a workspace before Telegram has opened its topic. Nothing is owed to a topic that never
+        // existed, and rows left waiting for it would hold their delivery lane forever. A creation already in flight is
+        // closed by the delivery that completes it.
+        this.store.finish(opened.id, { suppressed: "Workspace retired before its topic opened" });
+        const waiting = this.store.db.prepare("SELECT id FROM gateway_queue WHERE kind='telegram' AND state='pending' AND json_extract(payload,'$.workspaceId')=?")
+          .all(trackedId) as Array<{ id: string }>;
+        for (const row of waiting) this.store.finish(row.id, { suppressed: "Workspace retired before its topic opened" });
+      }
+    })();
   }
 
   private async newSession(row: QueueRow, action: CloudAction, binding: CloudBinding): Promise<void> {
@@ -247,7 +286,7 @@ export class CloudEngine {
     const provider = selected && action.type === "review" && !action.provider && this.reviewProvider.model
       ? {...selected, model: this.reviewProvider.model} : selected;
     if (!provider || (action.type === "review" && (provider.agent === binding.agent || !this.providers.some(p => p.agent === provider.agent)))) {
-      throw new Error("No eligible review provider is enabled. Configure a provider different from the task author.");
+      throw new TerminalError("No eligible review provider is enabled. Configure a provider different from the task author.");
     }
     let review = this.store.get<{ url: string; head: string; base: string }>(`review:${row.id}`);
     if (action.type === "review") {
@@ -255,9 +294,9 @@ export class CloudEngine {
       const pr = url ? await this.github.pr(binding.repoSlug, url) : binding.branch ? await this.github.find(binding.repoSlug, binding.branch) : null;
       if (this.store.get(`stop:${action.trackedId}`)) return;
       if (!pr) throw new Error("Provide the PR URL with /review so its exact head commit can be verified.");
-      if (pr.state !== "open") throw new Error("This PR is not open");
-      if (review && review.head !== pr.head) throw new Error("PR head changed while starting review. Request a fresh review.");
-      if (action.reviewHead && action.reviewHead !== pr.head) throw new Error("PR head changed during recovery. Request a fresh review of the new head.");
+      if (pr.state !== "open") throw new TerminalError("This PR is not open");
+      if (review && review.head !== pr.head) throw new TerminalError("PR head changed while starting review. Request a fresh review.");
+      if (action.reviewHead && action.reviewHead !== pr.head) throw new TerminalError("PR head changed during recovery. Request a fresh review of the new head.");
       review = { url: pr.url, head: pr.head, base: pr.base }; this.store.set(`review:${row.id}`, review);
       this.store.bind(action.trackedId, { ...binding, prUrl: pr.url, branch: pr.branch });
     }
@@ -285,7 +324,7 @@ export class CloudEngine {
       ? `Review ${review.url} at exact head ${review.head}, base ${review.base}. Verify these commits before reviewing; report a changed head instead of claiming completion. Report findings only. Do not edit files, push, approve, merge, or deploy. This session has normal Conductor permissions; these are review instructions.\n\n${action.prompt ?? ""}`
       : action.prompt ?? "";
     const session = await this.api.getSessionStatus(sessionId);
-    if (session.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    if (session.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, { ...action, prompt }, binding, sessionId, session.status === "working");
   }
 
@@ -293,7 +332,7 @@ export class CloudEngine {
     const nativeProvider = binding.synced ? nativeSessionProvider(await this.api.getSession(sessionId)) : undefined;
     if (action.legacyRequestId) {
       const gate = pendingCloudMessageCanSend(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
-      if (gate === "mismatch") throw new Error("Legacy pending message identity mismatch; reconcile before retrying");
+      if (gate === "mismatch") throw new TerminalError("Legacy pending message identity mismatch; reconcile before retrying");
       if (gate === "missing") return;
       if (gate === "suppressed") { completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId); return; }
     }
@@ -304,7 +343,7 @@ export class CloudEngine {
     if (!payload) {
       const files = (action.fileIds ?? []).map(id => {
         const file = this.bridge.file(id, action.trackedId);
-        if (!file) throw new Error("Attachment missing from this workspace");
+        if (!file) throw new TerminalError("Attachment missing from this workspace");
         return `${file.name} (attachment ID ${id}): ${this.bridge.link(id, action.trackedId)}`;
       });
       const bridged = !!this.store.db.prepare("SELECT 1 FROM gateway_credentials WHERE workspace_id=? AND revoked=0 LIMIT 1").get(action.trackedId);
@@ -312,7 +351,7 @@ export class CloudEngine {
       this.store.set(`send:${row.id}`, payload);
     }
     const existing = await findSubmittedMessage(this.api, sessionId, payload.messageId);
-    if (existing && !messageContainsExactText(existing.content, payload.message)) throw new Error("Message identity mismatch");
+    if (existing && !messageContainsExactText(existing.content, payload.message)) throw new TerminalError("Message identity mismatch");
     if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
     let submissionQueued = false;
     if (!existing) {
@@ -396,7 +435,11 @@ export class CloudEngine {
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
     if (["deleted", "archived"].includes(lifecycle.status)) {
       this.store.set(`poll-after:${trackedId}`, Date.now() + 60_000);
-      if (!binding.stopped && !["done", "stopped", "archived"].includes(ws.status)) this.notify(`unavailable:${trackedId}`, trackedId, "Conductor workspace is no longer available. Its history is retained; no task has been replayed.");
+      const detail = safeDetail(lifecycle.errorMessage);
+      if (!binding.stopped && !["done", "stopped", "archived", "failed"].includes(ws.status)) this.notify(`unavailable:${trackedId}`, trackedId,
+        `Conductor workspace is no longer available${detail ? `: ${detail}` : ""}. Its history is retained; no task has been replayed.`);
+      // Queued after the notice, in the same topic lane, so the notice is delivered before the topic closes.
+      this.retire(trackedId, lifecycle.status === "deleted" && detail ? "failed" : "archived");
       return;
     }
     const sessions = await this.api.listWorkspaceSessions(binding.workspaceId);
