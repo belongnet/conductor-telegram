@@ -98,7 +98,7 @@ src/
 | `/lanes` | `/lanes [pause\|resume\|retry\|provider-disable\|archive-approval\|shadow\|cutover\|rollback]` | Durable lane status and audited controls when Manifest v2 is configured; legacy scheduler controls otherwise |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
 | `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
-| `/review` | `/review <workspace> [instructions]` | Launch a code review session |
+| `/review` | `/review [PR number or URL]` (inside a topic) | Native review of that workspace's pull request. Bare `/review` finds the PR; `/review 500` and a GitHub URL also work |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
 | `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
 | `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md or AGENTS.md |

@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { CloudEngine } from "./engine.js";
-import { transcriptText } from "./engine.js";
+import { transcriptText, conductorApiRejected } from "./engine.js";
 import type { QueueRow } from "./store.js";
-import { enqueueText, TerminalError } from "./telegram.js";
+import { enqueueText, TerminalError, safeDetail } from "./telegram.js";
 import { createWorkspace, getAllWorkspacesForChat } from "../store/queries.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
-import { ConductorApiError } from "../integrations/conductor-api.js";
+import { ConductorApiError, conductorWorkspaceIsArchived } from "../integrations/conductor-api.js";
 import { messageContainsExactText } from "./engine.js";
 import { findSubmittedMessage } from "./messages.js";
 
@@ -31,24 +31,23 @@ export class CloudRouter {
       enqueueText(store, `${row.id}:choose`, input.chatId, "Choose a project with /run <project ID> <task>, or reply to a workspace message. An API router project has not been configured.", { threadId: input.threadId }); return;
     }
     let binding = store.get<{ workspaceId: string; sessionId: string }>("router-binding");
-    if (!binding) {
-      const name = `telegram-routing-${store.get<number>("telegram-bot-id") ?? "unconfigured"}`;
-      const candidates = (await this.engine.api.listProjectWorkspaces(project.id)).filter(w => w.name === name && w.creatorId === store.get("conductor-user-id") && !["archived", "deleted"].includes(w.state ?? ""));
-      if (candidates.length > 1) throw new TerminalError(`Multiple router workspaces exist; explicit reconciliation required. ${ROUTING_HINT}`);
-      if (candidates.length === 1) {
-        const sessions = await this.engine.api.listWorkspaceSessions(candidates[0].id);
-        if (sessions.length !== 1) throw new TerminalError(`Router session identity is ambiguous. ${ROUTING_HINT}`);
-        binding = { workspaceId: candidates[0].id, sessionId: sessions[0].id };
-      } else {
-        if (store.get("router-create-attempted")) throw new Error("Router creation receipt uncertain; will not create a duplicate");
-        store.set("router-create-attempted", true);
-        const provider = this.engine.providers[0];
-        binding = await this.engine.api.createWorkspace({ projectId: project.id, name, agent: provider.agent, model: provider.model });
+    if (binding) {
+      const gone = await this.routerGone(binding.workspaceId);
+      if (gone) {
+        this.retireRouter(binding.workspaceId, gone);
+        binding = undefined;
       }
-      store.set("router-binding", binding);
     }
+    if (!binding) binding = await this.bindRouter(project.id);
     const status = await this.engine.api.getWorkspaceStatus(binding.workspaceId);
     if (["initializing", "updating"].includes(status.status)) { store.retry(row.id, "Router provisioning", 5000); return; }
+    if (["archived", "deleted"].includes(status.status)) {
+      this.retireRouter(binding.workspaceId, safeDetail((status as {errorMessage?: string}).errorMessage) || status.status);
+      binding = await this.bindRouter(project.id);
+      const again = await this.engine.api.getWorkspaceStatus(binding.workspaceId);
+      if (["initializing", "updating"].includes(again.status)) { store.retry(row.id, "Router provisioning", 5000); return; }
+    }
+    binding = await this.liveRouterSession(binding);
     const workspaces = getAllWorkspacesForChat(input.chatId, -1).filter(w => store.binding(w.id));
     const messageId = deterministicUuid("route", row.id);
     if (!store.get(`router-sent:${row.id}`)) {
@@ -62,11 +61,20 @@ export class CloudRouter {
       const existing = await findSubmittedMessage(this.engine.api, binding.sessionId, messageId);
       if (existing && !messageContainsExactText(existing.content, prompt)) throw new TerminalError(`Router message identity mismatch. ${ROUTING_HINT}`);
       if (!existing) {
-        if (store.get(`router-send-attempted:${row.id}`)) throw new Error("Router submission receipt is uncertain; no command will be replayed");
+        if (store.get(`router-send-attempted:${row.id}`)) {
+          const first = store.get<string>(`router-send-error:${row.id}`);
+          throw new Error(`Router submission receipt is uncertain; no command will be replayed${first ? `: ${safeDetail(first)}` : ""}`);
+        }
         store.set(`router-send-attempted:${row.id}`, true);
         try { await this.engine.api.sendMessage({sessionId: binding.sessionId, messageId, message: prompt}); }
         catch (error) {
           if (error instanceof ConductorApiError && error.status === 429) store.set(`router-send-attempted:${row.id}`, false);
+          else if (conductorApiRejected(error)) {
+            store.set(`router-send-attempted:${row.id}`, false);
+            throw new TerminalError(`Conductor refused this message: ${safeDetail(error.message)}. ${ROUTING_HINT}`);
+          } else if (!store.get(`router-send-error:${row.id}`)) {
+            store.set(`router-send-error:${row.id}`, error instanceof Error ? error.message : "request failed");
+          }
           throw error;
         }
       }
@@ -92,7 +100,9 @@ export class CloudRouter {
     const messages = await this.engine.api.listSessionMessages({ sessionId: binding.sessionId, after: anchor.id, limit: 100 });
     const text = messages.map(transcriptText).filter(Boolean).at(-1);
     if (!text) { await waitForReply(); return; }
-    const result = RouteSchema.parse(JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, "")));
+    let result: z.infer<typeof RouteSchema>;
+    try { result = RouteSchema.parse(JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, ""))); }
+    catch { throw new TerminalError(`The router did not return a usable target. ${ROUTING_HINT}`); }
     store.db.transaction(() => {
       if (result.action === "new") {
         const project = projects.find(p => p.id === result.projectId);
@@ -109,5 +119,107 @@ export class CloudRouter {
           replyMarkup: { inline_keyboard: [[{ text: "Confirm", callback_data: key }]] } });
       }
     })();
+  }
+
+  private async routerGone(workspaceId: string): Promise<string | undefined> {
+    try {
+      const status = await this.engine.api.getWorkspaceStatus(workspaceId);
+      if (["archived", "deleted"].includes(status.status)) {
+        return safeDetail((status as {errorMessage?: string}).errorMessage) || status.status;
+      }
+    } catch (error) {
+      if (conductorApiRejected(error) && [404, 410].includes(error.status ?? 0)) return safeDetail(error.message) || "gone";
+      throw error;
+    }
+  }
+
+  private retireRouter(workspaceId: string, reason: string): void {
+    const store = this.engine.store;
+    const last = store.get<number>("router-healed-at");
+    if (last && Date.now() - last < 600_000) {
+      throw new TerminalError(`The router workspace is gone (${reason}). ${ROUTING_HINT}`);
+    }
+    store.db.transaction(() => {
+      store.set(`router-retired:${workspaceId}`, true);
+      store.clear("router-binding");
+      store.clear("router-create-attempted");
+      store.set("router-healed-at", Date.now());
+    })();
+  }
+
+  private routerName(): string {
+    return `telegram-routing-${this.engine.store.get<number>("telegram-bot-id") ?? "unconfigured"}`;
+  }
+
+  private async bindRouter(projectId: string): Promise<{ workspaceId: string; sessionId: string }> {
+    const store = this.engine.store;
+    const existing = store.get<{ workspaceId: string; sessionId: string }>("router-binding");
+    if (existing) return existing;
+    const name = this.routerName();
+    const candidates = (await this.engine.api.listProjectWorkspaces(projectId)).filter(w =>
+      w.name === name && w.creatorId === store.get("conductor-user-id") &&
+      !conductorWorkspaceIsArchived(w) && !store.get(`router-retired:${w.id}`));
+    if (candidates.length > 1) throw new TerminalError(`Multiple router workspaces exist; explicit reconciliation required. ${ROUTING_HINT}`);
+    let binding: { workspaceId: string; sessionId: string };
+    if (candidates.length === 1) {
+      const sessions = (await this.engine.api.listWorkspaceSessions(candidates[0].id)).filter(s => !s.archivedAt);
+      if (sessions.length === 1) binding = { workspaceId: candidates[0].id, sessionId: sessions[0].id };
+      else if (sessions.length === 0) binding = await this.createRouterSession(candidates[0].id);
+      else throw new TerminalError(`Router session identity is ambiguous. ${ROUTING_HINT}`);
+    } else {
+      if (store.get("router-create-attempted")) throw new Error("Router creation receipt uncertain; will not create a duplicate");
+      store.set("router-create-attempted", true);
+      const provider = this.engine.providers[0];
+      try {
+        binding = await this.engine.api.createWorkspace({ projectId, name, agent: provider.agent, model: provider.model });
+      } catch (error) {
+        if (conductorApiRejected(error)) {
+          store.set("router-create-attempted", false);
+          throw new TerminalError(`Conductor refused to create the router: ${safeDetail(error.message)}. ${ROUTING_HINT}`);
+        }
+        throw error;
+      }
+    }
+    store.set("router-binding", binding);
+    return binding;
+  }
+
+  private async createRouterSession(workspaceId: string): Promise<{ workspaceId: string; sessionId: string }> {
+    const store = this.engine.store;
+    if (store.get("router-session-attempted")) throw new Error("Router session creation receipt uncertain; will not create a duplicate");
+    store.set("router-session-attempted", true);
+    const provider = this.engine.providers[0];
+    try {
+      const created = await this.engine.api.createSession({ workspaceId, name: "routing", agent: provider.agent, model: provider.model,
+        ...(provider.agent !== "cursor" ? { effort: provider.effort } : {}) });
+      return { workspaceId, sessionId: created.id };
+    } catch (error) {
+      if (conductorApiRejected(error)) {
+        store.set("router-session-attempted", false);
+        throw new TerminalError(`Conductor refused to create the router session: ${safeDetail(error.message)}. ${ROUTING_HINT}`);
+      }
+      throw error;
+    }
+  }
+
+  private async liveRouterSession(binding: { workspaceId: string; sessionId: string }): Promise<{ workspaceId: string; sessionId: string }> {
+    try {
+      await this.engine.api.getSessionStatus(binding.sessionId);
+      return binding;
+    } catch (error) {
+      if (!(conductorApiRejected(error) && [404, 410].includes(error.status ?? 0))) throw error;
+    }
+    const sessions = (await this.engine.api.listWorkspaceSessions(binding.workspaceId)).filter(s => !s.archivedAt);
+    if (sessions.length === 1) {
+      const next = { workspaceId: binding.workspaceId, sessionId: sessions[0].id };
+      this.engine.store.set("router-binding", next);
+      return next;
+    }
+    if (sessions.length === 0) {
+      const next = await this.createRouterSession(binding.workspaceId);
+      this.engine.store.set("router-binding", next);
+      return next;
+    }
+    throw new TerminalError(`Router session identity is ambiguous. ${ROUTING_HINT}`);
   }
 }

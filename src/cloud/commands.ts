@@ -4,6 +4,7 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import type { GatewayStore, QueueRow } from "./store.js";
 import { CloudEngine, type CloudAction, type Provider } from "./engine.js";
+import { GitHubError, githubSlug } from "./catalog.js";
 import { gatewayHealth } from "./bridge.js";
 import { enqueueTelegram, enqueueText, TerminalError, type TelegramCall } from "./telegram.js";
 import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
@@ -44,7 +45,7 @@ export function repoTopicCandidates(repoName: string, projects: ConductorApiProj
 }
 
 const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "office_hours", "design_review", "gstack", "skill"]);
-const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
+const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR number or URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
 
 interface MediaJob {
   action?: CloudAction; decisionId?: number; chatId: string; threadId?: number; text?: string;
@@ -117,10 +118,11 @@ export class CloudCommands {
         reply(`Linked to ${selection.projectLabel}. Send a message here to start a new workspace in it.`); return;
       }
       if (data.startsWith("route:")) {
-        const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob }>(data);
+        const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob; ack?: string }>(data);
         if (!proposed || proposed.chatId !== chatId) return;
+        if (this.store.row(`${data}:confirmed:action`)) return;
         const action = { ...proposed.action, statusId };
-        this.enqueueTurn(reply, "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`); return;
+        this.enqueueTurn(reply, proposed.ack ?? "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`); return;
       }
       return;
     }
@@ -134,7 +136,7 @@ export class CloudCommands {
     }
     const command = match?.[1]?.toLowerCase();
     let args = match?.[3]?.trim() ?? "";
-    if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}`, {threadId, priority: 0, silent: true}); return; }
+    if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}${this.githubNote()}`, {threadId, priority: 0, silent: true}); return; }
     if (command === "sync") {
       if (!this.syncChatId) { reply("Cloud workspace sync needs TELEGRAM_CLOUD_SYNC_CHAT_ID set to a forum group."); return; }
       this.store.set("cloud-sync-after", 0);
@@ -158,7 +160,10 @@ export class CloudCommands {
     }
     if (["projects", "repos"].includes(command ?? "")) {
       const projects = await this.engine.catalog.projects(true);
-      reply(projects.map((p, i) => `${i + 1}. ${p.name}\n${p.id}\n${p.gitRemote}`).join("\n\n") || "No Conductor projects are available."); return;
+      const denied = await this.unreadableRepositories(projects.map(p => { try { return githubSlug(p.gitRemote); } catch { return ""; } }));
+      const slugOf = (p: ConductorApiProject): string => { try { return githubSlug(p.gitRemote); } catch { return ""; } };
+      reply((projects.map((p, i) => `${i + 1}. ${p.name}\n${p.id}\n${p.gitRemote}${denied.has(slugOf(p)) ? "\nGitHub: the gateway's token cannot read this repository" : ""}`).join("\n\n") || "No Conductor projects are available.") +
+        (denied.size ? "\n\n/review and /prs need that access. Add those repositories to the gateway's GitHub token with Pull requests: read." : "")); return;
     }
     if (command === "link") {
       const topic = threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
@@ -182,11 +187,18 @@ export class CloudCommands {
       const rows = getAllWorkspacesForChat(chatId, -1);
       if (command === "prs" || command === "ship_status") {
         const lines: string[] = [];
+        // No PR can ever be verified in a repository the token cannot read, so that is said instead of "no PRs yet".
+        const denied = await this.unreadableRepositories(rows.map(ws => this.store.binding(ws.id)?.repoSlug ?? ""));
         for (const ws of rows) {
-          const binding = this.store.binding(ws.id); if (!binding?.prUrl) continue;
+          const binding = this.store.binding(ws.id); if (!binding?.prUrl || denied.has(binding.repoSlug)) continue;
           try { const pr = await this.engine.github.pr(binding.repoSlug, binding.prUrl); lines.push(`${ws.name}: ${pr.merged ? "merged" : pr.state} ${pr.head.slice(0, 12)}\n${pr.url}`); }
-          catch { lines.push(`${ws.name}: PR status unavailable`); }
+          catch (error) {
+            const refused = error instanceof GitHubError && !error.rateLimited && [401, 403, 404].includes(error.status)
+              ? await this.engine.repoAccess(binding.repoSlug, true).catch(() => undefined) : undefined;
+            if (refused && !refused.ok) denied.set(binding.repoSlug, refused.status); else lines.push(`${ws.name}: PR status unavailable`);
+          }
         }
+        for (const [slug, status] of denied) lines.push(this.engine.github.advice(slug, status));
         reply(lines.join("\n\n") || "No verified PRs yet. Include the PR URL in /review or report it from the agent.");
       } else reply(rows.map(ws => `${ws.name} · ${ws.status}${this.store.binding(ws.id) ? " · cloud" : " · historical"}\n${ws.id}`).join("\n\n") || "No tracked workspaces.");
       return;
@@ -322,6 +334,23 @@ export class CloudCommands {
     const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt, statusId };
     this.enqueueTurn(reply, (media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked,
       `${row.id}:action`, action, media ? { ...media, chatId, threadId } : undefined, row.id);
+  }
+
+  /** Repositories the gateway's GitHub token cannot read. An outage or a rate limit leaves a repository unchecked rather than accused. */
+  private async unreadableRepositories(slugs: string[]): Promise<Map<string, number>> {
+    const denied = new Map<string, number>();
+    await Promise.all([...new Set(slugs.filter(Boolean))].map(async slug => {
+      try { const access = await this.engine.repoAccess(slug); if (!access.ok) denied.set(slug, access.status); } catch { /* Not checked. */ }
+    }));
+    return denied;
+  }
+
+  /** `/ping` is a liveness check in its own lane, so it reports only what an earlier command already learned. */
+  private githubNote(): string {
+    const rows = this.store.db.prepare("SELECT key,value FROM gateway_state WHERE key LIKE 'github-access:%'").all() as Array<{ key: string; value: string }>;
+    const denied = rows.filter(row => { const value = JSON.parse(row.value); return !value.ok && Date.now() - value.at < 24 * 3600_000; })
+      .map(row => row.key.slice("github-access:".length)).sort();
+    return denied.length ? `\nGitHub token cannot read: ${denied.join(", ")}` : "";
   }
 
   /** The status-card anchor and the work it represents become durable in one commit, anchor first. */

@@ -95,7 +95,7 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
  * it, across pacing retries and restarts alike. A newer state replaces an undelivered older one.
  */
 export function enqueueStatus(store: GatewayStore, id: string,
-  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string }): void {
+  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown }): void {
   store.db.transaction(() => {
     if (store.row(id)) return;
     store.assertWriter?.();
@@ -105,7 +105,8 @@ export function enqueueStatus(store: GatewayStore, id: string,
       .all(input.anchorId) as Array<{ id: string }>;
     for (const prior of pending) store.finish(prior.id, { supersededBy: id });
     const job: TelegramJob = { method: "editMessageText", statusOf: input.anchorId, workspaceId: input.workspaceId, sessionId: input.sessionId,
-      payload: { chat_id: chatId, text: escHtml(input.text), parse_mode: "HTML" } };
+      payload: { chat_id: chatId, text: escHtml(input.text), parse_mode: "HTML",
+        ...(input.replyMarkup ? { reply_markup: input.replyMarkup } : {}) } };
     store.enqueue("telegram", anchor?.conversation ?? `${chatId}:0:control`, job, id, 0);
   })();
 }
@@ -297,6 +298,18 @@ async function processClaimedRow(store: GatewayStore, row: QueueRow, handler: (r
         store.retry(row.id, failure.description, failure.delayMs); return;
       }
       if (error instanceof ConductorApiError && error.retryable) {
+        const previous = store.get<number>(`retryable-failures:${row.id}`) ?? 0;
+        store.set(`retryable-failures:${row.id}`, previous + 1);
+        if (previous + 1 === 3) {
+          const payload = JSON.parse(row.payload);
+          const trackedId: string | undefined = payload.trackedId ?? payload.action?.trackedId;
+          const anchorId: string | undefined = payload.statusId ?? payload.action?.statusId;
+          const ws = trackedId ? getWorkspace(trackedId) : undefined;
+          if (anchorId && ws && store.row(anchorId)) {
+            enqueueStatus(store, `slow:${row.id}`, { anchorId, chatId: ws.telegramChatId, workspaceId: ws.id,
+              text: "Conductor is not answering yet. Still trying; nothing was lost." });
+          }
+        }
         store.retry(row.id, error.message, Math.max(error.retryAfterMs, Math.min(60_000, row.attempts * 5000))); return;
       }
       if (error instanceof TerminalError) {

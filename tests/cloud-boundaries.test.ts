@@ -9,7 +9,7 @@ import { CloudEngine } from "../src/cloud/engine.js";
 import type { FileBridge } from "../src/cloud/bridge.js";
 import { CloudRouter } from "../src/cloud/router.js";
 import { CloudCommands } from "../src/cloud/commands.js";
-import { CloudGitHub } from "../src/cloud/catalog.js";
+import { CloudGitHub, GitHubError } from "../src/cloud/catalog.js";
 import { restoreLegacyOperations } from "../src/cloud/legacy.js";
 import { processQueue } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
@@ -232,3 +232,57 @@ test("GitHub PR inspection validates repository and commit identities and surfac
   status = 503;
   await assert.rejects(github.pr("org/repo", payload.html_url), /503/);
 });
+
+test("GitHub access probes pull requests and treats rate limits as unknown", async () => {
+  const replies: Array<{url: string; status: number; headers?: Record<string, string>}> = [];
+  const github = new CloudGitHub("test-token", (async (url: any) => {
+    const next = replies.shift()!;
+    assert.equal(String(url), next.url);
+    return new Response("[]", {status: next.status, headers: next.headers});
+  }) as typeof fetch);
+  replies.push({url: "https://api.github.com/repos/org/repo/pulls?state=open&per_page=1", status: 200});
+  assert.deepEqual(await github.access("org/repo"), {readable: true, status: 200});
+  replies.push({url: "https://api.github.com/repos/org/private/pulls?state=open&per_page=1", status: 404});
+  assert.deepEqual(await github.access("org/private"), {readable: false, status: 404});
+  replies.push({url: "https://api.github.com/repos/org/limited/pulls?state=open&per_page=1", status: 403, headers: {"x-ratelimit-remaining": "0"}});
+  await assert.rejects(github.access("org/limited"), error => error instanceof GitHubError && error.rateLimited);
+});
+
+test("an archived router workspace is replaced in the same pass", () => fixture(async f => {
+  f.api.getWorkspaceStatus = async () => {
+    const id = f.store.get<{workspaceId: string}>("router-binding")?.workspaceId;
+    return {workspaceId: id ?? "router-workspace", status: id === "router-workspace" ? "archived" : "ready"};
+  };
+  let created = 0;
+  f.api.createWorkspace = async () => {
+    created++;
+    return {workspaceId: "router-workspace-2", sessionId: "router-session-2"};
+  };
+  const row = f.routeRow();
+  await f.router.route(row);
+  assert.equal(created, 1);
+  assert.equal(f.store.get<{workspaceId: string}>("router-binding")?.workspaceId, "router-workspace-2");
+  assert.ok(f.store.get("router-retired:router-workspace"));
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.sends[0].sessionId, "router-session-2");
+}));
+
+test("a second router death within ten minutes stops", () => fixture(async f => {
+  f.store.set("router-healed-at", Date.now());
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "router-workspace", status: "deleted", errorMessage: "quota exceeded"});
+  await assert.rejects(f.router.route(f.routeRow()), /gone \(quota exceeded\).+\/run/);
+  assert.equal(f.sends.length, 0);
+}));
+
+test("a Conductor rejection clears the router send fence and an uncertain failure keeps it", () => fixture(async f => {
+  f.api.sendMessage = async () => { throw new ConductorApiError("bad request", 400); };
+  const rejected = f.routeRow();
+  await assert.rejects(f.router.route(rejected), /refused this message: bad request/);
+  assert.equal(f.store.get("router-send-attempted:route-job"), false);
+  f.store.enqueue("route", "router", {text: "Keep\n  the original request", chatId: "42"}, "route-uncertain");
+  f.api.sendMessage = async () => { throw new Error("network down"); };
+  await assert.rejects(f.router.route(f.store.row("route-uncertain")!), /network down/);
+  assert.equal(f.store.get("router-send-attempted:route-uncertain"), true);
+  await assert.rejects(f.router.route(f.store.row("route-uncertain")!), /receipt is uncertain.+network down/);
+  assert.equal(f.sends.length, 0);
+}));

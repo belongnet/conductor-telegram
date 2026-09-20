@@ -25,7 +25,8 @@ export class CloudWorkspaceSync {
     store.set("cloud-sync-after", Date.now() + 60_000);
     const [projects, workspaces] = await Promise.all([this.engine.catalog.projects(true), api.listWorkspaces({mine: true})]);
     const routerId = store.get<{workspaceId: string}>("router-binding")?.workspaceId;
-    const active = workspaces.filter(w => w.id !== routerId && !w.archivedAt && !["archived", "deleted"].includes(w.state ?? ""));
+    const routerName = `telegram-routing-${store.get<number>("telegram-bot-id") ?? "unconfigured"}`;
+    const active = workspaces.filter(w => w.id !== routerId && w.name !== routerName && !w.archivedAt && !["archived", "deleted"].includes(w.state ?? ""));
     const seen = new Set(active.map(w => w.id));
     const jobs: Array<{id: string; run: () => Promise<void>}> = active.map(w => ({id: w.id, run: () => this.attach(w, projects)}));
     for (const {id, binding} of store.bindings()) {

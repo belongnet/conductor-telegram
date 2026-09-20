@@ -10,7 +10,7 @@ import { createWorkspace, getWorkspace, getDecision, answerDecision, getWorkspac
 import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
-import { CloudGitHub } from "../src/cloud/catalog.js";
+import { CloudGitHub, GitHubError } from "../src/cloud/catalog.js";
 import { enqueueTelegram, enqueueText, enqueueStatus, TelegramDelivery, processQueue, ingestTelegram, reportBlocked, safeDetail, ATTENTION_AFTER_MS } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
 import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
@@ -55,6 +55,8 @@ function createFixture() {
     archiveWorkspace: async () => ({ workspaceId: "w1", status: "archived" }),
   };
   const engine = new CloudEngine(store, api as unknown as ConductorApiClient, bridge, new CloudGitHub("test"), undefined, true);
+  // No test may reach api.github.com. A test about repository access replaces this.
+  engine.github.access = async () => ({readable: true, status: 200});
   store.set("conductor-user-id", "owner");
   async function launch() { engine.queue("launch", { type: "launch", trackedId: ws.id, projectId: "p1", prompt: "Fix\nthe bug" }); await processQueue(store, ["cloud"], r => engine.action(r)); }
   return { dir, store, ws, bridge, api, engine, messages, sessions, launch, counts: () => ({ creates, sends }),
@@ -1656,3 +1658,120 @@ test("relayed upstream detail is scrubbed and bounded", () => {
   assert.equal(safeDetail("x".repeat(400)).length, 300);
   assert.equal(safeDetail(undefined), "");
 });
+
+const openPr = (number: number, head = "a".repeat(40)): import("../src/cloud/catalog.js").CloudPr => ({
+  url: `https://github.com/org/repo/pull/${number}`, number, head, base: "b".repeat(40), branch: "feature", state: "open", merged: false, draft: false,
+});
+
+test("bare /review finds one open PR from the transcript", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
+  f.messages.push({id: "pr", sessionId: "s1", type: "assistant", content: "Opened https://github.com/org/repo/pull/12", sessionIndex: 1, receivedAt: new Date().toISOString()});
+  f.engine.github.pr = async (_slug, url) => { assert.equal(url, "https://github.com/org/repo/pull/12"); return openPr(12); };
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.sessions.length, 2);
+  assert.equal(f.store.get<any>("session:s2")?.reviewUrl, "https://github.com/org/repo/pull/12");
+  assert.equal(JSON.parse(f.store.row("review:sent")!.payload).payload.text, "Reviewing PR #12 (aaaaaaa) in codex");
+  assert.equal(f.store.row("review")!.state, "done");
+}));
+
+test("short /review forms skip the transcript scan", () => fixture(async f => {
+  await f.launch();
+  let scanned = 0;
+  const list = f.api.listWorkspaceSessions;
+  f.api.listWorkspaceSessions = async () => { scanned++; return list(); };
+  f.api.getSessionMessageTail = async () => { scanned++; return []; };
+  f.engine.github.pr = async (_slug, url) => { assert.equal(url, "https://github.com/org/repo/pull/500"); return openPr(500); };
+  for (const prompt of ["500", "#500"]) {
+    const id = `review-${prompt}`;
+    scanned = 0;
+    f.engine.queue(id, {type: "review", trackedId: f.ws.id, prompt});
+    await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+    assert.equal(scanned, 0, `/${prompt} must not read Conductor transcripts`);
+    assert.equal(f.store.get<any>(`review:${id}`)?.url, "https://github.com/org/repo/pull/500");
+  }
+}));
+
+test("several transcript PRs are never guessed and a second tap adds nothing", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
+  f.messages.push({id: "prs", sessionId: "s1", type: "assistant",
+    content: "See https://github.com/org/repo/pull/8 and https://github.com/org/repo/pull/9", sessionIndex: 1, receivedAt: new Date().toISOString()});
+  f.engine.github.pr = async (_slug, url) => openPr(Number(url.split("/").at(-1)));
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.sessions.length, 1, "several PRs must not start a review");
+  assert.equal(f.store.row("review")!.state, "done");
+  const card = JSON.parse(f.store.row("review:choose")!.payload);
+  assert.equal(card.payload.text, "Which pull request should be reviewed?");
+  const key = card.payload.reply_markup.inline_keyboard[0][0].callback_data;
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  for (const id of [1, 2]) {
+    f.store.ingest([{update_id: id, callback_query: {id: `cb-${id}`, data: key, from: {id: 9}, message: {chat: {id: 42}}}}]);
+    await processQueue(f.store, ["update"], r => commands.handle(r));
+  }
+  const actions = f.store.db.prepare("SELECT id,payload FROM gateway_queue WHERE kind='cloud' AND id LIKE '%confirmed:action'").all() as any[];
+  assert.equal(actions.length, 1);
+  assert.equal(JSON.parse(actions[0].payload).prompt, "https://github.com/org/repo/pull/8");
+}));
+
+test("no open PR ends the review row at once with buttons", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
+  f.engine.github.find = async () => null;
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row("review")!.state, "done");
+  assert.equal(f.sessions.length, 1);
+  const card = JSON.parse(f.store.row("review:choose")!.payload);
+  assert.equal(card.payload.text, "No open pull request found for this workspace.");
+  assert.deepEqual(card.payload.reply_markup.inline_keyboard.map((row: any) => row[0].text),
+    ["Ask the agent to review its own diff", "Open a PR first"]);
+}));
+
+test("a merged cached PR does not dead-end a bare /review", () => fixture(async f => {
+  await f.launch();
+  f.store.bind(f.ws.id, {...f.store.binding(f.ws.id)!, prUrl: "https://github.com/org/repo/pull/1"});
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
+  f.messages.push({id: "pr", sessionId: "s1", type: "assistant", content: "https://github.com/org/repo/pull/9", sessionIndex: 1, receivedAt: new Date().toISOString()});
+  f.engine.github.pr = async (_slug, url) => url.endsWith("/1")
+    ? {...openPr(1), state: "closed", merged: true}
+    : openPr(9);
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.get<any>("session:s2")?.reviewUrl, "https://github.com/org/repo/pull/9");
+}));
+
+test("an unreadable repository short-circuits /review before any Conductor call", () => fixture(async f => {
+  await f.launch();
+  let conductor = 0;
+  const list = f.api.listWorkspaceSessions;
+  f.api.listWorkspaceSessions = async () => { conductor++; return list(); };
+  f.api.getSessionMessageTail = async () => { conductor++; return []; };
+  f.engine.github.access = async () => ({readable: false, status: 404});
+  enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(conductor, 0);
+  assert.equal(f.store.row("review")!.state, "done");
+  assert.match(JSON.parse(f.store.row("review:choose")!.payload).payload.text, /cannot read org\/repo/);
+  assert.equal(JSON.parse(f.store.row("review:choose")!.payload).payload.reply_markup.inline_keyboard.length, 1);
+}));
+
+test("a rate-limited 403 is never cached as unreadable", () => fixture(async f => {
+  f.engine.github.access = async () => { throw new GitHubError("GitHub request failed (403)", 403, true); };
+  await assert.rejects(() => f.engine.repoAccess("org/repo", true), /403/);
+  assert.equal(f.engine.githubDenied("org/repo"), undefined);
+  assert.equal(f.store.get("github-access:org/repo"), undefined);
+}));
+
+test("a Conductor rejection of a send clears the fence", () => fixture(async f => {
+  await f.launch();
+  f.api.sendMessage = async () => { throw new ConductorApiError("payload too large", 413); };
+  f.engine.queue("follow", {type: "send", trackedId: f.ws.id, prompt: "next"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row("follow")!.state, "blocked");
+  assert.match(f.store.row("follow")!.error!, /refused this message: payload too large/);
+  assert.equal(f.store.get("send-attempted:follow"), false);
+}));

@@ -25,9 +25,12 @@ function fixture(providers: Provider[] = DEFAULT_PROVIDERS, reviewProvider: {age
     sendMessage: async (_input: unknown) => {mutations.push("send"); return {};},
     cancelSession: async (_id: string) => {mutations.push("cancel"); return {};},
     createSession: async (_input: unknown) => {mutations.push("create-session"); return {id: "s2"};},
+    getSessionMessageTail: async (_id: string): Promise<any[]> => [],
   };
   const github = new CloudGitHub("unused");
   github.pr = async () => ({url: binding.prUrl!, number: 1, head: "a".repeat(40), base: "b".repeat(40), branch: "task", state: "open", merged: false, draft: false});
+  github.find = async () => null;
+  github.access = async () => ({readable: true, status: 200});
   const bridge = {refreshQueuedLinks() {}} as unknown as FileBridge;
   const engine = new CloudEngine(store, api as unknown as ConductorApiClient, bridge, github, providers, true, reviewProvider);
   async function send() {
@@ -276,5 +279,21 @@ test("a new session during reported PR lookup keeps the workspace running and pr
     assert.equal(f.store.get<any>("session:s2").terminal, false);
     assert.equal(getWorkspace(f.ws.id)?.status, "running");
     assert.ok(f.store.get<number>(`poll-after:${f.ws.id}`)! <= Date.now() + 15_000);
+  } finally {closeDb();}
+});
+
+test("a stop during the review transcript scan writes nothing", async () => {
+  const f = fixture();
+  try {
+    f.store.bind(f.ws.id, {...f.binding, prUrl: null, branch: null});
+    f.api.getSessionMessageTail = async () => {
+      f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
+      return [{id: "m", sessionId: "s1", type: "assistant", content: "Opened https://github.com/org/repo/pull/1", sessionIndex: 1, receivedAt: "2026-01-01T00:00:00Z"}];
+    };
+    f.engine.queue("review", {type: "review", trackedId: f.ws.id});
+    await f.engine.action(f.store.row("review")!);
+    assert.ok(!f.mutations.includes("create-session"));
+    assert.equal(f.store.get("review-pr:review"), undefined);
+    assert.equal(f.store.binding(f.ws.id)?.prUrl, null);
   } finally {closeDb();}
 });
