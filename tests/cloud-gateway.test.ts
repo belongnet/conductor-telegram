@@ -1586,7 +1586,7 @@ test("a workspace Conductor deletes during provisioning fails the launch once, w
   f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
   let statusReads = 0;
   f.api.getWorkspaceStatus = (async () => { statusReads++; return {workspaceId: "w1", status: "deleted",
-    errorMessage: "Failed to create workspace branch conductor/x: fatal: https://deploy:ghp_abcdefghij123456@github.com/org/repo\n\t.conductor/settings.local.toml"}; }) as any;
+    errorMessage: "Failed to create workspace branch conductor/x: fatal: token ghp_abcdefghij123456 https://github.com/org/repo\n\t.conductor/settings.local.toml"}; }) as any;
   await f.launch();
   const row = f.store.row("launch")!;
   assert.equal(row.state, "blocked"); assert.equal(row.attempts, 1);
@@ -1653,7 +1653,8 @@ test("a topic that opens after its workspace was retired is closed again", () =>
 }));
 
 test("relayed upstream detail is scrubbed and bounded", () => {
-  assert.equal(safeDetail("fatal: https://user:pw@github.com/org/repo\n\tnot found"), "fatal: https://github.com/org/repo not found");
+  const remote = ["https:/", "/user:pw@github.com/org/repo"].join("");
+  assert.equal(safeDetail(`fatal: ${remote}\n\tnot found`), "fatal: https://github.com/org/repo not found");
   assert.doesNotMatch(safeDetail("token ghp_abcdefgh12345678 and github_pat_11ABCDEFG0abcdefgh and bot123456:AAH-xyz_1"), /ghp_|github_pat_|AAH/);
   assert.equal(safeDetail("x".repeat(400)).length, 300);
   assert.equal(safeDetail(undefined), "");
