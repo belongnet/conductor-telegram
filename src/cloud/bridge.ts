@@ -136,6 +136,7 @@ export function gatewayHealth(store: GatewayStore, now = Date.now()): { ready: b
   const ingress = now - (store.get<number>("ingestion-last-success") ?? 0);
   const poll = now - (store.get<number>("cloud-access-last-success") ?? store.get<number>("cloud-poll-last-success") ?? 0);
   const stalledWorkspaces = store.bindings().filter(({id}) => {
+    if (getWorkspace(id)?.archivedAt) return false;
     const error = store.get<number>(`poll-error:${id}`) ?? 0;
     const success = store.get<number>(`poll-success:${id}`) ?? 0;
     return error > success && now - success > 120_000;

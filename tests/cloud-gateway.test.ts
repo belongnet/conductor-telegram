@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { getDb, closeDb } from "../src/store/db.js";
 import { createWorkspace, getWorkspace, getDecision, answerDecision, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId, upsertRepoTopic, linkTelegramMessage } from "../src/store/queries.js";
 import { GatewayStore } from "../src/cloud/store.js";
-import { FileBridge, startBridge } from "../src/cloud/bridge.js";
+import { FileBridge, startBridge, gatewayHealth } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
 import { CloudGitHub, GitHubError } from "../src/cloud/catalog.js";
 import { enqueueTelegram, enqueueText, enqueueStatus, TelegramDelivery, processQueue, ingestTelegram, reportBlocked, safeDetail, ATTENTION_AFTER_MS } from "../src/cloud/telegram.js";
@@ -78,6 +78,50 @@ test("cloud launch sends over native API without a desktop database or checkout"
   assert.equal(f.store.row("launch")?.state, "done");
   assert.equal(JSON.parse(f.store.row("launch:created:0")!.payload).payload.disable_notification, true);
   assert.equal(JSON.parse(f.store.row("launch:sent:0")!.payload).payload.disable_notification, true);
+}));
+
+test("readiness ignores old polling errors only after the workspace is retired", () => fixture(async f => {
+  await f.launch();
+  const now = Date.now();
+  f.store.set("ingestion-last-success", now);
+  f.store.set("cloud-access-last-success", now);
+  f.store.set(`poll-success:${f.ws.id}`, now - 180_000);
+  f.store.set(`poll-error:${f.ws.id}`, now - 1000);
+  assert.equal(gatewayHealth(f.store, now).ready, false);
+  f.store.db.prepare("UPDATE workspaces SET status='stopped' WHERE id=?").run(f.ws.id);
+  assert.equal(gatewayHealth(f.store, now).ready, false);
+  f.store.db.prepare("UPDATE workspaces SET status='failed',archived_at=? WHERE id=?").run(new Date(now).toISOString(), f.ws.id);
+  const health = gatewayHealth(f.store, now);
+  assert.equal(health.ready, true);
+  assert.equal(health.checks.stalledWorkspaces, 0);
+  assert.equal(f.store.get(`poll-error:${f.ws.id}`), now - 1000);
+}));
+
+test("closing an already deleted retired topic does not block delivery", () => fixture(async f => {
+  updateWorkspaceThreadId(f.ws.id, 123);
+  f.store.db.prepare("UPDATE workspaces SET archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+  enqueueTelegram(f.store, "retire-topic", {method: "closeForumTopic", workspaceId: f.ws.id,
+    payload: {chat_id: "42", message_thread_id: 123}});
+  const methods: string[] = [];
+  await new TelegramDelivery(f.store, async method => {
+    methods.push(method);
+    throw {response: {error_code: 400, description: "Bad Request: TOPIC_ID_INVALID"}};
+  }).tick();
+  assert.deepEqual(methods, ["closeForumTopic"]);
+  assert.equal(f.store.row("retire-topic")?.state, "done");
+  assert.equal(f.store.backlog().blocked, 0);
+  assert.equal(f.store.row("topic-recover:retire-topic"), undefined);
+}));
+
+test("an invalid topic for active work is recovered without dropping its message", () => fixture(async f => {
+  updateWorkspaceThreadId(f.ws.id, 123);
+  enqueueTelegram(f.store, "active-message", {method: "sendMessage", workspaceId: f.ws.id,
+    payload: {chat_id: "42", text: "Agent reply"}});
+  await new TelegramDelivery(f.store, async () => {
+    throw {response: {error_code: 400, description: "Bad Request: TOPIC_ID_INVALID"}};
+  }).tick();
+  assert.equal(f.store.row("active-message")?.state, "pending");
+  assert.equal(JSON.parse(f.store.row("topic-recover:active-message")!.payload).method, "createForumTopic");
 }));
 
 test("replies to migrated local history never queue cloud work against an unbound record", () => fixture(async f => {
