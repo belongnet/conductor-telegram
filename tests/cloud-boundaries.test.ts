@@ -9,7 +9,7 @@ import { CloudEngine } from "../src/cloud/engine.js";
 import type { FileBridge } from "../src/cloud/bridge.js";
 import { CloudRouter } from "../src/cloud/router.js";
 import { CloudCommands } from "../src/cloud/commands.js";
-import { CloudGitHub } from "../src/cloud/catalog.js";
+import { CloudGitHub, GitHubError } from "../src/cloud/catalog.js";
 import { restoreLegacyOperations } from "../src/cloud/legacy.js";
 import { processQueue } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
@@ -34,6 +34,7 @@ function makeFixture() {
     listProjects: async () => [{id: "p1", name: "conductor-telegram", gitRemote: binding.repoUrl}],
     listProjectWorkspaces: async (): Promise<any[]> => [],
     createWorkspace: async (_input: any): Promise<any> => ({workspaceId: "router-workspace", sessionId: "router-session"}),
+    createSession: async (_input: any): Promise<any> => ({id: "new-router-session"}),
     getWorkspaceStatus: async () => ({workspaceId: "w1", status: "ready"}),
     getSessionStatus: async (id: string) => ({workspaceId: "w1", sessionId: id, status: "idle"}),
     listWorkspaceSessions: async () => [{id: "s1", name: "Task"}],
@@ -232,3 +233,120 @@ test("GitHub PR inspection validates repository and commit identities and surfac
   status = 503;
   await assert.rejects(github.pr("org/repo", payload.html_url), /503/);
 });
+
+test("GitHub access probes pull requests and treats rate limits as unknown", async () => {
+  const replies: Array<{url: string; status: number; headers?: Record<string, string>}> = [];
+  const github = new CloudGitHub("test-token", (async (url: any) => {
+    const next = replies.shift()!;
+    assert.equal(String(url), next.url);
+    return new Response("[]", {status: next.status, headers: next.headers});
+  }) as typeof fetch);
+  replies.push({url: "https://api.github.com/repos/org/repo/pulls?state=open&per_page=1", status: 200});
+  assert.deepEqual(await github.access("org/repo"), {readable: true, status: 200});
+  replies.push({url: "https://api.github.com/repos/org/private/pulls?state=open&per_page=1", status: 404});
+  assert.deepEqual(await github.access("org/private"), {readable: false, status: 404});
+  replies.push({url: "https://api.github.com/repos/org/limited/pulls?state=open&per_page=1", status: 403, headers: {"x-ratelimit-remaining": "0"}});
+  await assert.rejects(github.access("org/limited"), error => error instanceof GitHubError && error.rateLimited);
+});
+
+test("an archived router workspace is replaced in the same pass", () => fixture(async f => {
+  f.api.getWorkspaceStatus = async () => {
+    const id = f.store.get<{workspaceId: string}>("router-binding")?.workspaceId;
+    return {workspaceId: id ?? "router-workspace", status: id === "router-workspace" ? "archived" : "ready"};
+  };
+  let created = 0;
+  f.api.createWorkspace = async () => {
+    created++;
+    return {workspaceId: "router-workspace-2", sessionId: "router-session-2"};
+  };
+  const row = f.routeRow();
+  await f.router.route(row);
+  assert.equal(created, 1);
+  assert.equal(f.store.get<{workspaceId: string}>("router-binding")?.workspaceId, "router-workspace-2");
+  assert.ok(f.store.get("router-retired:router-workspace"));
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.sends[0].sessionId, "router-session-2");
+}));
+
+test("a second router death within ten minutes stops", () => fixture(async f => {
+  f.store.set("router-healed-at", Date.now());
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "router-workspace", status: "deleted", errorMessage: "quota exceeded"});
+  await assert.rejects(f.router.route(f.routeRow()), /gone \(quota exceeded\).+\/run/);
+  assert.equal(f.sends.length, 0);
+}));
+
+test("router session recovery works again after a previously recovered session disappears", () => fixture(async f => {
+  const missing = new Set(["router-session"]);
+  f.api.getSessionStatus = async id => {
+    if (missing.has(id)) throw new ConductorApiError("Session gone", 404);
+    return {workspaceId: "router-workspace", sessionId: id, status: "idle"};
+  };
+  f.api.listWorkspaceSessions = async () => [];
+  let creates = 0;
+  f.api.createSession = async () => ({id: `recovered-${++creates}`});
+  await f.router.route(f.routeRow());
+  assert.equal(f.store.get("router-session-attempted"), undefined);
+  missing.add("recovered-1");
+  f.store.enqueue("route", "router", {text: "New request", chatId: "42"}, "second-route");
+  await new CloudRouter(f.engine, "p1").route(f.store.row("second-route")!);
+  assert.equal(creates, 2);
+  assert.deepEqual(f.sends.map(s => s.sessionId), ["recovered-1", "recovered-2"]);
+}));
+
+test("router session recovery fences a lost receipt until a unique live session can be adopted", () => fixture(async f => {
+  f.api.getSessionStatus = async id => {
+    if (id === "router-session") throw new ConductorApiError("Session gone", 404);
+    return {workspaceId: "router-workspace", sessionId: id, status: "idle"};
+  };
+  f.api.listWorkspaceSessions = async () => [];
+  let creates = 0;
+  f.api.createSession = async () => { creates++; throw new Error("lost response"); };
+  const row = f.routeRow();
+  await assert.rejects(f.router.route(row), /lost response/);
+  await assert.rejects(new CloudRouter(f.engine, "p1").route(row), /receipt uncertain/);
+  assert.equal(creates, 1);
+  f.api.listWorkspaceSessions = async () => [{id: "recovered", name: "routing"}];
+  await new CloudRouter(f.engine, "p1").route(row);
+  assert.equal(creates, 1);
+  assert.equal(f.store.get("router-session-attempted"), undefined);
+  assert.equal(f.sends[0].sessionId, "recovered");
+}));
+
+for (const creation of ["workspace", "session"] as const) test(`router ${creation} creation retries after a rate limit`, () => fixture(async f => {
+  let creates = 0;
+  if (creation === "workspace") {
+    f.store.clear("router-binding");
+    f.api.createWorkspace = async () => {
+      if (++creates === 1) throw new ConductorApiError("Rate limited", 429);
+      return {workspaceId: "router-workspace", sessionId: "recovered"};
+    };
+  } else {
+    f.api.getSessionStatus = async id => {
+      if (id === "router-session") throw new ConductorApiError("Session gone", 404);
+      return {workspaceId: "router-workspace", sessionId: id, status: "idle"};
+    };
+    f.api.listWorkspaceSessions = async () => [];
+    f.api.createSession = async () => {
+      if (++creates === 1) throw new ConductorApiError("Rate limited", 429);
+      return {id: "recovered"};
+    };
+  }
+  const row = f.routeRow();
+  await assert.rejects(f.router.route(row), error => error instanceof ConductorApiError && error.status === 429);
+  await new CloudRouter(f.engine, "p1").route(row);
+  assert.equal(creates, 2);
+  assert.equal(f.sends[0].sessionId, "recovered");
+}));
+
+test("a Conductor rejection clears the router send fence and an uncertain failure keeps it", () => fixture(async f => {
+  f.api.sendMessage = async () => { throw new ConductorApiError("bad request", 400); };
+  const rejected = f.routeRow();
+  await assert.rejects(f.router.route(rejected), /refused this message: bad request/);
+  assert.equal(f.store.get("router-send-attempted:route-job"), false);
+  f.store.enqueue("route", "router", {text: "Keep\n  the original request", chatId: "42"}, "route-uncertain");
+  f.api.sendMessage = async () => { throw new Error("network down"); };
+  await assert.rejects(f.router.route(f.store.row("route-uncertain")!), /network down/);
+  assert.equal(f.store.get("router-send-attempted:route-uncertain"), true);
+  await assert.rejects(f.router.route(f.store.row("route-uncertain")!), /receipt is uncertain.+network down/);
+  assert.equal(f.sends.length, 0);
+}));

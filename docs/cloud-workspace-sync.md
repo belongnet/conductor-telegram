@@ -10,7 +10,7 @@ The runtime implementation is available in cloud-only mode. The guided setup des
 
 Set `TELEGRAM_CLOUD_SYNC_CHAT_ID` to a negative Telegram supergroup ID. The group must have Topics enabled, the bot must be an administrator with Manage Topics, and `OWNER_USER_ID` must be set. The gateway validates all of these conditions before it starts.
 
-Every minute, and whenever the owner runs `/sync`, the gateway reads the operator's unarchived Conductor Cloud workspaces. It excludes its own router workspace. A workspace is attached only when its canonical Git remote identifies exactly one accessible Conductor project. Missing or ambiguous identities fail closed and appear as sync failures in readiness health.
+Every minute, and whenever the owner runs `/sync`, the gateway reads the operator's unarchived Conductor Cloud workspaces. It excludes its own router workspace by binding and by name (`telegram-routing-…`). A workspace is attached only when its canonical Git remote identifies exactly one accessible Conductor project. Missing or ambiguous identities fail closed and appear as sync failures in readiness health.
 
 For each newly attached workspace, the gateway:
 

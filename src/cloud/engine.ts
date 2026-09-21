@@ -2,16 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ConductorApiClient, ConductorApiMessage } from "../integrations/conductor-api.js";
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
-import { assistantTextFromTranscriptEvent } from "../lanes/decide.js";
+import { assistantTextFromTranscriptEvent, GITHUB_PR_URL_RE, githubPrUrlMatchesRepo } from "../lanes/decide.js";
 import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision,
-  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend,
+  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend, getRepoTopicByThreadId,
   completePendingCloudMessageDelivery, completePendingCloudTerminalIntent, type PendingCloudTerminalIntent } from "../store/queries.js";
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
 import { FileBridge } from "./bridge.js";
-import { CloudGitHub, ProjectCatalog } from "./catalog.js";
-import { enqueueTelegram, enqueueText, enqueueStatus } from "./telegram.js";
+import { CloudGitHub, GitHubError, ProjectCatalog, type CloudPr } from "./catalog.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, TerminalError, safeDetail } from "./telegram.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
 export const DEFAULT_PROVIDERS: Provider[] = [
@@ -84,6 +84,22 @@ export function recoverableProviderError(detail: string): boolean {
     || /\bmodel\b[^\n]*(?:unavailable|not (?:found|available|supported)|does not exist|may not exist|(?:do|may) not have access)/i.test(detail);
 }
 
+/** Conductor has already refused this request; retrying it cannot produce a different answer. */
+export function conductorApiRejected(error: unknown): error is ConductorApiError {
+  return error instanceof ConductorApiError && [400, 401, 403, 404, 410, 413, 422].includes(error.status ?? 0);
+}
+
+type ReviewPick =
+  | { kind: "url"; url: string; explicit: boolean }
+  | { kind: "choose"; urls: Array<{ url: string; number: number; head: string }> }
+  | { kind: "none" }
+  | { kind: "denied"; status: number };
+
+/** GitHub outages must remain retryable instead of being cached as an empty PR search. */
+function reviewLookupMustRetry(error: unknown): boolean {
+  return !(error instanceof GitHubError && error.status === 404 && !error.rateLimited);
+}
+
 export class CloudEngine {
   readonly catalog: ProjectCatalog;
   constructor(readonly store: GatewayStore, readonly api: ConductorApiClient, readonly bridge: FileBridge,
@@ -98,12 +114,41 @@ export class CloudEngine {
       threadId: ws.telegramThreadId, ...options });
   }
 
+  /**
+   * Repository access changes only when the owner edits the token, so it is remembered: an hour when
+   * readable, five minutes when not. Only an owner command probes. Polling reads what was last learned.
+   */
+  async repoAccess(slug: string, fresh = false): Promise<{ ok: boolean; status: number }> {
+    const key = `github-access:${slug.toLowerCase()}`;
+    const cached = this.store.get<{ ok: boolean; status: number; at: number }>(key);
+    if (cached && !fresh && Date.now() - cached.at < (cached.ok ? 3600_000 : 300_000)) return cached;
+    const result = await this.github.access(slug);
+    const value = { ok: result.readable, status: result.status, at: Date.now() };
+    this.store.set(key, value);
+    return value;
+  }
+
+  /** A refusal still fresh enough to act on without asking GitHub again. */
+  githubDenied(slug: string): { status: number } | undefined {
+    const cached = this.store.get<{ ok: boolean; status: number; at: number }>(`github-access:${slug.toLowerCase()}`);
+    return cached && !cached.ok && Date.now() - cached.at < 300_000 ? cached : undefined;
+  }
+
   /** Turn status is written onto the acknowledgement card; a turn without one gets a silent message. */
   private status(id: string, trackedId: string, anchorId: string | undefined, text: string, sessionId?: string): void {
     const ws = getWorkspace(trackedId);
     if (!ws) return;
     if (anchorId && this.store.row(anchorId)) enqueueStatus(this.store, id, { anchorId, chatId: ws.telegramChatId, workspaceId: trackedId, sessionId, text });
     else this.notify(id, trackedId, text, sessionId, { silent: true });
+  }
+
+  private stopped(row: QueueRow, action: CloudAction, submitted = false): boolean {
+    if (!this.store.get(`stop:${action.trackedId}`)) return false;
+    const mayBeSubmitted = submitted || this.store.get<boolean>(`send-attempted:${row.id}`);
+    this.status(`${row.id}:stopped`, action.trackedId, action.statusId, mayBeSubmitted
+      ? "Stop requested after submission. Use /status to check Conductor."
+      : "Stopped before this was sent.");
+    return true;
   }
 
   queue(id: string, action: CloudAction): void {
@@ -121,9 +166,10 @@ export class CloudEngine {
   async action(row: QueueRow): Promise<void> {
     const action = JSON.parse(row.payload) as CloudAction;
     const ws = getWorkspace(action.trackedId);
-    if (!ws) throw new Error("Tracked workspace no longer exists");
-    if (this.store.get(`stop:${ws.id}`) && !["stop", "archive"].includes(action.type)) {
-      this.status(`${row.id}:stopped`, ws.id, action.statusId, "The task was stopped; queued work was not replayed."); return;
+    if (!ws) throw new TerminalError("This workspace's record no longer exists. Start again with /run <project> <task>.");
+    if (!["stop", "archive"].includes(action.type) && this.stopped(row, action)) return;
+    if (ws.archivedAt && !["stop", "archive"].includes(action.type)) {
+      throw new TerminalError("This workspace is no longer available. Start again with /run <project> <task>.");
     }
     if (action.mediaPending) {
       const media = this.store.row(row.id.replace(/:action$/, ":media"));
@@ -131,19 +177,34 @@ export class CloudEngine {
     }
     if (action.type === "launch") return this.launch(row, action);
     const binding = this.store.binding(ws.id);
-    if (!binding) throw new Error("This historical workspace has no verified cloud binding. Start a new task using /run <project>.");
+    if (!binding) throw new TerminalError("This historical workspace has no verified cloud binding. Start a new task using /run <project>.");
     if (action.type === "stop" || action.type === "archive") {
-      // Include in-flight creations discovered after a lost response.
-      const sessions = await this.api.listWorkspaceSessions(binding.workspaceId);
+      // Include in-flight creations discovered after a lost response. A session can disappear
+      // between the list and cancel calls; that one is already stopped, so keep settling the rest.
+      let sessions: Awaited<ReturnType<ConductorApiClient["listWorkspaceSessions"]>>;
+      try { sessions = await this.api.listWorkspaceSessions(binding.workspaceId); }
+      catch (error) {
+        if (!(conductorApiRejected(error) && [404, 410].includes(error.status ?? 0))) throw error;
+        sessions = [];
+      }
       for (const session of sessions) {
-        await this.api.cancelSession(session.id);
-        const confirmed = await this.api.getSessionStatus(session.id);
-        if (confirmed.status === "working") { this.store.retry(row.id, "Waiting for cancellation to settle", 2000); return; }
+        try {
+          await this.api.cancelSession(session.id);
+          const confirmed = await this.api.getSessionStatus(session.id);
+          if (confirmed.status === "working") { this.store.retry(row.id, "Waiting for cancellation to settle", 2000); return; }
+        } catch (error) {
+          if (!(conductorApiRejected(error) && [404, 410].includes(error.status ?? 0))) throw error;
+        }
         const state = this.store.get<SessionState>(`session:${session.id}`);
         if (state) this.store.set(`session:${session.id}`, { ...state, stopped: true, terminal: true });
       }
       if (action.type === "archive") {
-        await this.api.archiveWorkspace(binding.workspaceId);
+        try { await this.api.archiveWorkspace(binding.workspaceId); }
+        catch (error) {
+          if (!(conductorApiRejected(error) && [404, 410].includes(error.status ?? 0))) throw error;
+        }
+      }
+      if (action.type === "archive" && !ws.archivedAt) {
         this.store.assertWriter?.(); archiveWorkspaceLocally(ws.id);
         this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(ws.id);
       }
@@ -163,16 +224,26 @@ export class CloudEngine {
       await this.api.renameSession(action.sessionId ?? binding.sessionId!, action.prompt ?? "");
       this.status(`${row.id}:done`, ws.id, action.statusId, "Cloud thread renamed."); return;
     }
-    if (action.type === "review" && !this.nativeReviews) throw new Error("Native cloud reviews are disabled. Set TELEGRAM_CLOUD_REVIEW_POLICY=native.");
+    if (action.type === "review" && !this.nativeReviews) {
+      this.offerReview(row, action, "Native cloud reviews are disabled.", [
+        { text: "Ask the agent to review its own diff", prompt: "Use /review", ack: "Asking the agent to review its own diff." },
+      ]);
+      return;
+    }
     if (action.type === "thread" || action.type === "review") {
-      const author = action.type === "review" && binding.synced
-        ? nativeSessionProvider(await this.api.getSession(action.sessionId ?? binding.sessionId!)) : undefined;
-      return this.newSession(row, action, {...binding, ...author});
+      return this.newSession(row, action, binding);
     }
     const sessionId = action.sessionId ?? binding.sessionId;
-    if (!sessionId) throw new Error("Cloud workspace has no active session");
-    const actual = await this.api.getSessionStatus(sessionId);
-    if (actual.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    if (!sessionId) throw new TerminalError("This workspace has no active thread. Pick one with /threads.");
+    let actual;
+    try { actual = await this.api.getSessionStatus(sessionId); }
+    catch (error) {
+      if (conductorApiRejected(error) && [404, 410].includes(error.status ?? 0)) {
+        throw new TerminalError("This thread no longer exists. Pick another with /threads, or /run <project> <task> to start fresh.");
+      }
+      throw error;
+    }
+    if (actual.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, action, binding, sessionId, actual.status === "working");
   }
 
@@ -183,8 +254,11 @@ export class CloudEngine {
       enqueueTelegram(this.store, `create-topic:${ws.id}`, { method: "createForumTopic", workspaceId: ws.id,
         payload: { chat_id: ws.telegramChatId, name: ws.name.slice(0, 128) } }, 0);
     }
-    const project = await this.catalog.resolve(action.projectId ?? "");
-    if (this.store.get(`stop:${ws.id}`)) return;
+    // An unknown or ambiguous project is the same answer on every attempt. An API failure is not, and keeps its own retry policy.
+    const project = await this.catalog.resolve(action.projectId ?? "").catch(error => {
+      throw error instanceof ConductorApiError ? error : new TerminalError(error instanceof Error ? error.message : "Repository unavailable");
+    });
+    if (this.stopped(row, action)) return;
     const provider = action.provider ?? this.providers[0];
     let binding = this.store.binding(ws.id);
     if (!binding) {
@@ -205,10 +279,18 @@ export class CloudEngine {
           ...(provider.agent !== "cursor" ? { effort: provider.effort } : {}),
           env: { TELEGRAM_BRIDGE_URL: this.bridge.publicUrl, TELEGRAM_BRIDGE_TOKEN: credential,
             TELEGRAM_TRACKED_WORKSPACE_ID: ws.id } }); }
-        catch (error) { if (this.providerRejected(row, action, provider, error)) return; throw error; }
+        catch (error) {
+          if (error instanceof ConductorApiError && error.status === 429) this.store.set(`create-attempt:${row.id}`, false);
+          if (this.providerRejected(row, action, provider, error)) return;
+          if (conductorApiRejected(error)) {
+            this.store.set(`create-attempt:${row.id}`, false);
+            throw new TerminalError(`Conductor refused this workspace: ${safeDetail(error.message)}`);
+          }
+          throw error;
+        }
       }
       const remote = await this.api.getWorkspace(created.workspaceId);
-      if (remote.repoUrl && repositoryRemoteIdentity(remote.repoUrl) !== repositoryRemoteIdentity(project.gitRemote)) throw new Error("Created workspace repository identity mismatch");
+      if (remote.repoUrl && repositoryRemoteIdentity(remote.repoUrl) !== repositoryRemoteIdentity(project.gitRemote)) throw new TerminalError("Created workspace repository identity mismatch");
       binding = { workspaceId: created.workspaceId, projectId: project.id, repoUrl: project.gitRemote,
         repoSlug: (repositoryRemoteIdentity(project.gitRemote) ?? "").replace(/^github.com\//, ""), branch: null, prUrl: null,
         sessionId: created.sessionId, ...provider, stopped: false };
@@ -220,18 +302,220 @@ export class CloudEngine {
       })();
       this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${created.deepLink}`, undefined, { silent: true });
     }
-    if (this.store.get(`stop:${ws.id}`)) { this.queue(`stop-created:${row.id}`, { type: "stop", trackedId: ws.id }); return; }
+    if (this.stopped(row, action)) { this.queue(`stop-created:${row.id}`, { type: "stop", trackedId: ws.id }); return; }
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
     if (lifecycle.status === "initializing" || lifecycle.status === "updating") {
+      this.status(`${row.id}:provisioning`, ws.id, action.statusId, "Conductor is preparing the workspace.");
       this.store.retry(row.id, "Waiting for cloud provisioning", 5000); return;
     }
-    if (["archived", "deleted"].includes(lifecycle.status)) throw new Error("Cloud workspace is archived or deleted");
+    if (["archived", "deleted"].includes(lifecycle.status)) {
+      // Conductor destroyed the workspace while provisioning. It will be the same on every attempt, and
+      // Conductor's own reason is the only useful thing to tell the owner.
+      const detail = safeDetail(lifecycle.errorMessage);
+      this.retire(ws.id, "failed");
+      throw new TerminalError(detail ? `Conductor could not create the workspace: ${detail}` : `Conductor could not create the workspace. It was ${lifecycle.status} while provisioning.`);
+    }
     const session = await this.api.getSessionStatus(binding.sessionId!);
-    if (session.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    if (session.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, action, binding, binding.sessionId!, session.status === "working");
   }
 
+  /** A Conductor workspace that is gone stops being polled and stops owning its topic. Its history stays. */
+  private retire(trackedId: string, status: "failed" | "archived"): void {
+    const ws = getWorkspace(trackedId);
+    if (!ws || ws.archivedAt) return;
+    this.store.assertWriter?.();
+    this.store.db.transaction(() => {
+      this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(trackedId);
+      // archived_at is what ends polling and frees the topic: a later message there is routed as a fresh request.
+      this.store.db.prepare("UPDATE workspaces SET status=?,archived_at=? WHERE id=?").run(status, new Date().toISOString(), trackedId);
+      // Only a topic this gateway opened for the workspace is touched, never an adopted or repository topic, and never by deletion.
+      const opened = this.store.row(`create-topic:${trackedId}`);
+      if (!opened) return;
+      if (ws.telegramThreadId) {
+        if (getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) return;
+        // The close joins the topic's own message lane, so notices already queued for it are delivered first.
+        this.store.enqueue("telegram", `${ws.telegramChatId}:${ws.telegramThreadId}`, { method: "closeForumTopic", workspaceId: trackedId,
+          payload: { chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId } }, `retire-topic:${trackedId}`, 20);
+      } else if (opened.state === "pending") {
+        // Conductor can destroy a workspace before Telegram has opened its topic. Nothing is owed to a topic that never
+        // existed, and rows left waiting for it would hold their delivery lane forever. A creation already in flight is
+        // closed by the delivery that completes it.
+        this.store.finish(opened.id, { suppressed: "Workspace retired before its topic opened" });
+        const waiting = this.store.db.prepare("SELECT id FROM gateway_queue WHERE kind='telegram' AND state='pending' AND json_extract(payload,'$.workspaceId')=?")
+          .all(trackedId) as Array<{ id: string }>;
+        for (const row of waiting) this.store.finish(row.id, { suppressed: "Workspace retired before its topic opened" });
+      }
+    })();
+  }
+
+  /**
+   * Resolve which pull request `/review` should pin, without guessing when several
+   * are open and without treating a GitHub token problem as "no PR".
+   */
+  private async reviewTarget(row: QueueRow, action: CloudAction, binding: CloudBinding): Promise<CloudPr | undefined> {
+    const key = `review-pr:${row.id}`;
+    const cached = this.store.get<ReviewPick>(key);
+    if (cached) return this.settleReviewPick(row, action, binding, cached);
+    const access = await this.repoAccess(binding.repoSlug, true);
+    if (this.store.get(`stop:${action.trackedId}`)) return;
+    if (!access.ok) {
+      const pick: ReviewPick = { kind: "denied", status: access.status };
+      this.store.set(key, pick);
+      return this.settleReviewPick(row, action, binding, pick);
+    }
+    const pick = await this.resolveReviewPick(action, binding);
+    if (!pick || this.store.get(`stop:${action.trackedId}`)) return;
+    this.store.set(key, pick);
+    return this.settleReviewPick(row, action, binding, pick);
+  }
+
+  private async resolveReviewPick(action: CloudAction, binding: CloudBinding): Promise<ReviewPick | undefined> {
+    const prompt = action.prompt?.trim() ?? "";
+    const urlInPrompt = prompt.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/)?.[0];
+    if (urlInPrompt) return { kind: "url", url: urlInPrompt, explicit: true };
+    const numbered = prompt.match(/^#?(\d+)(?:\s|$)/);
+    if (numbered && binding.repoSlug) {
+      return { kind: "url", url: `https://github.com/${binding.repoSlug}/pull/${numbered[1]}`, explicit: true };
+    }
+    if (binding.prUrl) {
+      try {
+        const pr = await this.github.pr(binding.repoSlug, binding.prUrl);
+        if (this.store.get(`stop:${action.trackedId}`)) return;
+        if (pr.state === "open") return { kind: "url", url: pr.url, explicit: false };
+      } catch (error) {
+        if (this.store.get(`stop:${action.trackedId}`)) return;
+        if (reviewLookupMustRetry(error)) throw error;
+      }
+    }
+    const scanned = await this.scanTranscriptPrs(action, binding);
+    if (this.store.get(`stop:${action.trackedId}`)) return;
+    const open: Array<{ url: string; number: number; head: string }> = [];
+    for (const url of scanned) {
+      if (this.store.get(`stop:${action.trackedId}`)) return;
+      try {
+        const pr = await this.github.pr(binding.repoSlug, url);
+        if (pr.state === "open") open.push({ url: pr.url, number: pr.number, head: pr.head });
+      } catch (error) {
+        // A missing transcript PR is not a candidate. An outage or rate limit is
+        // different: do not persist "no PR" while GitHub is unavailable.
+        if (reviewLookupMustRetry(error)) throw error;
+      }
+    }
+    if (this.store.get(`stop:${action.trackedId}`)) return;
+    if (open.length === 1) return { kind: "url", url: open[0].url, explicit: false };
+    if (open.length > 1) return { kind: "choose", urls: open.slice(0, 4) };
+    if (binding.branch) {
+      const pr = await this.github.find(binding.repoSlug, binding.branch);
+      if (this.store.get(`stop:${action.trackedId}`)) return;
+      if (pr) return { kind: "url", url: pr.url, explicit: false };
+    }
+    return { kind: "none" };
+  }
+
+  private async scanTranscriptPrs(action: CloudAction, binding: CloudBinding): Promise<string[]> {
+    const sessions = await this.api.listWorkspaceSessions(binding.workspaceId);
+    const ordered = [...sessions].sort((a, b) => Number(b.id === binding.sessionId) - Number(a.id === binding.sessionId));
+    const repo = `https://github.com/${binding.repoSlug}`;
+    const urls: string[] = [];
+    const seen = new Set<string>();
+    for (const session of ordered.slice(0, 5)) {
+      if (this.store.get(`stop:${action.trackedId}`)) return urls;
+      const state = this.store.get<SessionState>(`session:${session.id}`);
+      if (state?.role === "review" || /^Review /.test(session.name ?? "")) continue;
+      const tail = await this.api.getSessionMessageTail(session.id, 20);
+      for (const message of tail) {
+        const text = transcriptText(message);
+        for (const match of text.matchAll(new RegExp(GITHUB_PR_URL_RE.source, "gi"))) {
+          const url = match[0].replace(/[).,]+$/, "");
+          const key = url.toLowerCase();
+          if (seen.has(key) || !githubPrUrlMatchesRepo(url, repo)) continue;
+          seen.add(key);
+          urls.push(url);
+          if (urls.length >= 6) return urls;
+        }
+      }
+    }
+    return urls;
+  }
+
+  private async settleReviewPick(row: QueueRow, action: CloudAction, binding: CloudBinding, pick: ReviewPick): Promise<CloudPr | undefined> {
+    if (pick.kind === "denied") {
+      this.offerReview(row, action, this.github.advice(binding.repoSlug, pick.status), [
+        { text: "Ask the agent to review its own diff", prompt: "Use /review", ack: "Asking the agent to review its own diff." },
+      ]);
+      return;
+    }
+    if (pick.kind === "none") {
+      this.offerReview(row, action, "No open pull request found for this workspace.", [
+        { text: "Ask the agent to review its own diff", prompt: "Use /review", ack: "Asking the agent to review its own diff." },
+        { text: "Open a PR first", prompt: "Use /ship", ack: "Asking the agent to open a pull request." },
+      ]);
+      return;
+    }
+    if (pick.kind === "choose") {
+      this.offerReview(row, action, "Which pull request should be reviewed?", pick.urls.map(pr => ({
+        text: `PR #${pr.number} (${pr.head.slice(0, 7)})`.slice(0, 64),
+        reviewUrl: pr.url, ack: `Reviewing PR #${pr.number}.`,
+      })));
+      return;
+    }
+    try {
+      const pr = await this.github.pr(binding.repoSlug, pick.url);
+      if (this.store.get(`stop:${action.trackedId}`)) return;
+      if (pr.state !== "open") {
+        if (pick.explicit) throw new TerminalError("This PR is not open");
+        this.offerReview(row, action, "No open pull request found for this workspace.", [
+          { text: "Ask the agent to review its own diff", prompt: "Use /review", ack: "Asking the agent to review its own diff." },
+          { text: "Open a PR first", prompt: "Use /ship", ack: "Asking the agent to open a pull request." },
+        ]);
+        return;
+      }
+      return pr;
+    } catch (error) {
+      if (error instanceof TerminalError) throw error;
+      if (pick.explicit && error instanceof GitHubError && !error.rateLimited && error.status === 404) {
+        throw new TerminalError(`That pull request was not found in ${binding.repoSlug}.`);
+      }
+      if (error instanceof GitHubError && !error.rateLimited && [401, 403].includes(error.status)) {
+        throw new TerminalError(this.github.advice(binding.repoSlug, error.status));
+      }
+      if (pick.explicit && !(error instanceof GitHubError) && error instanceof Error && /PR belongs to another repository|invalid PR commit identities/i.test(error.message)) {
+        throw new TerminalError(error.message);
+      }
+      throw error;
+    }
+  }
+
+  /** Choice buttons live on the turn's card and reuse the router's confirm callback. */
+  private offerReview(row: QueueRow, action: CloudAction, text: string,
+    buttons: Array<{ text: string; prompt?: string; reviewUrl?: string; ack: string }>): void {
+    const ws = getWorkspace(action.trackedId);
+    if (!ws) return;
+    const keyboard = buttons.map((button, i) => {
+      const key = `route:${createHash("sha256").update(`${row.id}:${i}`).digest("hex").slice(0, 32)}`;
+      const next: CloudAction = button.reviewUrl
+        ? { type: "review", trackedId: action.trackedId, sessionId: action.sessionId, prompt: [button.reviewUrl, action.prompt].filter(Boolean).join("\n\n") }
+        : { type: "send", trackedId: action.trackedId, sessionId: action.sessionId, prompt: button.prompt ?? "" };
+      this.store.set(key, { chatId: ws.telegramChatId, action: next, ack: button.ack, choiceFence: `review-choice:${row.id}` });
+      return [{ text: button.text, callback_data: key }];
+    });
+    const replyMarkup = { inline_keyboard: keyboard };
+    if (action.statusId && this.store.row(action.statusId)) {
+      enqueueStatus(this.store, `${row.id}:choose`, { anchorId: action.statusId, chatId: ws.telegramChatId, workspaceId: ws.id, text, replyMarkup });
+    } else {
+      enqueueText(this.store, `${row.id}:choose`, ws.telegramChatId, text, { workspaceId: ws.id, threadId: ws.telegramThreadId, replyMarkup });
+    }
+  }
+
   private async newSession(row: QueueRow, action: CloudAction, binding: CloudBinding): Promise<void> {
+    const pr = action.type === "review" ? await this.reviewTarget(row, action, binding) : undefined;
+    if (this.stopped(row, action) || (action.type === "review" && !pr)) return;
+    if (action.type === "review" && binding.synced) {
+      const author = nativeSessionProvider(await this.api.getSession(action.sessionId ?? binding.sessionId!));
+      if (this.stopped(row, action)) return;
+      binding = {...binding, ...author};
+    }
     if (action.previousSessionId) {
       const previous = await this.api.getSessionStatus(action.previousSessionId);
       const previousState = this.store.get<SessionState>(`session:${action.previousSessionId}`);
@@ -247,17 +531,12 @@ export class CloudEngine {
     const provider = selected && action.type === "review" && !action.provider && this.reviewProvider.model
       ? {...selected, model: this.reviewProvider.model} : selected;
     if (!provider || (action.type === "review" && (provider.agent === binding.agent || !this.providers.some(p => p.agent === provider.agent)))) {
-      throw new Error("No eligible review provider is enabled. Configure a provider different from the task author.");
+      throw new TerminalError("No eligible review provider is enabled. Configure a provider different from the task author.");
     }
     let review = this.store.get<{ url: string; head: string; base: string }>(`review:${row.id}`);
-    if (action.type === "review") {
-      const url = action.prompt?.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/)?.[0] ?? binding.prUrl;
-      const pr = url ? await this.github.pr(binding.repoSlug, url) : binding.branch ? await this.github.find(binding.repoSlug, binding.branch) : null;
-      if (this.store.get(`stop:${action.trackedId}`)) return;
-      if (!pr) throw new Error("Provide the PR URL with /review so its exact head commit can be verified.");
-      if (pr.state !== "open") throw new Error("This PR is not open");
-      if (review && review.head !== pr.head) throw new Error("PR head changed while starting review. Request a fresh review.");
-      if (action.reviewHead && action.reviewHead !== pr.head) throw new Error("PR head changed during recovery. Request a fresh review of the new head.");
+    if (pr) {
+      if (review && review.head !== pr.head) throw new TerminalError("PR head changed while starting review. Request a fresh review.");
+      if (action.reviewHead && action.reviewHead !== pr.head) throw new TerminalError("PR head changed during recovery. Request a fresh review of the new head.");
       review = { url: pr.url, head: pr.head, base: pr.base }; this.store.set(`review:${row.id}`, review);
       this.store.bind(action.trackedId, { ...binding, prUrl: pr.url, branch: pr.branch });
     }
@@ -268,13 +547,21 @@ export class CloudEngine {
         if (matches.length !== 1) throw new Error("Session creation is uncertain; no duplicate will be started");
         sessionId = matches[0].id;
       } else {
-        if (this.store.get(`stop:${action.trackedId}`)) return;
+        if (this.stopped(row, action)) return;
         this.store.set(`session-attempt:${row.id}`, true);
         try {
           const created = await this.api.createSession({ workspaceId: binding.workspaceId, name,
             agent: provider.agent, model: provider.model, ...(provider.agent !== "cursor" ? { effort: provider.effort } : {}) });
           sessionId = created.id;
-        } catch (error) { if (this.providerRejected(row, action, provider, error, binding)) return; throw error; }
+        } catch (error) {
+          if (error instanceof ConductorApiError && error.status === 429) this.store.set(`session-attempt:${row.id}`, false);
+          if (this.providerRejected(row, action, provider, error, binding)) return;
+          if (conductorApiRejected(error)) {
+            this.store.set(`session-attempt:${row.id}`, false);
+            throw new TerminalError(`Conductor refused this thread: ${safeDetail(error.message)}`);
+          }
+          throw error;
+        }
       }
       this.store.set(`created-session:${row.id}`, sessionId);
       this.store.set(`session:${sessionId}`, { trackedId: action.trackedId, ...provider, role: action.type === "review" ? "review" : "task",
@@ -285,7 +572,7 @@ export class CloudEngine {
       ? `Review ${review.url} at exact head ${review.head}, base ${review.base}. Verify these commits before reviewing; report a changed head instead of claiming completion. Report findings only. Do not edit files, push, approve, merge, or deploy. This session has normal Conductor permissions; these are review instructions.\n\n${action.prompt ?? ""}`
       : action.prompt ?? "";
     const session = await this.api.getSessionStatus(sessionId);
-    if (session.workspaceId !== binding.workspaceId) throw new Error("Session belongs to another cloud workspace");
+    if (session.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, { ...action, prompt }, binding, sessionId, session.status === "working");
   }
 
@@ -293,18 +580,18 @@ export class CloudEngine {
     const nativeProvider = binding.synced ? nativeSessionProvider(await this.api.getSession(sessionId)) : undefined;
     if (action.legacyRequestId) {
       const gate = pendingCloudMessageCanSend(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
-      if (gate === "mismatch") throw new Error("Legacy pending message identity mismatch; reconcile before retrying");
+      if (gate === "mismatch") throw new TerminalError("Legacy pending message identity mismatch; reconcile before retrying");
       if (gate === "missing") return;
       if (gate === "suppressed") { completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId); return; }
     }
-    if (this.store.get(`stop:${action.trackedId}`)) {
+    if (this.stopped(row, action)) {
       await this.api.cancelSession(sessionId); return;
     }
     let payload = this.store.get<{ message: string; messageId: string }>(`send:${row.id}`);
     if (!payload) {
       const files = (action.fileIds ?? []).map(id => {
         const file = this.bridge.file(id, action.trackedId);
-        if (!file) throw new Error("Attachment missing from this workspace");
+        if (!file) throw new TerminalError("Attachment missing from this workspace");
         return `${file.name} (attachment ID ${id}): ${this.bridge.link(id, action.trackedId)}`;
       });
       const bridged = !!this.store.db.prepare("SELECT 1 FROM gateway_credentials WHERE workspace_id=? AND revoked=0 LIMIT 1").get(action.trackedId);
@@ -312,11 +599,14 @@ export class CloudEngine {
       this.store.set(`send:${row.id}`, payload);
     }
     const existing = await findSubmittedMessage(this.api, sessionId, payload.messageId);
-    if (existing && !messageContainsExactText(existing.content, payload.message)) throw new Error("Message identity mismatch");
-    if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
+    if (existing && !messageContainsExactText(existing.content, payload.message)) throw new TerminalError("Message identity mismatch");
+    if (this.stopped(row, action, !!existing)) { await this.api.cancelSession(sessionId); return; }
     let submissionQueued = false;
     if (!existing) {
-      if (this.store.get(`send-attempted:${row.id}`)) throw new Error("Submission receipt is uncertain; no command will be replayed");
+      if (this.store.get(`send-attempted:${row.id}`)) {
+        const first = this.store.get<string>(`send-error:${row.id}`);
+        throw new Error(`Submission receipt is uncertain; no command will be replayed${first ? `: ${safeDetail(first)}` : ""}`);
+      }
       this.bridge.refreshQueuedLinks(payload.message, action.trackedId);
       this.store.set(`send-attempted:${row.id}`, true);
       try {
@@ -325,10 +615,16 @@ export class CloudEngine {
       }
       catch (error) {
         if (error instanceof ConductorApiError && error.status === 429) this.store.set(`send-attempted:${row.id}`, false);
+        else if (conductorApiRejected(error)) {
+          this.store.set(`send-attempted:${row.id}`, false);
+          throw new TerminalError(`Conductor refused this message: ${safeDetail(error.message)}`);
+        } else if (!this.store.get(`send-error:${row.id}`)) {
+          this.store.set(`send-error:${row.id}`, error instanceof Error ? error.message : "request failed");
+        }
         throw error;
       }
     }
-    if (this.store.get(`stop:${action.trackedId}`)) { await this.api.cancelSession(sessionId); return; }
+    if (this.stopped(row, action, true)) { await this.api.cancelSession(sessionId); return; }
     if (action.legacyRequestId) completePendingCloudMessageDelivery(action.trackedId, action.legacyRequestId, binding.workspaceId, sessionId);
     const state = {...(this.store.get<SessionState>(`session:${sessionId}`) ?? { trackedId: action.trackedId, ...binding, role: "task" as const }), ...nativeProvider};
     // A continuation keeps writing to the card of the turn it continues.
@@ -336,8 +632,7 @@ export class CloudEngine {
     if (state.sentMessageId === payload.messageId) {
       // The send state and status row are separate durable writes. Recreate the deterministic edit
       // after a restart in the narrow window between them; enqueueStatus makes this idempotent.
-      this.status(`${row.id}:sent`, action.trackedId, statusId,
-        action.recovery ? `Continuing in ${state.agent} (${state.model}).` : `Sent to ${state.agent} (${state.model}).`, sessionId);
+      this.status(`${row.id}:sent`, action.trackedId, statusId, this.sentCard(action, state), sessionId);
       return;
     }
     const episode = action.recovery ? (action.episode ?? state.episode ?? row.id) : row.id;
@@ -361,7 +656,16 @@ export class CloudEngine {
     } else this.store.set(`recovery-providers:${episode}`, [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), state.agent])]);
     updateWorkspaceStatus(action.trackedId, "running");
     this.store.set(`poll-after:${action.trackedId}`, 0);
-    this.status(`${row.id}:sent`, action.trackedId, statusId, action.recovery ? `Continuing in ${state.agent} (${state.model}).` : `Sent to ${state.agent} (${state.model}).`, sessionId);
+    this.status(`${row.id}:sent`, action.trackedId, statusId, this.sentCard(action, state), sessionId);
+  }
+
+  private sentCard(action: CloudAction, state: SessionState): string {
+    if (action.recovery) return `Continuing in ${state.agent} (${state.model}).`;
+    if (action.type === "review" && state.reviewUrl && state.reviewHead) {
+      const number = state.reviewUrl.match(/\/pull\/(\d+)/)?.[1];
+      return `Reviewing PR #${number} (${state.reviewHead.slice(0, 7)}) in ${state.agent}`;
+    }
+    return `Sent to ${state.agent} (${state.model}).`;
   }
 
   /** Only a workspace this gateway created holds a bridge credential; any other agent is told to answer inline. */
@@ -396,7 +700,11 @@ export class CloudEngine {
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
     if (["deleted", "archived"].includes(lifecycle.status)) {
       this.store.set(`poll-after:${trackedId}`, Date.now() + 60_000);
-      if (!binding.stopped && !["done", "stopped", "archived"].includes(ws.status)) this.notify(`unavailable:${trackedId}`, trackedId, "Conductor workspace is no longer available. Its history is retained; no task has been replayed.");
+      const detail = safeDetail(lifecycle.errorMessage);
+      if (!binding.stopped && !["done", "stopped", "archived", "failed"].includes(ws.status)) this.notify(`unavailable:${trackedId}`, trackedId,
+        `Conductor workspace is no longer available${detail ? `: ${detail}` : ""}. Its history is retained; no task has been replayed.`);
+      // Queued after the notice, in the same topic lane, so the notice is delivered before the topic closes.
+      this.retire(trackedId, lifecycle.status === "deleted" && detail ? "failed" : "archived");
       return;
     }
     const sessions = await this.api.listWorkspaceSessions(binding.workspaceId);
@@ -521,8 +829,14 @@ export class CloudEngine {
           prompt: "The workspace slept during this task. Inspect files and transcript, preserve completed work, and continue only unfinished work. Report uncertainty before repeating side effects." });
       }
     }
-    for (const prUrl of reportedPrUrls) {
-      try { const pr = await this.github.pr(binding.repoSlug, prUrl); this.store.bind(trackedId, { ...this.store.binding(trackedId)!, prUrl: pr.url, branch: pr.branch }); } catch { /* Unverified transcript URLs never establish repository identity. */ }
+    // A repository the token cannot read fails every verification, so a known refusal skips GitHub until it expires.
+    for (const prUrl of this.githubDenied(binding.repoSlug) ? [] : reportedPrUrls) {
+      try { const pr = await this.github.pr(binding.repoSlug, prUrl); this.store.bind(trackedId, { ...this.store.binding(trackedId)!, prUrl: pr.url, branch: pr.branch }); }
+      catch (error) {
+        // Unverified transcript URLs never establish repository identity. A refusal is classified once, so the
+        // owner can be told what to grant, and a poll never fails because that probe did.
+        if (error instanceof GitHubError && !error.rateLimited && [401, 403, 404].includes(error.status)) await this.repoAccess(binding.repoSlug, true).catch(() => undefined);
+      }
     }
     // PR reads can overlap a stop or the creation of another thread. The final
     // aggregate must include every currently persisted session for this task.

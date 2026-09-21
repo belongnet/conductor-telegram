@@ -17,6 +17,23 @@ export interface TelegramJob {
 }
 /** An edit waits this long for its acknowledgement before it is delivered as a message instead. */
 const STATUS_ANCHOR_WAIT_MS = 300_000;
+/** A card edit is silent. A failure that lands later than this may arrive after the owner stopped watching the card. */
+export const ATTENTION_AFTER_MS = 15_000;
+
+/** Retrying cannot change this outcome, so the row blocks at once and the owner reads why. */
+export class TerminalError extends Error {
+  constructor(message: string) { super(message); this.name = "TerminalError"; }
+}
+
+/** Conductor relays raw git and provider output, which can carry credentialed remotes or tokens. */
+export function safeDetail(text: unknown, max = 300): string {
+  const cleaned = String(text ?? "")
+    .replace(/\/\/[^/\s@]+@/g, "//")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})\b/g, "[redacted]")
+    .replace(/bot\d+:[\w-]+/g, "bot[redacted]")
+    .replace(/\s+/g, " ").trim();
+  return cleaned.length > max ? `${cleaned.slice(0, max - 1).trimEnd()}…` : cleaned;
+}
 
 export function telegramFailure(error: unknown): { delayMs: number; permanent: boolean; unchanged: boolean; conflict: boolean; description: string } {
   const e = error as any;
@@ -78,7 +95,7 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
  * it, across pacing retries and restarts alike. A newer state replaces an undelivered older one.
  */
 export function enqueueStatus(store: GatewayStore, id: string,
-  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string }): void {
+  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown }): void {
   store.db.transaction(() => {
     if (store.row(id)) return;
     store.assertWriter?.();
@@ -88,7 +105,8 @@ export function enqueueStatus(store: GatewayStore, id: string,
       .all(input.anchorId) as Array<{ id: string }>;
     for (const prior of pending) store.finish(prior.id, { supersededBy: id });
     const job: TelegramJob = { method: "editMessageText", statusOf: input.anchorId, workspaceId: input.workspaceId, sessionId: input.sessionId,
-      payload: { chat_id: chatId, text: escHtml(input.text), parse_mode: "HTML" } };
+      payload: { chat_id: chatId, text: escHtml(input.text), parse_mode: "HTML",
+        ...(input.replyMarkup ? { reply_markup: input.replyMarkup } : {}) } };
     store.enqueue("telegram", anchor?.conversation ?? `${chatId}:0:control`, job, id, 0);
   })();
 }
@@ -141,7 +159,12 @@ export class TelegramDelivery {
         this.store.finish(row.id, result);
         if (result?.message_id && job.workspaceId) linkTelegramMessage(String(payload.chat_id), String(result.message_id), job.workspaceId, job.sessionId);
         if (result?.message_id && job.decisionId) this.store.linkDecision(String(payload.chat_id), result.message_id, job.decisionId);
-        if (result?.message_thread_id && job.method === "createForumTopic" && job.workspaceId) updateWorkspaceThreadId(job.workspaceId, result.message_thread_id);
+        if (result?.message_thread_id && job.method === "createForumTopic" && job.workspaceId) {
+          updateWorkspaceThreadId(job.workspaceId, result.message_thread_id);
+          // The workspace can be retired while its topic creation is in flight. Close what nobody will use.
+          if (getWorkspace(job.workspaceId)?.archivedAt) enqueueTelegram(this.store, `retire-topic:${job.workspaceId}`, { method: "closeForumTopic",
+            workspaceId: job.workspaceId, payload: { chat_id: payload.chat_id, message_thread_id: result.message_thread_id } }, 20);
+        }
         this.store.set("delivery-last-success", Date.now());
         this.store.set(chatKey, Date.now() + (String(payload.chat_id).startsWith("-") ? 3100 : 1100));
       })();
@@ -171,6 +194,9 @@ export class TelegramDelivery {
           this.store.retry(row.id, failure.description, 5000, row.attempts > 5);
           return;
         }
+        // Retired work keeps its history. A late message for its closed topic is dropped, because a
+        // permanently blocked delivery row would hold gateway readiness down for good.
+        if (ws) { this.store.finish(row.id, { suppressed: "Topic closed for retired work" }); return; }
       }
       this.store.retry(row.id, failure.description, failure.delayMs, failure.permanent);
       if (!failure.permanent) this.store.set("telegram-not-before", Date.now() + failure.delayMs);
@@ -202,6 +228,39 @@ export async function ingestTelegram(store: GatewayStore, call: TelegramCall, si
       if (failure.conflict || failure.permanent) throw new Error(failure.description);
       await pause(failure.delayMs, signal);
     }
+  }
+}
+
+/**
+ * Blocked work is reported once. The turn's own card says what happened, so it never stays at its
+ * acknowledgement. A ringing message follows only when nobody is likely to be watching that card.
+ */
+export function reportBlocked(store: GatewayStore, ownerChatId: string, now = Date.now()): void {
+  const rows = store.db.prepare("SELECT id,kind,error,payload FROM gateway_queue WHERE state='blocked' AND kind!='telegram'")
+    .all() as Array<{ id: string; kind: string; error: string | null; payload: string }>;
+  for (const row of rows) {
+    // The fence key predates the card. Renaming it would report every historical blocked row again.
+    if (store.get(`blocked-notified:${row.id}`)) continue;
+    const payload = JSON.parse(row.payload);
+    const trackedId: string | undefined = payload.trackedId ?? payload.action?.trackedId;
+    const anchorId: string | undefined = payload.statusId ?? payload.action?.statusId;
+    const anchor = anchorId ? store.row(anchorId) : undefined;
+    const ws = trackedId ? getWorkspace(trackedId) : undefined;
+    const live = ws && !ws.archivedAt ? ws : undefined;
+    const reason = row.error ?? "Operation failed";
+    store.db.transaction(() => {
+      if (anchor) enqueueStatus(store, `blocked-card:${row.id}`, { anchorId: anchor.id, chatId: ws?.telegramChatId ?? ownerChatId,
+        workspaceId: live?.id, text: `Not done: ${reason}` });
+      // The anchor's age, not the row's: a system continuation is young when it blocks, yet nobody is watching its card.
+      if (!anchor || now - anchor.created_at > ATTENTION_AFTER_MS) {
+        // A gateway-built route or media row names the chat it answers. A raw update can come from any chat, so it reports to the owner.
+        const chatId = ws?.telegramChatId ?? (row.kind !== "update" && payload.chatId ? String(payload.chatId) : ownerChatId);
+        const threadId = ws ? live?.telegramThreadId : row.kind !== "update" && payload.chatId ? payload.threadId : undefined;
+        enqueueText(store, `blocked:${row.id}`, chatId, `${ws ? "Operation" : "Telegram operation"} needs attention: ${reason}`,
+          { workspaceId: live?.id, threadId });
+      }
+      store.set(`blocked-notified:${row.id}`, true);
+    })();
   }
 }
 
@@ -239,7 +298,22 @@ async function processClaimedRow(store: GatewayStore, row: QueueRow, handler: (r
         store.retry(row.id, failure.description, failure.delayMs); return;
       }
       if (error instanceof ConductorApiError && error.retryable) {
+        const previous = store.get<number>(`retryable-failures:${row.id}`) ?? 0;
+        store.set(`retryable-failures:${row.id}`, previous + 1);
+        if (previous + 1 === 3) {
+          const payload = JSON.parse(row.payload);
+          const trackedId: string | undefined = payload.trackedId ?? payload.action?.trackedId;
+          const anchorId: string | undefined = payload.statusId ?? payload.action?.statusId;
+          const ws = trackedId ? getWorkspace(trackedId) : undefined;
+          if (anchorId && ws && store.row(anchorId)) {
+            enqueueStatus(store, `slow:${row.id}`, { anchorId, chatId: ws.telegramChatId, workspaceId: ws.id,
+              text: "Conductor is not answering yet. Still trying; nothing was lost." });
+          }
+        }
         store.retry(row.id, error.message, Math.max(error.retryAfterMs, Math.min(60_000, row.attempts * 5000))); return;
+      }
+      if (error instanceof TerminalError) {
+        store.retry(row.id, error.message.replace(/bot\d+:[\w-]+/g, "bot[redacted]"), 0, true); return;
       }
       const previous = store.get<number>(`queue-failures:${row.id}`) ?? 0;
       store.set(`queue-failures:${row.id}`, previous + 1);

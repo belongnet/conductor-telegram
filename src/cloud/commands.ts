@@ -4,8 +4,9 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import type { GatewayStore, QueueRow } from "./store.js";
 import { CloudEngine, type CloudAction, type Provider } from "./engine.js";
+import { GitHubError, githubSlug } from "./catalog.js";
 import { gatewayHealth } from "./bridge.js";
-import { enqueueTelegram, enqueueText, type TelegramCall } from "./telegram.js";
+import { enqueueTelegram, enqueueText, TerminalError, type TelegramCall } from "./telegram.js";
 import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
@@ -44,11 +45,13 @@ export function repoTopicCandidates(repoName: string, projects: ConductorApiProj
 }
 
 const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "office_hours", "design_review", "gstack", "skill"]);
-const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
+const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR number or URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
 
 interface MediaJob {
   action?: CloudAction; decisionId?: number; chatId: string; threadId?: number; text?: string;
   fileId: string; fileName: string; voice: boolean;
+  /** The acknowledgement that serves as this job's status card, so a failure lands on it. */
+  statusId?: string;
 }
 
 export class CloudCommands {
@@ -115,10 +118,16 @@ export class CloudCommands {
         reply(`Linked to ${selection.projectLabel}. Send a message here to start a new workspace in it.`); return;
       }
       if (data.startsWith("route:")) {
-        const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob }>(data);
+        const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob; ack?: string; choiceFence?: string }>(data);
         if (!proposed || proposed.chatId !== chatId) return;
+        if (proposed.choiceFence && this.store.get(proposed.choiceFence)) return;
+        if (this.store.row(`${data}:confirmed:action`)) return;
         const action = { ...proposed.action, statusId };
-        this.enqueueTurn(reply, "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`); return;
+        this.store.db.transaction(() => {
+          if (proposed.choiceFence) this.store.set(proposed.choiceFence, true);
+          this.enqueueTurn(reply, proposed.ack ?? "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`);
+        })();
+        return;
       }
       return;
     }
@@ -132,7 +141,7 @@ export class CloudCommands {
     }
     const command = match?.[1]?.toLowerCase();
     let args = match?.[3]?.trim() ?? "";
-    if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}`, {threadId, priority: 0, silent: true}); return; }
+    if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}${this.githubNote()}`, {threadId, priority: 0, silent: true}); return; }
     if (command === "sync") {
       if (!this.syncChatId) { reply("Cloud workspace sync needs TELEGRAM_CLOUD_SYNC_CHAT_ID set to a forum group."); return; }
       this.store.set("cloud-sync-after", 0);
@@ -156,7 +165,10 @@ export class CloudCommands {
     }
     if (["projects", "repos"].includes(command ?? "")) {
       const projects = await this.engine.catalog.projects(true);
-      reply(projects.map((p, i) => `${i + 1}. ${p.name}\n${p.id}\n${p.gitRemote}`).join("\n\n") || "No Conductor projects are available."); return;
+      const denied = await this.unreadableRepositories(projects.map(p => { try { return githubSlug(p.gitRemote); } catch { return ""; } }));
+      const slugOf = (p: ConductorApiProject): string => { try { return githubSlug(p.gitRemote); } catch { return ""; } };
+      reply((projects.map((p, i) => `${i + 1}. ${p.name}\n${p.id}\n${p.gitRemote}${denied.has(slugOf(p)) ? "\nGitHub: the gateway's token cannot read this repository" : ""}`).join("\n\n") || "No Conductor projects are available.") +
+        (denied.size ? "\n\n/review and /prs need that access. Add those repositories to the gateway's GitHub token with Pull requests: read." : "")); return;
     }
     if (command === "link") {
       const topic = threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
@@ -180,11 +192,18 @@ export class CloudCommands {
       const rows = getAllWorkspacesForChat(chatId, -1);
       if (command === "prs" || command === "ship_status") {
         const lines: string[] = [];
+        // No PR can ever be verified in a repository the token cannot read, so that is said instead of "no PRs yet".
+        const denied = await this.unreadableRepositories(rows.map(ws => this.store.binding(ws.id)?.repoSlug ?? ""));
         for (const ws of rows) {
-          const binding = this.store.binding(ws.id); if (!binding?.prUrl) continue;
+          const binding = this.store.binding(ws.id); if (!binding?.prUrl || denied.has(binding.repoSlug)) continue;
           try { const pr = await this.engine.github.pr(binding.repoSlug, binding.prUrl); lines.push(`${ws.name}: ${pr.merged ? "merged" : pr.state} ${pr.head.slice(0, 12)}\n${pr.url}`); }
-          catch { lines.push(`${ws.name}: PR status unavailable`); }
+          catch (error) {
+            const refused = error instanceof GitHubError && !error.rateLimited && [401, 403, 404].includes(error.status)
+              ? await this.engine.repoAccess(binding.repoSlug, true).catch(() => undefined) : undefined;
+            if (refused && !refused.ok) denied.set(binding.repoSlug, refused.status); else lines.push(`${ws.name}: PR status unavailable`);
+          }
         }
+        for (const [slug, status] of denied) lines.push(this.engine.github.advice(slug, status));
         reply(lines.join("\n\n") || "No verified PRs yet. Include the PR URL in /review or report it from the agent.");
       } else reply(rows.map(ws => `${ws.name} · ${ws.status}${this.store.binding(ws.id) ? " · cloud" : " · historical"}\n${ws.id}`).join("\n\n") || "No tracked workspaces.");
       return;
@@ -298,11 +317,11 @@ export class CloudCommands {
     }
     if (!target && !projectId) {
       if (media?.voice) {
-        this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId }, `${row.id}:media`);
+        this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId, statusId }, `${row.id}:media`);
         reply("Voice note received. Transcribing it before target confirmation."); return;
       }
       if (!prompt) { reply("Choose a workspace topic or /run <project> before sending attachments."); return; }
-      this.store.enqueue("route", "native-router", { text: prompt, chatId, threadId, ...(media ? {media: {...media, chatId, threadId}} : {}) }, `${row.id}:route`);
+      this.store.enqueue("route", "native-router", { text: prompt, chatId, threadId, statusId, ...(media ? {media: {...media, chatId, threadId}} : {}) }, `${row.id}:route`);
       reply("Finding a target. I’ll ask you to confirm it before starting work."); return;
     }
     if (!target) {
@@ -320,6 +339,26 @@ export class CloudCommands {
     const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt, statusId };
     this.enqueueTurn(reply, (media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked,
       `${row.id}:action`, action, media ? { ...media, chatId, threadId } : undefined, row.id);
+  }
+
+  /** Repositories the gateway's GitHub token cannot read. An outage or a rate limit leaves a repository unchecked rather than accused. */
+  private async unreadableRepositories(slugs: string[]): Promise<Map<string, number>> {
+    const denied = new Map<string, number>();
+    await Promise.all([...new Set(slugs.filter(Boolean))].map(async slug => {
+      try { const access = await this.engine.repoAccess(slug); if (!access.ok) denied.set(slug, access.status); } catch { /* Not checked. */ }
+    }));
+    return denied;
+  }
+
+  /** `/ping` is a liveness check in its own lane, so it reports only what an earlier command already learned. */
+  private githubNote(): string {
+    const rows = this.store.db.prepare("SELECT key,value FROM gateway_state WHERE key LIKE 'github-access:%'").all() as Array<{ key: string; value: string }>;
+    const denied = rows.filter(row => {
+      try { const value = JSON.parse(row.value) as { ok?: boolean; at?: number }; return value.ok === false && typeof value.at === "number" && Date.now() - value.at < 300_000; }
+      catch { return false; }
+    })
+      .map(row => row.key.slice("github-access:".length)).sort();
+    return denied.length ? `\nGitHub token cannot read: ${denied.join(", ")}` : "";
   }
 
   /** The status-card anchor and the work it represents become durable in one commit, anchor first. */
@@ -388,36 +427,36 @@ export class CloudCommands {
     const job = JSON.parse(row.payload) as MediaJob;
     if (job.action && this.store.get(`stop:${job.action.trackedId}`)) return;
     const info = await this.telegram("getFile", { file_id: job.fileId });
-    if (!info.file_path || info.file_size > 50 * 1024 * 1024) throw new Error("Telegram file unavailable or too large");
+    if (!info.file_path || info.file_size > 50 * 1024 * 1024) throw new TerminalError("Telegram file unavailable or too large");
     const token = process.env.BOT_TOKEN;
-    if (!token) throw new Error("Telegram credentials missing");
+    if (!token) throw new TerminalError("Telegram credentials missing");
     const response = await fetch(`https://api.telegram.org/file/bot${token}/${info.file_path}`, { signal: AbortSignal.timeout(60_000), redirect: "error" });
     if (!response.ok) throw new Error(`Telegram file download failed (${response.status})`);
     const chunks: Uint8Array[] = []; let size = 0;
-    for await (const chunk of response.body as any) { size += chunk.length; if (size > 50 * 1024 * 1024) throw new Error("Attachment too large"); chunks.push(chunk); }
+    for await (const chunk of response.body as any) { size += chunk.length; if (size > 50 * 1024 * 1024) throw new TerminalError("Attachment too large"); chunks.push(chunk); }
     const bytes = Buffer.concat(chunks);
     if (job.voice) {
       const local = path.join(tmpdir(), `ct-voice-${createHash("sha256").update(row.id).digest("hex")}`);
       writeFileSync(local, bytes, { mode: 0o600 });
       try {
         const transcript = await transcribeVoiceMessage(local);
-        if (!transcript) throw new Error("Voice transcription failed. Please retry or send text.");
+        if (!transcript) throw new TerminalError("Voice transcription failed. Please retry or send text.");
         if (job.action) job.action.prompt = [job.action.prompt, transcript].filter(Boolean).join("\n\n");
         else job.text = [job.text, transcript].filter(Boolean).join("\n\n");
       } finally { unlinkSync(local); }
     } else {
-      if (!job.action) throw new Error("Choose a workspace before sending this file");
+      if (!job.action) throw new TerminalError("Choose a workspace before sending this file");
       let id = this.store.get<string>(`media-file:${row.id}`);
       if (!id) { id = this.engine.bridge.save(job.action.trackedId, job.fileName, bytes); this.store.set(`media-file:${row.id}`, id); }
       job.action.fileIds = [id];
     }
     if (!job.action) {
-      this.store.enqueue("route", "native-router", { text: job.text, chatId: job.chatId, threadId: job.threadId }, `${row.id}:route`);
+      this.store.enqueue("route", "native-router", { text: job.text, chatId: job.chatId, threadId: job.threadId, statusId: job.statusId }, `${row.id}:route`);
       return;
     }
     if (job.decisionId) {
       const decision = getDecision(job.decisionId);
-      if (!decision || decision.workspaceId !== job.action.trackedId) throw new Error("Question workspace mismatch");
+      if (!decision || decision.workspaceId !== job.action.trackedId) throw new TerminalError("Question workspace mismatch");
       const files = (job.action.fileIds ?? []).map(id => `Attachment ${id}: ${this.engine.bridge.link(id, job.action!.trackedId)}`);
       if (!decision.answeredAt) answerDecision(job.decisionId, [job.action.prompt, ...files].filter(Boolean).join("\n"));
       enqueueText(this.store, `${row.id}:answered`, job.chatId, "Answer recorded.", { threadId: job.threadId }); return;

@@ -34,7 +34,7 @@ The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 
 
 In cloud-only mode, agent replies, questions, progress reports, and artifact links render Markdown as Telegram rich text, including bold, italics, strikethrough, inline code, code blocks, and clickable web links. Long replies keep their formatting across messages; answer buttons appear on the last message of a long question. Local file links remain readable as a label and path, and formatting that cannot be rendered safely falls back to literal text.
 
-Each message that starts, continues, or controls Cloud work gets one status card. The acknowledgement arrives silently and is edited in place as the task is handed to the agent and when it finishes, so only the agent's replies notify you. Agents in workspaces the gateway created are told about the Telegram MCP tools; agents in workspaces discovered from Conductor are asked to answer inline instead.
+Each message that starts, continues, or controls Cloud work gets one status card. The acknowledgement arrives silently and is edited in place as the task is handed to the agent and when it finishes. Failures update the card to `Not done: …`; a failure reported more than 15 seconds after the acknowledgement also sends a notification. Agents in workspaces the gateway created are told about the Telegram MCP tools; agents in workspaces discovered from Conductor are asked to answer inline instead.
 
 ## Architecture
 
@@ -98,7 +98,8 @@ src/
 | `/lanes` | `/lanes [pause\|resume\|retry\|provider-disable\|archive-approval\|shadow\|cutover\|rollback]` | Durable lane status and audited controls when Manifest v2 is configured; legacy scheduler controls otherwise |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
 | `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
-| `/review` | `/review <workspace> [instructions]` | Launch a code review session |
+| `/review` | `/review <workspace> [instructions]` (hybrid mode) | Launch a local code review session |
+| `/review` | `/review [PR number or URL]` (inside a topic, cloud-only mode) | With native reviews enabled, review that workspace's pull request. Bare `/review` finds the PR; `/review 500` and a GitHub URL also work |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
 | `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
 | `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md or AGENTS.md |
@@ -135,7 +136,7 @@ If a local prompt later fails because its CLI login disappeared, the bot can tak
 
 Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, query (`/projects`, `/fleet`), or run the lanes scheduler (`/lanes`) — without it, every member of the configured group shares that privilege.
 
-The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
+The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so hybrid-mode cloud `/review` attempts fail closed. Cloud-only mode can opt into [native reviews](docs/ovh-native-gateway.md#native-tasks-reviews-and-recovery), which use normal Conductor permissions.
 
 Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
