@@ -32,6 +32,12 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.11.1] - 2026-09-21
+
+### Fixed
+- Retired workspaces no longer keep readiness unhealthy because of historical polling errors.
+- Telegram's `TOPIC_ID_INVALID` response now completes cleanup for retired topics and recovers a replacement topic for active work without losing the pending message.
+
 ## [0.11.0] - 2026-09-20
 
 ### Fixed

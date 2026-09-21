@@ -182,7 +182,7 @@ export class TelegramDelivery {
       }
       // The card was deleted or cannot be edited; its state still has to reach the topic.
       if (job.method === "editMessageText" && failure.permanent) { this.fallback(row, job, failure.description); return; }
-      if (/message thread not found|message_thread_not_found|topic_deleted|TOPIC_CLOSED/i.test(failure.description) && job.workspaceId) {
+      if (/message thread not found|message_thread_not_found|topic_deleted|TOPIC_ID_INVALID|TOPIC_CLOSED/i.test(failure.description) && job.workspaceId) {
         // Recover through the same durable topic-operation queue. Do not leak into General.
         const ws = getWorkspace(job.workspaceId);
         if (ws && !ws.archivedAt && ws.status !== "archived") {
