@@ -34,6 +34,7 @@ function makeFixture() {
     listProjects: async () => [{id: "p1", name: "conductor-telegram", gitRemote: binding.repoUrl}],
     listProjectWorkspaces: async (): Promise<any[]> => [],
     createWorkspace: async (_input: any): Promise<any> => ({workspaceId: "router-workspace", sessionId: "router-session"}),
+    createSession: async (_input: any): Promise<any> => ({id: "new-router-session"}),
     getWorkspaceStatus: async () => ({workspaceId: "w1", status: "ready"}),
     getSessionStatus: async (id: string) => ({workspaceId: "w1", sessionId: id, status: "idle"}),
     listWorkspaceSessions: async () => [{id: "s1", name: "Task"}],
@@ -272,6 +273,69 @@ test("a second router death within ten minutes stops", () => fixture(async f => 
   f.api.getWorkspaceStatus = async () => ({workspaceId: "router-workspace", status: "deleted", errorMessage: "quota exceeded"});
   await assert.rejects(f.router.route(f.routeRow()), /gone \(quota exceeded\).+\/run/);
   assert.equal(f.sends.length, 0);
+}));
+
+test("router session recovery works again after a previously recovered session disappears", () => fixture(async f => {
+  const missing = new Set(["router-session"]);
+  f.api.getSessionStatus = async id => {
+    if (missing.has(id)) throw new ConductorApiError("Session gone", 404);
+    return {workspaceId: "router-workspace", sessionId: id, status: "idle"};
+  };
+  f.api.listWorkspaceSessions = async () => [];
+  let creates = 0;
+  f.api.createSession = async () => ({id: `recovered-${++creates}`});
+  await f.router.route(f.routeRow());
+  assert.equal(f.store.get("router-session-attempted"), undefined);
+  missing.add("recovered-1");
+  f.store.enqueue("route", "router", {text: "New request", chatId: "42"}, "second-route");
+  await new CloudRouter(f.engine, "p1").route(f.store.row("second-route")!);
+  assert.equal(creates, 2);
+  assert.deepEqual(f.sends.map(s => s.sessionId), ["recovered-1", "recovered-2"]);
+}));
+
+test("router session recovery fences a lost receipt until a unique live session can be adopted", () => fixture(async f => {
+  f.api.getSessionStatus = async id => {
+    if (id === "router-session") throw new ConductorApiError("Session gone", 404);
+    return {workspaceId: "router-workspace", sessionId: id, status: "idle"};
+  };
+  f.api.listWorkspaceSessions = async () => [];
+  let creates = 0;
+  f.api.createSession = async () => { creates++; throw new Error("lost response"); };
+  const row = f.routeRow();
+  await assert.rejects(f.router.route(row), /lost response/);
+  await assert.rejects(new CloudRouter(f.engine, "p1").route(row), /receipt uncertain/);
+  assert.equal(creates, 1);
+  f.api.listWorkspaceSessions = async () => [{id: "recovered", name: "routing"}];
+  await new CloudRouter(f.engine, "p1").route(row);
+  assert.equal(creates, 1);
+  assert.equal(f.store.get("router-session-attempted"), undefined);
+  assert.equal(f.sends[0].sessionId, "recovered");
+}));
+
+for (const creation of ["workspace", "session"] as const) test(`router ${creation} creation retries after a rate limit`, () => fixture(async f => {
+  let creates = 0;
+  if (creation === "workspace") {
+    f.store.clear("router-binding");
+    f.api.createWorkspace = async () => {
+      if (++creates === 1) throw new ConductorApiError("Rate limited", 429);
+      return {workspaceId: "router-workspace", sessionId: "recovered"};
+    };
+  } else {
+    f.api.getSessionStatus = async id => {
+      if (id === "router-session") throw new ConductorApiError("Session gone", 404);
+      return {workspaceId: "router-workspace", sessionId: id, status: "idle"};
+    };
+    f.api.listWorkspaceSessions = async () => [];
+    f.api.createSession = async () => {
+      if (++creates === 1) throw new ConductorApiError("Rate limited", 429);
+      return {id: "recovered"};
+    };
+  }
+  const row = f.routeRow();
+  await assert.rejects(f.router.route(row), error => error instanceof ConductorApiError && error.status === 429);
+  await new CloudRouter(f.engine, "p1").route(row);
+  assert.equal(creates, 2);
+  assert.equal(f.sends[0].sessionId, "recovered");
 }));
 
 test("a Conductor rejection clears the router send fence and an uncertain failure keeps it", () => fixture(async f => {

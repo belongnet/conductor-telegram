@@ -143,6 +143,7 @@ export class CloudRouter {
       store.set(`router-retired:${workspaceId}`, true);
       store.clear("router-binding");
       store.clear("router-create-attempted");
+      store.clear("router-session-attempted");
       store.set("router-healed-at", Date.now());
     })();
   }
@@ -173,6 +174,7 @@ export class CloudRouter {
       try {
         binding = await this.engine.api.createWorkspace({ projectId, name, agent: provider.agent, model: provider.model });
       } catch (error) {
+        if (error instanceof ConductorApiError && error.status === 429) store.clear("router-create-attempted");
         if (conductorApiRejected(error)) {
           store.set("router-create-attempted", false);
           throw new TerminalError(`Conductor refused to create the router: ${safeDetail(error.message)}. ${ROUTING_HINT}`);
@@ -180,7 +182,10 @@ export class CloudRouter {
         throw error;
       }
     }
-    store.set("router-binding", binding);
+    store.db.transaction(() => {
+      store.set("router-binding", binding);
+      store.clear("router-session-attempted");
+    })();
     return binding;
   }
 
@@ -192,8 +197,14 @@ export class CloudRouter {
     try {
       const created = await this.engine.api.createSession({ workspaceId, name: "routing", agent: provider.agent, model: provider.model,
         ...(provider.agent !== "cursor" ? { effort: provider.effort } : {}) });
-      return { workspaceId, sessionId: created.id };
+      const next = { workspaceId, sessionId: created.id };
+      store.db.transaction(() => {
+        store.set("router-binding", next);
+        store.clear("router-session-attempted");
+      })();
+      return next;
     } catch (error) {
+      if (error instanceof ConductorApiError && error.status === 429) store.clear("router-session-attempted");
       if (conductorApiRejected(error)) {
         store.set("router-session-attempted", false);
         throw new TerminalError(`Conductor refused to create the router session: ${safeDetail(error.message)}. ${ROUTING_HINT}`);
@@ -212,7 +223,10 @@ export class CloudRouter {
     const sessions = (await this.engine.api.listWorkspaceSessions(binding.workspaceId)).filter(s => !s.archivedAt);
     if (sessions.length === 1) {
       const next = { workspaceId: binding.workspaceId, sessionId: sessions[0].id };
-      this.engine.store.set("router-binding", next);
+      this.engine.store.db.transaction(() => {
+        this.engine.store.set("router-binding", next);
+        this.engine.store.clear("router-session-attempted");
+      })();
       return next;
     }
     if (sessions.length === 0) {

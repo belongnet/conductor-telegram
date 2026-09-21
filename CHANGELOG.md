@@ -40,6 +40,8 @@ All notable changes to conductor-telegram are documented here.
 - A workspace Conductor destroys while provisioning fails once, with Conductor's own reason, and is retired so it is no longer polled.
 - `/projects`, `/prs`, `/ping`, and cloud preflight report repositories the gateway's GitHub token cannot read.
 - An archived or deleted router workspace is replaced in the same pass. A Conductor 4xx refusal clears the send fence and tells you why; an uncertain failure still will not replay.
+- GitHub outages and rate limits remain retryable during PR discovery. Review choices preserve the selected thread and only one button can start work.
+- Router recovery works across repeated missing sessions and retries rate-limited creation. Stop and archive continue past missing sessions, and a stop received during a lookup or send updates the original turn card.
 
 ### Changed
 - `/review` in cloud-only mode accepts a PR number or URL. The help text and status card name the PR being reviewed.

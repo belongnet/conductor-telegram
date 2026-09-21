@@ -115,6 +115,30 @@ test("uncertain workspace creation is reconciled without another create", () => 
   assert.match(f.store.row("launch")?.error ?? "", /uncertain/);
 }));
 
+for (const type of ["launch", "thread"] as const) test(`${type} retries creation after a rate limit`, () => fixture(async f => {
+  if (type === "thread") await f.launch();
+  let creates = 0;
+  if (type === "launch") {
+    const create = f.api.createWorkspace;
+    f.api.createWorkspace = async () => {
+      if (++creates === 1) throw new ConductorApiError("Rate limited", 429);
+      return create();
+    };
+  } else {
+    const create = f.api.createSession;
+    f.api.createSession = async input => {
+      if (++creates === 1) throw new ConductorApiError("Rate limited", 429);
+      return create(input);
+    };
+  }
+  f.engine.queue("limited-create", {type, trackedId: f.ws.id, projectId: "p1", prompt: "Start this task"});
+  const row = f.store.row("limited-create")!;
+  await assert.rejects(f.engine.action(row), error => error instanceof ConductorApiError && error.status === 429);
+  await f.engine.action(row);
+  assert.equal(creates, 2);
+  assert.equal(f.counts().sends, type === "thread" ? 2 : 1);
+}));
+
 test("stop during creation prevents the first prompt from being sent", () => fixture(async f => {
   const original = f.api.createWorkspace;
   f.api.createWorkspace = async () => { const created = await original(); f.engine.queue("stop", { type: "stop", trackedId: f.ws.id }); return created; };
@@ -1684,7 +1708,7 @@ test("short /review forms skip the transcript scan", () => fixture(async f => {
   f.api.listWorkspaceSessions = async () => { scanned++; return list(); };
   f.api.getSessionMessageTail = async () => { scanned++; return []; };
   f.engine.github.pr = async (_slug, url) => { assert.equal(url, "https://github.com/org/repo/pull/500"); return openPr(500); };
-  for (const prompt of ["500", "#500"]) {
+  for (const prompt of ["500", "#500", "500 focus on auth", "#500 focus on auth"]) {
     const id = `review-${prompt}`;
     scanned = 0;
     f.engine.queue(id, {type: "review", trackedId: f.ws.id, prompt});
@@ -1694,7 +1718,7 @@ test("short /review forms skip the transcript scan", () => fixture(async f => {
   }
 }));
 
-test("several transcript PRs are never guessed and a second tap adds nothing", () => fixture(async f => {
+test("several transcript PRs require one choice and later taps on either button add nothing", () => fixture(async f => {
   await f.launch();
   enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
   f.messages.push({id: "prs", sessionId: "s1", type: "assistant",
@@ -1707,14 +1731,100 @@ test("several transcript PRs are never guessed and a second tap adds nothing", (
   const card = JSON.parse(f.store.row("review:choose")!.payload);
   assert.equal(card.payload.text, "Which pull request should be reviewed?");
   const key = card.payload.reply_markup.inline_keyboard[0][0].callback_data;
+  const otherKey = card.payload.reply_markup.inline_keyboard[1][0].callback_data;
   const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
-  for (const id of [1, 2]) {
-    f.store.ingest([{update_id: id, callback_query: {id: `cb-${id}`, data: key, from: {id: 9}, message: {chat: {id: 42}}}}]);
+  for (const [id, data] of [[1, key], [2, key], [3, otherKey]] as const) {
+    f.store.ingest([{update_id: id, callback_query: {id: `cb-${id}`, data, from: {id: 9}, message: {chat: {id: 42}}}}]);
     await processQueue(f.store, ["update"], r => commands.handle(r));
   }
   const actions = f.store.db.prepare("SELECT id,payload FROM gateway_queue WHERE kind='cloud' AND id LIKE '%confirmed:action'").all() as any[];
   assert.equal(actions.length, 1);
   assert.equal(JSON.parse(actions[0].payload).prompt, "https://github.com/org/repo/pull/8");
+}));
+
+test("review choices preserve the selected thread and roll back if queueing fails", () => fixture(async f => {
+  await f.launch();
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, sessionId: "selected-thread"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  const card = JSON.parse(f.store.row("review:choose:0")!.payload);
+  const key = card.payload.reply_markup.inline_keyboard[0][0].callback_data;
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  f.store.ingest([{update_id: 1, callback_query: {id: "cb", data: key, from: {id: 9}, message: {chat: {id: 42}}}}]);
+  const originalQueue = f.engine.queue.bind(f.engine);
+  f.engine.queue = () => { throw new Error("Queue unavailable"); };
+  await assert.rejects(commands.handle(f.store.row("update:1")!), /Queue unavailable/);
+  assert.equal(f.store.get("review-choice:review"), undefined);
+  assert.equal(f.store.row("update:1:reply:0"), undefined);
+  f.engine.queue = originalQueue;
+  await commands.handle(f.store.row("update:1")!);
+  const action = JSON.parse(f.store.row(`${key}:confirmed:action`)!.payload);
+  assert.equal(action.sessionId, "selected-thread");
+  assert.equal(action.prompt, "Use /review");
+}));
+
+for (const type of ["stop", "archive"] as const) {
+  for (const missingAt of ["cancel", "status"] as const) {
+    test(`${type} continues cancelling other sessions after a ${missingAt} 404`, () => fixture(async f => {
+      await f.launch();
+      f.sessions.push({id: "s2", name: "Second task"});
+      const cancelled: string[] = []; let archived = 0;
+      f.api.cancelSession = async id => {
+        cancelled.push(id);
+        if (id === "s1" && missingAt === "cancel") throw new ConductorApiError("Gone", 404);
+        return {workspaceId: "w1", sessionId: id, status: "idle", canceledQueuedMessages: 0};
+      };
+      const getStatus = f.api.getSessionStatus;
+      f.api.getSessionStatus = async id => {
+        if (id === "s1" && missingAt === "status") throw new ConductorApiError("Gone", 404);
+        return getStatus(id);
+      };
+      f.api.archiveWorkspace = async () => { archived++; return {workspaceId: "w1", status: "archived"}; };
+      f.engine.queue("control", {type, trackedId: f.ws.id});
+      await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+      assert.deepEqual(cancelled, ["s1", "s2"]);
+      assert.equal(archived, type === "archive" ? 1 : 0);
+      assert.equal(f.store.row("control")!.state, "done");
+      assert.equal(f.store.get<any>("session:s1")?.terminal, true);
+    }));
+  }
+}
+
+for (const mode of ["explicit", "cached", "transcript"] as const) {
+  for (const failure of [new GitHubError("Unavailable", 503), new GitHubError("Rate limited", 403, true), new TypeError("fetch failed")]) {
+    test(`${mode} review retries ${failure.message} without claiming a PR is missing or choosing another`, () => fixture(async f => {
+      await f.launch();
+      if (mode === "cached") f.store.bind(f.ws.id, {...f.store.binding(f.ws.id)!, prUrl: openPr(8).url});
+      if (mode === "transcript") f.messages.push({id: "prs", sessionId: "s1", type: "assistant", content: `${openPr(9).url} ${openPr(8).url}`});
+      let unavailable = true;
+      f.engine.github.pr = async (_slug, url) => {
+        if (url === openPr(8).url && unavailable) throw failure;
+        return openPr(Number(url.split("/").at(-1)));
+      };
+      f.engine.queue("review", {type: "review", trackedId: f.ws.id, prompt: mode === "explicit" ? "8" : undefined});
+      await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+      assert.equal(f.store.row("review")!.state, "pending");
+      assert.equal(f.sessions.length, 1);
+      assert.equal(f.store.row("review:choose:0"), undefined);
+      if (mode !== "explicit") assert.equal(f.store.get("review-pr:review"), undefined);
+      unavailable = false;
+      f.store.retry("review", "Retry now", 0);
+      await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+      assert.equal(f.store.row("review")!.state, "done");
+      if (mode === "transcript") {
+        assert.equal(f.sessions.length, 1);
+        assert.match(JSON.parse(f.store.row("review:choose:0")!.payload).payload.text, /Which pull request/);
+      } else assert.equal(f.store.get<any>("session:s2")?.reviewUrl, openPr(8).url);
+    }));
+  }
+}
+
+test("ping survives a malformed repository access cache entry", () => fixture(async f => {
+  f.store.db.prepare("INSERT INTO gateway_state VALUES (?,?)").run("github-access:org/repo", "broken json");
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  f.store.ingest([{update_id: 1, message: {message_id: 1, from: {id: 9}, chat: {id: 42}, text: "/ping"}}]);
+  await processQueue(f.store, ["health-update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:1")!.state, "done");
+  assert.match(JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text, /Gateway online/);
 }));
 
 test("no open PR ends the review row at once with buttons", () => fixture(async f => {
@@ -1746,7 +1856,9 @@ test("a merged cached PR does not dead-end a bare /review", () => fixture(async 
 
 test("an unreadable repository short-circuits /review before any Conductor call", () => fixture(async f => {
   await f.launch();
+  f.store.bind(f.ws.id, {...f.store.binding(f.ws.id)!, synced: true});
   let conductor = 0;
+  f.api.getSession = async () => { conductor++; throw new Error("GitHub denial must precede author lookup"); };
   const list = f.api.listWorkspaceSessions;
   f.api.listWorkspaceSessions = async () => { conductor++; return list(); };
   f.api.getSessionMessageTail = async () => { conductor++; return []; };

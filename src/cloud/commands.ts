@@ -118,11 +118,16 @@ export class CloudCommands {
         reply(`Linked to ${selection.projectLabel}. Send a message here to start a new workspace in it.`); return;
       }
       if (data.startsWith("route:")) {
-        const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob; ack?: string }>(data);
+        const proposed = this.store.get<{ chatId: string; action: CloudAction; media?: MediaJob; ack?: string; choiceFence?: string }>(data);
         if (!proposed || proposed.chatId !== chatId) return;
+        if (proposed.choiceFence && this.store.get(proposed.choiceFence)) return;
         if (this.store.row(`${data}:confirmed:action`)) return;
         const action = { ...proposed.action, statusId };
-        this.enqueueTurn(reply, proposed.ack ?? "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`); return;
+        this.store.db.transaction(() => {
+          if (proposed.choiceFence) this.store.set(proposed.choiceFence, true);
+          this.enqueueTurn(reply, proposed.ack ?? "Confirmed. Task queued.", `${data}:confirmed:action`, action, proposed.media, `${data}:confirmed`);
+        })();
+        return;
       }
       return;
     }
@@ -348,7 +353,10 @@ export class CloudCommands {
   /** `/ping` is a liveness check in its own lane, so it reports only what an earlier command already learned. */
   private githubNote(): string {
     const rows = this.store.db.prepare("SELECT key,value FROM gateway_state WHERE key LIKE 'github-access:%'").all() as Array<{ key: string; value: string }>;
-    const denied = rows.filter(row => { const value = JSON.parse(row.value); return !value.ok && Date.now() - value.at < 24 * 3600_000; })
+    const denied = rows.filter(row => {
+      try { const value = JSON.parse(row.value) as { ok?: boolean; at?: number }; return value.ok === false && typeof value.at === "number" && Date.now() - value.at < 24 * 3600_000; }
+      catch { return false; }
+    })
       .map(row => row.key.slice("github-access:".length)).sort();
     return denied.length ? `\nGitHub token cannot read: ${denied.join(", ")}` : "";
   }
