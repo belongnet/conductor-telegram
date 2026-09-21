@@ -495,7 +495,7 @@ export class CloudEngine {
     const keyboard = buttons.map((button, i) => {
       const key = `route:${createHash("sha256").update(`${row.id}:${i}`).digest("hex").slice(0, 32)}`;
       const next: CloudAction = button.reviewUrl
-        ? { type: "review", trackedId: action.trackedId, sessionId: action.sessionId, prompt: button.reviewUrl }
+        ? { type: "review", trackedId: action.trackedId, sessionId: action.sessionId, prompt: [button.reviewUrl, action.prompt].filter(Boolean).join("\n\n") }
         : { type: "send", trackedId: action.trackedId, sessionId: action.sessionId, prompt: button.prompt ?? "" };
       this.store.set(key, { chatId: ws.telegramChatId, action: next, ack: button.ack, choiceFence: `review-choice:${row.id}` });
       return [{ text: button.text, callback_data: key }];

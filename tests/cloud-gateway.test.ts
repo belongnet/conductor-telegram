@@ -1718,13 +1718,13 @@ test("short /review forms skip the transcript scan", () => fixture(async f => {
   }
 }));
 
-test("several transcript PRs require one choice and later taps on either button add nothing", () => fixture(async f => {
+test("several transcript PRs preserve review instructions and require just one choice", () => fixture(async f => {
   await f.launch();
   enqueueText(f.store, "cmd:reply", "42", "Queued for Conductor.", {silent: true});
   f.messages.push({id: "prs", sessionId: "s1", type: "assistant",
     content: "See https://github.com/org/repo/pull/8 and https://github.com/org/repo/pull/9", sessionIndex: 1, receivedAt: new Date().toISOString()});
   f.engine.github.pr = async (_slug, url) => openPr(Number(url.split("/").at(-1)));
-  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0"});
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "cmd:reply:0", prompt: "Focus on authentication"});
   await processQueue(f.store, ["cloud"], r => f.engine.action(r));
   assert.equal(f.sessions.length, 1, "several PRs must not start a review");
   assert.equal(f.store.row("review")!.state, "done");
@@ -1739,7 +1739,7 @@ test("several transcript PRs require one choice and later taps on either button 
   }
   const actions = f.store.db.prepare("SELECT id,payload FROM gateway_queue WHERE kind='cloud' AND id LIKE '%confirmed:action'").all() as any[];
   assert.equal(actions.length, 1);
-  assert.equal(JSON.parse(actions[0].payload).prompt, "https://github.com/org/repo/pull/8");
+  assert.equal(JSON.parse(actions[0].payload).prompt, "https://github.com/org/repo/pull/8\n\nFocus on authentication");
 }));
 
 test("review choices preserve the selected thread and roll back if queueing fails", () => fixture(async f => {
@@ -1825,6 +1825,18 @@ test("ping survives a malformed repository access cache entry", () => fixture(as
   await processQueue(f.store, ["health-update"], row => commands.handle(row));
   assert.equal(f.store.row("update:1")!.state, "done");
   assert.match(JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text, /Gateway online/);
+}));
+
+test("ping reports only repository denials still within the access-cache lifetime", () => fixture(async f => {
+  f.store.set("github-access:org/fresh", {ok: false, status: 404, at: Date.now()});
+  f.store.set("github-access:org/expired", {ok: false, status: 404, at: Date.now() - 300_001});
+  f.engine.github.access = async () => { throw new Error("Ping must not make GitHub requests"); };
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "42", "9");
+  f.store.ingest([{update_id: 1, message: {message_id: 1, from: {id: 9}, chat: {id: 42}, text: "/ping"}}]);
+  await processQueue(f.store, ["health-update"], row => commands.handle(row));
+  const text = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
+  assert.match(text, /cannot read: org\/fresh/);
+  assert.doesNotMatch(text, /org\/expired/);
 }));
 
 test("no open PR ends the review row at once with buttons", () => fixture(async f => {

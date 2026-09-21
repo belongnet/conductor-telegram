@@ -354,7 +354,7 @@ export class CloudCommands {
   private githubNote(): string {
     const rows = this.store.db.prepare("SELECT key,value FROM gateway_state WHERE key LIKE 'github-access:%'").all() as Array<{ key: string; value: string }>;
     const denied = rows.filter(row => {
-      try { const value = JSON.parse(row.value) as { ok?: boolean; at?: number }; return value.ok === false && typeof value.at === "number" && Date.now() - value.at < 24 * 3600_000; }
+      try { const value = JSON.parse(row.value) as { ok?: boolean; at?: number }; return value.ok === false && typeof value.at === "number" && Date.now() - value.at < 300_000; }
       catch { return false; }
     })
       .map(row => row.key.slice("github-access:".length)).sort();
