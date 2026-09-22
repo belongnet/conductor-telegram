@@ -73,8 +73,8 @@ function safetyManifest() {
       global: {
         provider_capacity: { claude: 3, codex: 2, cursor: 2 },
         provider_models: {
-          claude: "sonnet-5-1m",
-          codex: "gpt-5.6-sol",
+          claude: "fable-5-1",
+          codex: "gpt-6-astra",
           cursor: "grok-4.7",
         },
       },
@@ -448,7 +448,7 @@ test("rejected bounded deterministic validation atomically holds the lane, settl
       attempt_number: 1,
       role: "validation",
       provider: "claude",
-      model: "sonnet-5-1m",
+      model: "fable-5-1",
       nonce: "bounded-failed-nonce",
       head_sha: MERGED_ONE,
     });
@@ -491,12 +491,12 @@ test("rejected bounded deterministic validation atomically holds the lane, settl
   }
 });
 
-test("legacy fable manifest commissions bounded Claude validation on current Sonnet with immutable workspace and session plans", async () => {
+test("legacy Sonnet manifest commissions bounded Claude validation on current Fable with immutable workspace and session plans", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-bounded-model-"));
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
   try {
     const manifest = safetyManifest();
-    (manifest.global.provider_models as Record<string, string>).claude = "fable-5-1";
+    (manifest.global.provider_models as Record<string, string>).claude = "sonnet-5-1m";
     const lease = await store.claimLease({
       ownerId: "mac:legacy-bounded-model",
       ownerSite: "mac",
@@ -559,14 +559,14 @@ test("legacy fable manifest commissions bounded Claude validation on current Son
       role: "validation",
       boundedValidation: true,
     });
-    assert.equal(model, "sonnet-5-1m");
+    assert.equal(model, "fable-5-1");
     assert.equal(
       commissionedAttemptModel({
         manifest,
         provider: "claude",
         role: "validation",
       }),
-      "fable-5-1",
+      "sonnet-5-1m",
       "the legacy override is forbidden outside bounded validation"
     );
     const backupManifest = safetyManifest();
@@ -626,7 +626,7 @@ test("legacy fable manifest commissions bounded Claude validation on current Son
         ...binding,
       },
     });
-    assert.equal(workspaceAction.request_json.model, "sonnet-5-1m");
+    assert.equal(workspaceAction.request_json.model, "fable-5-1");
     await store.finishAction(lease, workspaceAction.action_id, {
       expected_action_version: workspaceAction.row_version,
       expected_run_version: (await store.snapshot()).runs[0]!.row_version,
@@ -674,7 +674,7 @@ test("legacy fable manifest commissions bounded Claude validation on current Son
         ...validationActionBinding(lane, run, reboundAttempt),
       },
     });
-    assert.equal(sessionAction.request_json.model, "sonnet-5-1m");
+    assert.equal(sessionAction.request_json.model, "fable-5-1");
   } finally {
     await store.close();
     fs.rmSync(root, { recursive: true, force: true });

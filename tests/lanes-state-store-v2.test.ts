@@ -34,8 +34,8 @@ function manifest(lanes = 10): LaneManifestV2 {
       global: {
         provider_capacity: { claude: 3, codex: 2, cursor: 2 },
         provider_models: {
-          claude: "sonnet-5-1m",
-          codex: "gpt-5.6-sol",
+          claude: "fable-5-1",
+          codex: "gpt-6-astra",
           cursor: "grok-4.7",
         },
       },
@@ -832,7 +832,7 @@ test("post-merge repair is the only PR-clear path and late stages may quarantine
           ...clearPatch,
           author_provider: "claude",
           provider: "claude",
-          model: "sonnet-5-1m",
+          model: "fable-5-1",
         },
       }),
       /proven post-merge repair/
@@ -871,7 +871,7 @@ test("post-merge repair is the only PR-clear path and late stages may quarantine
         ...clearPatch,
         author_provider: "claude",
         provider: "claude",
-        model: "sonnet-5-1m",
+        model: "fable-5-1",
         metadata: {
           ...run.metadata_json,
           repair_from_merged_sha: "2".repeat(40),

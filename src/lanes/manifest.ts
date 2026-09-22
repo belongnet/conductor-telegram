@@ -6,19 +6,20 @@ import { z } from "zod";
 
 const PROVIDERS = ["claude", "codex", "cursor"] as const;
 const MODELS = [
-  "sonnet-5-1m",
+  "fable-5-1",
   "opus-5-1m",
-  "gpt-5.6-sol",
+  "gpt-6-astra",
+  "gpt-6-sol",
   "grok-4.7",
 ] as const;
 export const APPROVED_PROVIDER_MODELS = {
-  claude: "sonnet-5-1m",
-  codex: "gpt-5.6-sol",
+  claude: "fable-5-1",
+  codex: "gpt-6-astra",
   cursor: "grok-4.7",
 } as const;
 export const APPROVED_PROVIDER_MODEL_OPTIONS = {
-  claude: ["sonnet-5-1m", "opus-5-1m"],
-  codex: ["gpt-5.6-sol"],
+  claude: ["fable-5-1", "opus-5-1m"],
+  codex: ["gpt-6-astra", "gpt-6-sol"],
   cursor: ["grok-4.7"],
 } as const;
 export const APPROVED_PROVIDER_CAPACITY = {

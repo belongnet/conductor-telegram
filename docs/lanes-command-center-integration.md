@@ -64,10 +64,10 @@ strings, the manifest's raw command argv arrays, and its raw read-only probe
 objects. Command Center recomputes both hashes from the active manifest and
 rejects extra fields, a wrong stage/type pair, or a validation prompt whose
 `authorized_git_actions` is not exactly empty. A legacy manifest that stored
-Claude Fable or Cursor Grok 4.6 may commission only the current primary
-(`sonnet-5-1m` or `grok-4.7`) for this exact human-authorized, globally paused
-validation run; it does not make either retired model valid in a new manifest
-or any other attempt path.
+Claude Sonnet, Codex GPT-5.6 Sol, or Cursor Grok 4.6 may commission only the
+current provider primary (`fable-5-1`, `gpt-6-astra`, or `grok-4.7`) for this
+exact human-authorized, globally paused validation run; it does not make a
+retired model valid in a new manifest or any other attempt path.
 
 Retirement is limited to an already merged one-shot validation run. Its stored
 merged SHA must match exactly, and every direct recurring dependent in the

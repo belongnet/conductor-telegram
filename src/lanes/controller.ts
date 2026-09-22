@@ -87,7 +87,8 @@ const NUDGE_MESSAGE =
 const LEGACY_BOUNDED_PROVIDER_MODELS: Partial<
   Record<ManifestProvider, string>
 > = {
-  claude: "fable-5-1",
+  claude: "sonnet-5-1m",
+  codex: "gpt-5.6-sol",
   cursor: "grok-4.6",
 };
 

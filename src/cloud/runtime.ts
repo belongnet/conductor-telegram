@@ -104,7 +104,7 @@ export async function startCloudGateway(): Promise<void> {
   if (!enabled.includes(primary.agent) || enabled.some(p => !DEFAULT_PROVIDERS.some(d => d.agent === p))) throw new Error("TELEGRAM_CLOUD_PROVIDERS must include the configured primary and only supported providers");
   const reviewAgent = process.env.TELEGRAM_REVIEW_AGENT_TYPE;
   if (reviewAgent && !enabled.includes(reviewAgent)) throw new Error("TELEGRAM_REVIEW_AGENT_TYPE must name an enabled cloud provider");
-  const engine = new CloudEngine(store, fencedApi, bridge, github, [primary, ...DEFAULT_PROVIDERS.filter(p => p.agent !== primary.agent && enabled.includes(p.agent))], process.env.TELEGRAM_CLOUD_REVIEW_POLICY === "native",
+  const engine = new CloudEngine(store, fencedApi, bridge, github, [primary, ...DEFAULT_PROVIDERS.filter(p => (p.agent !== primary.agent || p.model !== primary.model) && enabled.includes(p.agent))], process.env.TELEGRAM_CLOUD_REVIEW_POLICY === "native",
     {agent: reviewAgent as Provider["agent"] | undefined, model: process.env.TELEGRAM_REVIEW_MODEL});
   restoreLegacyOperations(engine);
   const commands = new CloudCommands(store, engine, call, ownerChatId, process.env.OWNER_USER_ID, syncChatId, syncInput as "all" | "commands");

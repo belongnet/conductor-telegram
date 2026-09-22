@@ -29,8 +29,8 @@ function manifest() {
       global: {
         provider_capacity: { claude: 3, codex: 2, cursor: 2 },
         provider_models: {
-          claude: "sonnet-5-1m",
-          codex: "gpt-5.6-sol",
+          claude: "fable-5-1",
+          codex: "gpt-6-astra",
           cursor: "grok-4.7",
         },
       },

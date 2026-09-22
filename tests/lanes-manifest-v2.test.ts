@@ -18,8 +18,8 @@ function validManifest(promptPath: string, promptHash: string): Record<string, u
     global: {
       provider_capacity: { claude: 3, codex: 2, cursor: 2 },
       provider_models: {
-        claude: "sonnet-5-1m",
-        codex: "gpt-5.6-sol",
+        claude: "fable-5-1",
+        codex: "gpt-6-astra",
         cursor: "grok-4.7",
       },
     },
@@ -77,10 +77,10 @@ test("Manifest v2 rejects runtime bindings, unknown/swapped models, cap drift, a
   );
 
   const swapped = structuredClone(base) as any;
-  swapped.global.provider_models.claude = "gpt-5.6-sol";
+  swapped.global.provider_models.claude = "gpt-6-astra";
   assert.throws(
     () => parseLaneManifest(swapped, "/tmp/manifest.json", { verifyPrompts: false }),
-    /must be sonnet-5-1m/
+    /must be fable-5-1/
   );
 
   const caps = structuredClone(base) as any;
@@ -168,7 +168,7 @@ test("Manifest v2 rejects runtime bindings, unknown/swapped models, cap drift, a
   );
 });
 
-test("Manifest v2 accepts Claude Opus backup while rejecting legacy provider models", () => {
+test("Manifest v2 accepts Claude Opus and Codex Sol backups while rejecting legacy provider models", () => {
   const base = validManifest("L1.md", "a".repeat(64));
   const claudeBackup = structuredClone(base) as any;
   claudeBackup.global.provider_models.claude = "opus-5-1m";
@@ -179,11 +179,30 @@ test("Manifest v2 accepts Claude Opus backup while rejecting legacy provider mod
     "opus-5-1m"
   );
 
-  const legacyFable = structuredClone(base) as any;
-  legacyFable.global.provider_models.claude = "fable-5-1";
+  const codexBackup = structuredClone(base) as any;
+  codexBackup.global.provider_models.codex = "gpt-6-sol";
+  assert.equal(
+    parseLaneManifest(codexBackup, "/tmp/manifest.json", {
+      verifyPrompts: false,
+    }).global.provider_models.codex,
+    "gpt-6-sol"
+  );
+
+  const legacySonnet = structuredClone(base) as any;
+  legacySonnet.global.provider_models.claude = "sonnet-5-1m";
   assert.throws(
     () =>
-      parseLaneManifest(legacyFable, "/tmp/manifest.json", {
+      parseLaneManifest(legacySonnet, "/tmp/manifest.json", {
+        verifyPrompts: false,
+      }),
+    /Invalid enum value/
+  );
+
+  const legacySol = structuredClone(base) as any;
+  legacySol.global.provider_models.codex = "gpt-5.6-sol";
+  assert.throws(
+    () =>
+      parseLaneManifest(legacySol, "/tmp/manifest.json", {
         verifyPrompts: false,
       }),
     /Invalid enum value/

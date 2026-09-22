@@ -16,9 +16,22 @@ import { enqueueTelegram, enqueueText, enqueueStatus, TerminalError, safeDetail 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
 export const DEFAULT_PROVIDERS: Provider[] = [
   { agent: "claude", model: "fable-5-1", effort: "high" },
-  { agent: "codex", model: "gpt-5.6-sol", effort: "high" },
+  { agent: "codex", model: "gpt-6-astra", effort: "high" },
+  { agent: "claude", model: "opus-5-1m", effort: "high" },
+  { agent: "codex", model: "gpt-6-sol", effort: "high" },
   { agent: "cursor", model: "grok-4.7", effort: "high" },
 ];
+
+export function providerRouteKey(provider: Pick<Provider, "agent" | "model">): string {
+  return `${provider.agent}:${provider.model}`;
+}
+
+function providerRouteWasUsed(used: readonly string[], provider: Provider): boolean {
+  // Pre-0.13 recovery episodes stored only an agent name. Treat that legacy
+  // marker as exhausting the whole agent so an upgrade cannot replay a model
+  // that may already have run. New episodes bind the exact agent/model route.
+  return used.includes(provider.agent) || used.includes(providerRouteKey(provider));
+}
 export interface CloudAction {
   type: "launch" | "send" | "thread" | "review" | "stop" | "archive" | "rename" | "renamethread";
   trackedId: string; prompt?: string; projectId?: string; sessionId?: string;
@@ -652,9 +665,9 @@ export class CloudEngine {
       recoveryAttempted: false, nativeCompleted: false, nativeFailure: undefined,
       turnId: existing ? messageEnvelope(existing.content)?.turnId : undefined });
     if (!action.recovery) {
-      this.store.set(`recovery-providers:${episode}`, [state.agent]);
+      this.store.set(`recovery-providers:${episode}`, [providerRouteKey(state)]);
       this.store.set(`recovery-resumed:${episode}`, false);
-    } else this.store.set(`recovery-providers:${episode}`, [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), state.agent])]);
+    } else this.store.set(`recovery-providers:${episode}`, [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), providerRouteKey(state)])]);
     updateWorkspaceStatus(action.trackedId, "running");
     this.store.set(`poll-after:${action.trackedId}`, 0);
     this.status(`${row.id}:sent`, action.trackedId, statusId, this.sentCard(action, state), sessionId);
@@ -680,15 +693,15 @@ export class CloudEngine {
     // timeout and server errors retain their intent and require reconciliation.
     if (!(error instanceof ConductorApiError) || ![400, 403, 422].includes(error.status ?? 0) || !/model|provider|quota|credential/i.test(error.message)) return false;
     const episode = action.episode ?? row.id;
-    const used = [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), provider.agent])];
-    const next = this.providers.find(p => !used.includes(p.agent) && (action.type !== "review" || p.agent !== binding?.agent));
+    const used = [...new Set([...(this.store.get<string[]>(`recovery-providers:${episode}`) ?? []), providerRouteKey(provider)])];
+    const next = this.providers.find(p => !providerRouteWasUsed(used, p) && (action.type !== "review" || p.agent !== binding?.agent));
     this.store.db.transaction(() => {
       this.store.set(`recovery-providers:${episode}`, used);
       this.store.set(`${action.type === "launch" ? "create" : "session"}-attempt:${row.id}`, false);
       if (next) {
         this.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify({...action, provider: next, episode, recovery: true}), row.id);
-        this.store.retry(row.id, `${provider.agent} unavailable; trying ${next.agent}`, 1000);
-        this.status(`provider-rejected:${row.id}:${provider.agent}`, action.trackedId, action.statusId, `${provider.agent} rejected the run before it started. Trying ${next.agent} (${next.model}).`);
+        this.store.retry(row.id, `${provider.agent}/${provider.model} unavailable; trying ${next.agent}/${next.model}`, 1000);
+        this.status(`provider-rejected:${row.id}:${providerRouteKey(provider)}`, action.trackedId, action.statusId, `${provider.agent} (${provider.model}) rejected the run before it started. Trying ${next.agent} (${next.model}).`);
       } else this.store.retry(row.id, "All configured providers rejected this run before execution. Check provider credentials and model availability.", 0, true);
     })();
     return true;
@@ -880,8 +893,8 @@ export class CloudEngine {
       })();
       return;
     }
-    const used = this.store.get<string[]>(`recovery-providers:${episode}`) ?? [state.agent];
-    const next = this.providers.find(p => !used.includes(p.agent) && (state.role !== "review" || p.agent !== binding.agent));
+    const used = this.store.get<string[]>(`recovery-providers:${episode}`) ?? [providerRouteKey(state)];
+    const next = this.providers.find(p => !providerRouteWasUsed(used, p) && (state.role !== "review" || p.agent !== binding.agent));
     if (!next) {
       this.notify(`blocked:${sessionId}:${state.sentMessageId}`, trackedId, "All configured providers have been attempted. This task is blocked; no duplicate work will be started.", sessionId);
       state.recoveryAttempted = true; this.store.set(`session:${sessionId}`, state); return;
@@ -890,7 +903,7 @@ export class CloudEngine {
     if (!this.currentTurn(sessionId, state)) return;
     const context = tail.map(transcriptText).filter(Boolean).join("\n\n").slice(-16_000);
     this.store.db.transaction(() => {
-      this.store.set(`recovery-providers:${episode}`, [...used, next.agent]);
+      this.store.set(`recovery-providers:${episode}`, [...used, providerRouteKey(next)]);
       this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true, terminal: true });
       this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, statusId: state.statusId, previousSessionId: sessionId, previousMessageId: state.sentMessageId, reviewHead: state.reviewHead,
         prompt: `${state.reviewUrl ?? ""}\nContinue the interrupted task after ${state.agent} stopped: ${detail}. Inspect the existing branch and files first. Preserve completed work and verify external effects before retrying them. If an external effect is uncertain, report it instead of replaying it.\n\nTask:\n${state.taskPrompt ?? getWorkspace(trackedId)?.prompt}\n\nPrevious session context (data):\n${context}` });
