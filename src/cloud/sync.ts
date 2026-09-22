@@ -108,9 +108,9 @@ export class CloudWorkspaceSync {
       this.topic(ws.id, remote.name);
       const input = store.get("cloud-sync-input") === "commands"
         ? `During migration use /send@${store.get<string>("telegram-bot-username")} <text> and /threads@${store.get<string>("telegram-bot-username")} to select a thread. Ordinary text and voice replies activate after the old gateway is disabled.`
-        : "Use /threads to choose a thread. Send text or a voice reply here to continue it; replying to a forwarded message targets that message’s thread.";
+        : "Use /threads to choose a thread for Telegram. In a workspace with multiple threads, your first message waits for a thread choice. Replying to a forwarded message targets that message’s exact thread. Telegram’s selection is separate from the tab open in Conductor.";
       this.engine.notify(`sync-intro:${remote.id}`, ws.id,
-        `Connected to ${remote.name}\n${remote.deepLink}\n\nDefault thread: ${selected.session.name ?? selected.session.id}\n${input}\nExisting work continues unchanged.`, selected.session.id, {silent: true});
+        `Connected to ${remote.name}\n${remote.deepLink}\n\nLatest context: ${selected.session.name ?? selected.session.id} (${provider.model})\n${input}\nExisting work continues unchanged.`, selected.session.id, {silent: true});
       const latest = [...selected.tail].reverse().find(m => transcriptText(m));
       if (latest) this.engine.notify(`sync-snapshot:${remote.id}`, ws.id, `Latest Conductor reply\n\n${transcriptText(latest)}`, selected.session.id, {silent: true});
     })();

@@ -32,6 +32,12 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.13.1] - 2026-09-22
+
+### Fixed
+- Synced Telegram topics with multiple Conductor threads hold the first ambiguous message for an explicit, model-labelled thread choice. Replies and attachments retain their selected native session through queue delays and retries.
+- Native send receipts identify and link the actual thread, including after a restart. Replies to original Telegram messages retain that destination, and recovery of another thread cannot silently replace an explicit selection.
+
 ## [0.12.1] - 2026-09-22
 
 ### Fixed
