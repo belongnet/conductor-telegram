@@ -185,9 +185,10 @@ export class GatewayStore {
       // The members of an album and a turn's transcripts are only re-read while its row can still run again.
       const members = this.db.prepare(`DELETE FROM gateway_state WHERE key LIKE 'album-members:%' AND NOT EXISTS
         (SELECT 1 FROM gateway_queue q WHERE q.id=substr(gateway_state.key,15) AND q.state IN ('pending','running'))`).run().changes;
-      const transcripts = this.db.prepare(`DELETE FROM gateway_state WHERE key LIKE 'media-transcript:%' AND NOT EXISTS
-        (SELECT 1 FROM gateway_queue q WHERE q.state IN ('pending','running') AND substr(gateway_state.key,18,length(q.id))=q.id)`).run().changes;
-      return albums + members + transcripts;
+      // Matched with the separator, so a row id that merely prefixes another cannot hold its keys.
+      const perFile = (prefix: string, offset: number): number => this.db.prepare(`DELETE FROM gateway_state WHERE key LIKE '${prefix}:%' AND NOT EXISTS
+        (SELECT 1 FROM gateway_queue q WHERE q.state IN ('pending','running') AND substr(gateway_state.key,${offset},length(q.id)+1)=q.id||':')`).run().changes;
+      return albums + members + perFile("media-transcript", 18) + perFile("media-file", 12);
     })();
   }
 

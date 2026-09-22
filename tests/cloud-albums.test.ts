@@ -462,8 +462,10 @@ test("an album whose download fails partway resumes without fetching or saving a
   assert.equal(released.mediaPending, false);
   assert.deepEqual(released.fileIds.map((id: string) => f.bridge.file(id, released.trackedId)?.name), ["photo-1.jpg", "photo-2.jpg", "photo-3.jpg"]);
   assert.equal(f.count("SELECT count(*) AS n FROM gateway_files"), 3);
-  // The album's files are fetched together, so one failing file never re-fetches the ones that succeeded.
-  assert.deepEqual(calls, ["photo-1", "photo-2", "photo-3", "photo-2", "photo-2"]);
+  // Files are fetched a couple at a time, so which worker runs when is not fixed. What is fixed: a file
+  // that arrived is never fetched again, and only the failing one is retried.
+  const fetches = calls.reduce<Record<string, number>>((all, id) => ({ ...all, [id]: (all[id] ?? 0) + 1 }), {});
+  assert.deepEqual(fetches, { "photo-1": 1, "photo-2": 3, "photo-3": 1 });
 }));
 
 test("a download blocks at once only when retrying cannot help", () => fixture(async f => {
@@ -568,7 +570,8 @@ test("an album stops waiting when its window closes, however slowly Telegram del
   await f.updates();
   assert.equal(f.store.row("update:1")!.state, "pending");
   // The window closes with nothing else delivered: the album is handled with what it has.
-  f.store.db.prepare("UPDATE gateway_queue SET created_at=created_at-2000, available_at=0 WHERE id='update:1'").run();
+  f.store.set("album:-42:0:album-1", { ...f.store.get<any>("album:-42:0:album-1"), at: Date.now() - 2000 });
+  f.store.db.prepare("UPDATE gateway_queue SET available_at=0 WHERE id='update:1'").run();
   await f.updates();
   assert.equal(f.payload("update:1:media").files.length, 1);
 }));
@@ -689,7 +692,7 @@ test("a late photo is refused when its album never reached Conductor", () => fix
 test("a photo of an album from long ago starts fresh instead of joining it", () => fixture(async f => {
   f.album(1, 2, { 0: "/run long-events" });
   await f.updates();
-  f.store.set("album:-42:album-1", { ...f.store.get<any>("album:-42:album-1"), at: Date.now() - ALBUM_JOIN_MS - 1 });
+  f.store.set("album:-42:0:album-1", { ...f.store.get<any>("album:-42:0:album-1"), at: Date.now() - ALBUM_JOIN_MS - 1 });
   f.store.ingest([{ update_id: 3, message: { message_id: 103, chat: { id: -42 }, from: { id: 9 }, media_group_id: "album-1", photo: [{ file_id: "photo-3" }] } }]);
   await f.updates();
   assert.match(f.text("update:3:reply:0"), /arrived after the rest of its album/);
@@ -718,9 +721,11 @@ test("album bookkeeping and voice transcripts are swept once their turn is over,
   await f.media();
   f.store.pruneTurnState(ALBUM_JOIN_MS);
   assert.equal(transcripts(), 0); assert.equal(members(), 0);
-  // The album stays joinable, and the attachment IDs its files were saved under are never swept.
+  // Per-file bookkeeping goes with them; the album stays joinable until its own window closes.
+  assert.equal(f.count("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'media-file:%'"), 0);
   assert.equal(f.count("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'album:%'"), 1);
-  assert.equal(f.count("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'media-file:%'"), 2);
+  // The saved files themselves are untouched: only the bridge's own retention removes those.
+  assert.equal(f.count("SELECT count(*) AS n FROM gateway_files"), 2);
   f.store.pruneTurnState(ALBUM_JOIN_MS, Date.now() + ALBUM_JOIN_MS + 1);
   assert.equal(f.count("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'album:%'"), 0);
 }));
@@ -742,4 +747,90 @@ test("a late photo waits for the album's own task to exist, rather than joining 
   assert.match(f.text("update:3:reply:0"), /arrived after the rest of its album/);
   assert.equal(f.store.row("update:3:action"), undefined);
   assert.equal(f.store.row("update:3:media"), undefined);
+}));
+
+test("a workspace whose launch never landed keeps its topic working", () => fixture(async f => {
+  // An album whose first file is too big blocks the launch after the workspace record exists.
+  f.sizes["photo-1"] = 25 * 1024 * 1024;
+  upsertRepoTopic({ chatId: "-42", repoPath: "/Users/legacy/repos/long-events", repoName: "long-events", telegramThreadId: 5 });
+  f.store.set("repo-topic-project:-42:5", "p1");
+  f.album(1, 1, {}, { message_thread_id: 5 });
+  await f.updates(); await f.media();
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const stranded = f.payload("update:1:action").trackedId;
+  assert.equal(f.store.row("update:1:action")!.state, "blocked");
+  // The topic still points at that workspace, so a plain message must launch it, not die on an empty project.
+  f.store.ingest([{ update_id: 2, message: { message_id: 102, chat: { id: -42 }, from: { id: 9 }, message_thread_id: 5, text: "try again please" } }]);
+  await f.updates();
+  const retry = f.payload("update:2:action");
+  assert.equal(retry.trackedId, stranded);
+  assert.equal(retry.type, "launch");
+  assert.equal(retry.projectId, "p1");
+}));
+
+test("an album gives up settling however the clock moves", () => fixture(async f => {
+  f.commands.albumWaitMs = 60_000;
+  f.commands.albumSettleMs = 1;
+  f.album(1, 1, { 0: "/run long-events" });
+  // The clock jumps backwards mid-album: the window alone would hold this lane until real time caught up.
+  for (let pass = 0; pass < 8; pass++) {
+    f.store.set("album:-42:0:album-1", { leader: "update:1", at: Date.now() + 3_600_000 });
+    f.store.db.prepare("UPDATE gateway_queue SET available_at=0 WHERE id='update:1'").run();
+    await f.updates();
+    if (f.store.row("update:1")!.state === "done") break;
+  }
+  assert.equal(f.store.row("update:1")!.state, "done");
+  assert.equal(f.payload("update:1:media").files.length, 1);
+}));
+
+test("a late photo does not join work its topic has already moved on from", () => fixture(async f => {
+  upsertRepoTopic({ chatId: "-42", repoPath: "/Users/legacy/repos/long-events", repoName: "long-events", telegramThreadId: 5 });
+  f.store.set("repo-topic-project:-42:5", "p1");
+  f.album(1, 2, { 0: "/run long-events first task" }, { message_thread_id: 5 });
+  await f.updates();
+  const first = f.payload("update:1:action").trackedId;
+  // The owner starts different work in the same topic, so the topic now carries that workspace.
+  f.store.ingest([{ update_id: 3, message: { message_id: 103, chat: { id: -42 }, from: { id: 9 }, message_thread_id: 5, text: "/run long-events second task" } }]);
+  await f.updates();
+  assert.notEqual(f.payload("update:3:action").trackedId, first);
+  // A straggler from the first album must not be fed into work the owner can no longer see there.
+  f.store.ingest([{ update_id: 4, message: { message_id: 104, chat: { id: -42 }, from: { id: 9 }, message_thread_id: 5,
+    media_group_id: "album-1", photo: [{ file_id: "photo-4" }] } }]);
+  await f.updates();
+  assert.match(f.text("update:4:reply:0"), /arrived after the rest of its album/);
+  assert.equal(f.store.row("update:4:action"), undefined);
+}));
+
+test("the same album id in another topic is another album", () => fixture(async f => {
+  f.album(1, 1, { 0: "/run long-events" });
+  await f.updates();
+  const general = f.payload("update:1:action").trackedId;
+  boundWorkspace(f, 7);
+  // Telegram reusing a media group id in another topic must not route that file into the first topic's work.
+  f.store.ingest([{ update_id: 2, message: { message_id: 102, chat: { id: -42 }, from: { id: 9 }, message_thread_id: 7,
+    media_group_id: "album-1", photo: [{ file_id: "photo-2" }] } }]);
+  await f.updates();
+  const other = f.payload("update:2:action");
+  assert.notEqual(other.trackedId, general);
+  assert.equal(other.type, "send");
+  assert.notEqual(f.text("update:2:reply:0"), "Added to the same task.");
+}));
+
+test("a control command is only ever the caption the owner led with", () => fixture(async f => {
+  const ws = boundWorkspace(f, 7);
+  f.album(1, 2, { 0: "look at these two", 1: "/archive" }, { message_thread_id: 7 });
+  await f.updates();
+  // /archive on the third photo must not stop the workspace with the first caption as its argument.
+  const action = f.payload("update:1:action");
+  assert.equal(action.type, "send"); assert.equal(action.trackedId, ws.id);
+  assert.equal(action.prompt, "look at these two\n\n/archive");
+  assert.equal(f.store.get(`stop:${ws.id}`), undefined);
+}));
+
+test("an album carrying a file type Telegram sends but the gateway cannot take says so", () => fixture(async f => {
+  f.store.ingest([1, 2].map(n => ({ update_id: n, message: { message_id: 100 + n, chat: { id: -42 }, from: { id: 9 },
+    media_group_id: "album-video", video: { file_id: `video-${n}` } } })));
+  await f.updates();
+  assert.match(f.text("update:1:reply:0"), /2 files of a type I cannot take yet\. Video is not supported\./);
+  assert.equal(f.store.row("update:1:action"), undefined);
 }));

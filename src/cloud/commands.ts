@@ -19,8 +19,11 @@ import type { RepoTopic } from "../types/index.js";
 const BURST_SECONDS = 2;
 /** How long an album stays joinable by a file Telegram delivers late, and how long its bookkeeping is kept. */
 export const ALBUM_JOIN_MS = 600_000;
-/** Album files are fetched a few at a time: one worker serves every chat, and each fetch can take a minute. */
-const MEDIA_DOWNLOAD_CONCURRENCY = 4;
+/** Album files are fetched a few at a time: one worker serves every chat, and each fetch can take a minute.
+ * Two at a time keeps the wait short while bounding how many whole files are held in memory at once. */
+const MEDIA_DOWNLOAD_CONCURRENCY = 2;
+/** However the clock behaves, an album settles after this many passes. */
+const ALBUM_MAX_SETTLES = 6;
 /** The Bot API refuses to hand a bot any file larger than this. */
 const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
 const TOO_LARGE = "This file is larger than the 20 MB Telegram lets bots download. Send a link to it instead.";
@@ -128,9 +131,16 @@ export class CloudCommands {
     }
     const files = messages.flatMap((m, i) => messageFile(m, messages.length > 1 ? i + 1 : undefined) ?? []);
     const captions = messages.map(m => String(m.text ?? m.caption ?? "").trim()).filter(Boolean);
-    if (!callback && !captions.length && !files.length) return;
+    // Video and its kin are not carried yet. Saying so beats dropping part of an album in silence.
+    const skipped = msg.media_group_id ? messages.filter(m => !messageFile(m)).length : 0;
+    if (!callback && !captions.length && !files.length) {
+      if (skipped) enqueueText(this.store, `${row.id}:reply`, chatId, `Telegram sent ${skipped === 1 ? "a file" : `${skipped} files`} of a type I cannot take yet. Video is not supported.`,
+        { threadId, priority: 0, silent: true });
+      return;
+    }
     const media = mediaPayload(files);
-    const voiceNote = files.some(file => file.voice);
+    // A voice note is transcribed to find its target; a message carrying anything else needs a target first.
+    const voiceNote = files.length > 0 && files.every(file => file.voice);
     // A direct reply answers the owner's own message, so it never needs to ring. The acknowledgement doubles as the
     // turn's status card: actions carry its row id so later states edit it instead of posting again.
     const reply = (text: string, suffix = "reply", markup?: unknown) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
@@ -192,8 +202,10 @@ export class CloudCommands {
       }
       return;
     }
-    // Any one caption of an album can carry the command; the rest add to its task.
-    const commanded = captions.findIndex(caption => /^\/[\w]+/.test(caption));
+    // Any one caption of an album can carry the command that starts its task; the rest add to that task.
+    // Only /run and /cloud are promoted from a later caption: a control command like /stop or /archive
+    // must be the caption the owner led with, never one found further down an album.
+    const commanded = /^\/[\w]+/.test(captions[0] ?? "") ? 0 : captions.findIndex(caption => /^\/(?:run|cloud)\b/i.test(caption));
     const raw = (commanded > 0 ? [captions[commanded], ...captions.filter((_, i) => i !== commanded)] : captions).join("\n\n");
     const match = raw.match(/^\/([\w]+)(?:@(\w+))?(?:\s+([\s\S]*))?$/);
     const addressedBot = match?.[2]?.toLowerCase();
@@ -406,7 +418,11 @@ export class CloudCommands {
     if (!target) throw new Error("Could not create workspace record");
     // A reply to any photo of an album reaches the work the album started.
     for (const message of messages) linkTelegramMessage(chatId, String(message.message_id), target.id, sessionId);
-    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId: launchProject?.id, prompt, statusId };
+    // A workspace whose launch never landed is still bound to its project by its own record, so a later
+    // message in its topic launches it rather than dying on an empty project.
+    const pinned = target.repoPath.startsWith("conductor-project:") ? target.repoPath.slice("conductor-project:".length) : undefined;
+    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId,
+      projectId: launchProject?.id ?? pinned, prompt, statusId };
     const received = files.length > 1 ? `${files.length} attachments received. Preparing them for Conductor.` : "Attachment received. Preparing it for Conductor.";
     this.enqueueTurn(reply, (media ? received : "Task received and queued.") + linked +
       (adopted ? "\n\nThis topic now follows that workspace. Later messages continue it; /run <project> <task> starts new work here." : ""),
@@ -500,7 +516,9 @@ export class CloudCommands {
    * was handled joins whatever work the album started.
    */
   private collectAlbum(row: QueueRow, msg: any, chatId: string): AlbumIntake {
-    const albumKey = `album:${chatId}:${msg.media_group_id}`;
+    // Scoped to the topic, like the lane an album is absorbed from: the same album id in another topic
+    // is another album, and must never be answered with this one's work.
+    const albumKey = `album:${chatId}:${msg.message_thread_id ?? 0}:${msg.media_group_id}`;
     const album = this.store.get<{ leader: string; at: number }>(albumKey);
     if (album && album.leader !== row.id) {
       if (Date.now() - album.at > ALBUM_JOIN_MS) return { kind: "late" };
@@ -510,26 +528,34 @@ export class CloudCommands {
       const action = JSON.parse(started.payload) as CloudAction;
       const ws = getWorkspace(action.trackedId);
       if (!ws || ws.archivedAt || ws.telegramChatId !== chatId) return { kind: "late" };
+      // One topic carries one workspace. A file cannot join work the topic has already moved on from.
+      const thread = msg.message_thread_id;
+      if (thread && getWorkspaceByThreadId(chatId, thread)?.id !== ws.id) return { kind: "late" };
       return { kind: "late", joined: { trackedId: ws.id, sessionId: action.sessionId } };
     }
     // Members are durable before their rows close, so a leader that retries later still has every file.
     const membersKey = `album-members:${row.id}`;
-    const absorbed = this.store.db.transaction(() => {
+    const arrived = this.store.db.transaction(() => {
       this.store.assertWriter?.();
-      const { rowid } = this.store.db.prepare("SELECT rowid FROM gateway_queue WHERE id=?").get(row.id) as { rowid: number };
+      const position = this.store.db.prepare("SELECT rowid FROM gateway_queue WHERE id=?").get(row.id) as { rowid: number } | undefined;
+      if (!position) return 0;
       const siblings = this.store.db.prepare(`SELECT id,payload FROM gateway_queue WHERE kind='update' AND conversation=? AND state='pending'
         AND rowid>? AND json_extract(payload,'$.message.media_group_id')=? AND json_extract(payload,'$.message.from.id') IS ? ORDER BY rowid`)
-        .all(row.conversation, rowid, String(msg.media_group_id), msg.from?.id ?? null) as Array<{ id: string; payload: string }>;
-      // Only a row still waiting in this lane may be closed; one already claimed elsewhere is never touched.
+        .all(row.conversation, position.rowid, String(msg.media_group_id), msg.from?.id ?? null) as Array<{ id: string; payload: string }>;
+      // Only a row still waiting in this lane may be closed. One claimed elsewhere keeps its own turn,
+      // so it is not also delivered inside this one.
       const absorb = this.store.db.prepare("UPDATE gateway_queue SET state='done',result=?,error=NULL,completed_at=? WHERE id=? AND state='pending'");
-      for (const sibling of siblings) absorb.run(JSON.stringify({ absorbedInto: row.id }), Date.now(), sibling.id);
-      if (siblings.length) this.store.set(membersKey, [...(this.store.get<any[]>(membersKey) ?? []), ...siblings.map(s => JSON.parse(s.payload).message)]);
-      this.store.set(albumKey, { leader: row.id, at: Date.now() });
-      return siblings.length;
+      const taken = siblings.filter(sibling => absorb.run(JSON.stringify({ absorbedInto: row.id }), Date.now(), sibling.id).changes === 1);
+      if (taken.length) this.store.set(membersKey, [...(this.store.get<any[]>(membersKey) ?? []), ...taken.map(s => JSON.parse(s.payload).message)]);
+      // The window runs from the last file to arrive, so a slow album is still collected as one message.
+      this.store.set(albumKey, { leader: row.id, at: taken.length || !album ? Date.now() : album.at });
+      return taken.length;
     })();
     const members = this.store.get<any[]>(membersKey) ?? [];
-    // Settle: something just arrived, or nothing has yet. Either way more of the album may still be on its way.
-    if ((absorbed > 0 || !members.length) && Date.now() - row.created_at < this.albumWaitMs) {
+    const since = this.store.get<{ at: number }>(albumKey)?.at ?? row.created_at;
+    // Settle: something just arrived, or nothing has yet. Either way more of the album may still be on its
+    // way. The attempt count ends the wait whatever the clock does.
+    if ((arrived > 0 || !members.length) && Date.now() - since < this.albumWaitMs && row.attempts < ALBUM_MAX_SETTLES) {
       this.store.retry(row.id, "Collecting album", this.albumSettleMs); return { kind: "wait" };
     }
     return { kind: "collected", messages: [msg, ...members] };
@@ -580,8 +606,13 @@ export class CloudCommands {
         if (existing) { saved[i] = existing; continue; }
         try {
           const bytes = await this.download(file);
-          saved[i] = this.engine.bridge.save(job.action!.trackedId, file.fileName, bytes);
-          this.store.set(key, saved[i]!);
+          // Saving the file and recording its ID commit together, so a crash cannot leave a saved file
+          // that the next attempt saves a second time.
+          saved[i] = this.store.db.transaction(() => {
+            const id = this.engine.bridge.save(job.action!.trackedId, file.fileName, bytes);
+            this.store.set(key, id);
+            return id;
+          })();
         } catch (error) { failures.push(error); }
       }
     }));
