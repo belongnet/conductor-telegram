@@ -43,6 +43,14 @@ All notable changes to conductor-telegram are documented here.
 ### Fixed
 - A workspace living in a repo topic no longer renames it. Renaming the workspace, or a name change picked up by cloud sync, used to rewrite the topic's title and erase the repository it stands for; repo topics were already protected from being closed the same way.
 
+## [0.11.2] - 2026-09-22
+
+### Changed
+- Cloud recovery and Manifest v2 now pin Cursor to `grok-4.7`, the current Grok line. Native session routing also accepts Composer and DeepSeek Cursor models so a later line is not rejected as unsupported.
+
+### Fixed
+- `.conductor/settings.local.toml` and `.conductor/settings.local.json` are gitignored, so a machine-local override no longer leaves the worktree dirty and strands lane validation, a cloud takeover, or creation of the next `conductor/telegram-*` workspace branch.
+
 ## [0.11.1] - 2026-09-21
 
 ### Fixed
