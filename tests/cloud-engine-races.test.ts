@@ -7,6 +7,7 @@ import {CloudEngine, DEFAULT_PROVIDERS, transcriptText, type Provider} from "../
 import {CloudGitHub} from "../src/cloud/catalog.js";
 import type {FileBridge} from "../src/cloud/bridge.js";
 import {ConductorApiError, type ConductorApiClient, type ConductorApiMessage} from "../src/integrations/conductor-api.js";
+import {enqueueText} from "../src/cloud/telegram.js";
 
 function fixture(providers: Provider[] = DEFAULT_PROVIDERS, reviewProvider: {agent?: Provider["agent"]; model?: string} = {}) {
   closeDb();
@@ -25,13 +26,17 @@ function fixture(providers: Provider[] = DEFAULT_PROVIDERS, reviewProvider: {age
     sendMessage: async (_input: unknown) => {mutations.push("send"); return {};},
     cancelSession: async (_id: string) => {mutations.push("cancel"); return {};},
     createSession: async (_input: unknown) => {mutations.push("create-session"); return {id: "s2"};},
+    getSessionMessageTail: async (_id: string): Promise<any[]> => [],
   };
   const github = new CloudGitHub("unused");
   github.pr = async () => ({url: binding.prUrl!, number: 1, head: "a".repeat(40), base: "b".repeat(40), branch: "task", state: "open", merged: false, draft: false});
+  github.find = async () => null;
+  github.access = async () => ({readable: true, status: 200});
   const bridge = {refreshQueuedLinks() {}} as unknown as FileBridge;
   const engine = new CloudEngine(store, api as unknown as ConductorApiClient, bridge, github, providers, true, reviewProvider);
   async function send() {
-    engine.queue("followup", {type: "send", trackedId: ws.id, prompt: "New task"});
+    enqueueText(store, "followup-ack", "42", "Queued for Conductor.");
+    engine.queue("followup", {type: "send", trackedId: ws.id, prompt: "New task", statusId: "followup-ack:0"});
     await engine.action(store.row("followup")!);
   }
   return {store, ws, binding, api, github, engine, mutations, send};
@@ -48,6 +53,26 @@ test("a stop confirmed while message reconciliation waits prevents a later send"
     await f.send();
     assert.ok(f.mutations.includes("cancel"));
     assert.ok(!f.mutations.includes("send"), "No new task may start after cancellation was confirmed");
+    const card = JSON.parse(f.store.row("followup:stopped")!.payload);
+    assert.equal(card.statusOf, "followup-ack:0");
+    assert.equal(card.payload.text, "Stopped before this was sent.");
+  } finally {closeDb();}
+});
+
+test("a stop during submission settles the original card without claiming the message was unsent", async () => {
+  const f = fixture();
+  try {
+    f.api.sendMessage = async () => {
+      f.mutations.push("send");
+      f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
+      return {};
+    };
+    await f.send();
+    assert.ok(f.mutations.includes("send"));
+    assert.ok(f.mutations.includes("cancel"));
+    const card = JSON.parse(f.store.row("followup:stopped")!.payload);
+    assert.equal(card.statusOf, "followup-ack:0");
+    assert.match(card.payload.text, /Stop requested after submission/);
   } finally {closeDb();}
 });
 
@@ -106,10 +131,14 @@ test("stop during review lookup prevents a new review session", async () => {
   try {
     const original = f.github.pr.bind(f.github);
     f.github.pr = async (...args) => {f.engine.queue("stop", {type: "stop", trackedId: f.ws.id}); return original(...args);};
-    f.engine.queue("review", {type: "review", trackedId: f.ws.id});
+    enqueueText(f.store, "review-ack", "42", "Queued for Conductor.");
+    f.engine.queue("review", {type: "review", trackedId: f.ws.id, statusId: "review-ack:0"});
     await f.engine.action(f.store.row("review")!);
     assert.ok(!f.mutations.includes("create-session"));
     assert.equal(f.store.binding(f.ws.id)?.stopped, true);
+    const card = JSON.parse(f.store.row("review:stopped")!.payload);
+    assert.equal(card.statusOf, "review-ack:0");
+    assert.equal(card.payload.text, "Stopped before this was sent.");
   } finally {closeDb();}
 });
 
@@ -276,5 +305,22 @@ test("a new session during reported PR lookup keeps the workspace running and pr
     assert.equal(f.store.get<any>("session:s2").terminal, false);
     assert.equal(getWorkspace(f.ws.id)?.status, "running");
     assert.ok(f.store.get<number>(`poll-after:${f.ws.id}`)! <= Date.now() + 15_000);
+  } finally {closeDb();}
+});
+
+test("a stop during the review transcript scan only settles the card", async () => {
+  const f = fixture();
+  try {
+    f.store.bind(f.ws.id, {...f.binding, prUrl: null, branch: null});
+    f.api.getSessionMessageTail = async () => {
+      f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
+      return [{id: "m", sessionId: "s1", type: "assistant", content: "Opened https://github.com/org/repo/pull/1", sessionIndex: 1, receivedAt: "2026-01-01T00:00:00Z"}];
+    };
+    f.engine.queue("review", {type: "review", trackedId: f.ws.id});
+    await f.engine.action(f.store.row("review")!);
+    assert.ok(!f.mutations.includes("create-session"));
+    assert.equal(f.store.get("review-pr:review"), undefined);
+    assert.equal(f.store.binding(f.ws.id)?.prUrl, null);
+    assert.ok(f.store.row("review:stopped:0"));
   } finally {closeDb();}
 });

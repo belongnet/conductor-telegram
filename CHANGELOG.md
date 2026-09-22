@@ -32,6 +32,54 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.12.0] - 2026-09-22
+
+### Added
+- `/land` runs the `land-and-deploy` skill in the topic's workspace, and `/document` is a short spelling of `document_release`. Both appear in `/skills`.
+
+### Changed
+- A repo topic now holds one workspace at a time. The first task adopts the topic and later messages continue that same workspace, so an album, a split paste, or a quick follow-up reaches one workspace rather than opening one per message. `/run <project> <task>` rolls the topic onto new work, and the acknowledgement says so the first time a topic adopts a workspace. A second message sent before the first task finishes launching joins it instead of starting a rival workspace.
+
+### Fixed
+- A workspace living in a repo topic no longer renames it. Renaming the workspace, or a name change picked up by cloud sync, used to rewrite the topic's title and erase the repository it stands for; repo topics were already protected from being closed the same way.
+
+## [0.11.2] - 2026-09-22
+
+### Changed
+- Cloud recovery and Manifest v2 now pin Cursor to `grok-4.7`, the current Grok line. Native session routing also accepts Composer and DeepSeek Cursor models so a later line is not rejected as unsupported.
+
+### Fixed
+- `.conductor/settings.local.toml` and `.conductor/settings.local.json` are gitignored, so a machine-local override no longer leaves the worktree dirty and strands lane validation, a cloud takeover, or creation of the next `conductor/telegram-*` workspace branch.
+
+## [0.11.1] - 2026-09-21
+
+### Fixed
+- Retired workspaces no longer keep readiness unhealthy because of historical polling errors.
+- Telegram's `TOPIC_ID_INVALID` response now completes cleanup for retired topics and recovers a replacement topic for active work without losing the pending message.
+
+## [0.11.0] - 2026-09-20
+
+### Fixed
+- Deterministic cloud failures now block on the first attempt and edit the turn's status card to `Not done: …` instead of retrying five times while it stays at "Queued for Conductor." A late failure still rings.
+- Bare `/review` finds an open pull request from a number (`/review 500`), a still-open cached URL, the transcript, or the branch. Several open PRs get buttons on the card; none get buttons to ask the agent to self-review or `/ship`. A GitHub token that cannot read the repository says so instead of "no PR found."
+- A workspace Conductor destroys while provisioning fails once, with Conductor's own reason, and is retired so it is no longer polled.
+- `/projects`, `/prs`, `/ping`, and cloud preflight report repositories the gateway's GitHub token cannot read.
+- An archived or deleted router workspace is replaced in the same pass. A Conductor 4xx refusal clears the send fence and tells you why; an uncertain failure still will not replay.
+- GitHub outages and rate limits remain retryable during PR discovery. Review choices preserve the selected thread and only one button can start work.
+- Router recovery works across repeated missing sessions and retries rate-limited creation. Stop and archive continue past missing sessions, and a stop received during a lookup or send updates the original turn card.
+
+### Changed
+- `/review` in cloud-only mode accepts a PR number or URL. The help text and status card name the PR being reviewed.
+
+## [0.10.0] - 2026-09-13
+
+### Changed
+- A cloud task now keeps one status message per turn. The acknowledgement is sent silently and then edited in place through "Sent to claude (…)" and "Conductor task finished.", so the agent's replies are the only messages that ring. Stop, archive, rename, and provider-fallback notices update the same card, and the workspace-created and sync connection notes are silent too. If the card cannot be edited, its text is delivered as a silent message instead.
+- Agents are told about the Telegram MCP tools only when their workspace holds a bridge credential. Workspaces discovered from Conductor never receive one, so their prompts now say that replies are forwarded to Telegram and ask the agent to answer inline, instead of prompting it to report that MCP tools are missing.
+
+### Fixed
+- A message sent to a sleeping cloud workspace no longer triggers an immediate "the workspace slept during this task" continuation. The gateway treated Conductor's own wake-up delay as an interrupted task, sending a second prompt and a duplicate "Sent to …" notice within seconds. A continuation now waits for evidence that the turn had started, or for five minutes of silence.
+
 ## [0.9.2] - 2026-09-11
 
 ### Fixed

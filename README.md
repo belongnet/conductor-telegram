@@ -34,6 +34,8 @@ The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 
 
 In cloud-only mode, agent replies, questions, progress reports, and artifact links render Markdown as Telegram rich text, including bold, italics, strikethrough, inline code, code blocks, and clickable web links. Long replies keep their formatting across messages; answer buttons appear on the last message of a long question. Local file links remain readable as a label and path, and formatting that cannot be rendered safely falls back to literal text.
 
+Each message that starts, continues, or controls Cloud work gets one status card. The acknowledgement arrives silently and is edited in place as the task is handed to the agent and when it finishes. Failures update the card to `Not done: …`; a failure reported more than 15 seconds after the acknowledgement also sends a notification. Agents in workspaces the gateway created are told about the Telegram MCP tools; agents in workspaces discovered from Conductor are asked to answer inline instead.
+
 ## Architecture
 
 ```
@@ -96,13 +98,14 @@ src/
 | `/lanes` | `/lanes [pause\|resume\|retry\|provider-disable\|archive-approval\|shadow\|cutover\|rollback]` | Durable lane status and audited controls when Manifest v2 is configured; legacy scheduler controls otherwise |
 | `/rename` | `/rename <name>` (inside a topic or as a reply) | Rename the current cloud workspace via the API |
 | `/renamethread` | `/renamethread <name>` (inside a topic or as a reply) | Rename the current cloud thread via the API |
-| `/review` | `/review <workspace> [instructions]` | Launch a code review session |
+| `/review` | `/review <workspace> [instructions]` (hybrid mode) | Launch a local code review session |
+| `/review` | `/review [PR number or URL]` (inside a topic, cloud-only mode) | With native reviews enabled, review that workspace's pull request. Bare `/review` finds the PR; `/review 500` and a GitHub URL also work |
 | `/send` | `/send <workspace> <message>` | Send a follow-up message to a running agent |
 | `/threads` | `/threads [workspace]` | List Conductor threads, switch the default thread, or start a new thread |
 | `/skills` | `/skills [workspace]` | List built-in gstack skills plus workspace skills parsed from CLAUDE.md or AGENTS.md |
 | `/skill` | `/skill <workspace> <name> [instructions]` | Invoke a specific workspace skill |
 | `/gstack` | `/gstack <workspace> [instructions]` | Use GStack skills (ship, qa, browse, etc.) |
-| `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu |
+| `/ship`, `/qa`, `/investigate`, `/retro`, `/health`, `/checkpoint`, `/document_release`, `/land_and_deploy`, `/office_hours`, `/design_review` | `/ship [instructions]` (reply or use inside a topic) | Shortcuts for well-known gstack skills, registered in Telegram's slash menu. `/land` and `/document` are short spellings of the last two |
 | `/workspaces` | `/workspaces` | List all tracked workspaces |
 | `/prs`, `/ship_status` | `/prs` | Show PR, check, merge, and stale-branch status for tracked workspaces |
 | `/decisions` | `/decisions` | Show unanswered agent questions for this chat |
@@ -116,7 +119,7 @@ Ways to target work from Telegram:
 
 1. **Reply** to any forwarded workspace message with text, media, `/send`, `/review`, `/skills`, `/skill`, `/gstack`, or any skill shortcut. If that message came from a specific Conductor thread, the reply goes back to that exact thread.
 2. **Send inside the workspace's forum topic** — skill shortcuts and `/skill` / `/gstack` pick up the topic's workspace automatically. Plain messages go to the workspace's active Conductor thread.
-3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message. In cloud-only mode the topic routes itself: its repository name is matched against the Conductor project catalog by project name or by the repository name in each project's remote, and a single match is recorded so every later message in that topic goes straight there. No match or more than one match asks with a picker instead of guessing, and says plainly that the message was not sent. Every message that names a project names the repository it points at, so a wrong route is visible the first time it happens. Use `/link` to see or change where a topic routes. The launched workspace still gets its own topic; the repo topic stays a launch pad.
+3. **Send inside a repo topic** — in forum mode, tap **Topic** beside a repo in `/repos` to create a durable repo topic. Text, photos, screenshots, generic files, and voice notes sent there start a new workspace for that repo without guessing from the message. In cloud-only mode the topic routes itself: its repository name is matched against the Conductor project catalog by project name or by the repository name in each project's remote, and a single match is recorded so every later message in that topic goes straight there. No match or more than one match asks with a picker instead of guessing, and says plainly that the message was not sent. Every message that names a project names the repository it points at, so a wrong route is visible the first time it happens. Use `/link` to see or change where a topic routes. One topic is one workspace: the first task adopts the topic, and later messages continue that same workspace instead of opening another, so an album or a split paste reaches one workspace rather than one per message. `/run <project> <task>` rolls the topic onto new work. A workspace living in a repo topic never renames or closes it, so the topic keeps its repository's name.
 4. **Hashtag a skill** anywhere in a message (text or voice) — e.g. `#ship fix the failing test` or `can you #qa this flow please`. The bot rewrites the message into a skill-invocation prompt for the target workspace. Voice transcripts are scanned for hashtags too.
 
 Conductor 0.72+ threads are mirrored into the same Telegram workspace topic. When a workspace has multiple visible Conductor sessions, forwarded messages include a `🧵` thread label. Use `/threads` in the topic to switch the active thread or start a new one.
@@ -133,7 +136,7 @@ If a local prompt later fails because its CLI login disappeared, the bot can tak
 
 Cloud commands act on your whole Conductor organization with the configured `CONDUCTOR_API_KEY`. In a group chat, set `OWNER_USER_ID` so only you can create (`/cloud`), rename, query (`/projects`, `/fleet`), or run the lanes scheduler (`/lanes`) — without it, every member of the configured group shares that privilege.
 
-The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so cloud `/review` attempts fail closed.
+The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so hybrid-mode cloud `/review` attempts fail closed. Cloud-only mode can opt into [native reviews](docs/ovh-native-gateway.md#native-tasks-reviews-and-recovery), which use normal Conductor permissions.
 
 Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
@@ -143,7 +146,7 @@ Manifest v2 is the production orchestration path. It is disabled by default and 
 
 The Mac worker is the preferred lease holder and the OVH service is a standby. A 75-second renewable fenced lease, 20-second heartbeat, 30-second active poll, 3-minute idle poll, and 15-minute full reconciliation ensure that only one worker mutates Conductor or a Git host. The returning Mac does not preempt a live OVH lease. Every external mutation is preceded by a deterministic durable action intent; messages, attestations, and notices bind their exact SHA-256 body. A lost response must reconcile the exact external payload before it can retry, so a lookalike tag cannot be mistaken for the commissioned result.
 
-Copy [docs/lanes.manifest-v2.example.json](docs/lanes.manifest-v2.example.json) to `~/.conductor-telegram/lanes.manifest.v2.json`. Manifest v2 accepts only the approved provider/model/cap map (`claude/fable-5-1` at 3, `codex/gpt-5.6-sol` at 2, `cursor/grok-4.6` at 2), rejects runtime IDs and dependency cycles, and verifies every prompt SHA-256 both on startup and immediately before a commissioned delivery. Recurring schedules are `daily`, `weekly`, or `every <positive integer><m|h|d>`.
+Copy [docs/lanes.manifest-v2.example.json](docs/lanes.manifest-v2.example.json) to `~/.conductor-telegram/lanes.manifest.v2.json`. Manifest v2 accepts only the approved provider/model/cap map (`claude/fable-5-1` at 3, `codex/gpt-5.6-sol` at 2, `cursor/grok-4.7` at 2), rejects runtime IDs and dependency cycles, and verifies every prompt SHA-256 both on startup and immediately before a commissioned delivery. Recurring schedules are `daily`, `weekly`, or `every <positive integer><m|h|d>`.
 
 Production workers require `LANES_STATE_BACKEND=http`, `COMMAND_CENTER_API_BASE_URL`, `COMMAND_CENTER_API_KEY`, `CONDUCTOR_API_KEY`, `BOT_TOKEN`, and `OWNER_CHAT_ID`. The OVH service is headless—it never polls or consumes Telegram updates—but it retains send-only credentials so the active lease holder can always emit a deduplicated safety alert. The Mac Telegram process additionally receives the separate `BELONG_HUMAN_APPROVAL_KEY`; that human key is forcibly removed from both lane-worker environments. `LANES_MANIFEST_SOURCE_REF` may carry the canonical Git revision; when omitted, both workers use the same content-addressed manifest SHA-256 rather than host-specific file paths. Add `GITLAB_TOKEN` only when a lane uses the GitLab adapter. SQLite requires both `LANES_STATE_BACKEND=sqlite` and `LANES_STANDALONE=1`; it is intended only for standalone tests and is never an HTTP fallback.
 
@@ -228,7 +231,7 @@ Add the bot to your target group, make it admin, then run setup in that group.
 8. If the bot shows a `Use This Chat` button, tap it. The bot will save this supergroup and your Telegram user automatically.
 9. Restart the bot only if you are running it with hardcoded env vars outside the CLI.
 
-New workspaces will create one forum topic per workspace automatically. Repo topics can also be created from `/repos` and reused as stable launch pads for that repository. If topic creation fails because the chat is not a forum or the bot lacks permissions, the bot falls back to normal chat messages.
+New workspaces will create one forum topic per workspace automatically. Repo topics can also be created from `/repos` and reused as the stable home for that repository's current workspace. If topic creation fails because the chat is not a forum or the bot lacks permissions, the bot falls back to normal chat messages.
 
 If the bot is already configured for your private chat, you can also add it to a new group and send `/setup` there from the same Telegram account. The bot will show what is missing and can switch itself into group/forum mode from that chat without first resetting `OWNER_CHAT_ID`.
 
@@ -368,7 +371,7 @@ npm run typecheck
 npm test
 ```
 
-Requires Node.js v22+. See [CONTRIBUTING.md](CONTRIBUTING.md) for branching, commit style, and PR guidelines.
+Requires Node.js v22+. See [CONTRIBUTING.md](CONTRIBUTING.md) for branching, commit style, and PR guidelines. Intentionally deferred repository work is tracked in [TODOS.md](TODOS.md).
 
 ## Troubleshooting
 

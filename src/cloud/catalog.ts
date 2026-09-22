@@ -30,18 +30,43 @@ export class ProjectCatalog {
   }
 }
 
+/**
+ * GitHub answers 404 both for a missing pull request and for a private repository the token was never
+ * granted, so a status alone never says which. Callers classify a refusal by probing the repository.
+ */
+export class GitHubError extends Error {
+  constructor(message: string, readonly status: number, readonly rateLimited = false) { super(message); this.name = "GitHubError"; }
+}
+
 export interface CloudPr { url: string; number: number; head: string; base: string; branch: string; state: string; merged: boolean; draft: boolean }
 export class CloudGitHub {
   constructor(private readonly token: string, private readonly fetcher: typeof fetch = fetch) {}
   async request(slug: string, suffix: string): Promise<any> {
-    if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) throw new Error("Invalid repository identity");
-    if (!this.token) throw new Error("GitHub credentials are required for PR status and reviews");
+    if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) throw new GitHubError("Invalid repository identity", 0);
+    if (!this.token) throw new GitHubError("GitHub credentials are required for PR status and reviews", 0);
     const response = await this.fetcher(`https://api.github.com/repos/${slug}${suffix}`, {
       headers: { Authorization: `Bearer ${this.token}`, Accept: "application/vnd.github+json", "User-Agent": "conductor-telegram" },
       signal: AbortSignal.timeout(15_000), redirect: "error",
     });
-    if (!response.ok) throw new Error(`GitHub request failed (${response.status})`);
+    if (!response.ok) throw new GitHubError(`GitHub request failed (${response.status})`, response.status, response.status === 429 ||
+      (response.status === 403 && (response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after"))));
     return response.json();
+  }
+  /** One call proves both that the token was granted this repository and that it may read pull requests. */
+  async access(slug: string): Promise<{ readable: boolean; status: number }> {
+    try { await this.request(slug, "/pulls?state=open&per_page=1"); return { readable: true, status: 200 }; }
+    catch (error) {
+      // A rate limit says nothing about access, and an outage must never be remembered as "cannot read".
+      if (error instanceof GitHubError && !error.rateLimited && [0, 401, 403, 404].includes(error.status)) return { readable: false, status: error.status };
+      throw error;
+    }
+  }
+  /** What the owner has to change, in one sentence. */
+  advice(slug: string, status: number): string {
+    if (status === 401) return "GitHub rejected the gateway's token. It is expired or revoked, so replace GH_TOKEN.";
+    if (status === 403) return `The gateway's GitHub token can see ${slug} but not its pull requests. Grant it Pull requests: read, or authorize it for the organization.`;
+    if (status === 404) return `The gateway's GitHub token cannot read ${slug}. Add that repository to the token with Pull requests: read.`;
+    return this.token ? `Pull request features need a GitHub repository, and this workspace uses ${slug || "another host"}.` : "This gateway has no GitHub token, so set GH_TOKEN.";
   }
   async pr(slug: string, url: string): Promise<CloudPr> {
     const parsed = new URL(url);

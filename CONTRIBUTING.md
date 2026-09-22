@@ -23,6 +23,8 @@ The project has three entry points:
 
 Run `npm run dev` to start the CLI in development mode. You'll need a `BOT_TOKEN` from [@BotFather](https://t.me/BotFather). Local workspace flows use a [Conductor](https://conductor.build) installation; Cloud-only flows can instead use a configured `CONDUCTOR_API_KEY` while the desktop app is closed or absent.
 
+Conductor workspaces add one repo rule. The tracked `.conductor/settings.toml` is the shared config; Conductor writes machine-local overrides beside it at `.conductor/settings.local.toml` and `.conductor/settings.local.json`. Both are gitignored and must stay untracked, because an override that turns up in `git status --untracked-files=all` leaves the worktree dirty, and lane validation, cloud takeover, and `conductor/telegram-*` branch creation all refuse to run against a dirty tree. `tests/conductor-settings.test.ts` enforces that rule, so keep the ignore lines in the committed `.gitignore`.
+
 ## Branching
 
 - Create a feature branch from `main`: `git checkout -b feat/your-feature`

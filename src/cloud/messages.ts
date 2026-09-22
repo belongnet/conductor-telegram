@@ -1,6 +1,7 @@
 import type {ConductorApiSession} from "../integrations/conductor-api.js";
 import type {Provider} from "./engine.js";
 import { ConductorApiError, type ConductorApiClient, type ConductorApiMessage } from "../integrations/conductor-api.js";
+import { TerminalError } from "./telegram.js";
 
 export function messageEnvelope(content: unknown): Record<string, any> | undefined {
   if (typeof content === "string") {
@@ -48,7 +49,7 @@ export function nativeSessionProvider(session: ConductorApiSession): Provider {
   const resolved = (session.resolvedModel ?? model).toLowerCase();
   const agent = /^(gpt|o\d|codex)([-_.]|$)/.test(resolved) ? "codex"
     : /(^|[-_.])(claude|opus|sonnet|haiku|fable)([-_.]|$)/.test(resolved) ? "claude"
-    : /^grok[-_.]/.test(resolved) ? "cursor" : undefined;
-  if (!agent || !model) throw new Error("Native session model is unavailable or unsupported; select a supported session with /threads.");
+    : /^(grok|composer|deepseek)[-_.]/.test(resolved) ? "cursor" : undefined;
+  if (!agent || !model) throw new TerminalError("Native session model is unavailable or unsupported; select a supported session with /threads.");
   return {agent, model, effort: session.effort ?? "high"};
 }
