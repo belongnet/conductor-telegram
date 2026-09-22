@@ -540,7 +540,7 @@ function canaryFixture() {
         provider_models: {
           claude: "fable-5-1",
           codex: "gpt-5.6-sol",
-          cursor: "grok-4.6",
+          cursor: "grok-4.7",
         },
       },
       lanes: [

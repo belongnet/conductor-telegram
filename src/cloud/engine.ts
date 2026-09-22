@@ -17,7 +17,7 @@ export interface Provider { agent: "claude" | "codex" | "cursor"; model: string;
 export const DEFAULT_PROVIDERS: Provider[] = [
   { agent: "claude", model: "fable-5-1", effort: "high" },
   { agent: "codex", model: "gpt-5.6-sol", effort: "high" },
-  { agent: "cursor", model: "grok-4.6", effort: "high" },
+  { agent: "cursor", model: "grok-4.7", effort: "high" },
 ];
 export interface CloudAction {
   type: "launch" | "send" | "thread" | "review" | "stop" | "archive" | "rename" | "renamethread";

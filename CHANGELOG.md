@@ -4,6 +4,9 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+### Changed
+- Cloud recovery and Manifest v2 now pin Cursor to `grok-4.7`, the current Grok line. Native session routing also accepts Composer and DeepSeek Cursor models so a later line is not rejected as unsupported.
+
 ### Added
 - `TELEGRAM_RUNTIME_MODE=cloud-only` runs a continuously hosted gateway through the native Conductor API, with project-based tasks, confirmed AI routing, dedicated PR review sessions, and recoverable provider interruptions. Existing installations keep the `hybrid` default.
 - Cloud workspaces can exchange private files, report progress, and ask persistent human questions through a scoped HTTPS MCP bridge. Linux voice notes use FFmpeg and Whisper.
