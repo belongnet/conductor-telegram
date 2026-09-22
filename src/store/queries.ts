@@ -383,7 +383,9 @@ export function getWorkspaceByThreadId(
   const db = getDb();
   const row = db
     .prepare(
-      "SELECT * FROM workspaces WHERE archived_at IS NULL AND telegram_chat_id = ? AND telegram_thread_id = ? ORDER BY created_at DESC LIMIT 1"
+      // Two workspaces can be stamped in the same millisecond, and a topic follows exactly one of
+      // them, so insertion order decides the tie rather than whichever row SQLite happens to scan first.
+      "SELECT * FROM workspaces WHERE archived_at IS NULL AND telegram_chat_id = ? AND telegram_thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1"
     )
     .get(chatId, threadId) as any;
   return row ? mapWorkspaceRow(row) : undefined;
