@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import {
+  APPROVED_PROVIDER_MODELS,
   canonicalManifestJson,
   type LaneManifestV2,
   type ManifestProvider,
@@ -30,6 +31,13 @@ import type {
 } from "./state-store.js";
 import { LaneStateStoreError } from "./state-store.js";
 import { retirementEvidenceProvesCompletion } from "./state-store.js";
+
+const LEGACY_BOUNDED_PROVIDER_MODELS: Partial<
+  Record<ManifestProvider, string>
+> = {
+  claude: "fable-5-1",
+  cursor: "grok-4.6",
+};
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS lane_v2_lease (
@@ -1041,11 +1049,13 @@ export class SqliteLaneStateStore implements LaneStateStore {
         }
       }
       const scoped = this.laneControl(run.manifest_revision_id, run.lane_id);
-      const legacyBoundedClaudeModel =
+      const nextProvider = next.provider as ManifestProvider | null;
+      const legacyBoundedProviderModel =
         input.to_status === "validating" &&
-        next.provider === "claude" &&
-        next.model === "sonnet-5-1m" &&
-        String(manifest.global.provider_models.claude) === "fable-5-1" &&
+        nextProvider !== null &&
+        next.model === APPROVED_PROVIDER_MODELS[nextProvider] &&
+        String(manifest.global.provider_models[nextProvider]) ===
+          LEGACY_BOUNDED_PROVIDER_MODELS[nextProvider] &&
         scoped?.state === "validation_authorized" &&
         scoped.run_id === run.run_id &&
         scoped.merged_sha === run.merged_sha;
@@ -1054,7 +1064,7 @@ export class SqliteLaneStateStore implements LaneStateStore {
         (!next.provider ||
           (manifest.global.provider_models[next.provider as ManifestProvider] !==
             next.model &&
-            !legacyBoundedClaudeModel))
+            !legacyBoundedProviderModel))
       ) {
         throw new LaneStateStoreError(
           "run model violates the manifest provider policy",
@@ -1246,11 +1256,10 @@ export class SqliteLaneStateStore implements LaneStateStore {
         conflict("validation attempt must bind the merged SHA");
       }
       const scoped = this.laneControl(run.manifest_revision_id, run.lane_id);
-      const legacyBoundedClaudeOverride =
+      const legacyBoundedProviderScope =
         input.role === "validation" &&
-        input.provider === "claude" &&
-        input.model === "sonnet-5-1m" &&
-        String(manifest.global.provider_models.claude) === "fable-5-1" &&
+        String(manifest.global.provider_models[input.provider]) ===
+          LEGACY_BOUNDED_PROVIDER_MODELS[input.provider] &&
         scoped?.state === "validation_authorized" &&
         scoped.run_id === run.run_id &&
         scoped.merged_sha === run.merged_sha &&
@@ -1259,10 +1268,10 @@ export class SqliteLaneStateStore implements LaneStateStore {
             .prepare("SELECT mode FROM lane_v2_controller WHERE state_id = 1")
             .get() as { mode: string }
         ).mode === "paused_safety";
-      if (
-        manifest.global.provider_models[input.provider] !== input.model &&
-        !legacyBoundedClaudeOverride
-      ) {
+      const requiredAttemptModel = legacyBoundedProviderScope
+        ? APPROVED_PROVIDER_MODELS[input.provider]
+        : manifest.global.provider_models[input.provider];
+      if (requiredAttemptModel !== input.model) {
         throw new LaneStateStoreError("attempt model violates manifest policy", 400);
       }
       const healthRow = this.db

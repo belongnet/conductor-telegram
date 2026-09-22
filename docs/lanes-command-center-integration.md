@@ -64,8 +64,9 @@ strings, the manifest's raw command argv arrays, and its raw read-only probe
 objects. Command Center recomputes both hashes from the active manifest and
 rejects extra fields, a wrong stage/type pair, or a validation prompt whose
 `authorized_git_actions` is not exactly empty. A legacy manifest that stored
-Claude Fable may commission `sonnet-5-1m` only for this exact human-authorized,
-globally paused validation run; it does not make Fable valid in a new manifest
+Claude Fable or Cursor Grok 4.6 may commission only the current primary
+(`sonnet-5-1m` or `grok-4.7`) for this exact human-authorized, globally paused
+validation run; it does not make either retired model valid in a new manifest
 or any other attempt path.
 
 Retirement is limited to an already merged one-shot validation run. Its stored

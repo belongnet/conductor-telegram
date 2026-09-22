@@ -4,7 +4,7 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
-## [0.12.0] - 2026-09-22
+## [0.13.0] - 2026-09-22
 
 ### Added
 - `TELEGRAM_RUNTIME_MODE=cloud-only` runs a continuously hosted gateway through the native Conductor API, with project-based tasks, confirmed AI routing, dedicated PR review sessions, and recoverable provider interruptions. Existing installations keep the `hybrid` default.
@@ -13,7 +13,7 @@ All notable changes to conductor-telegram are documented here.
 - A fenced Manifest v2 lane controller now runs independently from Telegram polling, stores all runtime bindings and action intents in Command Center/Postgres, supports Mac-preferred/OVH-standby leases, and fails closed rather than falling back to SQLite. It includes GitHub and GitLab delivery, current-head commissioned attestations, deterministic merged-SHA validation, provider breakers/caps, legacy adoption, safe archive batches, shadow/cutover controls, and launchd/systemd service definitions.
 - `conductor-telegram lanes worker`, `lanes status --json`, `lanes reconcile`, and `lanes import-legacy --dry-run|--apply` expose the durable controller. `doctor` verifies the manifest, prompt hashes, required credentials, and Command Center connectivity before cutover.
 - Revision-scoped lane controls can hold and release individual lanes, authorize one bounded validation run while the controller stays paused, or retire an already merged legacy lane from immutable evidence. Telegram exposes the bounded controls while retirement uses a hardened local evidence-file CLI.
-- Manifest v2 uses Claude Sonnet as the primary lane model and permits only Claude Opus as its same-provider backup; legacy Fable remains limited to the tightly scoped bounded-validation migration path, which commissions current Sonnet.
+- Manifest v2 uses Claude Sonnet as the primary lane model, permits only Claude Opus as its same-provider backup, and advances Cursor lanes to Grok 4.7. Legacy Fable and Grok 4.6 remain limited to tightly scoped bounded-validation migration paths, which commission the current provider model.
 - Optional config-driven Cloud lanes scheduler. When `LANES_CONFIG` or `~/.conductor-telegram/lanes.json` is present, the bot keeps at most one working lane per paid provider from an ordered queue with dependencies, nudging paused work after a gap or creating the next ready lane. `/lanes`, `/lanes run`, `/lanes pause`, and `/lanes resume` are owner-only. See `docs/lanes.example.json`.
 - Optional per-lane delivery stages now carry a PR through adversarial review, two provider-distinct final reviews, a GitHub-refreshed merge gate, and post-merge validation. The merge gate binds the PR to the configured repository, checks the exact reviewed head and GitHub policy state, and verifies the reported merge SHA against GitHub. Provider rotations support rate-limit stand-ins, markers use the real model, and `/lanes` exposes stage progress plus `archive` and `merge <id>` controls.
 - Lane delivery state, unanswered-nudge health, and provider outage resets are durable in SQLite. Dead agents restart in a new session inside the existing workspace, while tick hygiene safely archives completed work without recreating archived or abandoned workspaces.

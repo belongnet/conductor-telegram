@@ -31,7 +31,11 @@ import type {
   ManifestLane,
   ManifestProvider,
 } from "./manifest.js";
-import { canonicalManifestJson, resolveLanePromptPath } from "./manifest.js";
+import {
+  APPROVED_PROVIDER_MODELS,
+  canonicalManifestJson,
+  resolveLanePromptPath,
+} from "./manifest.js";
 import {
   ACTIVE_ATTEMPT_STATUSES,
   activeAttempt,
@@ -80,7 +84,12 @@ const FULL_SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const ARCHIVE_GRACE_MS = 60 * 60 * 1000;
 const NUDGE_MESSAGE =
   "Continue the commissioned task from the current workspace state. Follow the original controller protocol and finish with the required structured result.";
-const CURRENT_BOUNDED_CLAUDE_MODEL = "sonnet-5-1m";
+const LEGACY_BOUNDED_PROVIDER_MODELS: Partial<
+  Record<ManifestProvider, string>
+> = {
+  claude: "fable-5-1",
+  cursor: "grok-4.6",
+};
 
 type Role = LaneAttemptRecord["role"];
 
@@ -271,10 +280,10 @@ export function commissionedAttemptModel(input: {
   if (
     input.role === "validation" &&
     input.boundedValidation === true &&
-    input.provider === "claude" &&
-    String(input.manifest.global.provider_models.claude) === "fable-5-1"
+    String(input.manifest.global.provider_models[input.provider]) ===
+      LEGACY_BOUNDED_PROVIDER_MODELS[input.provider]
   ) {
-    return CURRENT_BOUNDED_CLAUDE_MODEL;
+    return APPROVED_PROVIDER_MODELS[input.provider];
   }
   return input.manifest.global.provider_models[input.provider];
 }

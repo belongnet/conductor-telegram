@@ -681,6 +681,112 @@ test("legacy fable manifest commissions bounded Claude validation on current Son
   }
 });
 
+test("legacy grok manifest commissions bounded Cursor validation on current Grok", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "legacy-bounded-grok-"));
+  const store = new SqliteLaneStateStore(path.join(root, "state.db"));
+  try {
+    const manifest = safetyManifest();
+    (manifest.global.provider_models as Record<string, string>).cursor = "grok-4.6";
+    const lease = await store.claimLease({
+      ownerId: "mac:legacy-bounded-grok",
+      ownerSite: "mac",
+      leaseSeconds: 75,
+    });
+    assert.ok(lease);
+    await store.stageManifest(lease, {
+      revisionId: "growth-safety",
+      sourceRef: "legacy-cursor-active-revision",
+      manifest,
+      createdBy: "test",
+    });
+    await store.activateManifest(lease, "growth-safety", 1);
+    const cutover = await store.createControl({
+      control_id: "legacy-grok-cutover",
+      idempotency_key: "legacy-grok-cutover",
+      kind: "cutover",
+      requested_by: "human:test",
+      payload: { revision_id: "growth-safety" },
+      approvalKey: "human-key",
+    });
+    await finish(store, lease, cutover);
+    await validatingRun(store, lease, "L1", MERGED_ONE);
+    const hold = await store.createControl({
+      control_id: "legacy-grok-hold",
+      idempotency_key: "legacy-grok-hold",
+      kind: "lane_hold",
+      lane_id: "L1",
+      requested_by: "human:test",
+      payload: { manifest_revision_id: "growth-safety", reason: "legacy cursor audit" },
+    });
+    await finish(store, lease, hold);
+    const pause = await store.createControl({
+      control_id: "legacy-grok-pause",
+      idempotency_key: "legacy-grok-pause",
+      kind: "pause",
+      requested_by: "human:test",
+      payload: { reason: "bounded legacy cursor validation" },
+    });
+    await finish(store, lease, pause);
+    const validate = await store.createControl({
+      control_id: "legacy-grok-validate",
+      idempotency_key: "legacy-grok-validate",
+      kind: "lane_validate",
+      lane_id: "L1",
+      requested_by: "human:test",
+      payload: {
+        manifest_revision_id: "growth-safety",
+        expected_hold_control_id: "legacy-grok-hold",
+        expected_run_id: "run-L1",
+        merged_sha: MERGED_ONE,
+      },
+      approvalKey: "human-key",
+    });
+    await finish(store, lease, validate);
+    const run = (await store.snapshot()).runs[0]!;
+    const model = commissionedAttemptModel({
+      manifest,
+      provider: "cursor",
+      role: "validation",
+      boundedValidation: true,
+    });
+    assert.equal(model, "grok-4.7");
+    assert.equal(
+      commissionedAttemptModel({ manifest, provider: "cursor", role: "validation" }),
+      "grok-4.6",
+      "the legacy Cursor override is forbidden outside bounded validation"
+    );
+    await assert.rejects(
+      store.beginAttempt(lease, run.run_id, {
+        attempt_id: "legacy-grok-attempt-rejected",
+        expected_run_version: run.row_version,
+        stage: "validation",
+        attempt_number: 1,
+        role: "validation",
+        provider: "cursor",
+        model: "grok-4.6",
+        nonce: "legacy-grok-nonce-rejected",
+        head_sha: MERGED_ONE,
+      }),
+      /model violates manifest policy/
+    );
+    const attempt = await store.beginAttempt(lease, run.run_id, {
+      attempt_id: "legacy-grok-attempt-current",
+      expected_run_version: run.row_version,
+      stage: "validation",
+      attempt_number: 1,
+      role: "validation",
+      provider: "cursor",
+      model,
+      nonce: "legacy-grok-nonce-current",
+      head_sha: MERGED_ONE,
+    });
+    assert.equal(attempt.model, "grok-4.7");
+  } finally {
+    await store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("lane retirement waits for recurring dependent containment and is restart-persistent and idempotent", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lane-retire-"));
   const filename = path.join(root, "state.db");

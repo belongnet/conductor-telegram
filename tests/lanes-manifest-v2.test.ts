@@ -168,7 +168,7 @@ test("Manifest v2 rejects runtime bindings, unknown/swapped models, cap drift, a
   );
 });
 
-test("Manifest v2 accepts Claude Opus backup while rejecting legacy Fable", () => {
+test("Manifest v2 accepts Claude Opus backup while rejecting legacy provider models", () => {
   const base = validManifest("L1.md", "a".repeat(64));
   const claudeBackup = structuredClone(base) as any;
   claudeBackup.global.provider_models.claude = "opus-5-1m";
@@ -184,6 +184,16 @@ test("Manifest v2 accepts Claude Opus backup while rejecting legacy Fable", () =
   assert.throws(
     () =>
       parseLaneManifest(legacyFable, "/tmp/manifest.json", {
+        verifyPrompts: false,
+      }),
+    /Invalid enum value/
+  );
+
+  const legacyGrok = structuredClone(base) as any;
+  legacyGrok.global.provider_models.cursor = "grok-4.6";
+  assert.throws(
+    () =>
+      parseLaneManifest(legacyGrok, "/tmp/manifest.json", {
         verifyPrompts: false,
       }),
     /Invalid enum value/
