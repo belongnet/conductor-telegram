@@ -20,9 +20,11 @@ For each newly attached workspace, the gateway:
 4. Silently posts a connection note and the latest visible reply as context.
 5. Forwards subsequent activity from every session into the same topic.
 
-A reply to a forwarded Telegram message returns to that message's exact Conductor session. In a synced workspace with multiple threads, a plain topic message waits for an explicit thread choice; the picker names each thread and its model, preserves the message and prepared attachments, and submits them once after selection. That choice becomes the topic's Telegram default. `/threads` changes it. A workspace with just one visible thread needs no choice. Pre-existing automatically discovered defaults are not treated as explicit selections.
+A reply to a forwarded Telegram message returns to that message's exact Conductor session. Once an outgoing message is delivered, replies to that original Telegram message retain its destination too, including `/threads new <prompt>` messages. In a synced workspace with multiple threads, a plain topic message waits for an explicit thread choice; the picker names each thread and its model, preserves the message and prepared attachments, and submits them once after selection. That choice becomes the topic's Telegram default. `/threads` changes it; `/threads new <prompt>` creates and selects a new thread. A workspace with just one visible thread needs no choice. Pre-existing automatically discovered defaults are not treated as explicit selections.
 
-Telegram's selection is separate from the tab open in the Conductor app: the Cloud API does not expose that tab. The send receipt names the actual thread and model and includes its Conductor deep link, where both the user message and agent response are recorded. Queued messages keep their selected thread across retries and later `/threads` changes. The gateway retains the session's native provider, model, and effort; unsupported or unavailable metadata is rejected instead of replaced with a guessed default.
+Telegram's selection is separate from the tab open in the Conductor app: the Cloud API does not expose that tab. The send receipt names the actual thread and model and includes its Conductor deep link, where both the user message and agent response are recorded. A restart can restore this receipt without resending the task. Queued messages and media keep their selected thread through preparation, retries, and later `/threads` changes. The gateway retains the session's native provider, model, and effort; unsupported or unavailable metadata is rejected instead of replaced with a guessed default.
+
+When recovery replaces the explicitly selected session, its replacement becomes the Telegram selection. Recovery of another session does not transfer that selection: the next ambiguous topic message asks for a thread again. A thread choice cannot submit a saved message after its workspace was stopped, or into an archived thread.
 
 Discovered workspaces do not receive an MCP bridge credential. Their agents are told to answer inline, and those replies reach Telegram through normal transcript forwarding. Workspaces created by the gateway keep the MCP bridge tools for explicit progress, artifact, and human-decision reporting.
 
@@ -58,6 +60,9 @@ CLI setup should expose the same choices, persist `cloudSyncChatId` and `cloudSy
 - A workspace created outside Telegram appears once in the configured forum within 60 seconds, including when it starts asleep.
 - Restarting the gateway creates no duplicate topic, transcript replay, or Conductor task.
 - New messages from every Conductor session arrive; replying targets the original session after a restart.
+- A topic with multiple visible threads holds an ambiguous message and its prepared attachments until an explicit choice; the picker identifies each thread's model.
+- Queued sends and media preserve the selected session through retries and later selection changes. Receipts and replies to original Telegram messages retain the actual destination after a restart.
+- Recovery transfers an explicit selection only when replacing that selected session; recovery of another thread cannot silently redirect the next topic message.
 - Only `OWNER_USER_ID` can submit work, and only inside topics created or attached by this gateway.
 - Ambiguous repository identities, unknown models, missing sessions, permission loss, and API failures do not guess or create work.
 - A rename updates the topic; archive or deletion closes it without deleting history.
