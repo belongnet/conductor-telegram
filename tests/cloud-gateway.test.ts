@@ -1200,17 +1200,21 @@ test("a repo topic routes itself to the one project matching its repository name
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
   const action = JSON.parse(f.store.row("update:1:action")!.payload);
   assert.equal(action.type, "launch"); assert.equal(action.projectId, "p2");
-  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
+  // One topic, one workspace: it lives here rather than opening a topic of its own.
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, 5);
   const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
   assert.match(ack, /Task received and queued/); assert.match(ack, /now routes to Long Events/);
+  assert.match(ack, /This topic now follows that workspace/);
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   assert.equal(f.counts().creates, 1);
-  assert.equal(JSON.parse(f.store.row(`create-topic:${action.trackedId}`)!.payload).payload.message_thread_id, undefined);
+  assert.equal(f.store.row(`create-topic:${action.trackedId}`), undefined);
   f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "second task"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   const second = JSON.parse(f.store.row("update:2:action")!.payload);
-  assert.equal(second.projectId, "p2"); assert.notEqual(second.trackedId, action.trackedId);
-  assert.doesNotMatch(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /now routes to/);
+  // The follow-up continues that workspace instead of opening another.
+  assert.equal(second.type, "send"); assert.equal(second.trackedId, action.trackedId);
+  const followUp = JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text;
+  assert.doesNotMatch(followUp, /now routes to/); assert.doesNotMatch(followUp, /now follows that workspace/);
 }));
 
 test("an ambiguous repo topic asks once per burst, answers a later attempt, and links on confirmation", () => fixture(async f => {
@@ -1261,17 +1265,25 @@ test("an ambiguous repo topic asks once per burst, answers a later attempt, and 
   assert.equal(JSON.parse(f.store.row("update:9:action")!.payload).projectId, "p2");
 }));
 
-test("an explicit /run links its repo topic so later plain messages launch without a command", () => fixture(async f => {
+test("an explicit /run adopts its repo topic so later plain messages continue that workspace", () => fixture(async f => {
   const commands = repoTopic(f, "other", 6);
   f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 6, text: "/run p1 first task"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   assert.equal(f.store.get("repo-topic-project:-42:6"), "p1");
   f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 6, text: "second task"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
+  // Sent before the first launch has bound: the topic must not gain a rival workspace.
+  const first = JSON.parse(f.store.row("update:1:action")!.payload);
   const action = JSON.parse(f.store.row("update:2:action")!.payload);
-  assert.equal(action.type, "launch"); assert.equal(action.projectId, "p1");
-  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
-  assert.notEqual(action.trackedId, JSON.parse(f.store.row("update:1:action")!.payload).trackedId);
+  assert.equal(action.trackedId, first.trackedId);
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, 6);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM workspaces WHERE telegram_thread_id=6").get() as any).n, 1);
+  // Once it is bound, a later message is a plain follow-up.
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  f.store.ingest([{update_id: 3, message: {message_id: 103, chat: {id: -42}, from: {id: 9}, message_thread_id: 6, text: "third task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const third = JSON.parse(f.store.row("update:3:action")!.payload);
+  assert.equal(third.type, "send"); assert.equal(third.trackedId, first.trackedId);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='telegram' AND payload LIKE '%reaches Conductor yet%'").get() as any).n, 0);
 }));
 
@@ -1353,7 +1365,7 @@ test("an ambiguous repo topic ranks related projects first and offers at most fo
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 0);
 }));
 
-test("a photo in a repo topic auto-links, launches its own workspace, and leaves the repo topic free", () => fixture(async f => {
+test("a photo in a repo topic auto-links and its workspace lives in that topic", () => fixture(async f => {
   f.api.listProjects = async () => [
     {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
     {id: "p2", name: "Screens", gitRemote: "git@github.com:org/screens.git"},
@@ -1366,7 +1378,7 @@ test("a photo in a repo topic auto-links, launches its own workspace, and leaves
   const action = JSON.parse(f.store.row("update:1:action")!.payload);
   assert.equal(action.type, "launch"); assert.equal(action.projectId, "p2"); assert.equal(action.mediaPending, true);
   assert.equal(JSON.parse(f.store.row("update:1:media")!.payload).fileId, "full");
-  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
+  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, 5);
   const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
   assert.match(ack, /Attachment received/); assert.match(ack, /now routes to Screens/);
 }));
@@ -1438,9 +1450,13 @@ test("a one-off /run in a linked repo topic stays a one-off and says where the t
     // Naming a project for one task must never silently re-point every later message.
     assert.equal(f.store.get("repo-topic-project:-42:5"), "p2", text);
   }
+  // Each /run rolls the topic onto the work it started, so the follow-up continues that workspace.
+  const latest = JSON.parse(f.store.row("update:3:action")!.payload).trackedId;
   f.store.ingest([{update_id: 4, message: {message_id: 104, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "plain follow-up"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
-  assert.equal(JSON.parse(f.store.row("update:4:action")!.payload).projectId, "p2");
+  assert.equal(JSON.parse(f.store.row("update:4:action")!.payload).trackedId, latest);
+  // The link the owner set with /link still decides where the NEXT fresh task goes.
+  assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
 }));
 
 test("a repo topic whose project the catalog stops listing asks again and keeps its link", () => fixture(async f => {
@@ -1534,7 +1550,7 @@ test("a button dropped from a later offer stops working instead of re-pointing t
   assert.match(JSON.parse(f.store.row("update:3:answer")!.payload).payload.text, /no longer on the table/);
 }));
 
-test("every photo of an album follows the one-off project named in its caption", () => fixture(async f => {
+test("an album reaches one workspace in the project its caption named", () => fixture(async f => {
   f.api.listProjects = async () => [
     {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
     {id: "p2", name: "other", gitRemote: "git@github.com:org/other.git"},
@@ -1548,14 +1564,16 @@ test("every photo of an album follows the one-off project named in its caption",
     message_thread_id: 5, media_group_id: "album-1", photo: [{file_id: `photo-${n}`}],
     ...(n === 2 ? {caption: "/run p1 fix these two screens"} : {})}})));
   for (const _ of [2, 3]) await processQueue(f.store, ["update"], row => commands.handle(row));
-  for (const id of [2, 3]) {
-    assert.equal(JSON.parse(f.store.row(`update:${id}:action`)!.payload).projectId, "p1", `update ${id}`);
-    assert.match(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.text, /one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/, `update ${id}`);
-  }
+  const captioned = JSON.parse(f.store.row("update:2:action")!.payload);
+  assert.equal(captioned.projectId, "p1");
+  assert.match(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/);
+  // Both photos are one intent, so they reach one workspace rather than one workspace each.
+  assert.equal(JSON.parse(f.store.row("update:3:action")!.payload).trackedId, captioned.trackedId);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM workspaces WHERE telegram_thread_id=5").get() as any).n, 1);
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
 }));
 
-test("a repo topic an earlier release pinned to a workspace goes back to launching new work", () => fixture(async f => {
+test("a workspace already living in a repo topic is continued, not replaced", () => fixture(async f => {
   f.api.listProjects = async () => [{id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"}];
   const commands = repoTopic(f, "repo");
   // v0.8.1 pinned the workspace it launched to the repo topic's own thread.
@@ -1565,11 +1583,10 @@ test("a repo topic an earlier release pinned to a workspace goes back to launchi
   f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "start something new"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   const action = JSON.parse(f.store.row("update:1:action")!.payload);
-  assert.equal(action.type, "launch");
-  assert.notEqual(action.trackedId, f.ws.id);
-  assert.equal(action.projectId, "p1");
-  assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
-  // Following up on the pinned workspace still works by replying to one of its messages.
+  // The workspace already in this topic is the topic's workspace: continue it.
+  assert.equal(action.type, "send");
+  assert.equal(action.trackedId, f.ws.id);
+  // Replying to one of its messages targets the same workspace.
   linkTelegramMessage("-42", "500", f.ws.id, "s1");
   f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5,
     reply_to_message: {message_id: 500}, text: "keep going"}}]);
@@ -1943,4 +1960,39 @@ test("a Conductor rejection of a send clears the fence", () => fixture(async f =
   assert.equal(f.store.row("follow")!.state, "blocked");
   assert.match(f.store.row("follow")!.error!, /refused this message: payload too large/);
   assert.equal(f.store.get("send-attempted:follow"), false);
+}));
+
+test("/land runs the land-and-deploy skill in the topic's workspace", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 9);
+  await f.launch();
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  for (const [i, text] of ["/land", "/land after the canary"].entries()) {
+    const id = i + 1;
+    f.store.ingest([{update_id: id, message: {message_id: 200 + id, chat: {id: -42}, from: {id: 9}, message_thread_id: 9, text}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    const action = JSON.parse(f.store.row(`update:${id}:action`)!.payload);
+    assert.equal(action.type, "send", text);
+    assert.equal(action.trackedId, f.ws.id, text);
+    // The alias resolves to the skill's real name, not to a /land nobody ships.
+    assert.match(action.prompt, /^Use \/land-and-deploy/, text);
+  }
+  assert.match(JSON.parse(f.store.row("update:2:action")!.payload).prompt, /after the canary/);
+}));
+
+test("a workspace living in a repo topic never renames it", () => fixture(async f => {
+  (f.api as any).renameWorkspace = async () => ({});
+  const commands = repoTopic(f, "repo");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "first task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const trackedId = JSON.parse(f.store.row("update:1:action")!.payload).trackedId;
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/rename Broken Link Review"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(getWorkspace(trackedId)?.name, "Broken Link Review");
+  // The topic is named for its repository; renaming the workspace must not rewrite it.
+  const renames = (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='telegram'").all() as any[])
+    .map(row => JSON.parse(row.payload)).filter(job => job.method === "editForumTopic");
+  assert.deepEqual(renames, []);
 }));

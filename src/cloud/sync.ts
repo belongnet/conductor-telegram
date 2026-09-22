@@ -1,6 +1,6 @@
 import type {ConductorApiProject, ConductorApiWorkspace, ConductorApiSession, ConductorApiSessionStatus, ConductorApiMessage} from "../integrations/conductor-api.js";
 import {repositoryRemoteIdentity} from "../lanes/repository-identity.js";
-import {createWorkspace, getWorkspace, updateWorkspaceConductorBinding, upsertThreadCursor} from "../store/queries.js";
+import {createWorkspace, getWorkspace, updateWorkspaceConductorBinding, upsertThreadCursor, getRepoTopicByThreadId} from "../store/queries.js";
 import {CloudEngine, transcriptText} from "./engine.js";
 import {nativeSessionProvider} from "./messages.js";
 import {enqueueTelegram} from "./telegram.js";
@@ -69,7 +69,8 @@ export class CloudWorkspaceSync {
           const revision = (store.get<number>(`sync-revision:${id}`) ?? 0) + 1;
           store.set(`sync-revision:${id}`, revision);
           store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(remote.name, remote.name, id);
-          if (ws.telegramThreadId) enqueueTelegram(store, `sync-rename:${id}:${revision}`, {method: "editForumTopic", workspaceId: id,
+          // Same rule as a rename command: a repo topic keeps the name of its repository.
+          if (ws.telegramThreadId && !getRepoTopicByThreadId(this.chatId, ws.telegramThreadId)) enqueueTelegram(store, `sync-rename:${id}:${revision}`, {method: "editForumTopic", workspaceId: id,
             payload: {chat_id: this.chatId, message_thread_id: ws.telegramThreadId, name: remote.name.slice(0, 128)}}, 20);
         })();
       }
