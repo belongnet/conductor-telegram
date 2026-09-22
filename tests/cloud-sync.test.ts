@@ -171,6 +171,71 @@ test("one visible native thread routes directly and a later thread does not redi
   assert.equal(f.sends[0].sessionId, "old");
 }));
 
+test("pre-upgrade attempted sends without a frozen thread require reconciliation", () => fixture(async f => {
+  await f.sync.sync(); const [{id, binding}] = f.store.bindings();
+  f.engine.queue("uncertain", {type: "send", trackedId: id, prompt: "already attempted"});
+  f.store.set("send-attempted:uncertain", true);
+  await assert.rejects(f.engine.action(f.store.row("uncertain")!), /no recorded thread/);
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.store.row("uncertain:choose-thread:0"), undefined);
+  assert.deepEqual(f.store.binding(id), binding);
+}));
+
+for (const selected of ["old", "recent"]) {
+  test(`recovery only transfers Telegram selection when replacing its selected thread (${selected})`, () => fixture(async f => {
+    await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+    f.store.bind(id, {...f.store.binding(id)!, sessionId: selected});
+    f.store.set(`selected-thread:${id}`, selected);
+    const status = f.api.getSessionStatus;
+    f.api.getSessionStatus = async sid => ({...await status(sid), status: sid === "recent" ? "error" : "idle"});
+    Object.assign(f.api, {createSession: async (input: any) => {
+      const session = {id: "replacement", ...input}; f.sessions.push(session); return session;
+    }});
+    f.engine.queue("recover", {type: "thread", trackedId: id, prompt: "resume", recovery: true, previousSessionId: "recent"});
+    await f.engine.action(f.store.row("recover")!);
+    assert.equal(f.sends[0].sessionId, "replacement");
+    assert.equal(f.store.get(`selected-thread:${id}`), selected === "recent" ? "replacement" : "old");
+    f.engine.queue("next", {type: "send", trackedId: id, prompt: "next task"});
+    await f.engine.action(f.store.row("next")!);
+    if (selected === "recent") assert.equal(f.sends[1].sessionId, "replacement");
+    else {
+      assert.equal(f.sends.length, 1, "recovering another thread cannot silently redirect the next message");
+      assert.ok(f.store.row("next:choose-thread:0"));
+    }
+  }));
+}
+
+test("a new thread command records its native target for replies after selection changes", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  Object.assign(f.api, {createSession: async (input: any) => {
+    const session = {id: "new-thread", ...input}; f.sessions.push(session); return session;
+  }});
+  f.store.ingest([{update_id: 1, message: {message_id: 1, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/threads new task"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(getWorkspaceMessageTarget("-42", "1")?.sessionId, "new-thread");
+  f.store.bind(id, {...f.store.binding(id)!, sessionId: "old"}); f.store.set(`selected-thread:${id}`, "old");
+  f.store.ingest([{update_id: 2, message: {message_id: 2, chat: {id: -42}, from: {id: 9}, message_thread_id: 7,
+    text: "continue", reply_to_message: {message_id: 1}}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.sends[1].sessionId, "new-thread");
+}));
+
+test("stop arriving during thread validation prevents selection and dispatch", () => fixture(async f => {
+  await f.sync.sync(); const [{id, binding}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  f.engine.queue("choice", {type: "send", trackedId: id, prompt: "hold"});
+  await f.engine.action(f.store.row("choice")!);
+  const key = JSON.parse(f.store.row("choice:choose-thread:0")!.payload).payload.reply_markup.inline_keyboard[0][0].callback_data;
+  const status = f.api.getSessionStatus;
+  f.api.getSessionStatus = async sid => {f.engine.queue("stop", {type: "stop", trackedId: id}); return status(sid);};
+  await tapThread(f, key);
+  assert.equal(f.store.row("choice:selected"), undefined);
+  assert.equal(f.store.get(`selected-thread:${id}`), undefined);
+  assert.deepEqual(f.store.binding(id), {...binding, stopped: true});
+  assert.equal(f.sends.length, 0);
+}));
+
 test("thread choices preserve prepared attachments and cannot send after stop", () => fixture(async f => {
   await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
   Object.assign(f.engine.bridge, {file: () => ({name: "screenshot.png"}), link: () => "https://bridge.test/file"});

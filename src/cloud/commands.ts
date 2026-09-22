@@ -274,7 +274,7 @@ export class CloudCommands {
       const binding = this.store.binding(target.id);
       if (!binding) { reply("This is historical local work. Start a cloud task with /run first."); return; }
       if (args.startsWith("new ") || (args === "new" && media)) {
-        const action: CloudAction = { type: "thread", trackedId: target.id, prompt: args.slice(4), statusId };
+        const action: CloudAction = { type: "thread", trackedId: target.id, prompt: args.slice(4), statusId, telegramMessageId: String(msg.message_id) };
         this.enqueueTurn(reply, "New thread queued.", `${row.id}:thread`, action,
           media ? {...media, chatId, threadId} : undefined, row.id); return;
       }

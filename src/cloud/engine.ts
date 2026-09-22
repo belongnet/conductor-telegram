@@ -614,7 +614,9 @@ export class CloudEngine {
         ...(review ? { reviewHead: review.head, reviewUrl: review.url, reviewBase: review.base, reviewValid: false } : {}) } satisfies SessionState);
       if (action.type !== "review") {
         this.store.bind(action.trackedId, { ...this.store.binding(action.trackedId)!, sessionId, ...provider });
-        this.store.set(`selected-thread:${action.trackedId}`, sessionId);
+        if (!action.recovery || this.store.get(`selected-thread:${action.trackedId}`) === action.previousSessionId) {
+          this.store.set(`selected-thread:${action.trackedId}`, sessionId);
+        }
       }
     }
     const prompt = review
