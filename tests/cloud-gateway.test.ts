@@ -1365,7 +1365,7 @@ test("a photo in a repo topic auto-links, launches its own workspace, and leaves
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
   const action = JSON.parse(f.store.row("update:1:action")!.payload);
   assert.equal(action.type, "launch"); assert.equal(action.projectId, "p2"); assert.equal(action.mediaPending, true);
-  assert.equal(JSON.parse(f.store.row("update:1:media")!.payload).fileId, "full");
+  assert.equal(JSON.parse(f.store.row("update:1:media")!.payload).files[0].fileId, "full");
   assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, null);
   const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
   assert.match(ack, /Attachment received/); assert.match(ack, /now routes to Screens/);
@@ -1534,12 +1534,13 @@ test("a button dropped from a later offer stops working instead of re-pointing t
   assert.match(JSON.parse(f.store.row("update:3:answer")!.payload).payload.text, /no longer on the table/);
 }));
 
-test("every photo of an album follows the one-off project named in its caption", () => fixture(async f => {
+test("an album in a repo topic is one launch in the one-off project named in its caption", () => fixture(async f => {
   f.api.listProjects = async () => [
     {id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git"},
     {id: "p2", name: "other", gitRemote: "git@github.com:org/other.git"},
   ];
   const commands = repoTopic(f, "repo");
+  commands.albumWaitMs = 0;
   f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link other"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
@@ -1548,10 +1549,17 @@ test("every photo of an album follows the one-off project named in its caption",
     message_thread_id: 5, media_group_id: "album-1", photo: [{file_id: `photo-${n}`}],
     ...(n === 2 ? {caption: "/run p1 fix these two screens"} : {})}})));
   for (const _ of [2, 3]) await processQueue(f.store, ["update"], row => commands.handle(row));
-  for (const id of [2, 3]) {
-    assert.equal(JSON.parse(f.store.row(`update:${id}:action`)!.payload).projectId, "p1", `update ${id}`);
-    assert.match(JSON.parse(f.store.row(`update:${id}:reply:0`)!.payload).payload.text, /one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/, `update ${id}`);
-  }
+  const action = JSON.parse(f.store.row("update:2:action")!.payload);
+  assert.equal(action.projectId, "p1");
+  assert.equal(action.prompt, "fix these two screens");
+  assert.deepEqual(JSON.parse(f.store.row("update:2:media")!.payload).files.map((file: any) => [file.fileId, file.fileName]),
+    [["photo-2", "photo-1.jpg"], ["photo-3", "photo-2.jpg"]]);
+  assert.match(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /2 attachments received[\s\S]*one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/);
+  // The second photo is part of the first update's work: no second workspace, launch, or acknowledgement.
+  assert.deepEqual(JSON.parse(f.store.row("update:3")!.result!), {absorbedInto: "update:2"});
+  assert.equal(f.store.row("update:3:action"), undefined);
+  assert.equal(f.store.row("update:3:reply:0"), undefined);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM workspaces").get() as any).n, 2);
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
 }));
 
