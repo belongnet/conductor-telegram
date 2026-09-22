@@ -538,7 +538,7 @@ function canaryFixture() {
       global: {
         provider_capacity: { claude: 3, codex: 2, cursor: 2 },
         provider_models: {
-          claude: "fable-5-1",
+          claude: "sonnet-5-1m",
           codex: "gpt-5.6-sol",
           cursor: "grok-4.7",
         },
@@ -1879,7 +1879,7 @@ test("unresolved external intent takes precedence over pending controls", async 
       patch: {
         author_provider: "claude",
         provider: "claude",
-        model: "fable-5-1",
+        model: "sonnet-5-1m",
         workspace_id: "priority-workspace",
         workspace_name:
           "[managed:growth][lane:CANARY][run:priority-run][stage:implementation][attempt:1]",
@@ -1892,7 +1892,7 @@ test("unresolved external intent takes precedence over pending controls", async 
       attempt_number: 1,
       role: "implementation",
       provider: "claude",
-      model: "fable-5-1",
+      model: "sonnet-5-1m",
       nonce: "priority-attempt-nonce",
       workspace_id: "priority-workspace",
     });
@@ -1909,7 +1909,7 @@ test("unresolved external intent takes precedence over pending controls", async 
         session_name:
           "[managed:growth][lane:CANARY][run:priority-run][stage:implementation][attempt:1][provider:claude]",
         provider: "claude",
-        model: "fable-5-1",
+        model: "sonnet-5-1m",
       },
     });
     await store.createControl({

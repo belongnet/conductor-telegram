@@ -1,8 +1,12 @@
 import Database from "better-sqlite3";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import type { LaneManifestV2, ManifestProvider } from "./manifest.js";
+import {
+  canonicalManifestJson,
+  type LaneManifestV2,
+  type ManifestProvider,
+} from "./manifest.js";
 import type {
   BeginActionInput,
   BeginAttemptInput,
@@ -15,6 +19,7 @@ import type {
   LaneLease,
   LaneNotificationClaim,
   LaneRunRecord,
+  LaneScopedControlState,
   LaneSnapshotV2,
   LaneStateStore,
   LeaseCredentials,
@@ -24,6 +29,7 @@ import type {
   UpdateAttemptInput,
 } from "./state-store.js";
 import { LaneStateStoreError } from "./state-store.js";
+import { retirementEvidenceProvesCompletion } from "./state-store.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS lane_v2_lease (
@@ -82,6 +88,26 @@ CREATE TABLE IF NOT EXISTS lane_v2_controls (
   control_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
   status TEXT NOT NULL, row_version INTEGER NOT NULL, payload_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lane_v2_lane_controls (
+  manifest_revision_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  row_version INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (manifest_revision_id, lane_id)
+);
+CREATE TABLE IF NOT EXISTS lane_v2_retirement_evidence_bindings (
+  evidence_id TEXT PRIMARY KEY,
+  external_key TEXT NOT NULL UNIQUE,
+  evidence_hash TEXT NOT NULL,
+  source_locator TEXT NOT NULL UNIQUE,
+  manifest_revision_id TEXT NOT NULL,
+  lane_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  merged_sha TEXT NOT NULL,
+  control_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS lane_v2_notifications (
   notification_key TEXT PRIMARY KEY, message_hash TEXT NOT NULL,
   claimed_by TEXT NOT NULL, lease_fence INTEGER NOT NULL,
@@ -121,6 +147,21 @@ function fullGitSha(value: string, field: string): string {
     );
   }
   return normalized;
+}
+
+function sameExactStringSet(left: unknown, right: readonly string[]): boolean {
+  if (
+    !Array.isArray(left) ||
+    left.some((value) => typeof value !== "string") ||
+    new Set(left).size !== left.length ||
+    new Set(right).size !== right.length ||
+    left.length !== right.length
+  ) {
+    return false;
+  }
+  const actual = [...left].sort();
+  const expected = [...right].sort();
+  return actual.every((value, index) => value === expected[index]);
 }
 const ATTEMPT_STATUSES = new Set([
   "commissioned",
@@ -252,6 +293,24 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function deterministicEvidenceId(controlId: string): string {
+  return `legacy-adoption-${createHash("sha256")
+    .update(controlId)
+    .digest("hex")
+    .slice(0, 24)}`;
+}
+
+function hasOnlyFiniteJsonNumbers(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(hasOnlyFiniteJsonNumbers);
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).every(
+      hasOnlyFiniteJsonNumbers
+    );
+  }
+  return true;
+}
+
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
   if (!value) return "''";
@@ -300,6 +359,47 @@ function manifestValidationCommands(
       ].join(" "),
     })),
   ];
+}
+
+function manifestValidationActionBinding(
+  lane: LaneManifestV2["lanes"][number],
+  run: LaneRunRecord,
+  attempt: LaneAttemptRecord
+): { validation_scope: Record<string, unknown>; validation_plan: Record<string, unknown> } {
+  if (!run.merged_sha) conflict("validation action requires merged SHA");
+  const profile = {
+    commands: lane.validation_profile.commands,
+    probes: lane.validation_profile.probes,
+  };
+  const preflight = manifestValidationCommands(lane, run.merged_sha)
+    .filter((entry) => entry.kind === "preflight")
+    .map((entry) => entry.command);
+  const validation_plan = {
+    manifest_revision_id: run.manifest_revision_id,
+    lane_id: run.lane_id,
+    run_id: run.run_id,
+    attempt_id: attempt.attempt_id,
+    merged_sha: run.merged_sha,
+    preflight,
+    commands: lane.validation_profile.commands,
+    probes: lane.validation_profile.probes,
+  };
+  return {
+    validation_scope: {
+      manifest_revision_id: run.manifest_revision_id,
+      lane_id: run.lane_id,
+      run_id: run.run_id,
+      attempt_id: attempt.attempt_id,
+      merged_sha: run.merged_sha,
+      validation_profile_sha256: createHash("sha256")
+        .update(canonicalManifestJson(profile))
+        .digest("hex"),
+      validation_plan_sha256: createHash("sha256")
+        .update(canonicalManifestJson(validation_plan))
+        .digest("hex"),
+    },
+    validation_plan,
+  };
 }
 
 function hasExactConductorValidationReceipts(
@@ -682,6 +782,52 @@ export class SqliteLaneStateStore implements LaneStateStore {
     return row ? parse<LaneRunRecord>(row.payload_json) : null;
   }
 
+  private laneControl(
+    manifestRevisionId: string,
+    laneId: string
+  ): LaneScopedControlState | null {
+    const row = this.db
+      .prepare(
+        "SELECT payload_json FROM lane_v2_lane_controls WHERE manifest_revision_id = ? AND lane_id = ?"
+      )
+      .get(manifestRevisionId, laneId) as { payload_json: string } | undefined;
+    return row ? parse<LaneScopedControlState>(row.payload_json) : null;
+  }
+
+  private saveLaneControl(
+    record: LaneScopedControlState,
+    expectedVersion: number | null
+  ): LaneScopedControlState {
+    if (expectedVersion === null) {
+      this.db
+        .prepare(
+          "INSERT INTO lane_v2_lane_controls (manifest_revision_id, lane_id, state, row_version, payload_json) VALUES (?, ?, ?, ?, ?)"
+        )
+        .run(
+          record.manifest_revision_id,
+          record.lane_id,
+          record.state,
+          record.row_version,
+          JSON.stringify(record)
+        );
+      return record;
+    }
+    const changed = this.db
+      .prepare(
+        "UPDATE lane_v2_lane_controls SET state = ?, row_version = ?, payload_json = ? WHERE manifest_revision_id = ? AND lane_id = ? AND row_version = ?"
+      )
+      .run(
+        record.state,
+        record.row_version,
+        JSON.stringify(record),
+        record.manifest_revision_id,
+        record.lane_id,
+        expectedVersion
+      );
+    if (changed.changes !== 1) conflict("lane control state changed");
+    return record;
+  }
+
   private saveRun(run: LaneRunRecord, expected: number): LaneRunRecord {
     const next = { ...run, row_version: expected + 1, updated_at: now() };
     const result = this.db
@@ -892,10 +1038,21 @@ export class SqliteLaneStateStore implements LaneStateStore {
           throw new LaneStateStoreError(`invalid ${field}`, 400);
         }
       }
+      const scoped = this.laneControl(run.manifest_revision_id, run.lane_id);
+      const legacyBoundedClaudeModel =
+        input.to_status === "validating" &&
+        next.provider === "claude" &&
+        next.model === "sonnet-5-1m" &&
+        String(manifest.global.provider_models.claude) === "fable-5-1" &&
+        scoped?.state === "validation_authorized" &&
+        scoped.run_id === run.run_id &&
+        scoped.merged_sha === run.merged_sha;
       if (
         next.model !== null &&
         (!next.provider ||
-          manifest.global.provider_models[next.provider as ManifestProvider] !== next.model)
+          (manifest.global.provider_models[next.provider as ManifestProvider] !==
+            next.model &&
+            !legacyBoundedClaudeModel))
       ) {
         throw new LaneStateStoreError(
           "run model violates the manifest provider policy",
@@ -1086,7 +1243,24 @@ export class SqliteLaneStateStore implements LaneStateStore {
       } else if (!run.merged_sha || input.head_sha !== run.merged_sha) {
         conflict("validation attempt must bind the merged SHA");
       }
-      if (manifest.global.provider_models[input.provider] !== input.model) {
+      const scoped = this.laneControl(run.manifest_revision_id, run.lane_id);
+      const legacyBoundedClaudeOverride =
+        input.role === "validation" &&
+        input.provider === "claude" &&
+        input.model === "sonnet-5-1m" &&
+        String(manifest.global.provider_models.claude) === "fable-5-1" &&
+        scoped?.state === "validation_authorized" &&
+        scoped.run_id === run.run_id &&
+        scoped.merged_sha === run.merged_sha &&
+        (
+          this.db
+            .prepare("SELECT mode FROM lane_v2_controller WHERE state_id = 1")
+            .get() as { mode: string }
+        ).mode === "paused_safety";
+      if (
+        manifest.global.provider_models[input.provider] !== input.model &&
+        !legacyBoundedClaudeOverride
+      ) {
         throw new LaneStateStoreError("attempt model violates manifest policy", 400);
       }
       const healthRow = this.db
@@ -1322,6 +1496,57 @@ export class SqliteLaneStateStore implements LaneStateStore {
         (!attempt || !ACTIVE_ATTEMPT.has(attempt.status))
       ) {
         conflict("action requires an active commissioned attempt");
+      }
+      if (attempt?.role === "validation") {
+        const manifest = this.manifestForRun(run);
+        const lane = manifest.lanes.find(
+          (candidate) => candidate.id === run.lane_id
+        );
+        if (!lane) conflict("validation action lane is missing from its manifest");
+        const expected = manifestValidationActionBinding(lane!, run, attempt);
+        const expectedStages: Record<string, string> = {
+          create_workspace: `${attempt.stage}-workspace`,
+          create_session: `${attempt.stage}-session`,
+          send_prompt: `${attempt.stage}-prompt`,
+          nudge_session: `${attempt.stage}-nudge`,
+        };
+        if (
+          run.status !== "validating" ||
+          attempt.head_sha !== run.merged_sha ||
+          !Object.hasOwn(expectedStages, input.action_type) ||
+          input.stage !== expectedStages[input.action_type] ||
+          canonicalManifestJson(input.request.validation_scope) !==
+            canonicalManifestJson(expected.validation_scope) ||
+          canonicalManifestJson(input.request.validation_plan) !==
+            canonicalManifestJson(expected.validation_plan)
+        ) {
+          conflict("validation action is outside its immutable manifest plan");
+        }
+        const controller = this.db
+          .prepare("SELECT mode FROM lane_v2_controller WHERE state_id = 1")
+          .get() as { mode: string };
+        if (controller.mode === "paused_safety") {
+          const scoped = this.laneControl(
+            run.manifest_revision_id,
+            run.lane_id
+          );
+          if (
+            scoped?.state !== "validation_authorized" ||
+            scoped.run_id !== run.run_id ||
+            scoped.merged_sha !== run.merged_sha
+          ) {
+            conflict("paused validation action lacks scoped authorization");
+          }
+        } else if (controller.mode !== "active") {
+          conflict("validation action requires active or bounded paused mode");
+        }
+        if (
+          input.action_type === "send_prompt" &&
+          (!Array.isArray(input.request.authorized_git_actions) ||
+            input.request.authorized_git_actions.length !== 0)
+        ) {
+          conflict("validation prompt cannot authorize Git mutations");
+        }
       }
       if (run.ambiguous_action_id) conflict("ambiguous action must be reconciled first");
       if (!ALLOWED_ACTIONS.has(input.action_type)) {
@@ -1791,11 +2016,16 @@ export class SqliteLaneStateStore implements LaneStateStore {
           input.evidence.all_green === true &&
           !input.evidence.pending &&
           !input.evidence.failed;
-        if (input.evidence_type === "required_checks") {
+        if (
+          input.evidence_type === "required_checks" ||
+          input.evidence_type === "merged_ci"
+        ) {
           accepted =
             accepted &&
-            JSON.stringify(input.evidence.required_checks ?? []) ===
-              JSON.stringify(lane!.delivery_adapter.required_checks ?? []) &&
+            sameExactStringSet(
+              input.evidence.required_checks ?? [],
+              lane!.delivery_adapter.required_checks ?? []
+            ) &&
             Array.isArray(input.evidence.missing_required_checks ?? []) &&
             ((input.evidence.missing_required_checks ?? []) as unknown[]).length === 0 &&
             Array.isArray(input.evidence.nonpassing_required_checks ?? []) &&
@@ -1885,7 +2115,89 @@ export class SqliteLaneStateStore implements LaneStateStore {
           accepted ? 1 : 0,
           JSON.stringify(record)
         );
-      this.saveRun(run, run.row_version);
+      const scoped = this.laneControl(run.manifest_revision_id, run.lane_id);
+      if (
+        !accepted &&
+        scoped?.state === "validation_authorized" &&
+        scoped.run_id === run.run_id &&
+        ["merged_ci", "deterministic_validation"].includes(
+          input.evidence_type
+        )
+      ) {
+        if (input.evidence_type === "deterministic_validation") {
+          const attemptRow = input.attempt_id
+            ? (this.db
+                .prepare(
+                  "SELECT payload_json FROM lane_v2_attempts WHERE attempt_id = ?"
+                )
+                .get(input.attempt_id) as { payload_json: string } | undefined)
+            : undefined;
+          const attempt = attemptRow
+            ? parse<LaneAttemptRecord>(attemptRow.payload_json)
+            : null;
+          if (
+            !attempt ||
+            attempt.run_id !== run.run_id ||
+            attempt.role !== "validation" ||
+            !ACTIVE_ATTEMPT.has(attempt.status)
+          ) {
+            conflict("rejected bounded validation lacks an active matching attempt");
+          }
+          const failedAttempt: LaneAttemptRecord = {
+            ...attempt,
+            status: "failed",
+            result_json: {
+              ...attempt.result_json,
+              passed: false,
+              durable_evidence_id: input.evidence_id,
+              hold_reason: "deterministic_validation evidence rejected",
+            },
+            row_version: attempt.row_version + 1,
+          };
+          const attemptChange = this.db
+            .prepare(
+              "UPDATE lane_v2_attempts SET status = 'failed', row_version = ?, payload_json = ? WHERE attempt_id = ? AND row_version = ?"
+            )
+            .run(
+              failedAttempt.row_version,
+              JSON.stringify(failedAttempt),
+              failedAttempt.attempt_id,
+              attempt.row_version
+            );
+          if (attemptChange.changes !== 1) conflict("validation attempt changed");
+        }
+        this.saveRun(
+          {
+            ...run,
+            status: "paused_safety",
+            stage: "validation-hold",
+            metadata_json: {
+              ...run.metadata_json,
+              resume_status: "validating",
+              resume_stage: "validation",
+              validation_hold_reason: `${input.evidence_type} evidence rejected`,
+            },
+          },
+          run.row_version
+        );
+        this.saveLaneControl(
+          {
+            ...scoped,
+            state: "held",
+            reason: `${input.evidence_type} evidence rejected`,
+            updated_at: now(),
+            row_version: scoped.row_version + 1,
+          },
+          scoped.row_version
+        );
+        this.event("lane_validation_returned_to_hold", run.run_id, {
+          lane_id: run.lane_id,
+          manifest_revision_id: run.manifest_revision_id,
+          evidence_type: input.evidence_type,
+        });
+      } else {
+        this.saveRun(run, run.row_version);
+      }
       this.event("evidence_recorded", runId, {
         evidence_id: input.evidence_id,
         accepted,
@@ -2055,7 +2367,14 @@ export class SqliteLaneStateStore implements LaneStateStore {
         .prepare("SELECT payload_json FROM lane_v2_controls WHERE idempotency_key = ?")
         .get(input.idempotency_key) as { payload_json: string } | undefined;
       if (existing) return parse<LaneControlRecord>(existing.payload_json);
-      const human = ["archive_approval", "cutover", "rollback"].includes(input.kind);
+      const human = [
+        "archive_approval",
+        "cutover",
+        "rollback",
+        "lane_release",
+        "lane_retire",
+        "lane_validate",
+      ].includes(input.kind);
       const allowed = new Set([
         "pause",
         "resume",
@@ -2066,12 +2385,213 @@ export class SqliteLaneStateStore implements LaneStateStore {
         "cutover",
         "shadow",
         "rollback",
+        "lane_hold",
+        "lane_release",
+        "lane_retire",
+        "lane_validate",
       ]);
       if (!allowed.has(input.kind)) {
         throw new LaneStateStoreError("unsupported lane control kind", 400);
       }
       if (input.kind === "retry" && !input.lane_id) {
         throw new LaneStateStoreError("retry control requires lane_id", 400);
+      }
+      if (input.kind.startsWith("lane_") && !input.lane_id) {
+        throw new LaneStateStoreError("lane-scoped control requires lane_id", 400);
+      }
+      if (input.kind.startsWith("lane_")) {
+        const controller = this.db
+          .prepare("SELECT active_revision_id FROM lane_v2_controller WHERE state_id = 1")
+          .get() as { active_revision_id: string | null };
+        const revision = String(input.payload?.manifest_revision_id ?? "");
+        if (!revision || revision !== controller.active_revision_id) {
+          throw new LaneStateStoreError(
+            "lane-scoped control must bind the active manifest revision",
+            409
+          );
+        }
+        const manifestRow = this.db
+          .prepare(
+            "SELECT manifest_json FROM lane_v2_manifests WHERE revision_id = ? AND state = 'active'"
+          )
+          .get(revision) as { manifest_json: string } | undefined;
+        const lane = manifestRow
+          ? parse<LaneManifestV2>(manifestRow.manifest_json).lanes.find(
+              (candidate) => candidate.id === input.lane_id
+            )
+          : undefined;
+        if (!lane) {
+          throw new LaneStateStoreError(
+            "lane-scoped control lane is absent from the active manifest",
+            400
+          );
+        }
+        const expectedPayloadKeys: Record<string, string[]> = {
+          lane_hold: ["manifest_revision_id", "reason"],
+          lane_release: ["expected_hold_control_id", "manifest_revision_id"],
+          lane_validate: [
+            "expected_hold_control_id",
+            "expected_run_id",
+            "manifest_revision_id",
+            "merged_sha",
+          ],
+          lane_retire: ["evidence_refs", "manifest_revision_id", "merged_sha"],
+        };
+        if (
+          JSON.stringify(Object.keys(input.payload ?? {}).sort()) !==
+          JSON.stringify(expectedPayloadKeys[input.kind])
+        ) {
+          throw new LaneStateStoreError(
+            `${input.kind} payload has unsupported or missing fields`,
+            400
+          );
+        }
+        if (
+          input.kind === "lane_hold" &&
+          !String(input.payload?.reason ?? "").trim()
+        ) {
+          throw new LaneStateStoreError("lane hold requires a non-empty reason", 400);
+        }
+        if (
+          ["lane_release", "lane_validate"].includes(input.kind) &&
+          !String(input.payload?.expected_hold_control_id ?? "").trim()
+        ) {
+          throw new LaneStateStoreError(
+            "lane release/validate must bind the current hold control",
+            400
+          );
+        }
+        if (
+          input.kind === "lane_validate" &&
+          (!String(input.payload?.expected_run_id ?? "").trim() ||
+            !GIT_SHA_RE.test(String(input.payload?.merged_sha ?? "")))
+        ) {
+          throw new LaneStateStoreError(
+            "lane validate must bind the held run and merged SHA",
+            400
+          );
+        }
+        if (input.kind === "lane_retire") {
+          if (lane.policy.kind !== "one_shot") {
+            throw new LaneStateStoreError("only a one-shot lane may be retired", 400);
+          }
+          fullGitSha(String(input.payload?.merged_sha ?? ""), "merged_sha");
+          const refs = input.payload?.evidence_refs;
+          const targetRun = (
+            this.db
+              .prepare("SELECT payload_json FROM lane_v2_runs ORDER BY rowid")
+              .all() as Array<{ payload_json: string }>
+          )
+            .map((row) => parse<LaneRunRecord>(row.payload_json))
+            .filter(
+              (candidate) =>
+                candidate.manifest_revision_id === revision &&
+                candidate.lane_id === input.lane_id
+            )
+            .sort((left, right) => right.generation - left.generation)[0];
+          const mergedSha = fullGitSha(
+            String(input.payload?.merged_sha ?? ""),
+            "merged_sha"
+          );
+          if (
+            !Array.isArray(refs) ||
+            refs.length === 0 ||
+            refs.some((entry) => {
+              if (!entry || typeof entry !== "object") return true;
+              const value = entry as Record<string, unknown>;
+              const document = value.evidence_document;
+              if (!document || typeof document !== "object" || Array.isArray(document)) {
+                return true;
+              }
+              const doc = document as Record<string, unknown>;
+              const documentKeys = [
+                "evidence_kind",
+                "evidence_payload",
+                "lane_id",
+                "manifest_revision_id",
+                "merged_sha",
+                "observed_at",
+                "run_id",
+                "source_locator",
+              ];
+              const exactDocument =
+                JSON.stringify(Object.keys(doc).sort()) ===
+                JSON.stringify(documentKeys);
+              const payload = doc.evidence_payload;
+              const observedAt = String(doc.observed_at ?? "");
+              const canonical = exactDocument
+                ? canonicalManifestJson(document)
+                : "";
+              const expectedHash = canonical
+                ? createHash("sha256").update(canonical).digest("hex")
+                : "";
+              return (
+                !SAFE_ID_RE.test(String(value.evidence_id ?? "")) ||
+                !SAFE_ID_RE.test(String(value.external_key ?? "")) ||
+                !/^[0-9a-f]{64}$/.test(String(value.evidence_hash ?? "")) ||
+                Object.keys(value).length !== 4 ||
+                !Object.hasOwn(value, "evidence_document") ||
+                !exactDocument ||
+                doc.manifest_revision_id !== revision ||
+                doc.lane_id !== input.lane_id ||
+                doc.run_id !== targetRun?.run_id ||
+                doc.merged_sha !== mergedSha ||
+                ![
+                  "merge_record",
+                  "required_checks",
+                  "canonical_replay",
+                  "deterministic_validation",
+                ].includes(String(doc.evidence_kind ?? "")) ||
+                !String(doc.source_locator ?? "").trim() ||
+                String(doc.source_locator).length > 2048 ||
+                !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(observedAt) ||
+                !Number.isFinite(Date.parse(observedAt)) ||
+                !payload ||
+                typeof payload !== "object" ||
+                Array.isArray(payload) ||
+                !hasOnlyFiniteJsonNumbers(payload) ||
+                value.evidence_hash !== expectedHash
+              );
+            })
+          ) {
+            throw new LaneStateStoreError(
+              "lane retirement requires immutable evidence id/key/hash triples",
+              400
+            );
+          }
+          const uniqueIds = new Set(
+            refs.map((entry) => String((entry as Record<string, unknown>).evidence_id))
+          );
+          const uniqueKeys = new Set(
+            refs.map((entry) => String((entry as Record<string, unknown>).external_key))
+          );
+          const uniqueLocators = new Set(
+            refs.map((entry) =>
+              String(
+                ((entry as Record<string, unknown>).evidence_document as Record<
+                  string,
+                  unknown
+                >).source_locator
+              )
+            )
+          );
+          if (
+            uniqueIds.size !== refs.length ||
+            uniqueKeys.size !== refs.length ||
+            uniqueLocators.size !== refs.length
+          ) {
+            throw new LaneStateStoreError(
+              "lane retirement evidence references must be unique",
+              400
+            );
+          }
+          if (!retirementEvidenceProvesCompletion(refs)) {
+            throw new LaneStateStoreError(
+              "lane retirement requires a successful merge record and validation receipt",
+              400
+            );
+          }
+        }
       }
       if (
         ["provider_disable", "provider_enable"].includes(input.kind) &&
@@ -2143,6 +2663,361 @@ export class SqliteLaneStateStore implements LaneStateStore {
     })();
   }
 
+  private applyLaneScopedControl(
+    current: LaneControlRecord,
+    activeRevision: string
+  ): Record<string, unknown> {
+    const laneId = current.lane_id!;
+    const revision = String(current.payload_json.manifest_revision_id ?? "");
+    if (revision !== activeRevision) {
+      conflict("lane-scoped control no longer matches the active manifest revision");
+    }
+    const manifestRow = this.db
+      .prepare(
+        "SELECT manifest_json FROM lane_v2_manifests WHERE revision_id = ? AND state = 'active'"
+      )
+      .get(revision) as { manifest_json: string } | undefined;
+    if (!manifestRow) conflict("lane-scoped control requires an active manifest");
+    const manifest = parse<LaneManifestV2>(manifestRow.manifest_json);
+    const lane = manifest.lanes.find((candidate) => candidate.id === laneId);
+    if (!lane) conflict("lane-scoped control lane left the active manifest");
+    const runs = (
+      this.db
+        .prepare("SELECT payload_json FROM lane_v2_runs ORDER BY rowid")
+        .all() as Array<{ payload_json: string }>
+    )
+      .map((row) => parse<LaneRunRecord>(row.payload_json))
+      .filter(
+        (run) =>
+          run.manifest_revision_id === revision && run.lane_id === laneId
+      )
+      .sort((left, right) => right.generation - left.generation);
+    let run = runs[0] ?? null;
+    if (run) {
+      const unresolved = this.db
+        .prepare(
+          "SELECT 1 FROM lane_v2_actions WHERE run_id = ? AND status IN ('pending','ambiguous') LIMIT 1"
+        )
+        .get(run.run_id);
+      if (unresolved) {
+        conflict("lane-scoped control cannot bypass an unresolved action");
+      }
+    }
+    const prior = this.laneControl(revision, laneId);
+    const stamp = now();
+    if (current.kind === "lane_hold") {
+      if (prior?.state === "retired") conflict("a retired lane cannot be held");
+      const previousStatus =
+        run?.status === "paused_safety"
+          ? String(run.metadata_json.resume_status ?? prior?.resume_status ?? "queued")
+          : run?.status ?? null;
+      const resumeStage =
+        run?.status === "paused_safety"
+          ? String(
+              run.metadata_json.resume_stage ??
+                prior?.resume_stage ??
+                run.stage
+            )
+          : run?.stage ?? null;
+      if (run && !TERMINAL.has(run.status) && run.status !== "paused_safety") {
+        run = this.saveRun(
+          {
+            ...run,
+            status: "paused_safety",
+            stage: "lane-hold",
+            metadata_json: {
+              ...run.metadata_json,
+              resume_status: run.status,
+              resume_stage: run.stage,
+              lane_hold_control_id: current.control_id,
+              lane_hold_reason: String(current.payload_json.reason),
+            },
+          },
+          run.row_version
+        );
+      }
+      const record: LaneScopedControlState = {
+        manifest_revision_id: revision,
+        lane_id: laneId,
+        state: "held",
+        control_id: current.control_id,
+        run_id: run?.run_id ?? null,
+        previous_status: previousStatus,
+        resume_status: previousStatus,
+        resume_stage: resumeStage,
+        merged_sha: run?.merged_sha ?? null,
+        evidence_refs_json: prior?.evidence_refs_json ?? [],
+        reason: String(current.payload_json.reason),
+        updated_at: stamp,
+        row_version: (prior?.row_version ?? 0) + 1,
+      };
+      this.saveLaneControl(record, prior?.row_version ?? null);
+      this.event("lane_held", run?.run_id ?? null, {
+        control_id: current.control_id,
+        lane_id: laneId,
+        manifest_revision_id: revision,
+      });
+      return {
+        lane_id: laneId,
+        run_id: run?.run_id ?? null,
+        previous_status: previousStatus,
+        status: "paused_safety",
+      };
+    }
+    if (current.kind === "lane_release") {
+      if (prior?.state !== "held") conflict("lane release requires a matching hold");
+      if (current.payload_json.expected_hold_control_id !== prior.control_id) {
+        conflict("lane release hold identity changed before apply");
+      }
+      if (run && run.run_id === prior.run_id && run.status === "paused_safety") {
+        const resumeStatus = String(prior.resume_status ?? "queued");
+        if (!TRANSITIONS.paused_safety.has(resumeStatus)) {
+          conflict("held lane has an invalid resume status");
+        }
+        run = this.saveRun(
+          {
+            ...run,
+            status: resumeStatus,
+            stage: prior.resume_stage ?? resumeStatus,
+            metadata_json: {
+              ...run.metadata_json,
+              lane_released_by_control_id: current.control_id,
+            },
+          },
+          run.row_version
+        );
+      }
+      const removed = this.db
+        .prepare(
+          "DELETE FROM lane_v2_lane_controls WHERE manifest_revision_id = ? AND lane_id = ? AND row_version = ?"
+        )
+        .run(revision, laneId, prior.row_version);
+      if (removed.changes !== 1) conflict("lane hold changed before release");
+      this.event("lane_released", run?.run_id ?? null, {
+        control_id: current.control_id,
+        lane_id: laneId,
+        manifest_revision_id: revision,
+      });
+      return {
+        lane_id: laneId,
+        run_id: run?.run_id ?? null,
+        previous_status: "paused_safety",
+        status: run?.status ?? null,
+      };
+    }
+    if (current.kind === "lane_validate") {
+      const controllerMode = (
+        this.db
+          .prepare("SELECT mode FROM lane_v2_controller WHERE state_id = 1")
+          .get() as { mode: string }
+      ).mode;
+      if (controllerMode !== "paused_safety") {
+        conflict("bounded lane validation requires the global safety pause");
+      }
+      if (lane.policy.kind !== "one_shot") {
+        conflict("only a one-shot lane may receive bounded validation authority");
+      }
+      if (prior?.state !== "held") {
+        conflict("lane validation requires a matching lane hold");
+      }
+      if (
+        current.payload_json.expected_hold_control_id !== prior.control_id ||
+        current.payload_json.expected_run_id !== prior.run_id ||
+        current.payload_json.merged_sha !== prior.merged_sha
+      ) {
+        conflict("lane validation hold identity changed before apply");
+      }
+      if (
+        !run ||
+        run.run_id !== prior.run_id ||
+        run.status !== "paused_safety" ||
+        String(run.metadata_json.resume_status ?? prior.resume_status ?? "") !==
+          "validating" ||
+        !run.merged_sha
+      ) {
+        conflict("lane validation requires a held merged validation-stage run");
+      }
+      run = this.saveRun(
+        {
+          ...run,
+          status: "validating",
+          stage: "validation",
+          metadata_json: {
+            ...run.metadata_json,
+            validation_authorized_control_id: current.control_id,
+          },
+        },
+        run.row_version
+      );
+      const record: LaneScopedControlState = {
+        ...prior,
+        state: "validation_authorized",
+        control_id: current.control_id,
+        merged_sha: run.merged_sha,
+        updated_at: stamp,
+        row_version: prior.row_version + 1,
+      };
+      this.saveLaneControl(record, prior.row_version);
+      this.event("lane_validation_authorized", run.run_id, {
+        control_id: current.control_id,
+        lane_id: laneId,
+        manifest_revision_id: revision,
+        merged_sha: run.merged_sha,
+      });
+      return {
+        lane_id: laneId,
+        run_id: run.run_id,
+        merged_sha: run.merged_sha,
+        validation_authorized: true,
+      };
+    }
+    if (current.kind !== "lane_retire") {
+      throw new LaneStateStoreError("unsupported lane-scoped control", 400);
+    }
+    if (lane.policy.kind !== "one_shot" || !run || !run.merged_sha) {
+      conflict("lane retirement requires a merged one-shot run");
+    }
+    const atValidation =
+      run.status === "validating" ||
+      (run.status === "paused_safety" &&
+        String(run.metadata_json.resume_status ?? "") === "validating");
+    if (!atValidation) conflict("lane retirement requires the validation stage");
+    const mergedSha = fullGitSha(
+      String(current.payload_json.merged_sha ?? ""),
+      "merged_sha"
+    );
+    if (mergedSha !== run.merged_sha) conflict("lane retirement merged SHA changed");
+    for (const dependent of manifest.lanes.filter(
+      (candidate) =>
+        candidate.policy.kind === "recurring" &&
+        candidate.dependencies.some((dependency) => dependency.lane_id === laneId)
+    )) {
+      const dependentControl = this.laneControl(revision, dependent.id);
+      const dependentRun = (
+        this.db
+          .prepare("SELECT payload_json FROM lane_v2_runs ORDER BY rowid")
+          .all() as Array<{ payload_json: string }>
+      )
+        .map((row) => parse<LaneRunRecord>(row.payload_json))
+        .filter(
+          (candidate) =>
+            candidate.manifest_revision_id === revision &&
+            candidate.lane_id === dependent.id
+        )
+        .sort((left, right) => right.generation - left.generation)[0];
+      if (
+        dependentControl?.state !== "held" &&
+        !(dependentRun && TERMINAL.has(dependentRun.status))
+      ) {
+        conflict(`recurring dependent ${dependent.id} must be held or terminal`);
+      }
+    }
+    const refs = current.payload_json.evidence_refs as Array<{
+      evidence_id: string;
+      external_key: string;
+      evidence_hash: string;
+      evidence_document: LaneScopedControlState["evidence_refs_json"][number]["evidence_document"];
+    }>;
+    for (const ref of refs) {
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO lane_v2_retirement_evidence_bindings
+             (evidence_id, external_key, evidence_hash, source_locator, manifest_revision_id, lane_id, run_id, merged_sha, control_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            ref.evidence_id,
+            ref.external_key,
+            ref.evidence_hash,
+            ref.evidence_document.source_locator,
+            revision,
+            laneId,
+            run.run_id,
+            mergedSha,
+            current.control_id,
+            stamp
+          );
+      } catch {
+        conflict("retirement evidence reference was already bound");
+      }
+    }
+    const adoption = {
+      evidence_id: deterministicEvidenceId(current.control_id),
+      external_key: `legacy-adoption:${current.control_id}`,
+      run_id: run.run_id,
+      evidence_type: "legacy_validation_adoption",
+      repo_owner: run.repo_owner,
+      repo_name: run.repo_name,
+      head_sha: mergedSha,
+      evidence: {
+        manifest_revision_id: revision,
+        lane_id: laneId,
+        run_id: run.run_id,
+        merged_sha: mergedSha,
+        evidence_refs: refs,
+      },
+      accepted: true,
+      recorded_at: stamp,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO lane_v2_evidence (evidence_id, external_key, run_id, head_sha, evidence_type, accepted, payload_json) VALUES (?, ?, ?, ?, ?, 1, ?)"
+      )
+      .run(
+        adoption.evidence_id,
+        adoption.external_key,
+        adoption.run_id,
+        adoption.head_sha,
+        adoption.evidence_type,
+        JSON.stringify(adoption)
+      );
+    run = this.saveRun(
+      {
+        ...run,
+        status: "validated",
+        stage: "terminal",
+        terminal_at: run.terminal_at ?? stamp,
+        metadata_json: {
+          ...run.metadata_json,
+          legacy_validation_adoption_control_id: current.control_id,
+        },
+      },
+      run.row_version
+    );
+    const retired: LaneScopedControlState = {
+      manifest_revision_id: revision,
+      lane_id: laneId,
+      state: "retired",
+      control_id: current.control_id,
+      run_id: run.run_id,
+      previous_status: prior?.previous_status ?? "validating",
+      resume_status: null,
+      resume_stage: null,
+      merged_sha: mergedSha,
+      evidence_refs_json: refs,
+      reason: "legacy merged validation adopted",
+      updated_at: stamp,
+      row_version: (prior?.row_version ?? 0) + 1,
+    };
+    this.saveLaneControl(retired, prior?.row_version ?? null);
+    this.event("lane_retired", run.run_id, {
+      control_id: current.control_id,
+      lane_id: laneId,
+      manifest_revision_id: revision,
+      merged_sha: mergedSha,
+    });
+    return {
+      lane_id: laneId,
+      run_id: run.run_id,
+      previous_status: "validating",
+      status: "validated",
+      retired: true,
+      merged_sha: mergedSha,
+      evidence_refs: refs,
+    };
+  }
+
   async finishControl(
     lease: LeaseCredentials,
     controlId: string,
@@ -2170,8 +3045,62 @@ export class SqliteLaneStateStore implements LaneStateStore {
       let mode = String(controller.mode);
       let revision = (controller.active_revision_id as string | null) ?? null;
       let reason = (controller.reason as string | null) ?? null;
+      const laneScoped = current.kind.startsWith("lane_");
+      let appliedResult: Record<string, unknown> = input.result ?? {};
       if (input.status === "applied") {
-        if (current.kind === "pause") {
+        if (laneScoped) {
+          if (!revision) conflict("lane-scoped control requires an active revision");
+          appliedResult = {
+            ...appliedResult,
+            ...this.applyLaneScopedControl(current, revision),
+          };
+        } else if (
+          current.kind === "provider_disable" ||
+          current.kind === "provider_enable"
+        ) {
+          const provider = String(current.payload_json.provider ?? "");
+          if (!["claude", "codex", "cursor"].includes(provider)) {
+            conflict("provider control has an invalid provider");
+          }
+          const row = this.db
+            .prepare(
+              "SELECT row_version, payload_json FROM lane_v2_providers WHERE provider = ?"
+            )
+            .get(provider) as
+            | { row_version: number; payload_json: string }
+            | undefined;
+          const previous = row
+            ? parse<Record<string, unknown>>(row.payload_json)
+            : { provider, state: "healthy", transient_failures: [] };
+          const next = {
+            ...previous,
+            provider,
+            state:
+              current.kind === "provider_disable" ? "disabled" : "healthy",
+            transient_failures:
+              current.kind === "provider_enable"
+                ? []
+                : previous.transient_failures ?? [],
+            breaker_until: null,
+            last_error_code: current.kind,
+            row_version: Number(row?.row_version ?? 0) + 1,
+            updated_at: now(),
+          };
+          this.db
+            .prepare(
+              `INSERT INTO lane_v2_providers (provider, row_version, payload_json)
+               VALUES (?, ?, ?) ON CONFLICT(provider) DO UPDATE SET
+                 row_version = excluded.row_version,
+                 payload_json = excluded.payload_json`
+            )
+            .run(provider, next.row_version, JSON.stringify(next));
+          this.event("provider_breaker_changed", null, {
+            provider,
+            state: next.state,
+            control_id: current.control_id,
+          });
+          appliedResult = { ...appliedResult, provider, state: next.state };
+        } else if (current.kind === "pause") {
           mode = "paused_safety";
           reason = `paused from ${String(controller.mode)}: [control:${current.control_id}] ${String(
             current.payload_json.reason ?? "operator pause"
@@ -2222,26 +3151,28 @@ export class SqliteLaneStateStore implements LaneStateStore {
           reason = "operator rollback";
         }
       }
-      const controllerChange = this.db
-        .prepare(
-          `UPDATE lane_v2_controller SET mode = ?, active_revision_id = ?,
-             reason = ?, updated_at = ?, row_version = row_version + 1
-           WHERE state_id = 1 AND row_version = ?`
-        )
-        .run(
-          mode,
-          revision,
-          reason,
-          now(),
-          input.expected_controller_version
-        );
-      if (controllerChange.changes !== 1) conflict("controller state changed");
+      if (!laneScoped) {
+        const controllerChange = this.db
+          .prepare(
+            `UPDATE lane_v2_controller SET mode = ?, active_revision_id = ?,
+               reason = ?, updated_at = ?, row_version = row_version + 1
+             WHERE state_id = 1 AND row_version = ?`
+          )
+          .run(
+            mode,
+            revision,
+            reason,
+            now(),
+            input.expected_controller_version
+          );
+        if (controllerChange.changes !== 1) conflict("controller state changed");
+      }
       const next: LaneControlRecord = {
         ...current,
         status: input.status,
         payload_json: {
           ...current.payload_json,
-          controller_result: input.result ?? {},
+          controller_result: appliedResult,
         },
         row_version: current.row_version + 1,
       };
@@ -2302,6 +3233,13 @@ export class SqliteLaneStateStore implements LaneStateStore {
         .prepare("SELECT payload_json FROM lane_v2_controls WHERE status = 'pending'")
         .all() as Array<{ payload_json: string }>
     ).map((row) => parse<LaneControlRecord>(row.payload_json));
+    const laneControls = (
+      this.db
+        .prepare(
+          "SELECT payload_json FROM lane_v2_lane_controls ORDER BY manifest_revision_id, lane_id"
+        )
+        .all() as Array<{ payload_json: string }>
+    ).map((row) => parse<LaneSnapshotV2["lane_controls"][number]>(row.payload_json));
     const eventRows = this.db
       .prepare("SELECT * FROM lane_v2_events WHERE event_seq > ? ORDER BY event_seq LIMIT 1000")
       .all(Math.max(0, sinceEventSeq)) as Array<Record<string, unknown>>;
@@ -2386,6 +3324,7 @@ export class SqliteLaneStateStore implements LaneStateStore {
       ambiguous_actions: actions.filter((action) => action.status === "ambiguous"),
       pending_actions: actions.filter((action) => action.status === "pending"),
       pending_controls: controls,
+      lane_controls: laneControls,
       dependencies,
       duplicates,
       events,

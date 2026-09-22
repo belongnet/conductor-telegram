@@ -5,11 +5,21 @@ import path from "node:path";
 import { z } from "zod";
 
 const PROVIDERS = ["claude", "codex", "cursor"] as const;
-const MODELS = ["fable-5-1", "gpt-5.6-sol", "grok-4.7"] as const;
+const MODELS = [
+  "sonnet-5-1m",
+  "opus-5-1m",
+  "gpt-5.6-sol",
+  "grok-4.7",
+] as const;
 export const APPROVED_PROVIDER_MODELS = {
-  claude: "fable-5-1",
+  claude: "sonnet-5-1m",
   codex: "gpt-5.6-sol",
   cursor: "grok-4.7",
+} as const;
+export const APPROVED_PROVIDER_MODEL_OPTIONS = {
+  claude: ["sonnet-5-1m", "opus-5-1m"],
+  codex: ["gpt-5.6-sol"],
+  cursor: ["grok-4.7"],
 } as const;
 export const APPROVED_PROVIDER_CAPACITY = {
   claude: 3,
@@ -175,6 +185,7 @@ const ManifestSchema = z
               z
                 .object({
                   kind: z.literal("recurring"),
+                  enabled: z.boolean().default(false),
                   schedule: z
                     .string()
                     .min(1)
@@ -205,7 +216,7 @@ const ManifestSchema = z
             merge_policy: z
               .object({
                 method: z.enum(["squash", "merge", "rebase"]),
-                auto_merge: z.literal(true),
+                auto_merge: z.boolean(),
                 deploy_notes: z.string().default(""),
                 replay_notes: z.string().default(""),
               })
@@ -261,14 +272,13 @@ const ManifestSchema = z
           message: `must be ${APPROVED_PROVIDER_CAPACITY[provider]}`,
         });
       }
-      if (
-        manifest.global.provider_models[provider] !==
-        APPROVED_PROVIDER_MODELS[provider]
-      ) {
+      if (!(APPROVED_PROVIDER_MODEL_OPTIONS[provider] as readonly string[]).includes(
+        manifest.global.provider_models[provider]
+      )) {
         context.addIssue({
           code: z.ZodIssueCode.custom,
           path: ["global", "provider_models", provider],
-          message: `must be ${APPROVED_PROVIDER_MODELS[provider]}`,
+          message: `must be ${APPROVED_PROVIDER_MODEL_OPTIONS[provider].join(" or ")}`,
         });
       }
     }
@@ -336,6 +346,20 @@ const ManifestSchema = z
           code: z.ZodIssueCode.custom,
           path: ["lanes", index, "merge_policy", "method"],
           message: "GitLab delivery supports squash or merge, not controller-initiated rebase",
+        });
+      }
+      if (lane.policy.kind === "one_shot" && !lane.merge_policy.auto_merge) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "merge_policy", "auto_merge"],
+          message: "one-shot lanes require automatic merge after their exact-head gates",
+        });
+      }
+      if (lane.policy.kind === "recurring" && lane.merge_policy.auto_merge) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "merge_policy", "auto_merge"],
+          message: "recurring lanes must not automatically merge",
         });
       }
     }

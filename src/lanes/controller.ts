@@ -61,6 +61,7 @@ import type {
   LaneLease,
   LaneRunRecord,
   LaneSnapshotV2,
+  LaneScopedControlState,
   LaneStateStore,
   LeaseCredentials,
 } from "./state-store.js";
@@ -79,6 +80,7 @@ const FULL_SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 const ARCHIVE_GRACE_MS = 60 * 60 * 1000;
 const NUDGE_MESSAGE =
   "Continue the commissioned task from the current workspace state. Follow the original controller protocol and finish with the required structured result.";
+const CURRENT_BOUNDED_CLAUDE_MODEL = "sonnet-5-1m";
 
 type Role = LaneAttemptRecord["role"];
 
@@ -203,6 +205,20 @@ function textForMessages(messages: readonly ConductorApiMessage[]): string {
     .join("\n");
 }
 
+function scopedLaneControl(
+  snapshot: LaneSnapshotV2,
+  laneId: string
+): LaneScopedControlState | null {
+  const revision = snapshot.controller?.active_revision_id;
+  if (!revision) return null;
+  return (
+    snapshot.lane_controls.find(
+      (control) =>
+        control.manifest_revision_id === revision && control.lane_id === laneId
+    ) ?? null
+  );
+}
+
 function lastProgressCursor(messages: readonly ConductorApiMessage[]): string | null {
   // The append-only transcript position is the cursor, not just assistant
   // prose. A deterministic nudge therefore creates a new observable cursor
@@ -244,6 +260,23 @@ function extractBoundPr(
 
 function roleStage(role: Role, slot = 1): string {
   return role === "final" ? `final-${slot}` : role;
+}
+
+export function commissionedAttemptModel(input: {
+  manifest: LaneManifestV2;
+  provider: ManifestProvider;
+  role: Role;
+  boundedValidation?: boolean;
+}): string {
+  if (
+    input.role === "validation" &&
+    input.boundedValidation === true &&
+    input.provider === "claude" &&
+    String(input.manifest.global.provider_models.claude) === "fable-5-1"
+  ) {
+    return CURRENT_BOUNDED_CLAUDE_MODEL;
+  }
+  return input.manifest.global.provider_models[input.provider];
 }
 
 function rolePrompt(input: {
@@ -577,6 +610,43 @@ function textHash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+export function validationActionBinding(
+  lane: ManifestLane,
+  run: LaneRunRecord,
+  attempt: LaneAttemptRecord
+): Record<string, unknown> {
+  if (attempt.role !== "validation") return {};
+  if (!run.merged_sha) {
+    throw new Error("validation action requires merged SHA");
+  }
+  const profile = {
+    commands: lane.validation_profile.commands,
+    probes: lane.validation_profile.probes,
+  };
+  const plan = {
+    manifest_revision_id: run.manifest_revision_id,
+    lane_id: run.lane_id,
+    run_id: run.run_id,
+    attempt_id: attempt.attempt_id,
+    merged_sha: run.merged_sha,
+    preflight: validationPreflightCommands(run.merged_sha),
+    commands: lane.validation_profile.commands,
+    probes: lane.validation_profile.probes,
+  };
+  return {
+    validation_scope: {
+      manifest_revision_id: run.manifest_revision_id,
+      lane_id: run.lane_id,
+      run_id: run.run_id,
+      attempt_id: attempt.attempt_id,
+      merged_sha: run.merged_sha,
+      validation_profile_sha256: textHash(canonicalManifestJson(profile)),
+      validation_plan_sha256: textHash(canonicalManifestJson(plan)),
+    },
+    validation_plan: plan,
+  };
+}
+
 function readVerifiedLanePrompt(
   manifest: LaneManifestV2,
   lane: ManifestLane
@@ -684,6 +754,74 @@ export class LaneController {
     // next lease holder emits the same notification exactly once.
     if (snapshot.controller?.mode === "paused_safety") {
       await this.notifyPausedSafety(snapshot);
+      const unsafeToValidate =
+        Object.entries(snapshot.capacity).some(
+          ([, capacity]) => capacity.active > capacity.limit
+        ) ||
+        snapshot.duplicates.length > 0 ||
+        !snapshot.manifest ||
+        snapshot.manifest.manifest_hash !== input.manifest.manifestHash ||
+        snapshot.controller.active_revision_id !== snapshot.manifest.revision_id;
+      if (unsafeToValidate) {
+        return {
+          acted: false,
+          active: true,
+          reason: "scoped validation blocked by controller safety invariants",
+        };
+      }
+      const authorized = snapshot.runs.find((run) => {
+        const control = scopedLaneControl(snapshot, run.lane_id);
+        return (
+          control?.state === "validation_authorized" &&
+          control.run_id === run.run_id &&
+          run.status === "validating" &&
+          Boolean(run.merged_sha)
+        );
+      });
+      if (authorized) {
+        const lane = input.manifest.lanes.find(
+          (candidate) => candidate.id === authorized.lane_id
+        );
+        if (!lane || lane.policy.kind !== "one_shot") {
+          await this.pauseAuthorizedValidation(
+            input.lease,
+            authorized.run_id,
+            "authorized validation is not bound to a one-shot manifest lane"
+          );
+          return {
+            acted: true,
+            active: true,
+            reason: "authorized validation failed closed",
+            runId: authorized.run_id,
+          };
+        }
+        const result = await this.advanceValidation(
+          input.lease,
+          snapshot,
+          input.manifest,
+          lane,
+          authorized,
+          { bounded: true }
+        );
+        const after = await this.store.snapshot();
+        const current = after.runs.find(
+          (candidate) => candidate.run_id === authorized.run_id
+        );
+        if (current?.status === "rework") {
+          await this.pauseAuthorizedValidation(
+            input.lease,
+            current.run_id,
+            "bounded validation failed; repair is not authorized"
+          );
+          return {
+            acted: true,
+            active: true,
+            reason: "validation failed and lane returned to hold",
+            runId: current.run_id,
+          };
+        }
+        return result;
+      }
     }
     const capacityBreach = Object.entries(snapshot.capacity).find(
       ([, capacity]) => capacity.active > capacity.limit
@@ -751,6 +889,10 @@ export class LaneController {
 
     for (const run of sortedActionableRuns(snapshot)) {
       if (run.status === "paused_safety" || run.status === "quarantined") continue;
+      const laneControl = scopedLaneControl(snapshot, run.lane_id);
+      if (laneControl?.state === "held" || laneControl?.state === "retired") {
+        continue;
+      }
       if (run.retry_at && Date.parse(run.retry_at) > this.now().getTime()) continue;
       if (
         !snapshot.manifest ||
@@ -827,6 +969,45 @@ export class LaneController {
     await this.notifyPausedSafety(await this.store.snapshot());
   }
 
+  private async pauseAuthorizedValidation(
+    lease: LeaseCredentials,
+    runId: string,
+    reason: string
+  ): Promise<void> {
+    const current = await this.freshRun(runId);
+    const snapshot = current.snapshot;
+    const revision = snapshot.controller?.active_revision_id;
+    if (!revision) throw new Error("bounded validation hold requires an active revision");
+    const idempotencyKey = deterministicLaneId(
+      "validation-hold",
+      revision,
+      current.run.lane_id,
+      current.run.run_id,
+      reason
+    );
+    const control = await this.store.createControl({
+      control_id: idempotencyKey,
+      idempotency_key: idempotencyKey,
+      kind: "lane_hold",
+      lane_id: current.run.lane_id,
+      requested_by: "lane-controller",
+      payload: { manifest_revision_id: revision, reason },
+    });
+    const beforeFinish = await this.store.snapshot();
+    const pending =
+      beforeFinish.pending_controls.find(
+        (candidate) => candidate.control_id === control.control_id
+      ) ?? control;
+    if (pending.status === "pending") {
+      await this.store.finishControl(lease, pending.control_id, {
+        expected_version: pending.row_version,
+        expected_controller_version: beforeFinish.controller?.row_version ?? 1,
+        status: "applied",
+        result: { reason },
+      });
+    }
+  }
+
   private async notifyPausedSafety(snapshot: LaneSnapshotV2): Promise<void> {
     const controller = snapshot.controller;
     if (controller?.mode !== "paused_safety") return;
@@ -878,15 +1059,7 @@ export class LaneController {
       await this.store.activateManifest(lease, revision, expectedManifestVersion);
       result = { revision_id: revision };
     } else if (control.kind === "provider_disable" || control.kind === "provider_enable") {
-      const provider = asProvider(String(control.payload_json.provider ?? ""));
-      const current = snapshot.providers.find((entry) => entry.provider === provider);
-      await this.store.recordProviderHealth(lease, {
-        provider,
-        expected_version: Number(current?.row_version ?? 0),
-        outcome: control.kind === "provider_disable" ? "disable" : "enable",
-        error_code: control.kind,
-      });
-      result = { provider };
+      result = { provider: asProvider(String(control.payload_json.provider ?? "")) };
     } else if (control.kind === "retry" && control.lane_id) {
       const run = snapshot.runs
         .filter((candidate) => candidate.lane_id === control.lane_id)
@@ -1781,6 +1954,10 @@ export class LaneController {
     for (const run of sortedActionableRuns(snapshot)) {
       const lane = manifest.lanes.find((candidate) => candidate.id === run.lane_id);
       if (!lane) continue;
+      const laneControl = scopedLaneControl(snapshot, run.lane_id);
+      if (laneControl?.state === "held" || laneControl?.state === "retired") {
+        continue;
+      }
       if (run.workspace_id) {
         const repositoryWorkspaces =
           workspacesByRepository.get(laneRepositoryIdentity(lane)) ?? [];
@@ -2033,7 +2210,7 @@ export class LaneController {
     const execution = await this.performAction({
       lease,
       run,
-      stage: "implementation-workspace",
+      stage: `${attempt.stage}-workspace`,
       attemptId: attempt.attempt_id,
       actionType: "create_workspace",
       request: {
@@ -2042,7 +2219,8 @@ export class LaneController {
         workspace_name: workspaceName,
         session_name: sessionName,
         provider,
-        model: manifest.global.provider_models[provider],
+        model: attempt.model,
+        ...validationActionBinding(lane, run, attempt),
       },
       mutate: async () => {
         const created = await this.conductor.createWorkspace({
@@ -2051,7 +2229,7 @@ export class LaneController {
           name: workspaceName,
           sessionName,
           agent: provider,
-          model: manifest.global.provider_models[provider],
+          model: attempt.model,
         });
         return {
           workspace_id: created.workspaceId,
@@ -2150,14 +2328,15 @@ export class LaneController {
         workspace_id: input.run.workspace_id,
         session_name: sessionName,
         provider: input.attempt.provider,
-        model: input.manifest.global.provider_models[input.attempt.provider],
+        model: input.attempt.model,
+        ...validationActionBinding(input.lane, input.run, input.attempt),
       },
       mutate: async () => {
         const session = await this.conductor.createSession({
           workspaceId: input.run.workspace_id!,
           name: sessionName,
           agent: input.attempt.provider,
-          model: input.manifest.global.provider_models[input.attempt.provider],
+          model: input.attempt.model,
         });
         return {
           session_id: session.id,
@@ -2209,6 +2388,7 @@ export class LaneController {
     provider: ManifestProvider;
     attemptNumber: number;
     sessionId?: string;
+    boundedValidation?: boolean;
   }): Promise<LaneAttemptRecord> {
     const stage = roleStage(input.role, input.attemptNumber);
     return this.store.beginAttempt(input.lease, input.run.run_id, {
@@ -2218,7 +2398,12 @@ export class LaneController {
       attempt_number: input.attemptNumber,
       role: input.role,
       provider: input.provider,
-      model: input.manifest.global.provider_models[input.provider],
+      model: commissionedAttemptModel({
+        manifest: input.manifest,
+        provider: input.provider,
+        role: input.role,
+        boundedValidation: input.boundedValidation,
+      }),
       nonce: deterministicLaneId("nonce", input.run.run_id, stage, input.attemptNumber, input.provider, input.run.head_sha ?? "none"),
       head_sha:
         input.role === "implementation"
@@ -2303,6 +2488,7 @@ export class LaneController {
           input.attempt.role === "implementation"
             ? ["push_managed_branch", "create_or_update_bound_pr"]
             : [],
+        ...validationActionBinding(input.lane, input.run, input.attempt),
       },
       mutate: async () => {
         const delivered = await this.conductor.sendMessage({
@@ -2367,6 +2553,7 @@ export class LaneController {
 
   private async updateProgressOrNudge(input: {
     lease: LeaseCredentials;
+    lane: ManifestLane;
     run: LaneRunRecord;
     attempt: LaneAttemptRecord;
     polled: Awaited<ReturnType<LaneController["pollAttempt"]>>;
@@ -2494,6 +2681,7 @@ export class LaneController {
         message_id: messageId,
         message_hash: textHash(message),
         progress_cursor: cursor,
+        ...validationActionBinding(input.lane, freshRun, attempt),
       },
       mutate: async () => {
         if (observedMessage) {
@@ -2741,7 +2929,7 @@ export class LaneController {
       }
       return { acted: true, active: true, reason: "PR bound", runId: changed.run_id };
     }
-    return this.updateProgressOrNudge({ lease, run, attempt, polled });
+    return this.updateProgressOrNudge({ lease, lane, run, attempt, polled });
   }
 
   private async advanceReviewOrFinal(
@@ -2828,6 +3016,14 @@ export class LaneController {
       }
       const recorded = await this.recordMergeEvidence(lease, run, policy, lane);
       if (recorded) return recorded;
+      if (!lane.merge_policy.auto_merge) {
+        return {
+          acted: false,
+          active: true,
+          reason: "automatic merge disabled by manifest",
+          runId: run.run_id,
+        };
+      }
       const current = await this.freshRun(run.run_id);
       const changed = await this.transition(lease, current.run, "merging", "merge");
       return { acted: true, active: true, reason: "merge gates satisfied", runId: changed.run_id };
@@ -2887,7 +3083,7 @@ export class LaneController {
       polled.status.status === "idle"
         ? exactReviewMarker({ attempt, run, text: polled.text })
         : null;
-    if (!marker) return this.updateProgressOrNudge({ lease, run, attempt, polled });
+    if (!marker) return this.updateProgressOrNudge({ lease, lane, run, attempt, polled });
     const tag = `[lane-attestation:${attempt.nonce}]`;
     const body = `${marker.raw}\n${tag}\n\n${String(marker.data.summary ?? "Commissioned review completed.")}`;
     const bodyHash = textHash(body);
@@ -3222,7 +3418,8 @@ export class LaneController {
     snapshot: LaneSnapshotV2,
     manifest: LaneManifestV2,
     lane: ManifestLane,
-    run: LaneRunRecord
+    run: LaneRunRecord,
+    options: { bounded?: boolean } = {}
   ): Promise<LaneControllerResult> {
     if (!run.merged_sha || !FULL_SHA_RE.test(run.merged_sha)) {
       throw new Error("validation requires merged SHA");
@@ -3237,6 +3434,19 @@ export class LaneController {
       checks.repoName !== run.repo_name.toLowerCase() ||
       checks.sha.toLowerCase() !== run.merged_sha.toLowerCase()
     ) {
+      if (options.bounded) {
+        await this.pauseAuthorizedValidation(
+          lease,
+          run.run_id,
+          "merged-SHA check response identity mismatch"
+        );
+        return {
+          acted: true,
+          active: true,
+          reason: "mismatched merged-SHA checks returned lane to hold",
+          runId: run.run_id,
+        };
+      }
       const current = await this.freshRun(run.run_id);
       const changed = await this.quarantineRun(
         lease,
@@ -3252,11 +3462,18 @@ export class LaneController {
       };
     }
     const freshForCi = await this.freshRun(run.run_id);
+    const checksGate = requiredChecksGate(
+      { checksStatus: checks.status, checks: checks.checks },
+      lane.delivery_adapter.required_checks ?? []
+    );
     const ciPayload = {
-      all_green: checks.status === "passing",
-      pending: checks.status === "pending" ? 1 : 0,
-      failed: checks.status === "failing" ? 1 : 0,
+      all_green: checksGate.passing,
+      pending: checksGate.missing.length + checksGate.pending.length,
+      failed: checksGate.failed.length,
       summary: checks.summary,
+      required_checks: lane.delivery_adapter.required_checks ?? [],
+      missing_required_checks: checksGate.missing,
+      nonpassing_required_checks: checksGate.notPassing,
     };
     const recordedCi = await this.store.recordEvidence(lease, run.run_id, {
       evidence_id: deterministicLaneId(
@@ -3274,23 +3491,47 @@ export class LaneController {
       head_sha: run.merged_sha!,
       evidence: ciPayload,
     });
-    if (checks.status === "pending") {
-      return { acted: false, active: true, reason: "merged SHA CI pending", runId: run.run_id };
-    }
-    if (checks.status === "failing") {
-      const current = await this.freshRun(run.run_id);
-      const changed = await this.transition(lease, current.run, "rework", "repair", {
-        metadata: { ...current.run.metadata_json, repair_reason: "merged SHA CI failed" },
-      });
-      return { acted: true, active: true, reason: "repair attempt required", runId: changed.run_id };
-    }
-    if (checks.status !== "passing") {
+    if (checksGate.missing.length > 0) {
       return {
-        acted: false,
+        acted: Boolean(options.bounded),
         active: true,
-        reason: "merged SHA CI unavailable",
+        reason: options.bounded
+          ? `merged SHA required checks missing; lane returned to hold: ${checksGate.missing.join(", ")}`
+          : `merged SHA required checks missing ${checksGate.missing.join(", ")}`,
         runId: run.run_id,
       };
+    }
+    if (checksGate.pending.length > 0) {
+      return {
+        acted: Boolean(options.bounded),
+        active: true,
+        reason: options.bounded
+          ? `merged SHA required checks pending; lane returned to hold: ${checksGate.pending.join(", ")}`
+          : `merged SHA required checks pending ${checksGate.pending.join(", ")}`,
+        runId: run.run_id,
+      };
+    }
+    if (checksGate.failed.length > 0) {
+      if (options.bounded) {
+        const held = await this.freshRun(run.run_id);
+        return {
+          acted: true,
+          active: true,
+          reason:
+            held.run.status === "paused_safety"
+              ? "required check failed and bounded validation returned to hold"
+              : "required check failed during bounded validation",
+          runId: run.run_id,
+        };
+      }
+      const current = await this.freshRun(run.run_id);
+      const changed = await this.transition(lease, current.run, "rework", "repair", {
+        metadata: {
+          ...current.run.metadata_json,
+          repair_reason: `merged SHA required checks failed: ${checksGate.failed.join(", ")}`,
+        },
+      });
+      return { acted: true, active: true, reason: "repair attempt required", runId: changed.run_id };
     }
     if (!evidenceWasAccepted(recordedCi)) {
       await this.pauseForSafety(
@@ -3339,6 +3580,7 @@ export class LaneController {
         role: "validation",
         provider,
         attemptNumber: number,
+        boundedValidation: options.bounded,
       });
       return { acted: true, active: true, reason: "validation commissioned", runId: run.run_id };
     }
@@ -3373,12 +3615,63 @@ export class LaneController {
         : null;
     if (failedValidation) {
       const beforeFailure = await this.freshRun(run.run_id);
-      const currentAttempt = beforeFailure.snapshot.attempts.find(
+      await this.store.recordEvidence(lease, run.run_id, {
+        evidence_id: deterministicLaneId(
+          "evidence",
+          "validation-failed",
+          attempt.attempt_id,
+          run.merged_sha
+        ),
+        external_key: `validation-failed:${attempt.nonce}:${run.merged_sha}`,
+        expected_run_version: beforeFailure.run.row_version,
+        attempt_id: attempt.attempt_id,
+        evidence_type: "deterministic_validation",
+        provider: attempt.provider,
+        nonce: attempt.nonce,
+        repo_owner: run.repo_owner,
+        repo_name: run.repo_name,
+        head_sha: run.merged_sha!,
+        evidence: {
+          nonce: attempt.nonce,
+          run: run.run_id,
+          stage: "validation",
+          head_sha: run.merged_sha,
+          merged_sha: run.merged_sha,
+          provider: attempt.provider,
+          passed: false,
+          source: "conductor_tool_events",
+          commands: failedValidation.marker.data.commands,
+          probes: failedValidation.marker.data.probes,
+          receipts: failedValidation.receipts,
+        },
+      });
+      if (options.bounded) {
+        const held = await this.freshRun(run.run_id);
+        const settledAttempt = held.snapshot.attempts.find(
+          (candidate) => candidate.attempt_id === attempt!.attempt_id
+        );
+        if (
+          held.run.status !== "paused_safety" ||
+          settledAttempt?.status !== "failed"
+        ) {
+          throw new Error(
+            "durable state did not atomically hold the run and settle bounded validation"
+          );
+        }
+        return {
+          acted: true,
+          active: true,
+          reason: "deterministic validation failed and lane returned to hold",
+          runId: run.run_id,
+        };
+      }
+      const afterEvidence = await this.freshRun(run.run_id);
+      const currentAttempt = afterEvidence.snapshot.attempts.find(
         (candidate) => candidate.attempt_id === attempt!.attempt_id
       )!;
       await this.store.updateAttempt(lease, currentAttempt.attempt_id, {
         expected_attempt_version: currentAttempt.row_version,
-        expected_run_version: beforeFailure.run.row_version,
+        expected_run_version: afterEvidence.run.row_version,
         status: "failed",
         progress_cursor: polled.cursor ?? undefined,
         result: {
@@ -3423,7 +3716,7 @@ export class LaneController {
             messages: polled.messages,
           })
         : null;
-    if (!validation) return this.updateProgressOrNudge({ lease, run, attempt, polled });
+    if (!validation) return this.updateProgressOrNudge({ lease, lane, run, attempt, polled });
     const beforeEvidence = await this.freshRun(run.run_id);
     const recordedValidation = await this.store.recordEvidence(lease, run.run_id, {
       evidence_id: deterministicLaneId("evidence", "validation", attempt.attempt_id, run.merged_sha),
@@ -3492,7 +3785,11 @@ export class LaneController {
       .map((lane) => ({ lane, generation: laneGenerationDue({ lane, runs: snapshot.runs, now: this.now() }) }))
       .filter(
         ({ lane, generation }) =>
-          generation.due && snapshot.dependencies[lane.id]?.ready !== false
+          generation.due &&
+          snapshot.dependencies[lane.id]?.ready !== false &&
+          !["held", "retired"].includes(
+            scopedLaneControl(snapshot, lane.id)?.state ?? ""
+          )
       )
       .sort((left, right) => {
         if (left.generation.recurring !== right.generation.recurring) {

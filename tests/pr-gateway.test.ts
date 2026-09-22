@@ -268,7 +268,7 @@ test("commissioned GitHub reviews are API reviews pinned to the exact head", () 
   );
 });
 
-test("GitLab-mirrored required checks cannot disappear from an otherwise green rollup", () => {
+test("GitLab-mirrored required checks cannot disappear or change case in an otherwise green rollup", () => {
   assert.deepEqual(
     requiredChecksGate(
       {
@@ -298,15 +298,21 @@ test("GitLab-mirrored required checks cannot disappear from an otherwise green r
     ).passing,
     false
   );
-  assert.equal(
+  assert.deepEqual(
     requiredChecksGate(
       {
         checksStatus: "passing",
         checks: [{ name: "GITLAB/LINT-AND-TEST", status: "passing" }],
       },
       ["gitlab/lint-and-test"]
-    ).passing,
-    true
+    ),
+    {
+      passing: false,
+      missing: ["gitlab/lint-and-test"],
+      notPassing: [],
+      pending: [],
+      failed: [],
+    }
   );
   assert.deepEqual(
     requiredChecksGate(
@@ -349,7 +355,8 @@ test("GitLab-mirrored required checks cannot disappear from an otherwise green r
       },
       []
     ).passing,
-    true
+    false,
+    "an empty allowlist preserves the host aggregate gate"
   );
   assert.equal(
     requiredChecksGate(

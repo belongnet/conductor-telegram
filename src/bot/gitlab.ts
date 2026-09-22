@@ -310,6 +310,12 @@ export class GitlabLaneGateway {
       sha: input.sha.toLowerCase(),
       status: summary.status,
       summary: summary.summary,
+      checks: statuses
+        .map((status) => ({
+          name: String(status.name ?? "").trim(),
+          status: summarizeChecks([statusAsRollup(status)]).status,
+        }))
+        .filter((status) => Boolean(status.name)),
     };
   }
 
