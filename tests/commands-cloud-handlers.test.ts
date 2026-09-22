@@ -2798,6 +2798,7 @@ test("ordinary repo launches explain every material local fallback", async () =>
     { cwd: repoDir }
   );
   const originalKey = process.env.CONDUCTOR_API_KEY;
+  const originalToken = process.env.CONDUCTOR_API_TOKEN;
   const originalBackend = process.env.CONDUCTOR_CLOUD_BACKEND;
 
   try {
@@ -2814,6 +2815,7 @@ test("ordinary repo launches explain every material local fallback", async () =>
 
     process.env.CONDUCTOR_CLOUD_BACKEND = "auto";
     delete process.env.CONDUCTOR_API_KEY;
+    delete process.env.CONDUCTOR_API_TOKEN;
     const unconfigured = fakeCtx("unconfigured fallback");
     const unconfiguredCalls = stubFetch({});
     await startWorkspaceForRepo(
@@ -2857,6 +2859,8 @@ test("ordinary repo launches explain every material local fallback", async () =>
   } finally {
     if (originalKey === undefined) delete process.env.CONDUCTOR_API_KEY;
     else process.env.CONDUCTOR_API_KEY = originalKey;
+    if (originalToken === undefined) delete process.env.CONDUCTOR_API_TOKEN;
+    else process.env.CONDUCTOR_API_TOKEN = originalToken;
     if (originalBackend === undefined) delete process.env.CONDUCTOR_CLOUD_BACKEND;
     else process.env.CONDUCTOR_CLOUD_BACKEND = originalBackend;
   }

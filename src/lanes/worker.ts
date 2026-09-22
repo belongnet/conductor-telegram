@@ -96,6 +96,7 @@ export function formatLaneStatus(snapshot: LaneSnapshotV2): Record<string, unkno
     lease: snapshot.lease,
     capacity: snapshot.capacity,
     provider_breakers: snapshot.providers,
+    lane_controls: snapshot.lane_controls,
     lanes: snapshot.runs.map((run) => {
       const attempt = snapshot.attempts
         .filter((candidate) => candidate.run_id === run.run_id)
@@ -124,6 +125,12 @@ export function formatLaneStatus(snapshot: LaneSnapshotV2): Record<string, unkno
         merged: run.merged_sha,
         retry_at: run.retry_at,
         ambiguous_action: run.ambiguous_action_id,
+        lane_control:
+          snapshot.lane_controls.find(
+            (control) =>
+              control.manifest_revision_id === run.manifest_revision_id &&
+              control.lane_id === run.lane_id
+          )?.state ?? null,
       };
     }),
     ambiguous_actions: snapshot.ambiguous_actions,

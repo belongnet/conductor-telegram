@@ -101,6 +101,95 @@ export type LaneControlRecord = {
   row_version: number;
 };
 
+export type LaneScopedControlState = {
+  manifest_revision_id: string;
+  lane_id: string;
+  state: "held" | "retired" | "validation_authorized";
+  control_id: string;
+  run_id: string | null;
+  previous_status: string | null;
+  resume_status: string | null;
+  resume_stage: string | null;
+  merged_sha: string | null;
+  evidence_refs_json: Array<{
+    evidence_id: string;
+    external_key: string;
+    evidence_hash: string;
+    evidence_document: {
+      manifest_revision_id: string;
+      lane_id: string;
+      run_id: string;
+      merged_sha: string;
+      evidence_kind:
+        | "merge_record"
+        | "required_checks"
+        | "canonical_replay"
+        | "deterministic_validation";
+      source_locator: string;
+      observed_at: string;
+      evidence_payload: Record<string, unknown>;
+    };
+  }>;
+  reason: string | null;
+  updated_at: string;
+  row_version: number;
+};
+
+export function retirementEvidenceProvesCompletion(refs: unknown): boolean {
+  if (!Array.isArray(refs) || refs.length === 0) return false;
+  const documents = refs
+    .map((entry) =>
+      entry && typeof entry === "object"
+        ? (entry as Record<string, unknown>).evidence_document
+        : null
+    )
+    .filter(
+      (document): document is Record<string, unknown> =>
+        Boolean(document) && typeof document === "object" && !Array.isArray(document)
+    );
+  if (documents.length !== refs.length) return false;
+  const provesMerge = documents.some((document) => {
+    const payload = document.evidence_payload;
+    return (
+      document.evidence_kind === "merge_record" &&
+      payload !== null &&
+      typeof payload === "object" &&
+      !Array.isArray(payload) &&
+      (payload as Record<string, unknown>).merged === true
+    );
+  });
+  const provesValidation = documents.some((document) => {
+    const payload = document.evidence_payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return false;
+    }
+    const value = payload as Record<string, unknown>;
+    if (document.evidence_kind === "required_checks") {
+      return (
+        value.all_green === true &&
+        Array.isArray(value.missing_required_checks) &&
+        value.missing_required_checks.length === 0 &&
+        Array.isArray(value.nonpassing_required_checks) &&
+        value.nonpassing_required_checks.length === 0
+      );
+    }
+    if (document.evidence_kind === "deterministic_validation") {
+      return value.passed === true;
+    }
+    if (document.evidence_kind === "canonical_replay") {
+      return (
+        value.verified === true &&
+        value.passed === true &&
+        [value.verdict, value.receipt_summary].some(
+          (entry) => typeof entry === "string" && entry.trim().length > 0
+        )
+      );
+    }
+    return false;
+  });
+  return provesMerge && provesValidation;
+}
+
 export type LaneSnapshotV2 = {
   manifest: null | {
     revision_id: string;
@@ -126,6 +215,7 @@ export type LaneSnapshotV2 = {
   ambiguous_actions: LaneActionRecordV2[];
   pending_actions: LaneActionRecordV2[];
   pending_controls: LaneControlRecord[];
+  lane_controls: LaneScopedControlState[];
   dependencies: Record<
     string,
     {

@@ -7,7 +7,7 @@ export async function handleDurableLanes(ctx: Context, rawArg: string): Promise<
   const { deterministicLaneId } = await import("../lanes/controller-policy.js");
   const store = await createLaneStateStore();
   try {
-    const [subcommand = "", first] = rawArg.split(/\s+/, 2);
+    const [subcommand = "", first, ...rest] = rawArg.trim().split(/\s+/);
     const command = subcommand.toLowerCase();
     const controls: Record<
       string,
@@ -39,6 +39,9 @@ export async function handleDurableLanes(ctx: Context, rawArg: string): Promise<
         payload: { revision_id: first },
       },
       rollback: { kind: "rollback", human: true },
+      hold: { kind: "lane_hold", laneId: first },
+      release: { kind: "lane_release", laneId: first, human: true },
+      validate: { kind: "lane_validate", laneId: first, human: true },
     };
     if (command === "run" || command === "reconcile") {
       await ctx.reply(
@@ -50,12 +53,12 @@ export async function handleDurableLanes(ctx: Context, rawArg: string): Promise<
       const control = controls[command];
       if (!control) {
         await ctx.reply(
-          "Usage: /lanes — status\n/lanes shadow <revision>\n/lanes pause|resume\n/lanes retry <lane>\n/lanes provider-disable|provider-enable <claude|codex|cursor>\n/lanes archive-approval batch\n/lanes cutover <revision>\n/lanes rollback"
+          "Usage: /lanes — status\n/lanes shadow <revision>\n/lanes pause|resume\n/lanes hold <lane> <reason>\n/lanes release <lane>\n/lanes validate <lane>\n/lanes retry <lane>\n/lanes provider-disable|provider-enable <claude|codex|cursor>\n/lanes archive-approval batch\n/lanes cutover <revision>\n/lanes rollback\nRetirement uses the local CLI: conductor-telegram lanes retire <lane> --merged-sha <sha> --evidence-json <path>."
         );
         return;
       }
       if (
-        (["retry", "archive-approval", "shadow", "cutover", "provider-disable", "provider-enable"].includes(command) &&
+        (["retry", "hold", "release", "validate", "archive-approval", "shadow", "cutover", "provider-disable", "provider-enable"].includes(command) &&
           !first)
       ) {
         await ctx.reply(`Usage: /lanes ${command} <value>`);
@@ -96,6 +99,51 @@ export async function handleDurableLanes(ctx: Context, rawArg: string): Promise<
           workspace_ids: workspaceIds,
           expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         };
+      }
+      if (["hold", "release", "validate"].includes(command)) {
+        const snapshot = await store.snapshot();
+        const revision = snapshot.controller?.active_revision_id;
+        if (!revision || snapshot.manifest?.revision_id !== revision) {
+          await ctx.reply("Lane control requires an exact active manifest revision.");
+          return;
+        }
+        const exists = (
+          (snapshot.manifest.manifest_json.lanes as Array<{ id?: string }> | undefined) ?? []
+        ).some((lane) => lane.id === first);
+        if (!exists) {
+          await ctx.reply(`Lane ${first} is absent from active manifest ${revision}.`);
+          return;
+        }
+        control.payload = { manifest_revision_id: revision };
+        const scoped = snapshot.lane_controls.find(
+          (candidate) =>
+            candidate.manifest_revision_id === revision &&
+            candidate.lane_id === first
+        );
+        if (command === "hold") {
+          const reason = rest.join(" ").trim();
+          if (!reason) {
+            await ctx.reply("Usage: /lanes hold <lane> <reason>");
+            return;
+          }
+          control.payload.reason = reason;
+        } else {
+          if (scoped?.state !== "held" || !scoped.control_id) {
+            await ctx.reply(`/lanes ${command} requires the current durable lane hold.`);
+            return;
+          }
+          control.payload.expected_hold_control_id = scoped.control_id;
+          if (command === "validate") {
+            if (!scoped.run_id || !scoped.merged_sha) {
+              await ctx.reply(
+                "/lanes validate requires a held merged validation run."
+              );
+              return;
+            }
+            control.payload.expected_run_id = scoped.run_id;
+            control.payload.merged_sha = scoped.merged_sha;
+          }
+        }
       }
       const messageId = String((ctx.message as any)?.message_id ?? randomUUID());
       const actor = `telegram:${ctx.from?.id ?? "owner"}`;

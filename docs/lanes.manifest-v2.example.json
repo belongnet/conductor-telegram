@@ -8,7 +8,7 @@
     },
     "provider_models": {
       "claude": "fable-5-1",
-      "codex": "gpt-5.6-sol",
+      "codex": "gpt-6-astra",
       "cursor": "grok-4.7"
     }
   },
@@ -62,11 +62,11 @@
       "preferred_providers": ["codex"],
       "fallback_providers": ["cursor", "claude"],
       "dependencies": [{ "lane_id": "L1", "milestone": "merged" }],
-      "policy": { "kind": "recurring", "schedule": "daily" },
+      "policy": { "kind": "recurring", "enabled": false, "schedule": "daily" },
       "delivery_adapter": { "kind": "github" },
       "merge_policy": {
         "method": "squash",
-        "auto_merge": true,
+        "auto_merge": false,
         "deploy_notes": "Observe repository-native CI only; the controller does not deploy.",
         "replay_notes": "None."
       },

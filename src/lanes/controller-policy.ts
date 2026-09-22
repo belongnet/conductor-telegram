@@ -214,6 +214,9 @@ export function laneGenerationDue(input: {
   if (input.lane.policy.kind === "one_shot") {
     return { due: laneRuns.length === 0, generation: next, recurring: false };
   }
+  if (!input.lane.policy.enabled) {
+    return { due: false, generation: next, recurring: true };
+  }
   const interval = recurringIntervalMs(input.lane.policy.schedule);
   if (interval === null) return { due: false, generation: next, recurring: true };
   const latest = laneRuns[0];
