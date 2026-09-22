@@ -40,6 +40,15 @@ function checkIgnore(target: string): {ignored: boolean; source: string} {
 const isTracked = (target: string) =>
   git("ls-files", "--error-unmatch", "--", target).status === 0;
 
+// These three assert a property of the repository, so they need one to read.
+// The production image is built from a context that excludes .git on purpose
+// (.dockerignore), and a hard failure there blocked every release image from
+// v0.11.2 on. Absent a checkout there is nothing to assert, so skip and say so;
+// on a dev machine and in CI, where the rules can actually drift, they run.
+const NO_REPO = git("rev-parse", "--is-inside-work-tree").status === 0
+  ? false
+  : "no git repository in this context (container build); ignore rules are asserted in CI";
+
 // Conductor writes machine-local overrides beside the tracked settings file.
 // Left unignored they keep `git status --untracked-files=all` non-empty, which
 // is what the lane validation preflight (src/lanes/controller.ts) and the cloud
@@ -49,7 +58,7 @@ for (const override of [
   ".conductor/settings.local.toml",
   ".conductor/settings.local.json",
 ]) {
-  test(`${override} is ignored and untracked so it cannot strand a workspace`, () => {
+  test(`${override} is ignored and untracked so it cannot strand a workspace`, { skip: NO_REPO }, () => {
     const {ignored, source} = checkIgnore(override);
     assert.ok(ignored, `${override} is not ignored — restore its .gitignore rule`);
     // The rule has to live in the committed .gitignore. A .git/info/exclude
@@ -70,7 +79,7 @@ for (const override of [
 // `.conductor/` rule would satisfy every assertion above while also swallowing
 // this file, so pin that boundary instead of the exact pattern text — which
 // leaves the rules free to be rewritten as long as they stay correct.
-test(".conductor/settings.toml stays tracked and unignored", () => {
+test(".conductor/settings.toml stays tracked and unignored", { skip: NO_REPO }, () => {
   assert.equal(
     checkIgnore(".conductor/settings.toml").ignored,
     false,
