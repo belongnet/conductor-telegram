@@ -38,6 +38,11 @@ All notable changes to conductor-telegram are documented here.
 - Synced Telegram topics with multiple Conductor threads hold the first ambiguous message for an explicit, model-labelled thread choice. Replies and attachments retain their selected native session through queue delays and retries.
 - Native send receipts identify and link the actual thread, including after a restart. Replies to original Telegram messages retain that destination, and recovery of another thread cannot silently replace an explicit selection.
 
+## [0.12.1] - 2026-09-22
+
+### Fixed
+- The production container image builds again. `tests/conductor-settings.test.ts` asserts repository ignore rules through `git check-ignore`, but the image is built from a context that excludes `.git` on purpose, so those three tests failed inside `docker build --target checks` and every release image from 0.11.2 on could not be produced. They now skip, with the reason stated, when there is no repository to read; on a developer machine and in CI, where the rules can actually drift, they still run.
+
 ## [0.12.0] - 2026-09-22
 
 ### Added
