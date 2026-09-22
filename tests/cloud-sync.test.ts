@@ -133,7 +133,10 @@ test("native rename cycles retain unique operations and archived work closes its
 
 test("native session provider resolution preserves exact models and rejects unknown providers", () => {
   assert.deepEqual(nativeSessionProvider({id: "s", deepLink: "x", model: "opus-5-1m", resolvedModel: "claude-opus-5[1m]", effort: "max"}), {agent: "claude", model: "opus-5-1m", effort: "max"});
+  assert.equal(nativeSessionProvider({id: "s", deepLink: "x", model: "grok-4.7"}).agent, "cursor");
   assert.equal(nativeSessionProvider({id: "s", deepLink: "x", model: "grok-4.6"}).agent, "cursor");
+  assert.equal(nativeSessionProvider({id: "s", deepLink: "x", model: "composer-2.5"}).agent, "cursor");
+  assert.equal(nativeSessionProvider({id: "s", deepLink: "x", model: "deepseek-v3.2"}).agent, "cursor");
   assert.throws(() => nativeSessionProvider({id: "s", deepLink: "x", model: "unrecognized"}), /unsupported/);
 });
 

@@ -314,9 +314,9 @@ test("an uncaptioned album in a linked repo topic launches one workspace named f
   assert.equal(action.type, "launch"); assert.equal(action.projectId, "p1");
   const ws = getWorkspace(action.trackedId)!;
   assert.equal(ws.name, "long-events: 2 attachments");
-  // A repo topic launches work; it never becomes the workspace's own topic.
-  assert.equal(ws.telegramThreadId, null);
-  assert.equal(f.text("update:1:reply:0"), "2 attachments received. Preparing them for Conductor.");
+  // The album's workspace lives in the topic it was sent from: one topic, one workspace.
+  assert.equal(ws.telegramThreadId, 5);
+  assert.match(f.text("update:1:reply:0"), /^2 attachments received\. Preparing them for Conductor\./);
   assert.deepEqual(JSON.parse(f.store.row("update:2")!.result!), { absorbedInto: "update:1" });
 }));
 

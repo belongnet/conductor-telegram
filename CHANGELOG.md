@@ -32,6 +32,25 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
+## [0.12.0] - 2026-09-22
+
+### Added
+- `/land` runs the `land-and-deploy` skill in the topic's workspace, and `/document` is a short spelling of `document_release`. Both appear in `/skills`.
+
+### Changed
+- A repo topic now holds one workspace at a time. The first task adopts the topic and later messages continue that same workspace, so an album, a split paste, or a quick follow-up reaches one workspace rather than opening one per message. `/run <project> <task>` rolls the topic onto new work, and the acknowledgement says so the first time a topic adopts a workspace. A second message sent before the first task finishes launching joins it instead of starting a rival workspace.
+
+### Fixed
+- A workspace living in a repo topic no longer renames it. Renaming the workspace, or a name change picked up by cloud sync, used to rewrite the topic's title and erase the repository it stands for; repo topics were already protected from being closed the same way.
+
+## [0.11.2] - 2026-09-22
+
+### Changed
+- Cloud recovery and Manifest v2 now pin Cursor to `grok-4.7`, the current Grok line. Native session routing also accepts Composer and DeepSeek Cursor models so a later line is not rejected as unsupported.
+
+### Fixed
+- `.conductor/settings.local.toml` and `.conductor/settings.local.json` are gitignored, so a machine-local override no longer leaves the worktree dirty and strands lane validation, a cloud takeover, or creation of the next `conductor/telegram-*` workspace branch.
+
 ## [0.11.1] - 2026-09-21
 
 ### Fixed
