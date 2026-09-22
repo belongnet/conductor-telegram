@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS lane_v2_retirement_evidence_bindings (
   control_id TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS lane_v2_retirement_evidence_hash_unique
+  ON lane_v2_retirement_evidence_bindings (evidence_hash);
 CREATE TABLE IF NOT EXISTS lane_v2_notifications (
   notification_key TEXT PRIMARY KEY, message_hash TEXT NOT NULL,
   claimed_by TEXT NOT NULL, lease_fence INTEGER NOT NULL,
@@ -2546,6 +2548,7 @@ export class SqliteLaneStateStore implements LaneStateStore {
                 String(doc.source_locator).length > 2048 ||
                 !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(observedAt) ||
                 !Number.isFinite(Date.parse(observedAt)) ||
+                Date.parse(observedAt) > Date.now() + 5 * 60 * 1_000 ||
                 !payload ||
                 typeof payload !== "object" ||
                 Array.isArray(payload) ||
@@ -2565,6 +2568,9 @@ export class SqliteLaneStateStore implements LaneStateStore {
           const uniqueKeys = new Set(
             refs.map((entry) => String((entry as Record<string, unknown>).external_key))
           );
+          const uniqueHashes = new Set(
+            refs.map((entry) => String((entry as Record<string, unknown>).evidence_hash))
+          );
           const uniqueLocators = new Set(
             refs.map((entry) =>
               String(
@@ -2578,6 +2584,7 @@ export class SqliteLaneStateStore implements LaneStateStore {
           if (
             uniqueIds.size !== refs.length ||
             uniqueKeys.size !== refs.length ||
+            uniqueHashes.size !== refs.length ||
             uniqueLocators.size !== refs.length
           ) {
             throw new LaneStateStoreError(

@@ -92,7 +92,8 @@ The document has exactly these keys:
 
 `evidence_kind` is one of `merge_record`, `required_checks`,
 `canonical_replay`, or `deterministic_validation`; `observed_at` is an ISO-8601
-timestamp with a timezone and `evidence_payload` is an object. The hash is the
+timestamp with a timezone no more than five minutes in the future, and
+`evidence_payload` is an object. The hash is the
 lowercase SHA-256 of UTF-8 canonical JSON (recursively sorted object keys,
 compact separators, Unicode unescaped, and no non-finite numbers). Command
 Center recomputes it, requires every scope field to equal the retirement

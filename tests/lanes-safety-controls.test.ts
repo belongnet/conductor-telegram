@@ -876,6 +876,34 @@ test("lane retirement rejects tampered hashes and cross-lane evidence identity",
       }),
       /immutable evidence id\/key\/hash triples/
     );
+    const futureEvidence = evidenceRef({
+      id: "future-source",
+      key: "future-key",
+      locator: "gitlab:nomadhub/example:pipeline:future",
+      laneId: "L1",
+      runId: run.run_id,
+      sha: MERGED_ONE,
+    });
+    futureEvidence.evidence_document.observed_at = "2999-01-01T00:00:00.000Z";
+    futureEvidence.evidence_hash = createHash("sha256")
+      .update(canonicalManifestJson(futureEvidence.evidence_document))
+      .digest("hex");
+    await assert.rejects(
+      store.createControl({
+        control_id: "retire-future-evidence",
+        idempotency_key: "retire-future-evidence",
+        kind: "lane_retire",
+        lane_id: "L1",
+        requested_by: "human:test",
+        payload: {
+          manifest_revision_id: "growth-safety",
+          merged_sha: MERGED_ONE,
+          evidence_refs: [futureEvidence],
+        },
+        approvalKey: "human-key",
+      }),
+      /immutable evidence id\/key\/hash triples/
+    );
   } finally {
     await store.close();
     fs.rmSync(root, { recursive: true, force: true });
