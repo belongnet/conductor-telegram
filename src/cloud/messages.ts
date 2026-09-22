@@ -49,7 +49,7 @@ export function nativeSessionProvider(session: ConductorApiSession): Provider {
   const resolved = (session.resolvedModel ?? model).toLowerCase();
   const agent = /^(gpt|o\d|codex)([-_.]|$)/.test(resolved) ? "codex"
     : /(^|[-_.])(claude|opus|sonnet|haiku|fable)([-_.]|$)/.test(resolved) ? "claude"
-    : /^grok[-_.]/.test(resolved) ? "cursor" : undefined;
+    : /^(grok|composer|deepseek)[-_.]/.test(resolved) ? "cursor" : undefined;
   if (!agent || !model) throw new TerminalError("Native session model is unavailable or unsupported; select a supported session with /threads.");
   return {agent, model, effort: session.effort ?? "high"};
 }

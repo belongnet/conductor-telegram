@@ -5,11 +5,11 @@ import path from "node:path";
 import { z } from "zod";
 
 const PROVIDERS = ["claude", "codex", "cursor"] as const;
-const MODELS = ["fable-5-1", "gpt-5.6-sol", "grok-4.6"] as const;
+const MODELS = ["fable-5-1", "gpt-5.6-sol", "grok-4.7"] as const;
 export const APPROVED_PROVIDER_MODELS = {
   claude: "fable-5-1",
   codex: "gpt-5.6-sol",
-  cursor: "grok-4.6",
+  cursor: "grok-4.7",
 } as const;
 export const APPROVED_PROVIDER_CAPACITY = {
   claude: 3,

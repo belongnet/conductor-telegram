@@ -10,3 +10,10 @@ dist/
 # Private workspace evidence, migration snapshots, and deployment configuration.
 .context/
 .conductor-telegram/
+
+# Machine-local Conductor overrides. Left unignored they keep `git status
+# --untracked-files=all` non-empty, which is what the lane validation preflight
+# and the cloud takeover guard refuse to run against, and Conductor has
+# reported them in failed `conductor/telegram-*` branch creation too.
+.conductor/settings.local.toml
+.conductor/settings.local.json
