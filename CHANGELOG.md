@@ -15,6 +15,7 @@ All notable changes to conductor-telegram are documented here.
 - Lane delivery state, unanswered-nudge health, and provider outage resets are durable in SQLite. Dead agents restart in a new session inside the existing workspace, while tick hygiene safely archives completed work without recreating archived or abandoned workspaces.
 
 ### Fixed
+- `.conductor/settings.local.toml` is gitignored so a machine-local override cannot block Conductor from creating the next `conductor/telegram-*` workspace branch.
 - Cloud Telegram updates and outgoing messages now use durable queues, ordered conversations, persistent question reply links, rate-limit backoff, and independent command and workspace polling. Startup topic maintenance no longer blocks messages.
 - Native task recovery preserves exact message identities, rechecks stop requests before new work, and avoids overwriting newer task state during polling. PR reviews remain bound to their exact commits and cannot grant merge approval.
 - Both Mac and OVH lease workers now require send-only Telegram alert credentials at startup. The OVH standby remains headless and never polls updates, but it can still deliver deduplicated safety alerts whenever it owns the controller lease.
