@@ -44,7 +44,9 @@ export function repoTopicCandidates(repoName: string, projects: ConductorApiProj
   return name ? projects.filter(project => matchesRepoName(project, name)) : [];
 }
 
-const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "office_hours", "design_review", "gstack", "skill"]);
+const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "land_and_deploy", "office_hours", "design_review", "gstack", "skill"]);
+/** Short spellings for skills whose own name is a mouthful to type on a phone. */
+const COMMAND_ALIASES: Record<string, string> = { land: "land_and_deploy", document: "document_release" };
 const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR number or URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
 
 interface MediaJob {
@@ -80,9 +82,12 @@ export class CloudCommands {
     const statusId = `${row.id}:reply:0`;
     const replyTarget = msg.reply_to_message ? getWorkspaceMessageTarget(chatId, String(msg.reply_to_message.message_id)) : undefined;
     let target = replyTarget?.workspace ?? (threadId ? getWorkspaceByThreadId(chatId, threadId) : undefined);
-    // A repo topic is a launch pad, never a workspace's own topic, including for a workspace an
-    // earlier release pinned to one. Reply to its message, or use its workspace ID, to follow up.
-    if (!replyTarget && target && threadId && getRepoTopicByThreadId(chatId, threadId)) target = undefined;
+    // A repo topic carries one workspace at a time, so a plain message continues the workspace
+    // already there. Only preserved local work from before the cutover launches fresh instead:
+    // testing the binding alone would miss a cloud workspace that has not finished launching,
+    // and a second message sent in those few seconds would open a rival workspace in the topic.
+    if (!replyTarget && target && threadId && !target.repoPath.startsWith("conductor-project:") &&
+      !this.store.binding(target.id) && getRepoTopicByThreadId(chatId, threadId)) target = undefined;
     let sessionId = replyTarget?.sessionId ?? undefined;
     if (callback) {
       const data = String(callback.data ?? "");
@@ -139,7 +144,8 @@ export class CloudCommands {
       const username = this.store.get<string>("telegram-bot-username");
       reply(`This gateway is awaiting cutover. Your message was not sent to Conductor.\n\nUse /send@${username} <text> in this topic. Plain text and voice replies will be enabled after the old gateway is stopped.`); return;
     }
-    const command = match?.[1]?.toLowerCase();
+    const typed = match?.[1]?.toLowerCase();
+    const command = (typed && COMMAND_ALIASES[typed]) ?? typed;
     let args = match?.[3]?.trim() ?? "";
     if (command === "ping") { const health = gatewayHealth(this.store); enqueueText(this.store, `${row.id}:reply`, chatId, `Gateway online · ${health.ready ? "ready" : "recovering"}\n${JSON.stringify(health.checks)}${this.githubNote()}`, {threadId, priority: 0, silent: true}); return; }
     if (command === "sync") {
@@ -255,7 +261,7 @@ export class CloudCommands {
       });
       reply("Select the active thread, or /threads new <prompt>.", "threads", { inline_keyboard: keyboard }); return;
     }
-    if (command === "skills") { reply("Skills: ship, qa, investigate, retro, health, checkpoint, document_release, office_hours, design_review. Use /skill <name> [instructions] in a workspace topic."); return; }
+    if (command === "skills") { reply("Skills: ship, qa, investigate, retro, health, checkpoint, document_release (/document), land_and_deploy (/land), office_hours, design_review. Use /skill <name> [instructions] in a workspace topic."); return; }
     if (["stop", "archive", "rename", "renamethread", "review", "send"].includes(command ?? "") || SHORTCUTS.has(command ?? "")) {
       if (!target) { reply("Reply to a workspace message, use its topic, or supply its workspace ID."); return; }
       const type = SHORTCUTS.has(command!) ? "send" : command as CloudAction["type"];
@@ -279,7 +285,7 @@ export class CloudCommands {
       projectId = chosen.id; target = undefined; sessionId = undefined;
     }
     const repoTopic = !target && threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
-    let linked = "";
+    let linked = ""; let adopted = false;
     if (repoTopic) {
       const key = topicProjectKey(chatId, threadId!);
       const stored = this.store.get<string>(key);
@@ -330,14 +336,16 @@ export class CloudCommands {
       if (!target) this.store.db.transaction(() => {
         target = createWorkspace({ name: prompt.slice(0, 70) || "Telegram task", prompt, repoPath: `conductor-project:${projectId}`, telegramChatId: chatId });
         this.store.set(`update-workspace:${row.id}`, target.id);
-        // A repo topic launches work; it never becomes the workspace's own topic.
-        if (threadId && !repoTopic) updateWorkspaceThreadId(target.id, threadId);
+        // The workspace lives in the topic its task was sent from: one topic, one workspace.
+        if (threadId) updateWorkspaceThreadId(target.id, threadId);
+        adopted = !!repoTopic;
       })();
     }
     if (!target) throw new Error("Could not create workspace record");
     linkTelegramMessage(chatId, String(msg.message_id), target.id, sessionId);
     const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt, statusId };
-    this.enqueueTurn(reply, (media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked,
+    this.enqueueTurn(reply, (media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked +
+      (adopted ? "\n\nThis topic now follows that workspace. Later messages continue it; /run <project> <task> starts new work here." : ""),
       `${row.id}:action`, action, media ? { ...media, chatId, threadId } : undefined, row.id);
   }
 

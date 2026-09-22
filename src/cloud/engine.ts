@@ -216,7 +216,8 @@ export class CloudEngine {
       await this.api.renameWorkspace(binding.workspaceId, action.prompt ?? "");
       this.store.assertWriter?.();
       this.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(action.prompt, action.prompt, ws.id);
-      if (ws.telegramThreadId) enqueueTelegram(this.store, `topic:${row.id}`, {method: "editForumTopic", workspaceId: ws.id,
+      // A repo topic is named for its repository; a workspace living there never renames it.
+      if (ws.telegramThreadId && !getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) enqueueTelegram(this.store, `topic:${row.id}`, {method: "editForumTopic", workspaceId: ws.id,
         payload: {chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId, name: (action.prompt ?? "").slice(0,128)}}, 20);
       this.status(`${row.id}:done`, ws.id, action.statusId, "Cloud workspace renamed."); return;
     }
