@@ -9,6 +9,19 @@ import type {FileBridge} from "../src/cloud/bridge.js";
 import {ConductorApiError, type ConductorApiClient, type ConductorApiMessage} from "../src/integrations/conductor-api.js";
 import {enqueueText} from "../src/cloud/telegram.js";
 
+test("default recovery ladder preserves the founder-approved model order", () => {
+  assert.deepEqual(
+    DEFAULT_PROVIDERS.map(({agent, model}) => `${agent}:${model}`),
+    [
+      "claude:fable-5-1",
+      "codex:gpt-6-astra",
+      "claude:opus-5-1m",
+      "codex:gpt-6-sol",
+      "cursor:grok-4.7",
+    ]
+  );
+});
+
 function fixture(providers: Provider[] = DEFAULT_PROVIDERS, reviewProvider: {agent?: Provider["agent"]; model?: string} = {}) {
   closeDb();
   const store = new GatewayStore(getDb(":memory:"));

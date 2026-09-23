@@ -1040,15 +1040,21 @@ test("queued expired attachment links renew without changing the message payload
 
 test("all eligible providers are attempted once and a user stop prevents further recovery", () => fixture(async f => {
   await f.launch();
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 5; i++) {
     f.status("error"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
     await processQueue(f.store, ["cloud"], r => f.engine.action(r));
   }
-  assert.equal(f.sessions.length, 3);
-  assert.deepEqual(f.store.get("recovery-providers:launch"), ["claude", "codex", "cursor"]);
+  assert.equal(f.sessions.length, 5);
+  assert.deepEqual(f.store.get("recovery-providers:launch"), [
+    "claude:fable-5-1",
+    "codex:gpt-6-astra",
+    "claude:opus-5-1m",
+    "codex:gpt-6-sol",
+    "cursor:grok-4.7",
+  ]);
   f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
   f.status("error"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
-  assert.equal(f.sessions.length, 3);
+  assert.equal(f.sessions.length, 5);
 }));
 
 test("topic maintenance coalesces and does not outrank transcript messages", () => fixture(async f => {
@@ -1107,12 +1113,15 @@ test("an unavailable provider rejected before launch is skipped without an uncer
   enqueueText(f.store, "provider-ack", "42", "Task received and queued.", {silent: true});
   f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix\nthe bug", statusId: "provider-ack:0"});
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
-  const rejected = JSON.parse(f.store.row("provider-rejected:launch:claude")!.payload);
+  const rejected = JSON.parse(f.store.row("provider-rejected:launch:claude:fable-5-1")!.payload);
   assert.equal(rejected.method, "editMessageText"); assert.equal(rejected.statusOf, "provider-ack:0");
   f.store.retry("launch", "eligible fallback", 0);
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   assert.equal(f.store.binding(f.ws.id)?.agent, "codex"); assert.equal(f.counts().sends, 1);
-  assert.deepEqual(f.store.get("recovery-providers:launch"), ["claude", "codex"]);
+  assert.deepEqual(f.store.get("recovery-providers:launch"), [
+    "claude:fable-5-1",
+    "codex:gpt-6-astra",
+  ]);
 }));
 
 for (const markdown of [false, true]) test(`partial ${markdown ? "rich" : "plain"} multi-message delivery resumes without repeating recorded receipts`, () => fixture(async f => {

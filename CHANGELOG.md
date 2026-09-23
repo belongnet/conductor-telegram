@@ -4,12 +4,30 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-22
+
+### Fixed
+- A photo album sent to Telegram is one message again. Telegram delivers an album as one update per file, with its caption on at most one of them, so a four-photo album captioned `/run long-events` started a workspace holding a single photo and no instructions, and answered the other three with "Choose a workspace topic or /run <project> before sending attachments." The album's first update now gathers the rest and sends one task carrying every file, wherever the caption sits. A photo Telegram delivers late joins that same task instead of being refused, for ten minutes, as long as the task actually reached Conductor.
+- Files sent without a word now reach the agent with an instruction to open them, and a workspace started from files alone is named for its project and their number instead of "Telegram task". A review sent with only a screenshot keeps its own instructions.
+- An album's files are fetched a couple at a time rather than one after another, so a ten-photo album no longer holds the single attachment worker for minutes while every other chat waits, and no more than a couple of files are held in memory at once. Each file is prepared at most once across retries, and a voice note is transcribed at most once. Collecting an album also ends after a fixed number of passes, so a clock that steps backwards cannot hold a topic's messages behind it.
+- Telegram refuses a bot any file over 20 MB. That refusal is now reported as itself, whether Telegram says so up front or the download proves it, instead of failing as an unexplained error after five attempts.
+- A repository topic carrying two workspaces stamped in the same millisecond follows the newer one, rather than whichever row the database happened to read first.
+- A workspace whose launch never landed no longer wedges its repository topic. The topic keeps that workspace, so a later plain message there used to start a launch with no project and fail on every attempt; it now launches the project the workspace was created for.
+- A file Telegram delivers late joins its album's work only while the topic still follows that work, and an album is identified per topic, so the same album id in another topic is another album. A file type the gateway cannot take yet, such as video, is reported rather than dropped in silence, and a control command like `/stop` counts only as the caption the owner led with, never one found further down an album.
+
+### Changed
+- Album bookkeeping and cached voice transcripts are swept once their turn is over, so the gateway's state table no longer grows for the life of the deployment. An attachment job also carries its first file in the shape a single-file release reads, so a rollback still prepares work that was already queued.
+
+## [0.14.0] - 2026-09-22
+
 ### Added
 - `TELEGRAM_RUNTIME_MODE=cloud-only` runs a continuously hosted gateway through the native Conductor API, with project-based tasks, confirmed AI routing, dedicated PR review sessions, and recoverable provider interruptions. Existing installations keep the `hybrid` default.
 - Cloud workspaces can exchange private files, report progress, and ask persistent human questions through a scoped HTTPS MCP bridge. Linux voice notes use FFmpeg and Whisper.
 - Pinned Node 22 container packaging, isolated acceptance service, separate gateway and lane supervision, health probes, verified state migration, backups, and a rollback guide support deployment on OVH.
 - A fenced Manifest v2 lane controller now runs independently from Telegram polling, stores all runtime bindings and action intents in Command Center/Postgres, supports Mac-preferred/OVH-standby leases, and fails closed rather than falling back to SQLite. It includes GitHub and GitLab delivery, current-head commissioned attestations, deterministic merged-SHA validation, provider breakers/caps, legacy adoption, safe archive batches, shadow/cutover controls, and launchd/systemd service definitions.
 - `conductor-telegram lanes worker`, `lanes status --json`, `lanes reconcile`, and `lanes import-legacy --dry-run|--apply` expose the durable controller. `doctor` verifies the manifest, prompt hashes, required credentials, and Command Center connectivity before cutover.
+- Revision-scoped lane controls can hold and release individual lanes, authorize one bounded validation run while the controller stays paused, or retire an already merged legacy lane from immutable evidence. Telegram exposes the bounded controls while retirement uses a hardened local evidence-file CLI.
+- Cloud recovery follows the exact Fable 5.1 → GPT-6 Astra → Opus 5 → GPT-6 Sol → Grok 4.7 ladder, tracking agent/model routes independently so a same-agent backup is not skipped. Manifest v2 uses Fable and Astra as the Claude and Codex primaries, permits only Opus 5 and GPT-6 Sol as their same-provider alternatives, and uses Grok 4.7 for Cursor. Sonnet, GPT-5.6 Sol, and Grok 4.6 remain limited to tightly scoped bounded-validation migration paths, which commission the current provider primary.
 - Optional config-driven Cloud lanes scheduler. When `LANES_CONFIG` or `~/.conductor-telegram/lanes.json` is present, the bot keeps at most one working lane per paid provider from an ordered queue with dependencies, nudging paused work after a gap or creating the next ready lane. `/lanes`, `/lanes run`, `/lanes pause`, and `/lanes resume` are owner-only. See `docs/lanes.example.json`.
 - Optional per-lane delivery stages now carry a PR through adversarial review, two provider-distinct final reviews, a GitHub-refreshed merge gate, and post-merge validation. The merge gate binds the PR to the configured repository, checks the exact reviewed head and GitHub policy state, and verifies the reported merge SHA against GitHub. Provider rotations support rate-limit stand-ins, markers use the real model, and `/lanes` exposes stage progress plus `archive` and `merge <id>` controls.
 - Lane delivery state, unanswered-nudge health, and provider outage resets are durable in SQLite. Dead agents restart in a new session inside the existing workspace, while tick hygiene safely archives completed work without recreating archived or abandoned workspaces.
@@ -28,23 +46,16 @@ All notable changes to conductor-telegram are documented here.
 - Lanes ticks skip creation when workspace listing fails, including a partial per-project fallback outage, so an API outage cannot bill a duplicate `[lane:…]` workspace.
 - An initializing lane whose first prompt never landed is re-prompted instead of being skipped forever. A transcript fetch failure on a live `working` session keeps occupying the provider slot; an idle/unread transcript is `unknown`, not a prompt retry.
 - Lane "done" detection uses assistant text from the last idle turn, not tool/command payloads or Codex reasoning/thinking items that happen to mention a pull request.
+- Merged-SHA CI now evaluates the manifest's exact case-sensitive required-check allowlist on both GitHub and GitLab. Missing checks remain unavailable, unrelated failures cannot trigger repairs, and rejected bounded-validation evidence returns the lane atomically to its durable hold.
 
 ### Security
 - Updated locked production dependencies to address published advisories before the cloud gateway release.
 
-## [0.12.2] - 2026-09-22
+## [0.13.1] - 2026-09-22
 
 ### Fixed
-- A photo album sent to Telegram is one message again. Telegram delivers an album as one update per file, with its caption on at most one of them, so a four-photo album captioned `/run long-events` started a workspace holding a single photo and no instructions, and answered the other three with "Choose a workspace topic or /run <project> before sending attachments." The album's first update now gathers the rest and sends one task carrying every file, wherever the caption sits. A photo Telegram delivers late joins that same task instead of being refused, for ten minutes, as long as the task actually reached Conductor.
-- Files sent without a word now reach the agent with an instruction to open them, and a workspace started from files alone is named for its project and their number instead of "Telegram task". A review sent with only a screenshot keeps its own instructions.
-- An album's files are fetched a couple at a time rather than one after another, so a ten-photo album no longer holds the single attachment worker for minutes while every other chat waits, and no more than a couple of files are held in memory at once. Each file is prepared at most once across retries, and a voice note is transcribed at most once. Collecting an album also ends after a fixed number of passes, so a clock that steps backwards cannot hold a topic's messages behind it.
-- Telegram refuses a bot any file over 20 MB. That refusal is now reported as itself, whether Telegram says so up front or the download proves it, instead of failing as an unexplained error after five attempts.
-- A repository topic carrying two workspaces stamped in the same millisecond follows the newer one, rather than whichever row the database happened to read first.
-- A workspace whose launch never landed no longer wedges its repository topic. The topic keeps that workspace, so a later plain message there used to start a launch with no project and fail on every attempt; it now launches the project the workspace was created for.
-- A file Telegram delivers late joins its album's work only while the topic still follows that work, and an album is identified per topic, so the same album id in another topic is another album. A file type the gateway cannot take yet, such as video, is reported rather than dropped in silence, and a control command like `/stop` counts only as the caption the owner led with, never one found further down an album.
-
-### Changed
-- Album bookkeeping and cached voice transcripts are swept once their turn is over, so the gateway's state table no longer grows for the life of the deployment. An attachment job also carries its first file in the shape a single-file release reads, so a rollback still prepares work that was already queued.
+- Synced Telegram topics with multiple Conductor threads hold the first ambiguous message for an explicit, model-labelled thread choice. Replies and attachments retain their selected native session through queue delays and retries.
+- Native send receipts identify and link the actual thread, including after a restart. Replies to original Telegram messages retain that destination, and recovery of another thread cannot silently replace an explicit selection.
 
 ## [0.12.1] - 2026-09-22
 

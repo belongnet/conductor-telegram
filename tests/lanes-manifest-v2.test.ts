@@ -19,7 +19,7 @@ function validManifest(promptPath: string, promptHash: string): Record<string, u
       provider_capacity: { claude: 3, codex: 2, cursor: 2 },
       provider_models: {
         claude: "fable-5-1",
-        codex: "gpt-5.6-sol",
+        codex: "gpt-6-astra",
         cursor: "grok-4.7",
       },
     },
@@ -77,7 +77,7 @@ test("Manifest v2 rejects runtime bindings, unknown/swapped models, cap drift, a
   );
 
   const swapped = structuredClone(base) as any;
-  swapped.global.provider_models.claude = "gpt-5.6-sol";
+  swapped.global.provider_models.claude = "gpt-6-astra";
   assert.throws(
     () => parseLaneManifest(swapped, "/tmp/manifest.json", { verifyPrompts: false }),
     /must be fable-5-1/
@@ -168,6 +168,57 @@ test("Manifest v2 rejects runtime bindings, unknown/swapped models, cap drift, a
   );
 });
 
+test("Manifest v2 accepts Claude Opus and Codex Sol backups while rejecting legacy provider models", () => {
+  const base = validManifest("L1.md", "a".repeat(64));
+  const claudeBackup = structuredClone(base) as any;
+  claudeBackup.global.provider_models.claude = "opus-5-1m";
+  assert.equal(
+    parseLaneManifest(claudeBackup, "/tmp/manifest.json", {
+      verifyPrompts: false,
+    }).global.provider_models.claude,
+    "opus-5-1m"
+  );
+
+  const codexBackup = structuredClone(base) as any;
+  codexBackup.global.provider_models.codex = "gpt-6-sol";
+  assert.equal(
+    parseLaneManifest(codexBackup, "/tmp/manifest.json", {
+      verifyPrompts: false,
+    }).global.provider_models.codex,
+    "gpt-6-sol"
+  );
+
+  const legacySonnet = structuredClone(base) as any;
+  legacySonnet.global.provider_models.claude = "sonnet-5-1m";
+  assert.throws(
+    () =>
+      parseLaneManifest(legacySonnet, "/tmp/manifest.json", {
+        verifyPrompts: false,
+      }),
+    /Invalid enum value/
+  );
+
+  const legacySol = structuredClone(base) as any;
+  legacySol.global.provider_models.codex = "gpt-5.6-sol";
+  assert.throws(
+    () =>
+      parseLaneManifest(legacySol, "/tmp/manifest.json", {
+        verifyPrompts: false,
+      }),
+    /Invalid enum value/
+  );
+
+  const legacyGrok = structuredClone(base) as any;
+  legacyGrok.global.provider_models.cursor = "grok-4.6";
+  assert.throws(
+    () =>
+      parseLaneManifest(legacyGrok, "/tmp/manifest.json", {
+        verifyPrompts: false,
+      }),
+    /Invalid enum value/
+  );
+});
+
 test("Manifest v2 confines prompts to regular files beneath its directory", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lane-manifest-paths-"));
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "lane-prompt-outside-"));
@@ -198,9 +249,10 @@ test("Manifest v2 confines prompts to regular files beneath its directory", () =
   }
 });
 
-test("recurring generations wait for a terminal interval and never overlap", () => {
+test("recurring generations are inert by default and opt in without auto-merge", () => {
   const value = validManifest("L1.md", "a".repeat(64)) as any;
   value.lanes[0].policy = { kind: "recurring", schedule: "every 2h" };
+  value.lanes[0].merge_policy.auto_merge = false;
   const lane = parseLaneManifest(value, "/tmp/manifest.json", {
     verifyPrompts: false,
   }).lanes[0];
@@ -215,13 +267,17 @@ test("recurring generations wait for a terminal interval and never overlap", () 
     laneGenerationDue({
       lane,
       runs: [terminal],
-      now: new Date("2026-09-04T11:59:59.999Z"),
+      now: new Date("2026-09-05T12:00:00.000Z"),
     }),
     { due: false, generation: 2, recurring: true }
   );
+  const enabledLane = {
+    ...lane,
+    policy: { ...lane.policy, enabled: true },
+  } as typeof lane;
   assert.deepEqual(
     laneGenerationDue({
-      lane,
+      lane: enabledLane,
       runs: [terminal],
       now: new Date("2026-09-04T12:00:00.000Z"),
     }),
@@ -229,10 +285,23 @@ test("recurring generations wait for a terminal interval and never overlap", () 
   );
   assert.equal(
     laneGenerationDue({
-      lane,
+      lane: enabledLane,
       runs: [{ ...terminal, status: "implementing" }],
       now: new Date("2026-09-05T12:00:00.000Z"),
     }).due,
     false
+  );
+});
+
+test("recurring lanes cannot opt into automatic merge", () => {
+  const value = validManifest("L1.md", "a".repeat(64)) as any;
+  value.lanes[0].policy = {
+    kind: "recurring",
+    enabled: true,
+    schedule: "daily",
+  };
+  assert.throws(
+    () => parseLaneManifest(value, "/tmp/manifest.json", { verifyPrompts: false }),
+    /recurring lanes must not automatically merge/
   );
 });

@@ -96,6 +96,7 @@ export interface GithubCommitChecksSnapshot {
   sha: string;
   status: PrChecksStatus;
   summary: string;
+  checks?: Array<{ name: string; status: PrChecksStatus }>;
 }
 
 export interface PrRefreshResult {
@@ -123,31 +124,33 @@ export function requiredChecksGate(
     failing: 3,
   };
   for (const check of policy.checks ?? []) {
-    const name = check.name.toLowerCase();
+    const name = check.name;
     const prior = observed.get(name);
     if (!prior || severity[check.status] > severity[prior]) {
       observed.set(name, check.status);
     }
   }
   const missing = requiredChecks.filter(
-    (name) => !observed.has(name.toLowerCase())
+    (name) => !observed.has(name)
   );
   const failed = requiredChecks.filter(
-    (name) => observed.get(name.toLowerCase()) === "failing"
+    (name) => observed.get(name) === "failing"
   );
   const pending = requiredChecks.filter((name) => {
-    const status = observed.get(name.toLowerCase());
+    const status = observed.get(name);
     return status === "pending" || status === "unknown";
   });
   const notPassing = requiredChecks.filter(
     (name) => failed.includes(name) || pending.includes(name)
   );
   return {
-    // The manifest names the checks that are merge gates. Optional checks in
-    // the host-wide rollup must not silently become required, and an empty
-    // required-check profile is satisfied vacuously. Git-host mergeability is
-    // still enforced independently immediately before the exact-head merge.
-    passing: missing.length === 0 && notPassing.length === 0,
+    // A configured manifest allowlist is exact and case-sensitive. Without
+    // one, preserve the legacy aggregate gate rather than turning an empty
+    // profile into a fail-open bypass for a failing host rollup.
+    passing:
+      requiredChecks.length === 0
+        ? policy.checksStatus === "passing"
+        : missing.length === 0 && notPassing.length === 0,
     missing,
     notPassing,
     pending,
@@ -404,6 +407,24 @@ export async function refreshCommitChecks(input: {
     sha: input.sha.toLowerCase(),
     status: checks.status,
     summary: checks.summary,
+    checks: [
+      ...checkPages.flatMap((page) => page.check_runs ?? []),
+      ...statusPages.flatMap((page) => page.statuses ?? []),
+    ]
+      .map((check) => {
+        const value = check as {
+          name?: string | null;
+          context?: string | null;
+          state?: string | null;
+          status?: string | null;
+          conclusion?: string | null;
+        };
+        return {
+          name: String(value.name ?? value.context ?? "").trim(),
+          status: summarizeChecks([value]).status,
+        };
+      })
+      .filter((check) => Boolean(check.name)),
   };
 }
 

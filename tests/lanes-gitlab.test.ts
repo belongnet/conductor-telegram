@@ -115,7 +115,7 @@ test("GitLab adapter binds exact head, publishes commissioned evidence, and veri
     ["unit", "gitlab/lint-and-test"]
   );
 
-  const body = `FINAL-REVIEW (gpt-5.6-sol): {"headSha":"${HEAD}","nonce":"n"}`;
+  const body = `FINAL-REVIEW (gpt-6-astra): {"headSha":"${HEAD}","nonce":"n"}`;
   const receipt = await fixture.gateway.postReview(MR_URL, body, HEAD);
   assert.equal(receipt.commitSha, HEAD);
   assert.equal(await fixture.gateway.hasCommentTag(MR_URL, '"nonce":"n"'), true);

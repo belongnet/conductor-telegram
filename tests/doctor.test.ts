@@ -134,7 +134,7 @@ test("doctor validates the durable manifest, credentials, and Command Center con
           provider_capacity: { claude: 3, codex: 2, cursor: 2 },
           provider_models: {
             claude: "fable-5-1",
-            codex: "gpt-5.6-sol",
+            codex: "gpt-6-astra",
             cursor: "grok-4.7",
           },
         },
