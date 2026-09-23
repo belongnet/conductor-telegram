@@ -1386,7 +1386,7 @@ test("a photo in a repo topic auto-links and its workspace lives in that topic",
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
   const action = JSON.parse(f.store.row("update:1:action")!.payload);
   assert.equal(action.type, "launch"); assert.equal(action.projectId, "p2"); assert.equal(action.mediaPending, true);
-  assert.equal(JSON.parse(f.store.row("update:1:media")!.payload).fileId, "full");
+  assert.equal(JSON.parse(f.store.row("update:1:media")!.payload).files[0].fileId, "full");
   assert.equal(getWorkspace(action.trackedId)?.telegramThreadId, 5);
   const ack = JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text;
   assert.match(ack, /Attachment received/); assert.match(ack, /now routes to Screens/);
@@ -1565,6 +1565,7 @@ test("an album reaches one workspace in the project its caption named", () => fi
     {id: "p2", name: "other", gitRemote: "git@github.com:org/other.git"},
   ];
   const commands = repoTopic(f, "repo");
+  commands.albumWaitMs = 0;
   f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "/link other"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
@@ -1575,9 +1576,14 @@ test("an album reaches one workspace in the project its caption named", () => fi
   for (const _ of [2, 3]) await processQueue(f.store, ["update"], row => commands.handle(row));
   const captioned = JSON.parse(f.store.row("update:2:action")!.payload);
   assert.equal(captioned.projectId, "p1");
-  assert.match(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/);
-  // Both photos are one intent, so they reach one workspace rather than one workspace each.
-  assert.equal(JSON.parse(f.store.row("update:3:action")!.payload).trackedId, captioned.trackedId);
+  assert.equal(captioned.prompt, "fix these two screens");
+  assert.deepEqual(JSON.parse(f.store.row("update:2:media")!.payload).files.map((file: any) => [file.fileId, file.fileName]),
+    [["photo-2", "photo-1.jpg"], ["photo-3", "photo-2.jpg"]]);
+  assert.match(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /2 attachments received[\s\S]*one-off in repo \u00b7 org\/repo\. repo still routes to other \u00b7 org\/other/);
+  // Both photos are one intent: one workspace, and one turn carrying both rather than a turn each.
+  assert.deepEqual(JSON.parse(f.store.row("update:3")!.result!), {absorbedInto: "update:2"});
+  assert.equal(f.store.row("update:3:action"), undefined);
+  assert.equal(f.store.row("update:3:reply:0"), undefined);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM workspaces WHERE telegram_thread_id=5").get() as any).n, 1);
   assert.equal(f.store.get("repo-topic-project:-42:5"), "p2");
 }));

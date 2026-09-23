@@ -6,7 +6,7 @@ import type { GatewayStore, QueueRow } from "./store.js";
 import { CloudEngine, type CloudAction, type Provider } from "./engine.js";
 import { GitHubError, githubSlug } from "./catalog.js";
 import { gatewayHealth } from "./bridge.js";
-import { enqueueTelegram, enqueueText, TerminalError, type TelegramCall } from "./telegram.js";
+import { enqueueTelegram, enqueueText, telegramFailure, TerminalError, type TelegramCall } from "./telegram.js";
 import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
@@ -17,7 +17,18 @@ import type { RepoTopic } from "../types/index.js";
 
 /** Telegram stamps `date` in seconds; one pasted list lands inside this window. */
 const BURST_SECONDS = 2;
-const ALBUM_MS = 600_000;
+/** How long an album stays joinable by a file Telegram delivers late, and how long its bookkeeping is kept. */
+export const ALBUM_JOIN_MS = 600_000;
+/** Album files are fetched a few at a time: one worker serves every chat, and each fetch can take a minute.
+ * Two at a time keeps the wait short while bounding how many whole files are held in memory at once. */
+const MEDIA_DOWNLOAD_CONCURRENCY = 2;
+/** However the clock behaves, an album settles after this many passes. */
+const ALBUM_MAX_SETTLES = 6;
+/** The Bot API refuses to hand a bot any file larger than this. */
+const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
+const TOO_LARGE = "This file is larger than the 20 MB Telegram lets bots download. Send a link to it instead.";
+/** Files sent without a word of instruction still reach the agent with one. */
+export const ATTACHMENTS_ONLY_PROMPT = "The owner sent the attached files without instructions. Open them, then respond to what they show.";
 
 /** This list drives DELETEs, so it can only ever name buttons, whatever is in the row. */
 const offeredKeys = (value: unknown): string[] =>
@@ -49,14 +60,52 @@ const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "chec
 const COMMAND_ALIASES: Record<string, string> = { land: "land_and_deploy", document: "document_release" };
 const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR number or URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
 
-interface MediaJob {
+interface MediaFile { fileId: string; fileName: string; voice: boolean }
+
+/**
+ * A queued attachment job. `files` is what this release reads; the first file is also written inline, so a
+ * gateway rolled back to a single-file release still prepares the job instead of dead-ending on it.
+ */
+interface MediaJob extends Partial<MediaFile> {
   action?: CloudAction; decisionId?: number; chatId: string; threadId?: number; text?: string;
-  fileId: string; fileName: string; voice: boolean;
+  /** Every file of the message, or of its whole album. Absent on jobs queued before albums were grouped. */
+  files?: MediaFile[];
   /** The acknowledgement that serves as this job's status card, so a failure lands on it. */
   statusId?: string;
 }
 
+function jobFiles(job: MediaJob): MediaFile[] {
+  return job.files ?? (job.fileId ? [{ fileId: job.fileId, fileName: job.fileName ?? "attachment", voice: !!job.voice }] : []);
+}
+
+/** Both shapes of one message's files: the array this release reads, and the inline first file a rollback reads. */
+function mediaPayload(files: MediaFile[]): (MediaJob & { files: MediaFile[] }) | undefined {
+  return files.length ? { files, ...files[0] } as MediaJob & { files: MediaFile[] } : undefined;
+}
+
+/** The file one Telegram message carries, if any. An album numbers its files so their names stay distinct. */
+function messageFile(message: any, position?: number): MediaFile | undefined {
+  const attachment = message.voice ?? message.audio ?? message.document ?? message.photo?.at(-1);
+  if (!attachment) return undefined;
+  const numbered = (name: string, extension = ""): string => position ? `${name}-${position}${extension}` : `${name}${extension}`;
+  return { fileId: attachment.file_id, voice: !!(message.voice || message.audio),
+    fileName: attachment.file_name ?? (message.photo ? numbered("photo", ".jpg") : message.document ? numbered("attachment") : numbered("voice", ".ogg")) };
+}
+
+type AlbumIntake =
+  | { kind: "wait" }
+  /** A file Telegram delivered after its album was handled, and the work it joins when there is any. */
+  | { kind: "late"; joined?: { trackedId: string; sessionId?: string } }
+  | { kind: "collected"; messages: any[] };
+
 export class CloudCommands {
+  /** How long the first update of an album keeps waiting for the rest of it, at most. */
+  albumWaitMs = 1500;
+  /** How long it waits after each arrival before deciding the album is complete. */
+  albumSettleMs = 300;
+  /** Whisper runs as a local binary; tests replace it. */
+  transcribe: (voicePath: string) => Promise<string | null> = transcribeVoiceMessage;
+
   constructor(readonly store: GatewayStore, readonly engine: CloudEngine, readonly telegram: TelegramCall,
     readonly ownerChatId: string, readonly ownerUserId?: string, readonly syncChatId?: string,
     readonly syncInput: "all" | "commands" = "all") {}
@@ -72,9 +121,26 @@ export class CloudCommands {
     if (String(msg.chat?.id) !== this.ownerChatId && !(this.ownerUserId && syncedTarget && this.store.get(`cloud-synced:${syncedTarget.id}`))) return;
     const chatId = String(msg.chat.id);
     const threadId = msg.message_thread_id;
-    const attachment = msg.voice ?? msg.audio ?? msg.document ?? msg.photo?.at(-1);
-    if (!callback && !msg.text && !msg.caption && !attachment) return;
-    const media = attachment ? { fileId: attachment.file_id, fileName: attachment.file_name ?? (msg.photo ? "photo.jpg" : "voice.ogg"), voice: !!(msg.voice || msg.audio) } : undefined;
+    // An album is one message: its first update handles every file and the caption, wherever that caption sits.
+    let messages: any[] = [msg];
+    let late: { joined?: { trackedId: string; sessionId?: string } } | undefined;
+    if (!callback && msg.media_group_id) {
+      const album = this.collectAlbum(row, msg, chatId);
+      if (album.kind === "wait") return;
+      if (album.kind === "late") late = album; else messages = album.messages;
+    }
+    const files = messages.flatMap((m, i) => messageFile(m, messages.length > 1 ? i + 1 : undefined) ?? []);
+    const captions = messages.map(m => String(m.text ?? m.caption ?? "").trim()).filter(Boolean);
+    // Video and its kin are not carried yet. Saying so beats dropping part of an album in silence.
+    const skipped = msg.media_group_id ? messages.filter(m => !messageFile(m)).length : 0;
+    if (!callback && !captions.length && !files.length) {
+      if (skipped) enqueueText(this.store, `${row.id}:reply`, chatId, `Telegram sent ${skipped === 1 ? "a file" : `${skipped} files`} of a type I cannot take yet. Video is not supported.`,
+        { threadId, priority: 0, silent: true });
+      return;
+    }
+    const media = mediaPayload(files);
+    // A voice note is transcribed to find its target; a message carrying anything else needs a target first.
+    const voiceNote = files.length > 0 && files.every(file => file.voice);
     // A direct reply answers the owner's own message, so it never needs to ring. The acknowledgement doubles as the
     // turn's status card: actions carry its row id so later states edit it instead of posting again.
     const reply = (text: string, suffix = "reply", markup?: unknown) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
@@ -161,13 +227,27 @@ export class CloudCommands {
       }
       return;
     }
-    const raw = String(msg.text ?? msg.caption ?? "").trim();
+    // Any one caption of an album can carry the command that starts its task; the rest add to that task.
+    // Only /run and /cloud are promoted from a later caption: a control command like /stop or /archive
+    // must be the caption the owner led with, never one found further down an album.
+    const commanded = /^\/[\w]+/.test(captions[0] ?? "") ? 0 : captions.findIndex(caption => /^\/(?:run|cloud)\b/i.test(caption));
+    const raw = (commanded > 0 ? [captions[commanded], ...captions.filter((_, i) => i !== commanded)] : captions).join("\n\n");
     const match = raw.match(/^\/([\w]+)(?:@(\w+))?(?:\s+([\s\S]*))?$/);
     const addressedBot = match?.[2]?.toLowerCase();
     if (addressedBot && addressedBot !== this.store.get<string>("telegram-bot-username")?.toLowerCase()) return;
     if (chatId === this.syncChatId && this.syncInput === "commands" && !addressedBot) {
       const username = this.store.get<string>("telegram-bot-username");
       reply(`This gateway is awaiting cutover. Your message was not sent to Conductor.\n\nUse /send@${username} <text> in this topic. Plain text and voice replies will be enabled after the old gateway is stopped.`); return;
+    }
+    if (late) {
+      // Telegram handed over the rest of an album after its first update was already handled. It joins that same
+      // work rather than starting new work or being refused.
+      if (!late.joined) { reply("This file arrived after the rest of its album was handled. Send it again on its own."); return; }
+      const action: CloudAction = { type: "send", trackedId: late.joined.trackedId, sessionId: late.joined.sessionId, prompt: raw, statusId,
+        telegramMessageId: String(msg.message_id) };
+      linkTelegramMessage(chatId, String(msg.message_id), late.joined.trackedId, late.joined.sessionId);
+      this.enqueueTurn(reply, "Added to the same task.", `${row.id}:action`, action, media ? { ...media, chatId, threadId } : undefined, row.id);
+      return;
     }
     const typed = match?.[1]?.toLowerCase();
     const command = (typed && COMMAND_ALIASES[typed]) ?? typed;
@@ -298,8 +378,9 @@ export class CloudCommands {
     }
     if (command && !["run", "cloud"].includes(command)) { reply(`Unknown command /${command}.\n\n${HELP}`); return; }
 
-    let projectId: string | undefined;
     let chosen: ConductorApiProject | undefined;
+    /** The project a new workspace starts in, when this message starts one. */
+    let launchProject: ConductorApiProject | undefined;
     let prompt = command ? args : raw;
     if (["run", "cloud"].includes(command ?? "")) {
       const projectInput = args.match(/^\S+/)?.[0];
@@ -307,7 +388,7 @@ export class CloudCommands {
       if (!projectInput || (!prompt && !media)) { reply("Usage: /run <project ID or name> <task>"); return; }
       try { chosen = await this.engine.catalog.resolve(projectInput); }
       catch (error) { reply(error instanceof Error ? error.message : "Repository unavailable"); return; }
-      projectId = chosen.id; target = undefined; sessionId = undefined;
+      launchProject = chosen; target = undefined; sessionId = undefined;
     }
     const repoTopic = !target && threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
     let linked = ""; let adopted = false;
@@ -316,20 +397,12 @@ export class CloudCommands {
       const stored = this.store.get<string>(key);
       const projects = await this.engine.catalog.projects();
       const current = stored ? projects.find(p => p.id === stored) : undefined;
-      // Telegram delivers an album as one update per file, with the caption on only one of them.
-      const albumKey = msg.media_group_id ? `repo-topic-album:${chatId}:${threadId}:${msg.media_group_id}` : undefined;
-      const album = !chosen && albumKey ? this.store.get<{ projectId: string; at: number }>(albumKey) : undefined;
-      if (album && Date.now() - album.at >= ALBUM_MS) this.store.clear(albumKey!);
-      const carried = album && Date.now() - album.at < ALBUM_MS ? projects.find(p => p.id === album.projectId) : undefined;
-      if (chosen || carried) {
-        const one = (chosen ?? carried)!;
+      if (chosen) {
         // /run and /cloud name a project for one task. They adopt an unlinked topic, and
         // never silently re-point a linked one; /link is the only way to change it.
-        if (chosen && albumKey) this.store.set(albumKey, { projectId: chosen.id, at: Date.now() });
-        projectId = one.id;
-        if (!current) { this.linkRepoTopic(chatId, threadId!, one.id); linked = `\n\n${repoTopic.repoName} now routes to ${projectLabel(one)}. Use /link to change it.`; }
-        else if (current.id !== one.id) linked = `\n\nThis one is a one-off in ${projectLabel(one)}. ${repoTopic.repoName} still routes to ${projectLabel(current)}. Use /link to change it.`;
-      } else if (current) projectId = current.id;
+        if (!current) { this.linkRepoTopic(chatId, threadId!, chosen.id); linked = `\n\n${repoTopic.repoName} now routes to ${projectLabel(chosen)}. Use /link to change it.`; }
+        else if (current.id !== chosen.id) linked = `\n\nThis one is a one-off in ${projectLabel(chosen)}. ${repoTopic.repoName} still routes to ${projectLabel(current)}. Use /link to change it.`;
+      } else if (current) launchProject = current;
       else if (stored) {
         // A catalog read can be stale or partial, so a link the owner confirmed is never deleted
         // on its absence, and never silently replaced. Ask until the catalog agrees or /link re-points it.
@@ -342,12 +415,12 @@ export class CloudCommands {
           this.offerRepoTopicProject({ repoTopic, chatId, threadId: threadId!, projects, reply, burst: true, at: Number(msg.date) || 0,
             lead: `${repoTopic.repoName} does not match exactly one Conductor project, so nothing sent here reaches Conductor yet.` }); return;
         }
-        this.linkRepoTopic(chatId, threadId!, candidates[0].id); projectId = candidates[0].id;
+        this.linkRepoTopic(chatId, threadId!, candidates[0].id); launchProject = candidates[0];
         linked = `\n\n${repoTopic.repoName} now routes to ${projectLabel(candidates[0])}. Use /link to change it.`;
       }
     }
-    if (!target && !projectId) {
-      if (media?.voice) {
+    if (!target && !launchProject) {
+      if (voiceNote) {
         this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId, statusId }, `${row.id}:media`);
         reply("Voice note received. Transcribing it before target confirmation."); return;
       }
@@ -358,8 +431,10 @@ export class CloudCommands {
     if (!target) {
       const existing = this.store.get<string>(`update-workspace:${row.id}`);
       if (existing) target = getWorkspace(existing);
+      // Files sent without a word still deserve a name that says what they are.
+      const unnamed = media && !voiceNote && launchProject ? `${launchProject.name}: ${files.length} attachment${files.length === 1 ? "" : "s"}` : "Telegram task";
       if (!target) this.store.db.transaction(() => {
-        target = createWorkspace({ name: prompt.slice(0, 70) || "Telegram task", prompt, repoPath: `conductor-project:${projectId}`, telegramChatId: chatId });
+        target = createWorkspace({ name: prompt.slice(0, 70) || unnamed, prompt, repoPath: `conductor-project:${launchProject!.id}`, telegramChatId: chatId });
         this.store.set(`update-workspace:${row.id}`, target.id);
         // The workspace lives in the topic its task was sent from: one topic, one workspace.
         if (threadId) updateWorkspaceThreadId(target.id, threadId);
@@ -367,9 +442,15 @@ export class CloudCommands {
       })();
     }
     if (!target) throw new Error("Could not create workspace record");
-    linkTelegramMessage(chatId, String(msg.message_id), target.id, sessionId);
-    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId, projectId, prompt, statusId, telegramMessageId: String(msg.message_id) };
-    this.enqueueTurn(reply, (media ? "Attachment received. Preparing it for Conductor." : "Task received and queued.") + linked +
+    // A reply to any photo of an album reaches the work the album started.
+    for (const message of messages) linkTelegramMessage(chatId, String(message.message_id), target.id, sessionId);
+    // A workspace whose launch never landed is still bound to its project by its own record, so a later
+    // message in its topic launches it rather than dying on an empty project.
+    const pinned = target.repoPath.startsWith("conductor-project:") ? target.repoPath.slice("conductor-project:".length) : undefined;
+    const action: CloudAction = { type: this.store.binding(target.id) ? "send" : "launch", trackedId: target.id, sessionId,
+      projectId: launchProject?.id ?? pinned, prompt, statusId, telegramMessageId: String(msg.message_id) };
+    const received = files.length > 1 ? `${files.length} attachments received. Preparing them for Conductor.` : "Attachment received. Preparing it for Conductor.";
+    this.enqueueTurn(reply, (media ? received : "Task received and queued.") + linked +
       (adopted ? "\n\nThis topic now follows that workspace. Later messages continue it; /run <project> <task> starts new work here." : ""),
       `${row.id}:action`, action, media ? { ...media, chatId, threadId } : undefined, row.id);
   }
@@ -455,44 +536,143 @@ export class CloudCommands {
     })();
   }
 
-  async media(row: QueueRow): Promise<void> {
-    const cooldown = (this.store.get<number>("telegram-not-before") ?? 0) - Date.now();
-    if (cooldown > 0) { this.store.retry(row.id, "Telegram cooldown", cooldown); return; }
-    const job = JSON.parse(row.payload) as MediaJob;
-    if (job.action && this.store.get(`stop:${job.action.trackedId}`)) return;
-    const info = await this.telegram("getFile", { file_id: job.fileId });
-    if (!info.file_path || info.file_size > 50 * 1024 * 1024) throw new TerminalError("Telegram file unavailable or too large");
+  /**
+   * Telegram delivers an album as one update per file, with its caption on at most one of them. The first update
+   * handled leads: it absorbs its siblings from its own lane, where no other worker can claim one while the leader
+   * is pending or running, and waits a settling interval each time more arrive. A file delivered after the album
+   * was handled joins whatever work the album started.
+   */
+  private collectAlbum(row: QueueRow, msg: any, chatId: string): AlbumIntake {
+    // Scoped to the topic, like the lane an album is absorbed from: the same album id in another topic
+    // is another album, and must never be answered with this one's work.
+    const albumKey = `album:${chatId}:${msg.message_thread_id ?? 0}:${msg.media_group_id}`;
+    const album = this.store.get<{ leader: string; at: number }>(albumKey);
+    if (album && album.leader !== row.id) {
+      if (Date.now() - album.at > ALBUM_JOIN_MS) return { kind: "late" };
+      const started = this.store.row(`${album.leader}:action`) ?? this.store.row(`${album.leader}:thread`);
+      // Work that never reached Conductor cannot be joined: a send onto it would only dead-end differently.
+      if (!started || started.state === "blocked") return { kind: "late" };
+      const action = JSON.parse(started.payload) as CloudAction;
+      const ws = getWorkspace(action.trackedId);
+      if (!ws || ws.archivedAt || ws.telegramChatId !== chatId) return { kind: "late" };
+      // One topic carries one workspace. A file cannot join work the topic has already moved on from.
+      const thread = msg.message_thread_id;
+      if (thread && getWorkspaceByThreadId(chatId, thread)?.id !== ws.id) return { kind: "late" };
+      return { kind: "late", joined: { trackedId: ws.id, sessionId: action.sessionId } };
+    }
+    // Members are durable before their rows close, so a leader that retries later still has every file.
+    const membersKey = `album-members:${row.id}`;
+    const arrived = this.store.db.transaction(() => {
+      this.store.assertWriter?.();
+      const position = this.store.db.prepare("SELECT rowid FROM gateway_queue WHERE id=?").get(row.id) as { rowid: number } | undefined;
+      if (!position) return 0;
+      const siblings = this.store.db.prepare(`SELECT id,payload FROM gateway_queue WHERE kind='update' AND conversation=? AND state='pending'
+        AND rowid>? AND json_extract(payload,'$.message.media_group_id')=? AND json_extract(payload,'$.message.from.id') IS ? ORDER BY rowid`)
+        .all(row.conversation, position.rowid, String(msg.media_group_id), msg.from?.id ?? null) as Array<{ id: string; payload: string }>;
+      // Only a row still waiting in this lane may be closed. One claimed elsewhere keeps its own turn,
+      // so it is not also delivered inside this one.
+      const absorb = this.store.db.prepare("UPDATE gateway_queue SET state='done',result=?,error=NULL,completed_at=? WHERE id=? AND state='pending'");
+      const taken = siblings.filter(sibling => absorb.run(JSON.stringify({ absorbedInto: row.id }), Date.now(), sibling.id).changes === 1);
+      if (taken.length) this.store.set(membersKey, [...(this.store.get<any[]>(membersKey) ?? []), ...taken.map(s => JSON.parse(s.payload).message)]);
+      // The window runs from the last file to arrive, so a slow album is still collected as one message.
+      this.store.set(albumKey, { leader: row.id, at: taken.length || !album ? Date.now() : album.at });
+      return taken.length;
+    })();
+    const members = this.store.get<any[]>(membersKey) ?? [];
+    const since = this.store.get<{ at: number }>(albumKey)?.at ?? row.created_at;
+    // Settle: something just arrived, or nothing has yet. Either way more of the album may still be on its
+    // way. The attempt count ends the wait whatever the clock does.
+    if ((arrived > 0 || !members.length) && Date.now() - since < this.albumWaitMs && row.attempts < ALBUM_MAX_SETTLES) {
+      this.store.retry(row.id, "Collecting album", this.albumSettleMs); return { kind: "wait" };
+    }
+    return { kind: "collected", messages: [msg, ...members] };
+  }
+
+  /** Telegram hands a bot at most 20 MB of any one file. It usually refuses up front, but a reported size can be
+   * wrong, so the bytes are counted too. */
+  private async download(file: MediaFile): Promise<Buffer> {
+    let info: { file_path?: string; file_size?: number };
+    try { info = await this.telegram("getFile", { file_id: file.fileId }); }
+    catch (error) {
+      if (/file is too big/i.test(telegramFailure(error).description)) throw new TerminalError(TOO_LARGE);
+      throw error;
+    }
+    if ((info.file_size ?? 0) > TELEGRAM_DOWNLOAD_LIMIT) throw new TerminalError(TOO_LARGE);
+    if (!info.file_path) throw new TerminalError("Telegram file unavailable");
     const token = process.env.BOT_TOKEN;
     if (!token) throw new TerminalError("Telegram credentials missing");
     const response = await fetch(`https://api.telegram.org/file/bot${token}/${info.file_path}`, { signal: AbortSignal.timeout(60_000), redirect: "error" });
     if (!response.ok) throw new Error(`Telegram file download failed (${response.status})`);
     const chunks: Uint8Array[] = []; let size = 0;
-    for await (const chunk of response.body as any) { size += chunk.length; if (size > 50 * 1024 * 1024) throw new TerminalError("Attachment too large"); chunks.push(chunk); }
-    const bytes = Buffer.concat(chunks);
-    if (job.voice) {
-      const local = path.join(tmpdir(), `ct-voice-${createHash("sha256").update(row.id).digest("hex")}`);
-      writeFileSync(local, bytes, { mode: 0o600 });
-      try {
-        const transcript = await transcribeVoiceMessage(local);
+    for await (const chunk of response.body as any) { size += chunk.length; if (size > TELEGRAM_DOWNLOAD_LIMIT) throw new TerminalError(TOO_LARGE); chunks.push(chunk); }
+    return Buffer.concat(chunks);
+  }
+
+  async media(row: QueueRow): Promise<void> {
+    const cooldown = (this.store.get<number>("telegram-not-before") ?? 0) - Date.now();
+    if (cooldown > 0) { this.store.retry(row.id, "Telegram cooldown", cooldown); return; }
+    const job = JSON.parse(row.payload) as MediaJob;
+    if (job.action && this.store.get(`stop:${job.action.trackedId}`)) return;
+    const files = jobFiles(job);
+    // Every file is prepared at most once, so a retry resumes where the last attempt stopped.
+    const fileIds: string[] = [];
+    const saved = new Array<string | undefined>(files.length);
+    const attachments = files.map((file, i) => ({ file, i })).filter(({ file }) => !file.voice);
+    if (attachments.length && !job.action) throw new TerminalError("Choose a workspace before sending this file");
+    // One media worker serves every chat, so an album's files are fetched a few at a time rather than one by one.
+    // A failure stops its own fetch only: every other fetch settles before the job fails, so none outlives the
+    // attempt and saves a file the next attempt would save again.
+    let next = 0;
+    const failures: unknown[] = [];
+    await Promise.all(Array.from({ length: Math.min(MEDIA_DOWNLOAD_CONCURRENCY, attachments.length) }, async () => {
+      while (next < attachments.length && !failures.length) {
+        const { file, i } = attachments[next++];
+        // The first file keeps the key a single-file job used, so a job queued before albums is never saved twice.
+        const key = i === 0 ? `media-file:${row.id}` : `media-file:${row.id}:${i}`;
+        const existing = this.store.get<string>(key);
+        if (existing) { saved[i] = existing; continue; }
+        try {
+          const bytes = await this.download(file);
+          // Saving the file and recording its ID commit together, so a crash cannot leave a saved file
+          // that the next attempt saves a second time.
+          saved[i] = this.store.db.transaction(() => {
+            const id = this.engine.bridge.save(job.action!.trackedId, file.fileName, bytes);
+            this.store.set(key, id);
+            return id;
+          })();
+        } catch (error) { failures.push(error); }
+      }
+    }));
+    if (failures.length) throw failures[0];
+    // Whisper is one CPU-bound process at a time; voice notes are transcribed in order, after the downloads.
+    const transcripts: string[] = [];
+    for (const [i, file] of files.entries()) {
+      if (!file.voice) { if (saved[i]) fileIds.push(saved[i]!); continue; }
+      const key = `media-transcript:${row.id}:${i}`;
+      let transcript = this.store.get<string>(key);
+      if (transcript === undefined) {
+        const local = path.join(tmpdir(), `ct-voice-${createHash("sha256").update(`${process.pid}:${row.id}:${i}`).digest("hex")}`);
+        writeFileSync(local, await this.download(file), { mode: 0o600 });
+        try { transcript = await this.transcribe(local) ?? undefined; } finally { unlinkSync(local); }
         if (!transcript) throw new TerminalError("Voice transcription failed. Please retry or send text.");
-        if (job.action) job.action.prompt = [job.action.prompt, transcript].filter(Boolean).join("\n\n");
-        else job.text = [job.text, transcript].filter(Boolean).join("\n\n");
-      } finally { unlinkSync(local); }
-    } else {
-      if (!job.action) throw new TerminalError("Choose a workspace before sending this file");
-      let id = this.store.get<string>(`media-file:${row.id}`);
-      if (!id) { id = this.engine.bridge.save(job.action.trackedId, job.fileName, bytes); this.store.set(`media-file:${row.id}`, id); }
-      job.action.fileIds = [id];
+        this.store.set(key, transcript);
+      }
+      transcripts.push(transcript);
     }
     if (!job.action) {
-      this.store.enqueue("route", "native-router", { text: job.text, chatId: job.chatId, threadId: job.threadId, statusId: job.statusId }, `${row.id}:route`);
+      const text = [job.text, ...transcripts].filter(Boolean).join("\n\n");
+      this.store.enqueue("route", "native-router", { text, chatId: job.chatId, threadId: job.threadId, statusId: job.statusId }, `${row.id}:route`);
       return;
     }
+    job.action.prompt = [job.action.prompt, ...transcripts].filter(Boolean).join("\n\n");
+    if (fileIds.length) job.action.fileIds = fileIds;
+    // A review already carries its instructions, and an answer is only ever the owner's own words.
+    if (!job.decisionId && job.action.type !== "review" && !job.action.prompt.trim() && fileIds.length) job.action.prompt = ATTACHMENTS_ONLY_PROMPT;
     if (job.decisionId) {
       const decision = getDecision(job.decisionId);
       if (!decision || decision.workspaceId !== job.action.trackedId) throw new TerminalError("Question workspace mismatch");
-      const files = (job.action.fileIds ?? []).map(id => `Attachment ${id}: ${this.engine.bridge.link(id, job.action!.trackedId)}`);
-      if (!decision.answeredAt) answerDecision(job.decisionId, [job.action.prompt, ...files].filter(Boolean).join("\n"));
+      const links = (job.action.fileIds ?? []).map(id => `Attachment ${id}: ${this.engine.bridge.link(id, job.action!.trackedId)}`);
+      if (!decision.answeredAt) answerDecision(job.decisionId, [job.action.prompt, ...links].filter(Boolean).join("\n"));
       enqueueText(this.store, `${row.id}:answered`, job.chatId, "Answer recorded.", { threadId: job.threadId }); return;
     }
     const reservedId = `${row.id.replace(/:media$/, "")}:action`;

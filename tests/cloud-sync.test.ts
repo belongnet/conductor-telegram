@@ -319,7 +319,7 @@ test("sync voice replies reserve the correct session while transcription runs se
   const action = JSON.parse(f.store.row("update:1:action")!.payload);
   assert.equal(action.sessionId, "old"); assert.equal(action.mediaPending, true);
   const media = JSON.parse(f.store.row("update:1:media")!.payload);
-  assert.equal(media.action.sessionId, "old"); assert.equal(media.voice, true);
+  assert.equal(media.action.sessionId, "old"); assert.equal(media.files[0].voice, true);
   assert.equal(f.sends.length, 0);
 }));
 

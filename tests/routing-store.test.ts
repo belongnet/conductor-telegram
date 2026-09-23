@@ -17,6 +17,7 @@ import {
   getRepoTopicByThreadId,
   getRepoTopicsForChat,
   getWorkspace,
+  getWorkspaceByThreadId,
   getWorkspaceMessageTarget,
   linkTelegramMessage,
   recordRouteAttempt,
@@ -413,4 +414,15 @@ test("relabelling a cursor to cloud-api drops its local-namespace position", () 
     closeDb();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a topic holding two workspaces stamped in the same millisecond follows the newer one", () => {
+  withTempDb(() => {
+    const older = createWorkspace({name: "older", prompt: "first", repoPath: "conductor-project:p1", telegramChatId: "-42"});
+    const newer = createWorkspace({name: "newer", prompt: "second", repoPath: "conductor-project:p1", telegramChatId: "-42"});
+    const db = getDb();
+    // Two /run commands in the same tick: the timestamps tie, so only insertion order tells them apart.
+    db.prepare("UPDATE workspaces SET telegram_thread_id=5, created_at='2026-09-22T10:00:00.000Z' WHERE id IN (?,?)").run(older.id, newer.id);
+    assert.equal(getWorkspaceByThreadId("-42", 5)?.id, newer.id);
+  });
 });

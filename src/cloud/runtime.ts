@@ -8,7 +8,7 @@ import { GatewayStore } from "./store.js";
 import { FileBridge, startBridge } from "./bridge.js";
 import { CloudEngine, DEFAULT_PROVIDERS, type Provider } from "./engine.js";
 import { CloudGitHub } from "./catalog.js";
-import { CloudCommands } from "./commands.js";
+import { ALBUM_JOIN_MS, CloudCommands } from "./commands.js";
 import { ingestTelegram, pause, QueueDispatcher, reportBlocked, TelegramDelivery, type TelegramCall } from "./telegram.js";
 import { CloudRouter } from "./router.js";
 import { CloudPoller } from "./poller.js";
@@ -149,7 +149,7 @@ export async function startCloudGateway(): Promise<void> {
       loop("cloud-poller", 1000, () => poller.tick()),
       loop("cloud-sync", 1000, () => sync?.tick()),
       loop("cloud-access", 60_000, async () => { await fencedApi.getIdentity(); store.set("cloud-access-last-success", Date.now()); }),
-      loop("retention", 3600_000, () => bridge.prune()),
+      loop("retention", 3600_000, () => { bridge.prune(); store.pruneTurnState(ALBUM_JOIN_MS); }),
     ]);
   } catch (error) {
     // An operator asked this process to stop. Whichever fenced call lost the race to the

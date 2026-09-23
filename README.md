@@ -140,7 +140,7 @@ Cloud commands act on your whole Conductor organization with the configured `CON
 
 The official API is still beta. Cloud operations therefore use runtime response and resource-identity validation, bounded retries only for idempotent requests, throttled non-overlapping polls, and persisted message-ID cursors that are never mixed with desktop SQLite row IDs. Enforced review permission policies are not exposed by the API, so hybrid-mode cloud `/review` attempts fail closed. Cloud-only mode can opt into [native reviews](docs/ovh-native-gateway.md#native-tasks-reviews-and-recovery), which use normal Conductor permissions.
 
-Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
+Photos, screenshots, voice notes, and audio files sent as replies are staged or transcribed for the agent. An album counts as one message: every file in it goes to the same task, whichever photo carries the caption. A photo Telegram delivers late joins that same task for ten minutes, provided the task reached Conductor. A file type the gateway cannot take yet, such as video, is reported rather than dropped in silence. Files sent without a caption reach the agent with an instruction to open them, and Telegram lets bots download files up to 20 MB. General-topic messages that the bot can only infer now ask for confirmation before starting or routing work.
 
 ## Durable lanes controller (Manifest v2)
 

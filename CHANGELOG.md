@@ -4,6 +4,20 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-22
+
+### Fixed
+- A photo album sent to Telegram is one message again. Telegram delivers an album as one update per file, with its caption on at most one of them, so a four-photo album captioned `/run long-events` started a workspace holding a single photo and no instructions, and answered the other three with "Choose a workspace topic or /run <project> before sending attachments." The album's first update now gathers the rest and sends one task carrying every file, wherever the caption sits. A photo Telegram delivers late joins that same task instead of being refused, for ten minutes, as long as the task actually reached Conductor.
+- Files sent without a word now reach the agent with an instruction to open them, and a workspace started from files alone is named for its project and their number instead of "Telegram task". A review sent with only a screenshot keeps its own instructions.
+- An album's files are fetched a couple at a time rather than one after another, so a ten-photo album no longer holds the single attachment worker for minutes while every other chat waits, and no more than a couple of files are held in memory at once. Each file is prepared at most once across retries, and a voice note is transcribed at most once. Collecting an album also ends after a fixed number of passes, so a clock that steps backwards cannot hold a topic's messages behind it.
+- Telegram refuses a bot any file over 20 MB. That refusal is now reported as itself, whether Telegram says so up front or the download proves it, instead of failing as an unexplained error after five attempts.
+- A repository topic carrying two workspaces stamped in the same millisecond follows the newer one, rather than whichever row the database happened to read first.
+- A workspace whose launch never landed no longer wedges its repository topic. The topic keeps that workspace, so a later plain message there used to start a launch with no project and fail on every attempt; it now launches the project the workspace was created for.
+- A file Telegram delivers late joins its album's work only while the topic still follows that work, and an album is identified per topic, so the same album id in another topic is another album. A file type the gateway cannot take yet, such as video, is reported rather than dropped in silence, and a control command like `/stop` counts only as the caption the owner led with, never one found further down an album.
+
+### Changed
+- Album bookkeeping and cached voice transcripts are swept once their turn is over, so the gateway's state table no longer grows for the life of the deployment. An attachment job also carries its first file in the shape a single-file release reads, so a rollback still prepares work that was already queued.
+
 ## [0.14.0] - 2026-09-22
 
 ### Added

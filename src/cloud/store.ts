@@ -172,6 +172,26 @@ export class GatewayStore {
       .get(chatId, String(messageId)) as { decision_id: number } | undefined)?.decision_id;
   }
 
+  /**
+   * Album bookkeeping and voice transcripts only matter while their turn is unfinished, and the state table is
+   * read by prefix scans elsewhere, so they are not left to accumulate for the life of the deployment.
+   */
+  pruneTurnState(joinWindowMs: number, now = Date.now()): number {
+    this.assertWriter?.();
+    return this.db.transaction(() => {
+      // An album stops being joinable once its window closes, so its leader record has nothing left to say.
+      const albums = this.db.prepare("DELETE FROM gateway_state WHERE key LIKE 'album:%' AND CAST(json_extract(value,'$.at') AS INTEGER) < ?")
+        .run(now - joinWindowMs).changes;
+      // The members of an album and a turn's transcripts are only re-read while its row can still run again.
+      const members = this.db.prepare(`DELETE FROM gateway_state WHERE key LIKE 'album-members:%' AND NOT EXISTS
+        (SELECT 1 FROM gateway_queue q WHERE q.id=substr(gateway_state.key,15) AND q.state IN ('pending','running'))`).run().changes;
+      // Matched with the separator, so a row id that merely prefixes another cannot hold its keys.
+      const perFile = (prefix: string, offset: number): number => this.db.prepare(`DELETE FROM gateway_state WHERE key LIKE '${prefix}:%' AND NOT EXISTS
+        (SELECT 1 FROM gateway_queue q WHERE q.state IN ('pending','running') AND substr(gateway_state.key,${offset},length(q.id)+1)=q.id||':')`).run().changes;
+      return albums + members + perFile("media-transcript", 18) + perFile("media-file", 12);
+    })();
+  }
+
   backlog(): { pending: number; blocked: number; oldestMs: number } {
     const row = this.db.prepare(`SELECT sum(state IN ('pending','running')) AS pending,
       sum(state='blocked') AS blocked,min(CASE WHEN state IN ('pending','running') THEN created_at END) AS oldest
