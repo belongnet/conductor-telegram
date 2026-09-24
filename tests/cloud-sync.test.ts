@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {getDb, closeDb} from "../src/store/db.js";
-import {getWorkspace, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId, linkTelegramMessage} from "../src/store/queries.js";
-import {GatewayStore} from "../src/cloud/store.js";
+import {createWorkspace, getWorkspace, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId, linkTelegramMessage,
+  updateWorkspaceConductorBinding, upsertRepoTopic} from "../src/store/queries.js";
+import {GatewayStore, type CloudBinding} from "../src/cloud/store.js";
 import {CloudEngine} from "../src/cloud/engine.js";
 import {CloudCommands} from "../src/cloud/commands.js";
 import {CloudWorkspaceSync} from "../src/cloud/sync.js";
@@ -349,6 +350,140 @@ test("native rename cycles retain unique operations and archived work closes its
   await f.sync.sync(); assert.ok(getWorkspace(id)?.archivedAt);
   assert.equal(JSON.parse(f.store.row(`sync-close:${id}`)!.payload).method, "closeForumTopic");
   assert.equal(f.store.bindings().length, 1); assert.equal(getThreadCursor(id, "recent")?.lastMessageId, "baseline");
+}));
+
+test("a gateway workspace's creation key is never shown as its name, whatever tag surrounds it", () => fixture(async f => {
+  // A workspace this gateway launched: its own record, bound to the Conductor workspace it created.
+  const ws = createWorkspace({name: "Fix the login bug", prompt: "Fix the login bug", repoPath: "conductor-project:project", telegramChatId: "-42"});
+  updateWorkspaceThreadId(ws.id, 7);
+  f.store.bind(ws.id, {workspaceId: "native-1", projectId: "project", repoUrl: "git@github.com:org/repo.git", repoSlug: "org/repo",
+    branch: null, prUrl: null, sessionId: "recent", agent: "claude", model: "fable-5-1", effort: "high", stopped: false});
+  f.workspaces[0].name = `[agents] telegram-${ws.id}`;
+  await f.sync.sync();
+  assert.equal(getWorkspace(ws.id)?.name, "Fix the login bug");
+  assert.equal(f.store.row(`sync-rename:${ws.id}:1`), undefined);
+  f.workspaces[0].name = "[agents] Login fix";
+  await f.sync.sync();
+  assert.equal(getWorkspace(ws.id)?.name, "[agents] Login fix");
+  assert.equal(JSON.parse(f.store.row(`sync-rename:${ws.id}:1`)!.payload).payload.name, "[agents] Login fix");
+}));
+
+/** A workspace this gateway launched, not one discovery found: bound to the Conductor workspace it created, "recent" its first thread. */
+function gatewayWorkspace(f: ReturnType<typeof makeFixture>, name: string, threadId?: number) {
+  const ws = createWorkspace({name, prompt: name, repoPath: "conductor-project:project", telegramChatId: "-42"});
+  if (threadId) {
+    // Its launch opened the topic, which Telegram then numbered.
+    f.store.enqueue("telegram", "-42:0:topics", {method: "createForumTopic", workspaceId: ws.id, payload: {chat_id: "-42", name}}, `create-topic:${ws.id}`, 0);
+    f.store.finish(`create-topic:${ws.id}`, {message_thread_id: threadId});
+    updateWorkspaceThreadId(ws.id, threadId);
+  }
+  updateWorkspaceConductorBinding(ws.id, {workspaceId: "native-1", sessionId: "recent", backendKind: "cloud-api"});
+  const binding: CloudBinding = {workspaceId: "native-1", projectId: "project", repoUrl: "git@github.com:org/repo.git", repoSlug: "org/repo",
+    branch: null, prUrl: null, sessionId: "recent", agent: "claude", model: "fable-5-1", effort: "high", stopped: false};
+  f.store.bind(ws.id, binding);
+  return {ws, binding};
+}
+
+test("a Conductor rename of a workspace living in a repo topic leaves the repository's topic name alone", () => fixture(async f => {
+  upsertRepoTopic({chatId: "-42", repoPath: "/Users/legacy/repos/repo", repoName: "repo", telegramThreadId: 7});
+  const {ws} = gatewayWorkspace(f, "Fix the login bug", 7);
+  f.workspaces[0].name = "Login fix";
+  await f.sync.sync();
+  assert.equal(getWorkspace(ws.id)?.name, "Login fix");
+  assert.equal(getWorkspace(ws.id)?.conductorWorkspaceName, "Login fix");
+  assert.equal(f.store.row(`sync-rename:${ws.id}:1`), undefined, "the topic keeps its repository's name");
+}));
+
+test("after an upgrade, a workspace still called by its creation key takes its first thread's title on its next poll, and sync keeps it", () => fixture(async f => {
+  const {ws, binding} = gatewayWorkspace(f, "Fix the login bug", 7);
+  // Before this release, launch recorded the key as the Conductor name and sync copied it over the task's name.
+  // Another tool has tagged it since.
+  const key = `telegram-${ws.id}`;
+  f.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(key, key, ws.id);
+  f.workspaces[0].name = `[agents] ${key}`;
+  f.sessions[1].name = "Login fix"; // Conductor titled the first thread from the task.
+  const renames: string[] = [];
+  Object.assign(f.api, {
+    getWorkspace: async () => ({...f.workspaces[0]}),
+    renameWorkspace: async (_id: string, name: string) => { renames.push(name); f.workspaces[0].name = name; return {...f.workspaces[0]}; },
+  });
+  await f.sync.sync();
+  assert.equal(getWorkspace(ws.id)?.name, key, "sync never spreads the tagged key");
+  assert.equal(f.store.row(`sync-rename:${ws.id}:1`), undefined);
+  await f.engine.pollWorkspace(ws.id, binding);
+  assert.deepEqual(renames, ["[agents] Login fix"]);
+  assert.equal(getWorkspace(ws.id)?.name, "[agents] Login fix");
+  assert.equal(getWorkspace(ws.id)?.conductorWorkspaceName, "[agents] Login fix");
+  assert.equal(JSON.parse(f.store.row(`title-topic:${ws.id}`)!.payload).payload.name, "[agents] Login fix");
+  await f.sync.sync();
+  assert.equal(f.store.row(`sync-rename:${ws.id}:1`), undefined, "the adopted name is already Conductor's");
+  assert.equal(renames.length, 1);
+}));
+
+test("polling a discovered workspace never reads or renames its Conductor name", () => fixture(async f => {
+  await f.sync.sync(); const [{id, binding}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  let naming = 0;
+  Object.assign(f.api, {
+    getWorkspace: async () => { naming++; return f.workspaces[0]; },
+    renameWorkspace: async () => { naming++; throw new Error("Discovery must not rename native work"); },
+  });
+  await f.engine.pollWorkspace(id, binding);
+  assert.equal(naming, 0, "discovery stays read-only in Conductor");
+  assert.equal(f.store.get(`workspace-titled:${id}`), undefined);
+  assert.ok(f.store.get(`poll-success:${id}`));
+}));
+
+test("a thread named by a creation key reads as what it is, with its model, wherever Telegram names it", () => fixture(async f => {
+  await f.sync.sync(); const [{id, binding}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  // A recovery thread a gateway opened before threads were renamed, beside one Conductor has not titled.
+  Object.assign(f.sessions[0], {name: undefined, model: undefined, resolvedModel: "claude-fable-5-1"});
+  f.sessions[1].name = "Task recover:s1:m1";
+  const at = new Date().toISOString();
+  f.messages.push({id: "untitled-reply", sessionId: "old", sessionIndex: 0, type: "assistant", content: "Checked the logs.", receivedAt: at},
+    {id: "recovery-reply", sessionId: "recent", sessionIndex: 5, type: "assistant", content: "Recovered result.", receivedAt: at});
+  await f.engine.pollWorkspace(id, binding);
+  const text = (row: string) => JSON.parse(f.store.row(row)!.payload).payload.text;
+  assert.match(text("transcript:old:untitled-reply:0"), /^Untitled · claude-fable-5-1\n/, "as the pickers below call it");
+  assert.match(text("transcript:recent:recovery-reply:0"), /^Recovery · gpt-5\.6-sol\n/);
+  const labels = (row: string) => JSON.parse(f.store.row(row)!.payload).payload.reply_markup.inline_keyboard.flat().map((b: any) => b.text);
+  f.store.ingest([{update_id: 1, message: {message_id: 1, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/threads"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  assert.deepEqual(labels("update:1:threads:0"), ["Untitled · claude-fable-5-1", "Recovery · gpt-5.6-sol"]);
+  await tapThread(f, JSON.parse(f.store.row("update:1:threads:0")!.payload).payload.reply_markup.inline_keyboard[1][0].callback_data);
+  assert.equal(text("update:50:reply:0"), "Telegram now targets Recovery (gpt-5.6-sol).");
+  f.store.ingest([{update_id: 51, message: {message_id: 51, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/threads"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  assert.deepEqual(labels("update:51:threads:0"), ["Untitled · claude-fable-5-1", "● Recovery · gpt-5.6-sol"]);
+  // A message waiting for a thread choice names them the same way.
+  f.store.clear(`selected-thread:${id}`);
+  f.engine.queue("plain", {type: "send", trackedId: id, prompt: "go on"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.deepEqual(labels("plain:choose-thread:0"), ["Untitled · claude-fable-5-1", "Recovery · gpt-5.6-sol"]);
+}));
+
+test("the send receipt and the connection note call a keyed thread what it is", () => fixture(async f => {
+  f.sessions[1].name = "Task recover:s1:m1";
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  assert.match(JSON.parse(f.store.row("sync-intro:native-1:0")!.payload).payload.text, /Latest context: Recovery \(gpt-5\.6-sol\)/);
+  f.store.set(`selected-thread:${id}`, "recent");
+  f.engine.queue("plain", {type: "send", trackedId: id, prompt: "go on"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.match(JSON.parse(f.store.row("plain:sent:0")!.payload).payload.text, /^Sent to Recovery \(gpt-5\.6-sol\)\./);
+}));
+
+test("discovery leaves this gateway's own workspace to its launch, even before the launch has bound it", () => fixture(async f => {
+  // The launch's create response was lost: its record exists, its binding waits for reconciliation.
+  const ws = createWorkspace({name: "Fix the login bug", prompt: "Fix the login bug", repoPath: "conductor-project:project", telegramChatId: "-42"});
+  f.workspaces[0].name = `[agents] telegram-${ws.id}`;
+  await f.sync.sync();
+  assert.equal(f.store.bindings().length, 0, "no second record is bound to the workspace the launch will reconcile");
+  assert.equal(f.store.db.prepare("SELECT 1 FROM gateway_queue WHERE id LIKE 'create-topic:%'").get(), undefined);
+}));
+
+test("the router stays out of discovery when another tool tags its name", () => fixture(async f => {
+  f.workspaces[0].name = "[telegram] telegram-routing-unconfigured";
+  await f.sync.sync();
+  assert.equal(f.store.bindings().length, 0);
 }));
 
 test("native session provider resolution preserves exact models and rejects unknown providers", () => {

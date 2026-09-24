@@ -1,8 +1,9 @@
 import type {ConductorApiProject, ConductorApiWorkspace, ConductorApiSession, ConductorApiSessionStatus, ConductorApiMessage} from "../integrations/conductor-api.js";
 import {repositoryRemoteIdentity} from "../lanes/repository-identity.js";
-import {createWorkspace, getWorkspace, updateWorkspaceConductorBinding, upsertThreadCursor, getRepoTopicByThreadId} from "../store/queries.js";
+import {createWorkspace, getWorkspace, updateWorkspaceConductorBinding, upsertThreadCursor} from "../store/queries.js";
 import {CloudEngine, transcriptText} from "./engine.js";
 import {nativeSessionProvider} from "./messages.js";
+import {creationKey, threadName} from "./names.js";
 import {enqueueTelegram} from "./telegram.js";
 
 /** Discovery only attaches existing work; it never sends, wakes, cancels, or creates native work. */
@@ -26,7 +27,8 @@ export class CloudWorkspaceSync {
     const [projects, workspaces] = await Promise.all([this.engine.catalog.projects(true), api.listWorkspaces({mine: true})]);
     const routerId = store.get<{workspaceId: string}>("router-binding")?.workspaceId;
     const routerName = `telegram-routing-${store.get<number>("telegram-bot-id") ?? "unconfigured"}`;
-    const active = workspaces.filter(w => w.id !== routerId && w.name !== routerName && !w.archivedAt && !["archived", "deleted"].includes(w.state ?? ""));
+    // Matched as a word, so the router stays excluded when another tool tags its name.
+    const active = workspaces.filter(w => w.id !== routerId && !w.name.split(/\s+/).includes(routerName) && !w.archivedAt && !["archived", "deleted"].includes(w.state ?? ""));
     const seen = new Set(active.map(w => w.id));
     const jobs: Array<{id: string; run: () => Promise<void>}> = active.map(w => ({id: w.id, run: () => this.attach(w, projects)}));
     for (const {id, binding} of store.bindings()) {
@@ -64,19 +66,24 @@ export class CloudWorkspaceSync {
       const {id} = matches[0], ws = getWorkspace(id);
       if (!ws || ws.telegramChatId !== this.chatId || store.get(`stop:${id}`) || ws.archivedAt) return;
       store.set(`cloud-synced:${id}`, true);
-      if (ws.name !== remote.name) {
+      // A workspace the gateway created is called by its creation key until it takes its first thread's title.
+      // The key is never a name to show, whatever tag an outside renamer put around it.
+      const keyed = remote.name.includes(creationKey(id));
+      if (!keyed && ws.name !== remote.name) {
         store.db.transaction(() => {
           const revision = (store.get<number>(`sync-revision:${id}`) ?? 0) + 1;
           store.set(`sync-revision:${id}`, revision);
-          store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(remote.name, remote.name, id);
-          // Same rule as a rename command: a repo topic keeps the name of its repository.
-          if (ws.telegramThreadId && !getRepoTopicByThreadId(this.chatId, ws.telegramThreadId)) enqueueTelegram(store, `sync-rename:${id}:${revision}`, {method: "editForumTopic", workspaceId: id,
-            payload: {chat_id: this.chatId, message_thread_id: ws.telegramThreadId, name: remote.name.slice(0, 128)}}, 20);
+          // A rename made in Conductor is mirrored into the record and the topic.
+          this.engine.retitle(id, remote.name, `sync-rename:${id}:${revision}`);
         })();
       }
-      this.topic(id, remote.name);
+      this.topic(id, keyed ? ws.name : remote.name);
       return;
     }
+    // A workspace this gateway created carries its creation key until it is titled. Its launch binds it, even after a
+    // lost create response; discovery never adopts it as someone else's work.
+    const own = remote.name.match(/telegram-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)?.[1];
+    if (own && getWorkspace(own)) return;
     const sessions = (await api.listWorkspaceSessions(remote.id)).filter(s => !s.archivedAt);
     if (!sessions.length) return; // Provisioning may not have created the first session yet.
     const snapshots: Array<{session: ConductorApiSession; status: ConductorApiSessionStatus; tail: ConductorApiMessage[]}> = [];
@@ -110,7 +117,7 @@ export class CloudWorkspaceSync {
         ? `During migration use /send@${store.get<string>("telegram-bot-username")} <text> and /threads@${store.get<string>("telegram-bot-username")} to select a thread. Ordinary text and voice replies activate after the old gateway is disabled.`
         : "Use /threads to choose a thread for Telegram. In a workspace with multiple threads, your first message waits for a thread choice. Replying to a forwarded message targets that message’s exact thread. Telegram’s selection is separate from the tab open in Conductor.";
       this.engine.notify(`sync-intro:${remote.id}`, ws.id,
-        `Connected to ${remote.name}\n${remote.deepLink}\n\nLatest context: ${selected.session.name ?? selected.session.id} (${provider.model})\n${input}\nExisting work continues unchanged.`, selected.session.id, {silent: true});
+        `Connected to ${remote.name}\n${remote.deepLink}\n\nLatest context: ${threadName(selected.session.name, selected.session.id)} (${provider.model})\n${input}\nExisting work continues unchanged.`, selected.session.id, {silent: true});
       const latest = [...selected.tail].reverse().find(m => transcriptText(m));
       if (latest) this.engine.notify(`sync-snapshot:${remote.id}`, ws.id, `Latest Conductor reply\n\n${transcriptText(latest)}`, selected.session.id, {silent: true});
     })();

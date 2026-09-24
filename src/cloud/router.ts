@@ -9,6 +9,7 @@ import { deterministicUuid } from "../lanes/controller-policy.js";
 import { ConductorApiError, conductorWorkspaceIsArchived } from "../integrations/conductor-api.js";
 import { messageContainsExactText } from "./engine.js";
 import { findSubmittedMessage } from "./messages.js";
+import { taskTitle } from "./names.js";
 
 /** Every routing failure ends with the two ways that never need the router. */
 const ROUTING_HINT = "Use /run <project> <task> or reply in a workspace topic.";
@@ -107,7 +108,7 @@ export class CloudRouter {
       if (result.action === "new") {
         const project = projects.find(p => p.id === result.projectId);
         if (!project) throw new TerminalError(`Router returned an unknown project. ${ROUTING_HINT}`);
-        const ws = createWorkspace({ name: input.text.slice(0, 70), prompt: input.text, repoPath: `conductor-project:${project.id}`, telegramChatId: input.chatId });
+        const ws = createWorkspace({ name: taskTitle(input.text, "Telegram task"), prompt: input.text, repoPath: `conductor-project:${project.id}`, telegramChatId: input.chatId });
         store.set(key, { chatId: input.chatId, media: input.media, action: { type: "launch", trackedId: ws.id, projectId: project.id, prompt: input.text } });
         enqueueText(store, `${row.id}:confirm`, input.chatId, `Start this task in ${project.name}?\n\n${input.text}`, { threadId: input.threadId,
           replyMarkup: { inline_keyboard: [[{ text: "Confirm", callback_data: key }]] } });
@@ -158,7 +159,8 @@ export class CloudRouter {
     if (existing) return existing;
     const name = this.routerName();
     const candidates = (await this.engine.api.listProjectWorkspaces(projectId)).filter(w =>
-      w.name === name && w.creatorId === store.get("conductor-user-id") &&
+      // Matched as a word, so a lost create response still reconciles after another tool tagged the name.
+      w.name.split(/\s+/).includes(name) && w.creatorId === store.get("conductor-user-id") &&
       !conductorWorkspaceIsArchived(w) && !store.get(`router-retired:${w.id}`));
     if (candidates.length > 1) throw new TerminalError(`Multiple router workspaces exist; explicit reconciliation required. ${ROUTING_HINT}`);
     let binding: { workspaceId: string; sessionId: string };
