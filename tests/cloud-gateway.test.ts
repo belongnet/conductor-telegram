@@ -17,6 +17,7 @@ import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
 import { readWorkspaceArtifact } from "../src/mcp/remote.js";
 import { acquireGatewayLease } from "../src/cloud/runtime.js";
 import {CloudPoller} from "../src/cloud/poller.js";
+import { ATTACHMENTS_ONLY_PROMPT } from "../src/cloud/messages.js";
 
 async function fixture(fn: (f: ReturnType<typeof createFixture>) => Promise<void>): Promise<void> {
   const f = createFixture();
@@ -32,11 +33,16 @@ function createFixture() {
   const sessions: any[] = [{ id: "s1", name: "Task", deepLink: "conductor://s1" }];
   let sessionStatus: "idle" | "working" | "error" = "idle";
   let errorMessage = "quota exhausted";
+  // Conductor's own name for the workspace. The default is no creation key, so a poll never retitles it.
+  const remote = { name: "workspace" };
+  const renames: string[] = [];
   const api = {
     listProjects: async () => [{ id: "p1", name: "repo", gitRemote: "git@github.com:org/repo.git" }],
     getIdentity: async () => ({ userId: "owner" }),
     createWorkspace: async () => { creates++; return { workspaceId: "w1", sessionId: "s1", deepLink: "conductor://w1" }; },
-    getWorkspace: async () => ({ id: "w1", name: "workspace", repoUrl: "https://github.com/org/repo", deepLink: "conductor://w1" }),
+    getWorkspace: async () => ({ id: "w1", name: remote.name, repoUrl: "https://github.com/org/repo", deepLink: "conductor://w1" }),
+    renameWorkspace: async (_id: string, name: string) => { renames.push(name); remote.name = name; return { id: "w1", name, createdAt: "", deepLink: "conductor://w1" }; },
+    renameSession: async (id: string, name: string) => { const session = sessions.find(s => s.id === id); if (session) session.name = name; return { ...session }; },
     getWorkspaceStatus: async () => ({ workspaceId: "w1", status: "ready" }),
     listProjectWorkspaces: async () => [],
     listWorkspaceSessions: async () => sessions,
@@ -59,7 +65,7 @@ function createFixture() {
   engine.github.access = async () => ({readable: true, status: 200});
   store.set("conductor-user-id", "owner");
   async function launch() { engine.queue("launch", { type: "launch", trackedId: ws.id, projectId: "p1", prompt: "Fix\nthe bug" }); await processQueue(store, ["cloud"], r => engine.action(r)); }
-  return { dir, store, ws, bridge, api, engine, messages, sessions, launch, counts: () => ({ creates, sends }),
+  return { dir, store, ws, bridge, api, engine, messages, sessions, remote, renames, launch, counts: () => ({ creates, sends }),
     status: (value: typeof sessionStatus, detail = errorMessage) => { sessionStatus = value; errorMessage = detail; store.set(`poll-after:${ws.id}`, 0); } };
 }
 
@@ -373,9 +379,12 @@ test("quota failure queues one fallback; an API outage never launches a replacem
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   const rows = f.store.db.prepare("SELECT * FROM gateway_queue WHERE id LIKE 'recover:%'").all();
   assert.equal(rows.length, 1);
-  const notice = JSON.parse(f.store.row(`recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`)!.payload);
+  const noticeId = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
+  const notice = JSON.parse(f.store.row(noticeId)!.payload);
   assert.equal(notice.method, "editMessageText");
   assert.equal(notice.statusOf, "quota-ack:0", "provider fallback updates the existing turn card");
+  assert.equal(notice.payload.text, "claude (fable-5-1) hit a usage limit. Continuing in codex (gpt-6-astra); existing work is kept.");
+  assert.equal(f.store.row(`${noticeId}:topic:0`), undefined, "a fresh card in the workspace's own chat already says it");
   f.status("error"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'recover:%'").get() as any).n, 1);
   f.api.getSessionStatus = async () => { throw new Error("API offline"); };
@@ -414,15 +423,603 @@ test("provider recovery continues and completes on the original turn card", () =
   const continuation = JSON.parse(f.store.row(`${recovery.id}:sent`)!.payload);
   assert.equal(continuation.method, "editMessageText");
   assert.equal(continuation.statusOf, "recovery-ack:0");
+  assert.equal(continuation.payload.text, "Continuing in codex (gpt-6-astra) after claude (fable-5-1) stopped.",
+    "the card's later state still names the model it replaced");
   const sessionId = f.sessions.at(-1).id as string;
+  assert.equal(f.sessions.at(-1).name, "Recovery", "the replacement thread is named for what it is, not its creation key");
   const state = f.store.get<any>(`session:${sessionId}`);
   f.messages.push({id: "recovered-answer", sessionId, type: "assistant", content: "Recovered result.",
     sessionIndex: f.messages.length, receivedAt: new Date().toISOString()});
   f.status("idle"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.match(JSON.parse(f.store.row(`transcript:${sessionId}:recovered-answer:0`)!.payload).payload.text, /^Recovery · gpt-6-astra\n/,
+    "beside the thread that stopped, each reply says which model is speaking");
   const complete = JSON.parse(f.store.row(`complete:${sessionId}:${state.sentMessageId}`)!.payload);
   assert.equal(complete.method, "editMessageText");
   assert.equal(complete.statusOf, "recovery-ack:0");
-  assert.equal(complete.payload.text, "Conductor task finished after recovery.");
+  assert.equal(complete.payload.text, "Conductor task finished after recovery in codex (gpt-6-astra).");
+}));
+
+/** A forum-group workspace created under its creation key like every gateway launch, in a topic its launch opened. */
+async function keyedLaunch(f: ReturnType<typeof createFixture>, threadId: number | null = 7): Promise<void> {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  f.remote.name = `telegram-${f.ws.id}`;
+  delete f.sessions[0].name; // Conductor has not titled the first thread yet.
+  await f.launch();
+  if (threadId) updateWorkspaceThreadId(f.ws.id, threadId); // Telegram opened the topic.
+}
+/** Naming is paced and backed off; a test that means "later" says so. The attempts so far still count. */
+function titleRetryDue(f: ReturnType<typeof createFixture>): void {
+  const retry = f.store.get<{after: number; attempts: number}>(`workspace-title-retry:${f.ws.id}`);
+  if (retry) f.store.set(`workspace-title-retry:${f.ws.id}`, {...retry, after: 0});
+  f.store.clear("workspace-title-not-before");
+}
+async function poll(f: ReturnType<typeof createFixture>): Promise<void> {
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+}
+
+test("a launched workspace takes its first thread's Conductor title once, keeping an outside tag", () => fixture(async f => {
+  let created: any;
+  const create = f.api.createWorkspace;
+  (f.api as any).createWorkspace = async (input: any) => { created = input; return create(); };
+  await keyedLaunch(f);
+  assert.equal(created.name, `telegram-${f.ws.id}`, "creation keeps the key that reconciles a lost response");
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, null, "the creation key is not recorded as a name");
+  await poll(f);
+  assert.deepEqual(f.renames, [], "an untitled first thread leaves the workspace alone");
+  // The owner's renamer tagged the key before Conductor titled the thread.
+  f.remote.name = `[agents] telegram-${f.ws.id}`;
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["[agents] Auxiliary LLM Error Fix"]);
+  assert.equal(getWorkspace(f.ws.id)?.name, "[agents] Auxiliary LLM Error Fix");
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, "[agents] Auxiliary LLM Error Fix");
+  const edit = JSON.parse(f.store.row(`title-topic:${f.ws.id}`)!.payload);
+  assert.equal(edit.method, "editForumTopic");
+  assert.deepEqual(edit.payload, {chat_id: "-42", message_thread_id: 7, name: "[agents] Auxiliary LLM Error Fix"});
+  f.sessions[0].name = "Something else entirely";
+  await poll(f);
+  assert.equal(f.renames.length, 1, "the title is adopted once");
+}));
+
+test("a name given since creation stands, and /rename outranks a thread title that arrives later", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.engine.queue("update:5:action", {type: "rename", trackedId: f.ws.id, prompt: "Customer billing"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["Customer billing"]);
+  assert.equal(getWorkspace(f.ws.id)?.name, "Customer billing");
+}));
+
+test("a workspace renamed in Conductor keeps that name when its thread is titled", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.remote.name = "Named in Conductor";
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, []);
+  assert.equal(f.store.get(`workspace-titled:${f.ws.id}`), true);
+}));
+
+test("a title that cannot be applied yet never fails the poll, and is taken literally", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Fix $& the $1 route";
+  const rename = f.api.renameWorkspace;
+  f.api.renameWorkspace = async () => { throw new ConductorApiError("Unavailable", 503, true); };
+  await poll(f);
+  assert.ok(f.store.get(`poll-success:${f.ws.id}`), "the poll still succeeds");
+  assert.equal(f.store.get(`workspace-titled:${f.ws.id}`), undefined, "an outage is retried");
+  f.api.renameWorkspace = rename;
+  await poll(f);
+  assert.deepEqual(f.renames, [], "not on the very next poll: the retry waits");
+  titleRetryDue(f);
+  await poll(f);
+  assert.deepEqual(f.renames, ["Fix $& the $1 route"]);
+}));
+
+test("a title Conductor keeps refusing is asked for less and less often, then let go", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  let attempts = 0;
+  f.api.renameWorkspace = async () => { attempts++; throw new ConductorApiError("Invalid name", 422); };
+  await poll(f); await poll(f);
+  assert.equal(attempts, 1, "a refusal is not retried on the next poll");
+  const waits: number[] = [];
+  for (let i = 0; i < 10; i++) {
+    const retry = f.store.get<{after: number}>(`workspace-title-retry:${f.ws.id}`);
+    if (retry) waits.push(Math.round((retry.after - Date.now()) / 60_000));
+    titleRetryDue(f); await poll(f);
+  }
+  assert.equal(attempts, 8, "eight tries in all");
+  assert.deepEqual(waits, [1, 2, 4, 8, 16, 32, 60], "each wait is twice the last, up to an hour");
+  assert.equal(f.store.get(`workspace-titled:${f.ws.id}`), true, "then the workspace keeps its name");
+  assert.equal(getWorkspace(f.ws.id)?.name, "test", "the workspace keeps the name it was given in Telegram");
+}));
+
+test("a workspace in a repo topic takes its title without renaming the repository's topic", () => fixture(async f => {
+  repoTopic(f, "repo", 7);
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+  assert.equal(getWorkspace(f.ws.id)?.name, "Auxiliary LLM Error Fix");
+  assert.equal(f.store.row(`title-topic:${f.ws.id}`), undefined);
+}));
+
+test("a title waits until the workspace's own topic has opened", () => fixture(async f => {
+  await keyedLaunch(f, null);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, []);
+  updateWorkspaceThreadId(f.ws.id, 7);
+  await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+  assert.equal(JSON.parse(f.store.row(`title-topic:${f.ws.id}`)!.payload).payload.message_thread_id, 7);
+}));
+
+test("a fallback is also said in the workspace topic when its card is elsewhere, never linked to the thread that stopped", () => fixture(async f => {
+  await keyedLaunch(f);
+  // A routed task's card answers in General, not in the workspace's topic.
+  enqueueText(f.store, "general-ack", "-42", "Confirmed. Task queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "general-ack:0"});
+  f.status("error", "You're out of usage credits. Switch to another model to continue.");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const id = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
+  const text = "claude (fable-5-1) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept.";
+  const card = JSON.parse(f.store.row(id)!.payload);
+  assert.equal(card.statusOf, "general-ack:0");
+  assert.equal(card.payload.text, text);
+  const line = JSON.parse(f.store.row(`${id}:topic:0`)!.payload);
+  assert.equal(line.method, "sendMessage");
+  assert.equal(line.payload.text, text);
+  assert.equal(line.payload.message_thread_id, 7);
+  assert.equal(line.payload.disable_notification, true);
+  assert.equal(line.sessionId, undefined, "a reply to the notice must follow the replacement, not the thread that stopped");
+}));
+
+test("a fallback beside a card that has scrolled away in its own topic is said there too", () => fixture(async f => {
+  await keyedLaunch(f);
+  enqueueText(f.store, "old-ack", "-42", "Task received and queued.", {threadId: 7, silent: true});
+  f.store.db.prepare("UPDATE gateway_queue SET created_at=? WHERE id='old-ack:0'").run(Date.now() - 60_000);
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "old-ack:0"});
+  f.status("error");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.ok(f.store.row(`recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}:topic:0`));
+}));
+
+test("a new thread is named for its task, and a rename Conductor loses still sends the task", () => fixture(async f => {
+  await f.launch();
+  f.engine.queue("update:30:thread", {type: "thread", trackedId: f.ws.id, prompt: "investigate the flaky login test\nwith logs"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.sessions.at(-1).name, "investigate the flaky login test");
+  f.api.renameSession = async () => { throw new ConductorApiError("Unavailable", 503, true); };
+  f.engine.queue("update:31:thread", {type: "thread", trackedId: f.ws.id, prompt: "check the footer"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.row("update:31:thread")?.state, "done");
+  assert.equal(f.counts().sends, 3);
+}));
+
+test("replies from a thread still named by its creation key read as what it is, with its model", () => fixture(async f => {
+  await f.launch();
+  // A recovery thread opened before threads were renamed.
+  f.sessions.push({id: "s2", name: "Task recover:s1:m1", model: "gpt-6-astra", deepLink: "conductor://s2"});
+  f.messages.push({id: "earlier-answer", sessionId: "s2", type: "assistant", content: "Looking into it.",
+    sessionIndex: f.messages.length, receivedAt: new Date().toISOString()});
+  await poll(f); // Anchors the thread's cursor on what it already said.
+  f.messages.push({id: "late-answer", sessionId: "s2", type: "assistant", content: "Recovered result.",
+    sessionIndex: f.messages.length, receivedAt: new Date().toISOString()});
+  await poll(f);
+  assert.match(JSON.parse(f.store.row("transcript:s2:late-answer:0")!.payload).payload.text, /^Recovery · gpt-6-astra\n/);
+}));
+
+test("a fallback without a card is said once, in the workspace topic, linked to no thread", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.status("error", "You're out of usage credits. Switch to another model to continue.");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const id = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
+  const line = JSON.parse(f.store.row(`${id}:0`)!.payload);
+  assert.equal(line.method, "sendMessage");
+  assert.equal(line.payload.text, "claude (fable-5-1) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept.");
+  assert.equal(line.payload.message_thread_id, 7);
+  assert.equal(line.payload.disable_notification, true);
+  assert.equal(line.sessionId, undefined, "a reply to the notice must follow the replacement, not the thread that stopped");
+  assert.equal(f.store.row(`${id}:topic:0`), undefined, "with no card, the notice already is the topic line");
+}));
+
+test("a replacement refused before it starts is also said in the workspace topic when its card is elsewhere", () => fixture(async f => {
+  await keyedLaunch(f);
+  enqueueText(f.store, "general-ack", "-42", "Confirmed. Task queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "general-ack:0"});
+  f.status("error");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  f.api.createSession = async () => { throw new ConductorApiError("Provider model unavailable", 400); };
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const recovery = f.store.db.prepare("SELECT id FROM gateway_queue WHERE kind='cloud' AND id LIKE 'recover:%'").get() as {id: string};
+  const id = `provider-rejected:${recovery.id}:codex:gpt-6-astra`;
+  const text = "codex (gpt-6-astra) rejected the run before it started. Trying claude (opus-5-1m).";
+  const card = JSON.parse(f.store.row(id)!.payload);
+  assert.equal(card.statusOf, "general-ack:0");
+  assert.equal(card.payload.text, text);
+  const line = JSON.parse(f.store.row(`${id}:topic:0`)!.payload);
+  assert.equal(line.payload.text, text);
+  assert.equal(line.payload.message_thread_id, 7);
+  assert.equal(line.sessionId, undefined);
+}));
+
+test("a reconnect names the model it keeps, and its continuation's card says it continues there", () => fixture(async f => {
+  await f.launch();
+  enqueueText(f.store, "reconnect-ack", "42", "Task received and queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "reconnect-ack:0"});
+  f.status("error", "connection lost");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const sent = f.store.get<any>("session:s1").sentMessageId;
+  assert.equal(JSON.parse(f.store.row(`resume-notice:s1:${sent}`)!.payload).payload.text,
+    "Reconnecting the existing claude (fable-5-1) session before trying a fallback.");
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  // The same thread carries on, so there is no model it replaced to name.
+  assert.equal(JSON.parse(f.store.row(`resume:s1:${sent}:sent`)!.payload).payload.text, "Continuing in claude (fable-5-1).");
+}));
+
+test("/rename names the workspace everywhere: its record, its Conductor name and its topic", () => fixture(async f => {
+  await keyedLaunch(f);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/rename Customer billing"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.deepEqual(f.renames, ["Customer billing"]);
+  assert.equal(getWorkspace(f.ws.id)?.name, "Customer billing");
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, "Customer billing");
+  const edit = JSON.parse(f.store.row("topic:update:1:action")!.payload);
+  assert.equal(edit.method, "editForumTopic");
+  assert.deepEqual(edit.payload, {chat_id: "-42", message_thread_id: 7, name: "Customer billing"});
+  assert.deepEqual(f.store.get(`workspace-titled:${f.ws.id}`), {owner: "Customer billing"}, "the owner's name is never replaced by a thread title");
+  assert.equal(JSON.parse(f.store.row("update:1:action:done")!.payload).payload.text, "Cloud workspace renamed.");
+}));
+
+for (const phase of ["read", "rename", "owner", "owner-lands-first"] as const) test(`a /rename that overlaps a title being adopted (${phase}) keeps the owner's name`, () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  const ownerRename = () => {
+    f.engine.queue("update:5:action", {type: "rename", trackedId: f.ws.id, prompt: "Customer billing"});
+    return processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  };
+  const read = f.api.getWorkspace, rename = f.api.renameWorkspace;
+  // The owner's rename commits while the poll waits on Conductor: for the workspace's name, or for its own rename.
+  if (phase === "read") f.api.getWorkspace = async () => { const remote = await read(); await ownerRename(); return remote; };
+  else if (phase === "rename") f.api.renameWorkspace = async (id, name) => { const renamed = await rename(id, name); if (name !== "Customer billing") await ownerRename(); return renamed; };
+  // Or the owner's rename reaches Conductor while the title's is still on its way, so the title lands last.
+  else if (phase === "owner-lands-first") f.api.renameWorkspace = async (id, name) => { if (name === "Auxiliary LLM Error Fix") await ownerRename(); return rename(id, name); };
+  // Or the poll runs while the owner's rename is still on its way to Conductor.
+  else f.api.renameWorkspace = async (id, name) => { if (name === "Customer billing") await poll(f); return rename(id, name); };
+  if (phase === "owner") await ownerRename(); else await poll(f);
+  // A title already on its way when the owner renamed is followed by the owner's name again, whichever landed last.
+  const expected = {read: ["Customer billing"], owner: ["Customer billing"],
+    rename: ["Auxiliary LLM Error Fix", "Customer billing", "Customer billing"],
+    "owner-lands-first": ["Customer billing", "Auxiliary LLM Error Fix", "Customer billing"]}[phase];
+  assert.deepEqual(f.renames, expected, "once the owner has named it, the title is never sent, and never kept");
+  assert.equal(f.remote.name, "Customer billing");
+  assert.equal(getWorkspace(f.ws.id)?.name, "Customer billing");
+  assert.equal(f.store.row(`title-topic:${f.ws.id}`), undefined, "the topic is never renamed to the title");
+}));
+
+test("a lost create response is reconciled by its key even after another tool tagged the name", () => fixture(async f => {
+  f.api.createWorkspace = async () => { throw new Error("lost receipt"); };
+  await f.launch();
+  const key = `telegram-${f.ws.id}`;
+  f.remote.name = `[agents] ${key}`;
+  // Only the owner's workspace whose name holds this key is the one that was created.
+  (f.api as any).listProjectWorkspaces = async () => [
+    {id: "w1", name: `[agents] ${key}`, creatorId: "owner", deepLink: "conductor://w1"},
+    {id: "w2", name: key, creatorId: "someone-else", deepLink: "conductor://w2"},
+    {id: "w3", name: "telegram-another-task", creatorId: "owner", deepLink: "conductor://w3"},
+  ];
+  f.store.retry("launch", "retry", 0);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row("launch")?.state, "done");
+  assert.equal(f.store.binding(f.ws.id)?.workspaceId, "w1");
+  assert.deepEqual(f.counts(), {creates: 0, sends: 1});
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, null, "a tagged key is still not a name");
+}));
+
+test("until it is titled, a keyed workspace is introduced by its task, never its creation key", () => fixture(async f => {
+  await keyedLaunch(f);
+  const receipt = f.bridge.event(f.ws.id, {id: randomUUID(), type: "human_request", payload: {question: "Ship it?", options: ["Yes", "No"]}});
+  f.engine.events();
+  assert.equal(JSON.parse(f.store.row(`decision:${receipt.decisionId}:0`)!.payload).payload.text, "test needs your input:\n\nShip it?");
+  // A deleted topic is opened again under the workspace's name. Everything queued so far has been delivered.
+  f.store.db.prepare("UPDATE gateway_queue SET state='done' WHERE kind='telegram'").run();
+  enqueueText(f.store, "agent-reply", "-42", "Agent reply", {workspaceId: f.ws.id, threadId: 7});
+  await new TelegramDelivery(f.store, async () => { throw {response: {error_code: 400, description: "Bad Request: message thread not found"}}; }).tick();
+  assert.equal(JSON.parse(f.store.row("topic-recover:agent-reply:0")!.payload).payload.name, "test");
+}));
+
+test("a title refused for credentials is asked for again once they work", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  const rename = f.api.renameWorkspace;
+  for (const status of [401, 403]) {
+    f.api.renameWorkspace = async () => { throw new ConductorApiError("Unauthorized", status); };
+    titleRetryDue(f); await poll(f);
+    assert.equal(f.store.get(`workspace-titled:${f.ws.id}`), undefined, `${status}: a rotated key must not leave the workspace unnamed for good`);
+    assert.ok(f.store.get(`poll-success:${f.ws.id}`));
+  }
+  f.api.renameWorkspace = rename;
+  titleRetryDue(f); await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+  assert.equal(getWorkspace(f.ws.id)?.name, "Auxiliary LLM Error Fix");
+}));
+
+test("a workspace archived while its title is applied is not renamed in Telegram", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  const rename = f.api.renameWorkspace;
+  f.api.renameWorkspace = async (id, name) => {
+    const renamed = await rename(id, name);
+    f.store.db.prepare("UPDATE workspaces SET status='archived',archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+    return renamed;
+  };
+  await poll(f);
+  assert.equal(getWorkspace(f.ws.id)?.name, "test");
+  assert.equal(f.store.row(`title-topic:${f.ws.id}`), undefined, "a closing topic is not renamed");
+  assert.equal(f.store.get(`workspace-titled:${f.ws.id}`), true);
+}));
+
+test("a first thread still named by a creation key is not a title, and Conductor's answer is the name kept", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Task update:12:thread";
+  await poll(f);
+  assert.deepEqual(f.renames, [], "a key is never adopted as a title");
+  f.sessions[0].name = "  Auxiliary LLM Error Fix  ";
+  const rename = f.api.renameWorkspace;
+  f.api.renameWorkspace = async (id, name) => ({...await rename(id, name), name: "Auxiliary LLM error fix"});
+  await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"], "the title is sent trimmed");
+  assert.equal(getWorkspace(f.ws.id)?.name, "Auxiliary LLM error fix", "Conductor's answer is the name");
+  assert.equal(JSON.parse(f.store.row(`title-topic:${f.ws.id}`)!.payload).payload.name, "Auxiliary LLM error fix");
+}));
+
+test("a task's workspace and topic open under its first line, cut at a word", () => fixture(async f => {
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9},
+    text: "/run p1 Fix the login bug on the settings page when the session token has expired\nLogs are attached below."}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const action = JSON.parse(f.store.row("update:1:action")!.payload);
+  const title = "Fix the login bug on the settings page when the session…";
+  assert.equal(getWorkspace(action.trackedId)?.name, title);
+  assert.match(action.prompt, /Logs are attached below\.$/, "the task itself is never shortened");
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(JSON.parse(f.store.row(`create-topic:${action.trackedId}`)!.payload).payload.name, title);
+}));
+
+test("a long thread title cut on a space is still adopted", () => fixture(async f => {
+  await keyedLaunch(f);
+  const title = `${"a".repeat(99)} ${"b".repeat(20)}`;
+  f.sessions[0].name = title;
+  await poll(f);
+  assert.deepEqual(f.renames, ["a".repeat(99)]);
+  await poll(f);
+  assert.equal(f.renames.length, 1, "adopted once, not retried every poll");
+}));
+
+test("a /rename Conductor refuses leaves the workspace free to take its thread's title", () => fixture(async f => {
+  await keyedLaunch(f);
+  const rename = f.api.renameWorkspace;
+  f.api.renameWorkspace = async (id, name) => { if (name === "Bad/Name") throw new ConductorApiError("Invalid name", 422); return rename(id, name); };
+  f.engine.queue("update:6:action", {type: "rename", trackedId: f.ws.id, prompt: "Bad/Name"});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.get(`workspace-titled:${f.ws.id}`), undefined, "a name that never landed does not hold the workspace");
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+}));
+
+test("a fallback while the workspace's topic is still opening is said there once it opens, not only in General", () => fixture(async f => {
+  await keyedLaunch(f, null); // The topic is still being created.
+  enqueueText(f.store, "general-ack", "-42", "Confirmed. Task queued.", {silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: "general-ack:0"});
+  f.status("error", "You're out of usage credits. Switch to another model to continue.");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const line = JSON.parse(f.store.row(`recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}:topic:0`)!.payload);
+  assert.equal(line.workspaceId, f.ws.id, "delivery waits for the topic and posts it there");
+  assert.equal(line.payload.disable_notification, true);
+}));
+
+/** Gives the task's first turn a status card: its acknowledgement, wherever the owner wrote. */
+function statusCard(f: ReturnType<typeof createFixture>, id: string, chatId: string, options: {threadId?: number} = {}): void {
+  enqueueText(f.store, id, chatId, "Task received and queued.", {...options, silent: true});
+  f.store.set("session:s1", {...f.store.get<any>("session:s1"), statusId: `${id}:0`});
+}
+
+test("an owner's name that lost the race to Conductor is put back, even when the first put-back fails", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  const rename = f.api.renameWorkspace;
+  let owners = 0;
+  f.api.renameWorkspace = async (id, name) => {
+    if (name === "Auxiliary LLM Error Fix") {
+      // The owner's /rename reaches Conductor while the title's rename is still on its way, so the title lands last.
+      f.engine.queue("update:5:action", {type: "rename", trackedId: f.ws.id, prompt: "Customer billing"});
+      await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+    } else if (++owners === 2) throw new ConductorApiError("Unavailable", 503, true); // The first put-back is lost.
+    return rename(id, name);
+  };
+  await poll(f);
+  assert.equal(f.remote.name, "Auxiliary LLM Error Fix");
+  assert.deepEqual(f.store.get(`workspace-titled:${f.ws.id}`), {owner: "Customer billing", repair: true});
+  titleRetryDue(f); await poll(f);
+  assert.equal(f.remote.name, "Customer billing", "a later poll puts the owner's name back");
+  assert.deepEqual(f.store.get(`workspace-titled:${f.ws.id}`), {owner: "Customer billing"});
+  assert.equal(getWorkspace(f.ws.id)?.name, "Customer billing");
+}));
+
+test("a reply to a fallback reaches the replacement even when the thread that stopped was chosen with /threads", () => fixture(async f => {
+  await f.launch();
+  f.store.set(`selected-thread:${f.ws.id}`, "s1");
+  f.status("error", "You're out of usage credits. Switch to another model to continue.");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  // The owner answers before the replacement has opened.
+  f.engine.queue("update:60:action", {type: "send", trackedId: f.ws.id, prompt: "keep going"});
+  assert.equal(JSON.parse(f.store.row("update:60:action")!.payload).sessionId, undefined, "never frozen onto the thread being replaced");
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  const replacement = f.store.binding(f.ws.id)!.sessionId;
+  assert.notEqual(replacement, "s1");
+  assert.deepEqual(f.messages.filter(m => m.type === "user" && String(m.content).startsWith("keep going")).map(m => m.sessionId), [replacement]);
+}));
+
+test("a fallback notice delivered before its replacement opened is answered by the replacement", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.status("error", "You're out of usage credits. Switch to another model to continue.");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const id = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
+  // Without a card the notice is the topic's own message, and Telegram delivered it with no thread to link it to.
+  f.store.finish(`${id}:0`, {message_id: 700});
+  linkTelegramMessage("-42", "700", f.ws.id);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(getWorkspaceMessageTarget("-42", "700")?.sessionId, f.store.binding(f.ws.id)!.sessionId);
+}));
+
+test("a reply to a review's fallback notice reaches the replacement reviewer, not the task's own thread", () => fixture(async f => {
+  await f.launch();
+  f.engine.github.pr = async () => ({url: "https://github.com/org/repo/pull/1", head: "a".repeat(40), base: "b".repeat(40), branch: "feature", number: 1, state: "open", merged: false, draft: false});
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, prompt: "https://github.com/org/repo/pull/1"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  // The reviewer runs out of credits while the task's own thread is idle.
+  f.api.getSessionStatus = async (sessionId: string) => ({workspaceId: "w1", sessionId, status: sessionId === "s2" ? "error" as const : "idle" as const, errorMessage: "You're out of usage credits."});
+  await poll(f);
+  const id = `recover-notice:s2:${f.store.get<any>("session:s2").sentMessageId}`;
+  f.store.finish(`${id}:0`, {message_id: 701});
+  linkTelegramMessage("42", "701", f.ws.id);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  const target = getWorkspaceMessageTarget("42", "701")?.sessionId;
+  assert.notEqual(target, "s2");
+  assert.equal(f.store.get<any>(`session:${target}`)?.role, "review");
+  assert.equal(f.store.binding(f.ws.id)?.sessionId, "s1", "the task keeps its own thread");
+}));
+
+test("a fresh card in the workspace's own topic already says the fallback there, linked to no thread", () => fixture(async f => {
+  await keyedLaunch(f);
+  statusCard(f, "topic-ack", "-42", {threadId: 7});
+  f.status("error");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const id = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
+  const card = JSON.parse(f.store.row(id)!.payload);
+  assert.equal(card.statusOf, "topic-ack:0");
+  assert.equal(card.sessionId, undefined, "a reply to the card must not revive the thread that stopped");
+  assert.equal(f.store.row(`${id}:topic:0`), undefined);
+}));
+
+test("a workspace takes its first thread's title, never the name of a thread the gateway opened", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.status("error", "You're out of usage credits. Switch to another model to continue.");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.binding(f.ws.id)?.sessionId, "s2");
+  assert.equal(f.sessions[1].name, "Recovery");
+  f.status("idle"); await poll(f);
+  assert.deepEqual(f.renames, [], "a replacement thread's name is no title for the workspace");
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  titleRetryDue(f); await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+}));
+
+test("a thread title is data: bracketed tags, control and invisible characters never reach the workspace's name", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.remote.name = `[agents] telegram-${f.ws.id}`;
+  f.sessions[0].name = "[lane:growth:claude]  Fix\nonboarding​ stall\u0007";
+  await poll(f);
+  assert.deepEqual(f.renames, ["[agents] Fix onboarding stall"], "an outside tag around the key is kept; tags inside the title are not");
+}));
+
+test("a long title is cut without splitting a character in two", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = `${"a".repeat(99)}\u{1F600} and more`;
+  await poll(f);
+  assert.deepEqual(f.renames, ["a".repeat(99)]);
+  assert.equal(JSON.parse(f.store.row(`title-topic:${f.ws.id}`)!.payload).payload.name, "a".repeat(99));
+}));
+
+test("workspaces take their titles a few seconds apart", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.store.set("workspace-title-not-before", Date.now() + 5_000); // Another workspace was just titled.
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, [], "this one waits its turn");
+  f.store.clear("workspace-title-not-before");
+  await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+  assert.ok((f.store.get<number>("workspace-title-not-before") ?? 0) > Date.now(), "and holds the next one back");
+}));
+
+test("renaming a topic the owner deleted neither brings it back nor holds delivery", () => fixture(async f => {
+  await keyedLaunch(f);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  f.store.db.prepare("UPDATE gateway_queue SET state='done' WHERE kind='telegram' AND id!=?").run(`title-topic:${f.ws.id}`);
+  const methods: string[] = [];
+  await new TelegramDelivery(f.store, async method => {
+    methods.push(method);
+    throw {response: {error_code: 400, description: "Bad Request: TOPIC_ID_INVALID"}};
+  }).tick();
+  assert.deepEqual(methods, ["editForumTopic"]);
+  assert.equal(f.store.row(`title-topic:${f.ws.id}`)?.state, "done");
+  assert.equal(f.store.row(`topic-recover:title-topic:${f.ws.id}`), undefined, "a deleted topic is not opened again only to be renamed");
+  assert.equal(f.store.backlog().blocked, 0);
+}));
+
+test("a workspace started in a topic it did not open takes its title without renaming that topic", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 55); // The owner's own topic.
+  f.remote.name = `telegram-${f.ws.id}`;
+  delete f.sessions[0].name;
+  await f.launch();
+  f.sessions[0].name = "Refund Rounding Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["Refund Rounding Fix"]);
+  assert.equal(getWorkspace(f.ws.id)?.name, "Refund Rounding Fix");
+  assert.equal(f.store.row(`title-topic:${f.ws.id}`), undefined);
+}));
+
+test("an older workspace never renames a topic that newer work has taken over", () => fixture(async f => {
+  await keyedLaunch(f);
+  // A later /run in the same topic started newer work there.
+  const newer = createWorkspace({name: "newer task", prompt: "newer task", repoPath: "conductor-project:p1", telegramChatId: "-42"});
+  updateWorkspaceThreadId(newer.id, 7);
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["Auxiliary LLM Error Fix"]);
+  assert.equal(f.store.row(`title-topic:${f.ws.id}`), undefined, "the topic follows the newer work now");
+}));
+
+test("a workspace renamed in Conductor before it was titled goes by that name, never its creation key", () => fixture(async f => {
+  await keyedLaunch(f);
+  // What a launch before this release recorded.
+  f.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(`telegram-${f.ws.id}`, `telegram-${f.ws.id}`, f.ws.id);
+  f.remote.name = "Named in Conductor";
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, []);
+  assert.equal(getWorkspace(f.ws.id)?.name, "Named in Conductor");
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, "Named in Conductor");
+  assert.equal(JSON.parse(f.store.row(`title-topic:${f.ws.id}`)!.payload).payload.name, "Named in Conductor");
+}));
+
+test("a new thread started with files alone is named for them, never for the gateway's instruction", () => fixture(async f => {
+  await f.launch();
+  const files = ["one.png", "two.png"].map(name => f.bridge.save(f.ws.id, name, Buffer.from(name)));
+  f.engine.queue("update:32:thread", {type: "thread", trackedId: f.ws.id, prompt: ATTACHMENTS_ONLY_PROMPT, fileIds: files});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.sessions.at(-1).name, "2 attachments");
+  assert.equal(f.store.row("update:32:thread")?.state, "done");
+}));
+
+test("an error Conductor reports is scrubbed of credentials before it reaches Telegram", () => fixture(async f => {
+  await f.launch();
+  f.status("error", "fatal: could not read from https://x-access-token:ghs_abcdefgh12345678@github.com/org/repo.git");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const text = JSON.parse(f.store.row(`error:s1:${f.store.get<any>("session:s1").sentMessageId}:0`)!.payload).payload.text;
+  assert.doesNotMatch(text, /ghs_|x-access-token/);
+  assert.match(text, /^Conductor reported an error: fatal: could not read from https:\/\/github\.com\/org\/repo\.git/);
 }));
 
 test("PR review records exact head, uses a separate session, and detects later changes", () => fixture(async f => {
@@ -437,6 +1034,7 @@ test("PR review records exact head, uses a separate session, and detects later c
   f.engine.queue("review", { type: "review", trackedId: f.ws.id, prompt: "https://github.com/org/repo/pull/1" });
   await processQueue(f.store, ["cloud"], r => f.engine.action(r));
   assert.equal(f.sessions.length, 2);
+  assert.equal(f.sessions[1].name, "Review PR #1");
   assert.equal(f.store.get<any>("session:s2")?.reviewHead, head);
   assert.equal(f.store.binding(f.ws.id)?.sessionId, "s1");
   f.status("working"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
@@ -1775,6 +2373,27 @@ test("bare /review finds one open PR from the transcript", () => fixture(async f
   assert.equal(f.store.get<any>("session:s2")?.reviewUrl, "https://github.com/org/repo/pull/12");
   assert.equal(JSON.parse(f.store.row("review:sent")!.payload).payload.text, "Reviewing PR #12 (aaaaaaa) in codex");
   assert.equal(f.store.row("review")!.state, "done");
+}));
+
+test("bare /review trusts the gateway's record of each thread over its title", () => fixture(async f => {
+  await f.launch();
+  // The task thread's title happens to start like a review's; the gateway's review thread was renamed by hand.
+  f.sessions[0].name = "Review the auth module";
+  f.sessions.push({id: "s2", name: "Security pass", deepLink: "conductor://s2"}, {id: "s3", name: "Review PR #4", deepLink: "conductor://s3"});
+  f.store.set("session:s2", {trackedId: f.ws.id, agent: "codex", model: "gpt-6-astra", effort: "high", role: "review"});
+  const at = new Date().toISOString();
+  f.messages.push(
+    {id: "task-pr", sessionId: "s1", type: "assistant", content: "Opened https://github.com/org/repo/pull/12", sessionIndex: 1, receivedAt: at},
+    {id: "review-pr", sessionId: "s2", type: "assistant", content: "Reviewed https://github.com/org/repo/pull/3", sessionIndex: 2, receivedAt: at},
+    // Not a thread the gateway opened, so its title is all there is to go on.
+    {id: "outside-review-pr", sessionId: "s3", type: "assistant", content: "Reviewed https://github.com/org/repo/pull/4", sessionIndex: 3, receivedAt: at});
+  const looked: string[] = [];
+  f.engine.github.pr = async (_slug, url) => { looked.push(url); return openPr(Number(url.split("/").at(-1))); };
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.deepEqual([...new Set(looked)], ["https://github.com/org/repo/pull/12"]);
+  assert.equal(f.store.get<any>("session:s4")?.reviewUrl, "https://github.com/org/repo/pull/12");
+  assert.equal(f.sessions.at(-1).name, "Review PR #12");
 }));
 
 test("short /review forms skip the transcript scan", () => fixture(async f => {

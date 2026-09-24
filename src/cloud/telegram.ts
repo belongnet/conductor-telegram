@@ -1,5 +1,6 @@
 import type { GatewayStore, QueueRow } from "./store.js";
 import { linkTelegramMessage, updateWorkspaceThreadId, getWorkspace } from "../store/queries.js";
+import type { Workspace } from "../types/index.js";
 import { createReadStream } from "node:fs";
 import { escHtml, markdownToTelegramChunks } from "../bot/format.js";
 import {ConductorApiError} from "../integrations/conductor-api.js";
@@ -53,15 +54,33 @@ export function telegramFailure(error: unknown): { delayMs: number; permanent: b
 export function enqueueTelegram(store: GatewayStore, id: string, job: TelegramJob, priority = 10): void {
   const p = job.payload;
   const topicOperation = /ForumTopic/.test(job.method);
+  const conversation = `${p.chat_id}:${p.message_thread_id ?? 0}${topicOperation ? ":topics" : priority === 0 ? ":control" : ""}`;
   if (job.method === "editForumTopic" && !store.row(id)) {
     store.assertWriter?.();
-    const edits = store.db.prepare("SELECT id,payload FROM gateway_queue WHERE kind='telegram' AND state='pending'").all() as Array<{id: string; payload: string}>;
+    // Every edit of a topic waits in that topic's own lane, so the lane alone holds each edit this one replaces.
+    const edits = store.db.prepare("SELECT id,payload FROM gateway_queue WHERE conversation=? AND kind='telegram' AND state='pending'").all(conversation) as Array<{id: string; payload: string}>;
     for (const edit of edits) {
       const prior = JSON.parse(edit.payload) as TelegramJob;
       if (prior.method === job.method && prior.payload.chat_id === p.chat_id && prior.payload.message_thread_id === p.message_thread_id) store.finish(edit.id, { supersededBy: id });
     }
   }
-  store.enqueue("telegram", `${p.chat_id}:${p.message_thread_id ?? 0}${topicOperation ? ":topics" : priority === 0 ? ":control" : ""}`, job, id, priority);
+  store.enqueue("telegram", conversation, job, id, priority);
+}
+
+/** A forum workspace whose own topic is still being opened has no thread id yet, and neither does General. */
+export function topicOpening(store: GatewayStore, workspaceId: string, threadId: number | null | undefined): boolean {
+  return !!store.get(`topic-required:${workspaceId}`) && !threadId;
+}
+
+/**
+ * Whether a turn's status card can be seen from its workspace's topic: delivered there rather than wherever the owner
+ * wrote, and recent enough not to have scrolled out of view.
+ */
+export function statusCardSeen(store: GatewayStore, anchor: QueueRow, ws: Workspace, now = Date.now()): boolean {
+  const card = JSON.parse(anchor.payload) as TelegramJob;
+  const inTopic = card.workspaceId === ws.id || (!topicOpening(store, ws.id, ws.telegramThreadId) &&
+    String(card.payload.chat_id) === ws.telegramChatId && (card.payload.message_thread_id ?? null) === (ws.telegramThreadId ?? null));
+  return inTopic && now - anchor.created_at <= ATTENTION_AFTER_MS;
 }
 
 /** Agent Markdown is rendered before splitting; control messages stay literal. */
@@ -147,7 +166,7 @@ export class TelegramDelivery {
         if (job.decisionId && (workspace?.archivedAt || ["done", "stopped", "failed", "archived"].includes(workspace?.status ?? ""))) {
           this.store.finish(row.id, {suppressed: "Question belongs to terminal work; retained in decision history"}); return;
         }
-        if (this.store.get(`topic-required:${job.workspaceId}`) && !workspace?.telegramThreadId) {
+        if (topicOpening(this.store, job.workspaceId, workspace?.telegramThreadId)) {
           this.store.retry(row.id, "Waiting for workspace topic", 1000); return;
         }
         if (workspace?.telegramThreadId) payload.message_thread_id = workspace.telegramThreadId;
@@ -183,6 +202,12 @@ export class TelegramDelivery {
       // The card was deleted or cannot be edited; its state still has to reach the topic.
       if (job.method === "editMessageText" && failure.permanent) { this.fallback(row, job, failure.description); return; }
       if (/message thread not found|message_thread_not_found|topic_deleted|TOPIC_ID_INVALID|TOPIC_CLOSED/i.test(failure.description) && job.workspaceId) {
+        // A topic that is gone takes no new name. Opening one only to rename it would bring back a topic the owner
+        // deleted, and the edit would still point at the old one. A message that needs the topic opens it, under the
+        // workspace's current name.
+        if (job.method === "editForumTopic" && !/TOPIC_CLOSED/i.test(failure.description)) {
+          this.store.finish(row.id, { suppressed: "Topic no longer exists" }); return;
+        }
         // Recover through the same durable topic-operation queue. Do not leak into General.
         const ws = getWorkspace(job.workspaceId);
         if (ws && !ws.archivedAt && ws.status !== "archived") {

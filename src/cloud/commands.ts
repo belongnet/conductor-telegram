@@ -10,7 +10,8 @@ import { enqueueTelegram, enqueueText, telegramFailure, TerminalError, type Tele
 import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
-import {nativeSessionProvider} from "./messages.js";
+import {nativeSessionProvider, ATTACHMENTS_ONLY_PROMPT} from "./messages.js";
+import { taskTitle, threadLabel, threadName } from "./names.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import type { ConductorApiProject } from "../integrations/conductor-api.js";
 import type { RepoTopic } from "../types/index.js";
@@ -27,8 +28,7 @@ const ALBUM_MAX_SETTLES = 6;
 /** The Bot API refuses to hand a bot any file larger than this. */
 const TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024;
 const TOO_LARGE = "This file is larger than the 20 MB Telegram lets bots download. Send a link to it instead.";
-/** Files sent without a word of instruction still reach the agent with one. */
-export const ATTACHMENTS_ONLY_PROMPT = "The owner sent the attached files without instructions. Open them, then respond to what they show.";
+export { ATTACHMENTS_ONLY_PROMPT };
 
 /** This list drives DELETEs, so it can only ever name buttons, whatever is in the row. */
 const offeredKeys = (value: unknown): string[] =>
@@ -198,7 +198,7 @@ export class CloudCommands {
             this.store.set(selectedActionId, selection.sessionId);
             this.engine.queue(selectedActionId, {...action, sessionId: selection.sessionId});
           }
-          reply(`Telegram now targets ${session.name ?? "Untitled"} (${session.model ?? session.resolvedModel ?? "unknown model"}).${action ? " Your saved message is queued." : ""}`);
+          reply(`Telegram now targets ${threadName(session.name)} (${session.model ?? session.resolvedModel ?? "unknown model"}).${action ? " Your saved message is queued." : ""}`);
         })();
         return;
       }
@@ -362,7 +362,7 @@ export class CloudCommands {
       const keyboard = sessions.map(s => {
         const key = `thread:${createHash("sha256").update(`${target!.id}:${s.id}`).digest("hex").slice(0, 32)}`;
         this.store.set(key, { trackedId: target!.id, sessionId: s.id });
-        return [{ text: `${s.id === this.store.get(`selected-thread:${target!.id}`) ? "● " : ""}${s.name ?? "Untitled"} · ${s.model ?? s.resolvedModel ?? "Unknown model"}`, callback_data: key }];
+        return [{ text: `${s.id === this.store.get(`selected-thread:${target!.id}`) ? "● " : ""}${threadLabel(s.name, s.model ?? s.resolvedModel ?? "Unknown model")}`, callback_data: key }];
       });
       reply("Select the thread for Telegram replies, or /threads new <prompt>. This selection is separate from the tab open in Conductor.", "threads", keyboard.length ? { inline_keyboard: keyboard } : undefined); return;
     }
@@ -434,7 +434,7 @@ export class CloudCommands {
       // Files sent without a word still deserve a name that says what they are.
       const unnamed = media && !voiceNote && launchProject ? `${launchProject.name}: ${files.length} attachment${files.length === 1 ? "" : "s"}` : "Telegram task";
       if (!target) this.store.db.transaction(() => {
-        target = createWorkspace({ name: prompt.slice(0, 70) || unnamed, prompt, repoPath: `conductor-project:${launchProject!.id}`, telegramChatId: chatId });
+        target = createWorkspace({ name: taskTitle(prompt, unnamed), prompt, repoPath: `conductor-project:${launchProject!.id}`, telegramChatId: chatId });
         this.store.set(`update-workspace:${row.id}`, target.id);
         // The workspace lives in the topic its task was sent from: one topic, one workspace.
         if (threadId) updateWorkspaceThreadId(target.id, threadId);

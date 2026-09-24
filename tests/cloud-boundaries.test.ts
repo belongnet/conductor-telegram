@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { getDb, closeDb } from "../src/store/db.js";
-import { createWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus,
+import { createWorkspace, getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus,
   enqueuePendingCloudMessage, getPendingCloudMessages, persistPendingCloudLaunch,
   getPendingCloudLaunch, upsertThreadCursor, getThreadCursor } from "../src/store/queries.js";
 import { GatewayStore, type CloudBinding } from "../src/cloud/store.js";
@@ -113,6 +113,20 @@ test("native routing preserves the request and requires owner confirmation, with
   assert.equal(f.sends.length, 1, "only the classifier prompt was sent");
 }));
 
+test("a routed new task's workspace is named by its first line, and the task is kept whole", () => fixture(async f => {
+  const text = "Migrate the billing webhooks to the new event bus\nKeep the old endpoint alive until Friday.";
+  f.store.enqueue("route", "router", {text, chatId: "42"}, "route-new");
+  const row = f.store.row("route-new")!;
+  await f.router.route(row);
+  f.messages.push({type: "assistant", content: JSON.stringify({action: "new", projectId: "p1", prompt: "Migrate the billing webhooks"})});
+  await f.router.route(row);
+  const key = JSON.parse(f.store.row("route-new:confirm:0")!.payload).payload.reply_markup.inline_keyboard[0][0].callback_data;
+  const proposed = f.store.get<{action: {trackedId: string; prompt: string}}>(key)!;
+  assert.equal(getWorkspace(proposed.action.trackedId)?.name, "Migrate the billing webhooks to the new event bus");
+  assert.equal(getWorkspace(proposed.action.trackedId)?.prompt, text);
+  assert.equal(proposed.action.prompt, text);
+}));
+
 test("native router rejects unknown project IDs and workspaces from another chat", () => fixture(async f => {
   const foreign = createWorkspace({name: "Other chat", prompt: "private", repoPath: "x", telegramChatId: "99"});
   f.store.bind(foreign.id, f.binding);
@@ -167,6 +181,20 @@ test("native router never recreates an uncertain workspace after a restart", () 
   await assert.rejects(f.router.route(row), /lost creation response/);
   await assert.rejects(new CloudRouter(f.engine, "p1").route(row), /receipt uncertain/);
   assert.equal(attempts, 1);
+}));
+
+test("a lost router create response is reconciled after another tool tagged the router's name", () => fixture(async f => {
+  f.store.db.prepare("DELETE FROM gateway_state WHERE key='router-binding'").run();
+  f.store.set("conductor-user-id", "owner");
+  let attempts = 0;
+  f.api.createWorkspace = async () => {attempts++; throw new Error("lost creation response");};
+  const row = f.routeRow();
+  await assert.rejects(f.router.route(row), /lost creation response/);
+  f.api.listProjectWorkspaces = async () => [{id: "router-workspace", name: "[telegram] telegram-routing-unconfigured", creatorId: "owner", deepLink: "x"}];
+  f.api.listWorkspaceSessions = async () => [{id: "router-session", name: "Telegram Message Classification"}];
+  await new CloudRouter(f.engine, "p1").route(row);
+  assert.equal(attempts, 1, "never created twice");
+  assert.deepEqual(f.store.get("router-binding"), {workspaceId: "router-workspace", sessionId: "router-session"});
 }));
 
 test("legacy message adoption preserves native identity and exact bytes across repeated restoration", () => fixture(async f => {

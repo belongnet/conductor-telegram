@@ -1,17 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ConductorApiClient, ConductorApiMessage } from "../integrations/conductor-api.js";
+import type { ConductorApiClient, ConductorApiMessage, ConductorApiSession } from "../integrations/conductor-api.js";
 import { ConductorApiError } from "../integrations/conductor-api.js";
 import { deterministicUuid } from "../lanes/controller-policy.js";
 import { assistantTextFromTranscriptEvent, GITHUB_PR_URL_RE, githubPrUrlMatchesRepo } from "../lanes/decide.js";
-import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider } from "./messages.js";
+import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider, ATTACHMENTS_ONLY_PROMPT } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision, linkTelegramMessage,
-  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend, getRepoTopicByThreadId,
+  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend, getRepoTopicByThreadId, getWorkspaceByThreadId,
   completePendingCloudMessageDelivery, completePendingCloudTerminalIntent, type PendingCloudTerminalIntent } from "../store/queries.js";
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
 import { FileBridge } from "./bridge.js";
 import { CloudGitHub, GitHubError, ProjectCatalog, type CloudPr } from "./catalog.js";
-import { enqueueTelegram, enqueueText, enqueueStatus, TerminalError, safeDetail } from "./telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, TerminalError, safeDetail, statusCardSeen, topicOpening, type TelegramJob } from "./telegram.js";
+import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle } from "./names.js";
+import type { Workspace } from "../types/index.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
 export const DEFAULT_PROVIDERS: Provider[] = [
@@ -53,6 +55,14 @@ interface SessionState {
 }
 /** A message to a sleeping workspace is queued and wakes it; only after this long is silence a stalled turn. */
 const WAKE_GRACE_MS = 300_000;
+/** Workspaces take their titles a few seconds apart, so the first pass after an upgrade never crowds out the work. */
+const TITLE_PACE_MS = 5_000;
+/** A title that cannot be applied yet is tried again later, twice as late each time, up to an hour, then let go. */
+const TITLE_RETRY_MS = 60_000;
+const TITLE_RETRY_MAX_MS = 3_600_000;
+const TITLE_ATTEMPTS = 8;
+/** `true` once the workspace has its name; `owner` while a /rename holds it, `repair` until Conductor has it back. */
+type TitleFence = true | { owner: string; repair?: boolean };
 
 export function transcriptText(message: ConductorApiMessage): string {
   // The native API wraps provider events, including hidden tool/lifecycle
@@ -93,9 +103,27 @@ export function transcriptText(message: ConductorApiMessage): string {
   return parts.join("\n");
 }
 
+/** A turn cut off under a provider that may still work: its own thread is resumed before another provider is tried. */
+const INTERRUPTED = /disconnected|connection.*(?:closed|lost)|sandbox.*(?:stop|expired)|interrupted/i;
+
+/** Failures another provider can recover from, most specific first, each with how it reads after the provider's name. */
+const PROVIDER_STOPS: Array<[RegExp, string]> = [
+  [/out of (?:usage )?credits|insufficient.*(?:credit|balance)/i, "ran out of usage credits"],
+  [/rate.?limit/i, "was rate limited"],
+  [/quota|usage limit|hit.*limit/i, "hit a usage limit"],
+  [/capacity|overloaded/i, "is over capacity"],
+  [/authentication|unauthorized|expired.*token|invalid.*credential/i, "could not authenticate"],
+  [/\bmodel\b[^\n]*(?:unavailable|not (?:found|available|supported)|does not exist|may not exist|(?:do|may) not have access)/i, "is unavailable"],
+  [INTERRUPTED, "was interrupted"],
+];
+
 export function recoverableProviderError(detail: string): boolean {
-  return /(?:authentication|unauthorized|expired.*token|invalid.*credential|quota|rate.?limit|capacity|usage limit|out of (?:usage )?credits|hit.*limit|insufficient.*(?:credit|balance)|overloaded|disconnected|connection.*(?:closed|lost)|sandbox.*(?:stop|expired)|interrupted)/i.test(detail)
-    || /\bmodel\b[^\n]*(?:unavailable|not (?:found|available|supported)|does not exist|may not exist|(?:do|may) not have access)/i.test(detail);
+  return PROVIDER_STOPS.some(([pattern]) => pattern.test(detail));
+}
+
+/** Why a provider stopped, worded to follow its name: "claude (fable-5-1) ran out of usage credits". */
+export function stopReason(detail: string): string {
+  return PROVIDER_STOPS.find(([pattern]) => pattern.test(detail))?.[1] ?? `stopped: ${safeDetail(detail, 120).replace(/[.!?\s]+$/, "")}`;
 }
 
 /** Conductor has already refused this request; retrying it cannot produce a different answer. */
@@ -156,6 +184,19 @@ export class CloudEngine {
     else this.notify(id, trackedId, text, sessionId, { silent: true });
   }
 
+  /**
+   * A change of provider goes on the card, and also into the workspace's topic when the card cannot be seen there:
+   * it answers wherever the owner wrote, and an older one has scrolled away. Neither is linked to the thread that
+   * stopped, so a reply follows the workspace's current thread instead of reviving the failed one.
+   */
+  private announce(id: string, trackedId: string, anchorId: string | undefined, text: string): void {
+    this.status(id, trackedId, anchorId, text);
+    const ws = getWorkspace(trackedId);
+    const anchor = anchorId ? this.store.row(anchorId) : undefined;
+    // Without a card, status() already said it in the topic.
+    if (ws && anchor && !statusCardSeen(this.store, anchor, ws)) this.notify(`${id}:topic`, trackedId, text, undefined, { silent: true });
+  }
+
   private stopped(row: QueueRow, action: CloudAction, submitted = false): boolean {
     if (!this.store.get(`stop:${action.trackedId}`)) return false;
     const mayBeSubmitted = submitted || this.store.get<boolean>(`send-attempted:${row.id}`);
@@ -169,7 +210,9 @@ export class CloudEngine {
     // Freeze an explicit Telegram selection before media preparation or queue delays.
     const binding = this.store.binding(action.trackedId);
     const selected = this.store.get<string>(`selected-thread:${action.trackedId}`);
-    if (action.type === "send" && !action.sessionId && selected && selected === binding?.sessionId) {
+    // A thread being replaced after it stopped is no destination: the send finds its replacement when it runs.
+    const replaced = selected ? this.store.get<SessionState>(`session:${selected}`) : undefined;
+    if (action.type === "send" && !action.sessionId && selected && selected === binding?.sessionId && !(replaced?.recoveryAttempted && replaced.terminal)) {
       action = {...action, sessionId: selected};
     }
     // Stop fences are synchronous, ahead of any already-running network request.
@@ -233,12 +276,18 @@ export class CloudEngine {
       return;
     }
     if (action.type === "rename") {
-      await this.api.renameWorkspace(binding.workspaceId, action.prompt ?? "");
-      this.store.assertWriter?.();
-      this.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(action.prompt, action.prompt, ws.id);
-      // A repo topic is named for its repository; a workspace living there never renames it.
-      if (ws.telegramThreadId && !getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) enqueueTelegram(this.store, `topic:${row.id}`, {method: "editForumTopic", workspaceId: ws.id,
-        payload: {chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId, name: (action.prompt ?? "").slice(0,128)}}, 20);
+      // Fenced before the call: a thread title arriving meanwhile must never replace the owner's name. The name is
+      // kept with the fence, so a title rename that overlapped this one can put it back in Conductor.
+      const titled = `workspace-titled:${ws.id}`;
+      const before = this.store.get<TitleFence>(titled);
+      this.store.set(titled, { owner: action.prompt ?? "" } satisfies TitleFence);
+      try { await this.api.renameWorkspace(binding.workspaceId, action.prompt ?? ""); }
+      catch (error) {
+        // A name Conductor refuses never lands, so whatever held the name before holds it again.
+        if (conductorApiRejected(error)) { if (before === undefined) this.store.clear(titled); else this.store.set(titled, before); }
+        throw error;
+      }
+      this.retitle(ws.id, action.prompt ?? "", `topic:${row.id}`);
       this.status(`${row.id}:done`, ws.id, action.statusId, "Cloud workspace renamed."); return;
     }
     if (action.type === "renamethread") {
@@ -287,7 +336,7 @@ export class CloudEngine {
             const keyboard = sessions.map(session => {
               const key = `thread:${createHash("sha256").update(`${row.id}:${session.id}`).digest("hex").slice(0, 32)}`;
               this.store.set(key, {trackedId: action.trackedId, sessionId: session.id, pendingActionId: row.id});
-              return [{text: `${session.name ?? "Untitled"} · ${session.model ?? session.resolvedModel ?? "Unknown model"}`, callback_data: key}];
+              return [{text: threadLabel(session.name, session.model ?? session.resolvedModel ?? "Unknown model"), callback_data: key}];
             });
             enqueueText(this.store, `${row.id}:choose-thread`, ws.telegramChatId,
               `Choose the Conductor thread for this message. This topic contains multiple threads; the tab open on your Mac is not shared with Telegram. Your message is saved and has not been sent.\n\n${(action.prompt ?? "Attachment").slice(0, 500)}`,
@@ -321,11 +370,12 @@ export class CloudEngine {
     const provider = action.provider ?? this.providers[0];
     let binding = this.store.binding(ws.id);
     if (!binding) {
-      const name = `telegram-${ws.id}`;
+      const name = creationKey(ws.id);
       let created: { workspaceId: string; sessionId: string; deepLink: string };
       const previous = this.store.get<boolean>(`create-attempt:${row.id}`);
       if (previous) {
-        const candidates = (await this.api.listProjectWorkspaces(project.id)).filter(w => w.name === name && w.creatorId === this.store.get<string>("conductor-user-id"));
+        // An outside renamer may have tagged the name meanwhile. The key holds a UUID, so containing it is still unique.
+        const candidates = (await this.api.listProjectWorkspaces(project.id)).filter(w => w.name.includes(name) && w.creatorId === this.store.get<string>("conductor-user-id"));
         if (candidates.length !== 1) throw new Error("Workspace creation receipt is uncertain. Reconciliation found no unique workspace; creation will not be replayed.");
         const sessions = await this.api.listWorkspaceSessions(candidates[0].id);
         if (sessions.length !== 1) throw new Error("Workspace creation has ambiguous sessions; operator attention required");
@@ -356,7 +406,8 @@ export class CloudEngine {
       this.store.db.transaction(() => {
         this.store.bind(ws.id, binding!);
         updateWorkspaceConductorBinding(ws.id, { workspaceId: created.workspaceId, sessionId: created.sessionId, backendKind: "cloud-api" });
-        this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(remote.name, ws.id);
+        // The creation key is not a name. Until the first thread's title replaces it, the workspace goes by its task.
+        if (!remote.name.includes(name)) this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(remote.name, ws.id);
         this.store.set(`session:${created.sessionId}`, { trackedId: ws.id, ...provider, role: "task" } satisfies SessionState);
       })();
       this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${created.deepLink}`, undefined, { silent: true });
@@ -406,6 +457,101 @@ export class CloudEngine {
         for (const row of waiting) this.store.finish(row.id, { suppressed: "Workspace retired before its topic opened" });
       }
     })();
+  }
+
+  /**
+   * A workspace has one name: its record, its last known Conductor name and, when an edit is asked for, its topic. A
+   * repo topic keeps its repository's name.
+   */
+  retitle(trackedId: string, name: string, topicJobId?: string): void {
+    const ws = getWorkspace(trackedId);
+    if (!ws) return;
+    this.store.assertWriter?.();
+    this.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(name, name, trackedId);
+    if (topicJobId && ws.telegramThreadId && !getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) enqueueTelegram(this.store, topicJobId, {method: "editForumTopic", workspaceId: trackedId,
+      payload: {chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId, name: clip(name, 128)}}, 20);
+  }
+
+  /**
+   * The topic a workspace renames on its own: one this gateway opened for it and that still follows it. A topic the
+   * owner made, or one a newer workspace has taken over, keeps its name.
+   */
+  private ownTopic(ws: Workspace): string | undefined {
+    return ws.telegramThreadId && this.store.row(`create-topic:${ws.id}`) &&
+      getWorkspaceByThreadId(ws.telegramChatId, ws.telegramThreadId)?.id === ws.id ? `title-topic:${ws.id}` : undefined;
+  }
+
+  /** Naming is paced across workspaces and backed off per workspace, so it never competes with the work. */
+  private titleTurn(trackedId: string, now = Date.now()): boolean {
+    const retry = this.store.get<{ after: number }>(`workspace-title-retry:${trackedId}`);
+    if (now < (retry?.after ?? 0) || now < (this.store.get<number>("workspace-title-not-before") ?? 0)) return false;
+    this.store.set("workspace-title-not-before", now + TITLE_PACE_MS);
+    return true;
+  }
+
+  /**
+   * The gateway creates a workspace under its creation key, so Conductor never titles it, but Conductor does title its
+   * first thread from the task. That title becomes the workspace's name once, keeping any tag an outside renamer put
+   * around the key. A name the owner or Conductor gave it since creation stands. Naming never fails a poll.
+   */
+  private async adoptTitle(trackedId: string, binding: CloudBinding, sessions: ConductorApiSession[]): Promise<void> {
+    const fence = `workspace-titled:${trackedId}`, retry = `workspace-title-retry:${trackedId}`;
+    const ws = getWorkspace(trackedId);
+    const claimed = this.store.get<TitleFence>(fence);
+    const repair = typeof claimed === "object" && claimed.repair ? claimed.owner : undefined;
+    if (binding.synced || !ws?.conductorSessionId || ws.archivedAt || (claimed && repair === undefined)) return;
+    const title = threadTitle(sessions.find(session => session.id === ws.conductorSessionId)?.name);
+    // Nothing to do until the first thread has a title, nor while the topic is still opening under the old name.
+    if (repair === undefined && (!title || topicOpening(this.store, trackedId, ws.telegramThreadId))) return;
+    if (!this.titleTurn(trackedId)) return;
+    const key = creationKey(trackedId);
+    try {
+      let owner = repair;
+      if (owner === undefined) {
+        const remote = await this.api.getWorkspace(binding.workspaceId);
+        if (this.store.get(fence)) return;
+        if (!remote.name.includes(key)) {
+          // Named since creation, by the owner or in Conductor: that name stands, and the workspace goes by it here too.
+          this.store.db.transaction(() => {
+            this.store.set(fence, true);
+            const current = getWorkspace(trackedId);
+            if (current && !current.archivedAt && (!current.conductorWorkspaceName || current.conductorWorkspaceName.includes(key) || current.name.includes(key))) {
+              this.retitle(trackedId, remote.name, this.ownTopic(current));
+            }
+          })();
+          this.store.clear(retry);
+          return;
+        }
+        // Split, not String.replace: a title may hold "$&" and its kin.
+        const target = remote.name.split(key).join(title!);
+        const renamed = await this.api.renameWorkspace(binding.workspaceId, target);
+        owner = this.store.db.transaction(() => {
+          const current = this.store.get<TitleFence>(fence);
+          // The owner renamed it while this rename was in flight. Whichever reached Conductor last, the owner's name stands.
+          if (typeof current === "object") { this.store.set(fence, { owner: current.owner, repair: true }); return current.owner; }
+          if (current) return undefined;
+          this.store.set(fence, true);
+          const fresh = getWorkspace(trackedId);
+          if (fresh && !fresh.archivedAt) this.retitle(trackedId, renamed?.name?.trim() || target, this.ownTopic(fresh));
+          return undefined;
+        })();
+      }
+      if (owner !== undefined) {
+        await this.api.renameWorkspace(binding.workspaceId, owner);
+        this.store.set(fence, { owner });
+      }
+      this.store.clear(retry);
+    } catch {
+      // Tried again later, less often each time, then let go: the workspace keeps the name Telegram already shows.
+      const attempts = (this.store.get<{ attempts: number }>(retry)?.attempts ?? 0) + 1;
+      if (attempts < TITLE_ATTEMPTS) {
+        this.store.set(retry, { after: Date.now() + Math.min(TITLE_RETRY_MAX_MS, TITLE_RETRY_MS * 2 ** (attempts - 1)), attempts });
+        return;
+      }
+      const current = this.store.get<TitleFence>(fence);
+      this.store.set(fence, typeof current === "object" ? { owner: current.owner } : true);
+      this.store.clear(retry);
+    }
   }
 
   /**
@@ -481,7 +627,8 @@ export class CloudEngine {
     for (const session of ordered.slice(0, 5)) {
       if (this.store.get(`stop:${action.trackedId}`)) return urls;
       const state = this.store.get<SessionState>(`session:${session.id}`);
-      if (state?.role === "review" || /^Review /.test(session.name ?? "")) continue;
+      // The gateway's own record decides; a task thread may well be titled "Review the auth module".
+      if (state ? state.role === "review" : /^Review /.test(session.name ?? "")) continue;
       const tail = await this.api.getSessionMessageTail(session.id, 20);
       for (const message of tail) {
         const text = transcriptText(message);
@@ -631,6 +778,16 @@ export class CloudEngine {
           this.store.set(`selected-thread:${action.trackedId}`, sessionId);
         }
       }
+      // The key identified the thread only until its id was recorded. From here it is called what it is for, by the
+      // owner's own words, never the instruction the gateway adds to files sent without any. The rename is cosmetic, so
+      // the task does not wait on it, and Telegram reads the key the same way if it is lost.
+      const files = action.fileIds?.length ?? 0;
+      const label = pr ? `Review PR #${pr.number}` : action.previousSessionId ? "Recovery"
+        : taskTitle(action.prompt === ATTACHMENTS_ONLY_PROMPT ? "" : action.prompt ?? "", files ? `${files} attachment${files === 1 ? "" : "s"}` : "Thread");
+      const named = sessionId;
+      void Promise.resolve().then(() => this.api.renameSession(named, label)).catch(() => undefined);
+      // A reply to the notice that announced this replacement belongs to it, not to the thread that stopped.
+      if (action.previousSessionId && action.previousMessageId) this.relinkNotice(`recover-notice:${action.previousSessionId}:${action.previousMessageId}`, action.trackedId, sessionId);
     }
     const prompt = review
       ? `Review ${review.url} at exact head ${review.head}, base ${review.base}. Verify these commits before reviewing; report a changed head instead of claiming completion. Report findings only. Do not edit files, push, approve, merge, or deploy. This session has normal Conductor permissions; these are review instructions.\n\n${action.prompt ?? ""}`
@@ -638,6 +795,21 @@ export class CloudEngine {
     const session = await this.api.getSessionStatus(sessionId);
     if (session.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
     await this.send(row, { ...action, prompt }, binding, sessionId, session.status === "working");
+  }
+
+  /** Points a posted notice at the thread that now carries its work, including a reply link it has already earned. */
+  private relinkNotice(id: string, trackedId: string, sessionId: string): void {
+    for (const rowId of [`${id}:0`, `${id}:topic:0`]) {
+      const row = this.store.row(rowId);
+      if (!row) continue;
+      const job = JSON.parse(row.payload) as TelegramJob;
+      const receipt = row.state === "done" && row.result ? JSON.parse(row.result) : undefined;
+      if (receipt?.message_id) linkTelegramMessage(String(job.payload.chat_id), String(receipt.message_id), trackedId, sessionId);
+      else if (row.state !== "done") {
+        this.store.assertWriter?.();
+        this.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify({ ...job, sessionId }), rowId);
+      }
+    }
   }
 
   private async send(row: QueueRow, action: CloudAction, binding: CloudBinding, sessionId: string, sessionWasWorking: boolean): Promise<void> {
@@ -702,7 +874,7 @@ export class CloudEngine {
     const threadLink = nativeSession
       ? `\n${nativeSession.deepLink ?? `conductor://workspace?id=${encodeURIComponent(binding.workspaceId)}&session=${encodeURIComponent(sessionId)}`}` : "";
     const receipt = (nativeSession && !action.recovery && action.type !== "review"
-      ? `Sent to ${nativeSession.name ?? state.agent} (${state.model}).` : this.sentCard(action, state)) + threadLink;
+      ? `Sent to ${threadName(nativeSession.name, state.agent)} (${state.model}).` : this.sentCard(action, state)) + threadLink;
     if (state.sentMessageId === payload.messageId) {
       // The send state and status row are separate durable writes. Recreate the deterministic edit
       // after a restart in the narrow window between them; enqueueStatus makes this idempotent.
@@ -734,7 +906,11 @@ export class CloudEngine {
   }
 
   private sentCard(action: CloudAction, state: SessionState): string {
-    if (action.recovery) return `Continuing in ${state.agent} (${state.model}).`;
+    if (action.recovery) {
+      // A replacement thread's card still says what it replaced; this edit supersedes the notice that named it.
+      const previous = action.previousSessionId ? this.store.get<SessionState>(`session:${action.previousSessionId}`) : undefined;
+      return `Continuing in ${state.agent} (${state.model})${previous ? ` after ${previous.agent} (${previous.model}) stopped` : ""}.`;
+    }
     if (action.type === "review" && state.reviewUrl && state.reviewHead) {
       const number = state.reviewUrl.match(/\/pull\/(\d+)/)?.[1];
       return `Reviewing PR #${number} (${state.reviewHead.slice(0, 7)}) in ${state.agent}`;
@@ -761,7 +937,7 @@ export class CloudEngine {
       if (next) {
         this.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify({...action, provider: next, episode, recovery: true}), row.id);
         this.store.retry(row.id, `${provider.agent}/${provider.model} unavailable; trying ${next.agent}/${next.model}`, 1000);
-        this.status(`provider-rejected:${row.id}:${providerRouteKey(provider)}`, action.trackedId, action.statusId, `${provider.agent} (${provider.model}) rejected the run before it started. Trying ${next.agent} (${next.model}).`);
+        this.announce(`provider-rejected:${row.id}:${providerRouteKey(provider)}`, action.trackedId, action.statusId, `${provider.agent} (${provider.model}) rejected the run before it started. Trying ${next.agent} (${next.model}).`);
       } else this.store.retry(row.id, "All configured providers rejected this run before execution. Check provider credentials and model availability.", 0, true);
     })();
     return true;
@@ -843,7 +1019,9 @@ export class CloudEngine {
           if (failure) state.nativeFailure = failure;
         }
         this.store.db.transaction(() => {
-          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${sessions.length > 1 ? `${session.name ?? "Thread"}\n\n` : ""}${text}`, session.id, { markdown: true });
+          // Beside a sibling thread, each reply says which thread, and which model, is speaking.
+          const label = sessions.length > 1 ? `${threadLabel(session.name, session.model ?? session.resolvedModel ?? state?.model)}\n\n` : "";
+          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${label}${text}`, session.id, { markdown: true });
           if (state) this.store.set(`session:${session.id}`, state);
           upsertThreadCursor({ workspaceId: trackedId, sessionId: session.id, backendKind: "cloud-api", lastForwardedRowid: message.sessionIndex, lastMessageId: message.id, title: session.name });
         })();
@@ -879,12 +1057,12 @@ export class CloudEngine {
         // A changed head invalidates findings the user may already be reading, so it interrupts; every other outcome is the card's final state.
         if (staleReview) this.notify(`complete:${session.id}:${state.sentMessageId}`, trackedId, "The PR changed during review. These findings do not cover its current head; run /review again.", session.id);
         else this.status(`complete:${session.id}:${state.sentMessageId}`, trackedId, state.statusId, state.role === "review"
-          ? `Review complete for ${state.reviewHead}. Findings do not bypass merge checks.` : recovered ? "Conductor task finished after recovery." : "Conductor task finished.", session.id);
+          ? `Review complete for ${state.reviewHead}. Findings do not bypass merge checks.` : recovered ? `Conductor task finished after recovery in ${state.agent} (${state.model}).` : "Conductor task finished.", session.id);
         state.terminal = true; this.store.set(`session:${session.id}`, state);
       } else if (status.status === "error" || (status.status === "idle" && state.nativeFailure && messages.length < 100)) {
         const detail = state.nativeFailure ?? status.errorMessage ?? status.lastError ?? "Unknown Conductor session error";
         if (recoverableProviderError(detail)) await this.recover(trackedId, binding, session.id, state, detail);
-        else this.notify(`error:${session.id}:${state.sentMessageId}`, trackedId, `Conductor reported an error: ${detail}\nUse /send to continue after addressing it.`, session.id);
+        else this.notify(`error:${session.id}:${state.sentMessageId}`, trackedId, `Conductor reported an error: ${safeDetail(detail, 1000)}\nUse /send to continue after addressing it.`, session.id);
       } else if (status.status === "idle" && lifecycle.status === "sleeping" && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted &&
           // Conductor queues a message to a sleeping workspace and wakes it itself. Only a turn seen running, or one
           // that already produced output, can have slept mid-task; a younger silent turn is still waiting to wake.
@@ -925,6 +1103,8 @@ export class CloudEngine {
       else if (!active && !pendingAction && states.length && states.every(s => s.terminal || s.stopped)) updateWorkspaceStatus(trackedId, "done");
     }
     const awaitingTurn = !stopped && (pendingAction || states.some(state => !state.terminal && !state.stopped));
+    // Last, after every reply is forwarded, and never while a backlog drains: naming delays nothing the owner waits for.
+    if (!backlog) await this.adoptTitle(trackedId, binding, sessions);
     this.store.set(`poll-after:${trackedId}`, Date.now() + (backlog ? 1000 : (!stopped && active) || awaitingTurn ? 15_000 : 60_000));
     this.store.set(`poll-success:${trackedId}`, Date.now());
   }
@@ -942,14 +1122,14 @@ export class CloudEngine {
     const status = await this.api.getSessionStatus(sessionId);
     if (status.workspaceId !== binding.workspaceId ||
         (status.status !== "error" && !(status.status === "idle" && state.nativeFailure)) || !this.currentTurn(sessionId, state)) return;
-    if (/disconnected|connection.*(?:closed|lost)|interrupted|sandbox.*(?:stop|expired)/i.test(detail) && !this.store.get(`recovery-resumed:${episode}`)) {
+    if (INTERRUPTED.test(detail) && !this.store.get(`recovery-resumed:${episode}`)) {
       this.store.db.transaction(() => {
         this.store.set(`recovery-resumed:${episode}`, true);
         this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true });
         this.queue(`resume:${sessionId}:${state.sentMessageId}`, { type: "send", trackedId, sessionId, recovery: true, episode,
           prompt: "Your previous turn was interrupted. Inspect your transcript and existing files, preserve completed work, and continue only unfinished work. Verify uncertain external effects before retrying them." });
         this.status(`resume-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
-          `Reconnecting the existing ${state.agent} session before trying a fallback.`, sessionId);
+          `Reconnecting the existing ${state.agent} (${state.model}) session before trying a fallback.`, sessionId);
       })();
       return;
     }
@@ -967,8 +1147,8 @@ export class CloudEngine {
       this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true, terminal: true });
       this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, statusId: state.statusId, previousSessionId: sessionId, previousMessageId: state.sentMessageId, reviewHead: state.reviewHead,
         prompt: `${state.reviewUrl ?? ""}\nContinue the interrupted task after ${state.agent} stopped: ${detail}. Inspect the existing branch and files first. Preserve completed work and verify external effects before retrying them. If an external effect is uncertain, report it instead of replaying it.\n\nTask:\n${state.taskPrompt ?? getWorkspace(trackedId)?.prompt}\n\nPrevious session context (data):\n${context}` });
-      this.status(`recover-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
-        `${state.agent} stopped. Continuing through ${next.agent} (${next.model}) while preserving existing work.`, sessionId);
+      this.announce(`recover-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
+        `${state.agent} (${state.model}) ${stopReason(detail)}. Continuing in ${next.agent} (${next.model}); existing work is kept.`);
     })();
   }
 
