@@ -175,8 +175,20 @@ export class TelegramDelivery {
       delete payload.filename;
       const result = await this.call(job.method, payload);
       this.store.db.transaction(() => {
+        // Recovery can retarget a notice while its Telegram request is in
+        // flight. relinkNotice updates the durable payload; consult it after
+        // the network call so this receipt cannot restore the stale session
+        // snapshot captured when the row was claimed.
+        const durableJob = JSON.parse(
+          this.store.row(row.id)?.payload ?? row.payload,
+        ) as TelegramJob;
         this.store.finish(row.id, result);
-        if (result?.message_id && job.workspaceId) linkTelegramMessage(String(payload.chat_id), String(result.message_id), job.workspaceId, job.sessionId);
+        if (result?.message_id && durableJob.workspaceId) linkTelegramMessage(
+          String(payload.chat_id),
+          String(result.message_id),
+          durableJob.workspaceId,
+          durableJob.sessionId,
+        );
         if (result?.message_id && job.decisionId) this.store.linkDecision(String(payload.chat_id), result.message_id, job.decisionId);
         if (result?.message_thread_id && job.method === "createForumTopic" && job.workspaceId) {
           updateWorkspaceThreadId(job.workspaceId, result.message_thread_id);
@@ -191,11 +203,18 @@ export class TelegramDelivery {
       const failure = telegramFailure(error);
       if (failure.unchanged) {
         this.store.db.transaction(() => {
+          const durableJob = JSON.parse(
+            this.store.row(row.id)?.payload ?? row.payload,
+          ) as TelegramJob;
           this.store.finish(row.id, true);
           // Telegram returns an error rather than the edited Message when the prior attempt already
           // applied the same text. Restore the reply association from the resolved anchor receipt.
-          if (job.payload.message_id && job.workspaceId) linkTelegramMessage(String(job.payload.chat_id),
-            String(job.payload.message_id), job.workspaceId, job.sessionId);
+          if (job.payload.message_id && durableJob.workspaceId) linkTelegramMessage(
+            String(job.payload.chat_id),
+            String(job.payload.message_id),
+            durableJob.workspaceId,
+            durableJob.sessionId,
+          );
         })();
         return;
       }

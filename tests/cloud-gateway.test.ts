@@ -897,6 +897,41 @@ test("a reply to a review's fallback notice reaches the replacement reviewer, no
   assert.equal(f.store.binding(f.ws.id)?.sessionId, "s1", "the task keeps its own thread");
 }));
 
+test("an in-flight review fallback notice keeps the replacement reviewer link", () => fixture(async f => {
+  await f.launch();
+  f.store.db.prepare("UPDATE gateway_queue SET state='done' WHERE kind='telegram'").run();
+  f.engine.github.pr = async () => ({url: "https://github.com/org/repo/pull/1", head: "a".repeat(40), base: "b".repeat(40), branch: "feature", number: 1, state: "open", merged: false, draft: false});
+  f.engine.queue("review", {type: "review", trackedId: f.ws.id, prompt: "https://github.com/org/repo/pull/1"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  f.store.db.prepare("UPDATE gateway_queue SET state='done' WHERE kind='telegram'").run();
+  f.api.getSessionStatus = async (sessionId: string) => ({workspaceId: "w1", sessionId, status: sessionId === "s2" ? "error" as const : "idle" as const, errorMessage: "You're out of usage credits."});
+  await poll(f);
+  const id = `recover-notice:s2:${f.store.get<any>("session:s2").sentMessageId}`;
+
+  let begin!: () => void;
+  const started = new Promise<void>(resolve => { begin = resolve; });
+  let complete!: (value: {message_id: number}) => void;
+  const response = new Promise<{message_id: number}>(resolve => { complete = resolve; });
+  const delivery = new TelegramDelivery(f.store, async () => {
+    begin();
+    return response;
+  });
+  f.store.set("telegram-chat-after:42", 0);
+  const inFlight = delivery.tick();
+  await started;
+  assert.equal(f.store.row(`${id}:0`)?.state, "running");
+
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  const replacement = f.store.get<any>("created-session:recover:s2:" + f.store.get<any>("session:s2").sentMessageId);
+  complete({message_id: 702});
+  await inFlight;
+
+  const target = getWorkspaceMessageTarget("42", "702")?.sessionId;
+  assert.equal(target, replacement);
+  assert.equal(f.store.get<any>(`session:${target}`)?.role, "review");
+  assert.equal(f.store.binding(f.ws.id)?.sessionId, "s1", "the task keeps its own thread");
+}));
+
 test("a fresh card in the workspace's own topic already says the fallback there, linked to no thread", () => fixture(async f => {
   await keyedLaunch(f);
   statusCard(f, "topic-ack", "-42", {threadId: 7});
