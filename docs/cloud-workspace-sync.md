@@ -32,6 +32,8 @@ Discovery is read-only in Conductor: it does not create, wake, stop, archive, or
 
 Conductor workspace renames update the topic name. Archived or deleted workspaces close their topics while preserving Telegram history and the durable binding. The gateway does not take over existing repository launch topics.
 
+A workspace the gateway creates carries a `telegram-<id>` creation key as its Conductor name until Conductor has titled its first thread, because the key is how a lost create response is reconciled and Conductor never titles a workspace created with a name. Sync never copies that key into a topic or local name, including when another tool has tagged it (`[agents] telegram-<id>`), and a workspace the gateway is still creating is left to its launch rather than attached as discovered work. Once the first thread has a title, the workspace takes it once, in Conductor and in the topic the gateway opened for it, keeping any tag around the key. A name set with `/rename` or in Conductor since creation is never replaced, and discovered workspaces are never renamed: discovery stays read-only in Conductor.
+
 ## Coexistence and cutover
 
 `TELEGRAM_CLOUD_SYNC_INPUT` controls input from the sync group:
@@ -66,5 +68,6 @@ CLI setup should expose the same choices, persist `cloudSyncChatId` and `cloudSy
 - Only `OWNER_USER_ID` can submit work, and only inside topics created or attached by this gateway.
 - Ambiguous repository identities, unknown models, missing sessions, permission loss, and API failures do not guess or create work.
 - A rename updates the topic; archive or deletion closes it without deleting history.
+- A gateway workspace's creation key never becomes a topic name; the workspace takes its first thread's title once, and a name given since creation stands.
 - Commands-only migration mode prevents ordinary text, files, and voice from becoming tasks.
 - More than 100 visible workspaces are discovered with bounded concurrency and without overlapping scans.

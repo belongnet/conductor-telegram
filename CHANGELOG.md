@@ -4,6 +4,20 @@ All notable changes to conductor-telegram are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Workspaces started from Telegram are called by their task again, in Conductor and in their topic. The gateway creates each one under a `telegram-<id>` key, which it needs to recover a lost create response, and Conductor never titles a workspace created with a name, so the minute-by-minute sync copied that key over the task's first line and topics ended up called `[agents] telegram-b9bed051-9e94-…`. The key now stays out of sight: the topic opens under the task's first line, and as soon as Conductor has titled the workspace's first thread, which it does from the task even when the agent's first turn fails, the workspace takes that title in Conductor and in its topic. A tag another tool put around the key, such as `[agents] `, is kept. A name given with `/rename` or in Conductor since creation is never replaced, including by a title rename that was already on its way.
+- On upgrade, each open workspace this gateway created is renamed the same way, a few seconds apart, and Telegram shows one "topic renamed" notice for each. Only a topic the gateway opened for that workspace, and that still follows it, is renamed; a topic you made, or one newer work has since taken over, keeps its name. The title is taken as data: one line, without bracketed tags or invisible characters, so it can never pose as another tool's name tag, and a long one is cut without splitting a character. A rename Conductor refuses or loses is tried again, less and less often, and never holds up a reply.
+- A fallback to another model is visible where the work is. The notice names the model that stopped, why, and the one taking over ("claude (fable-5-1) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept."), and it is also posted silently in the workspace's topic when the turn's card sits elsewhere, such as General after a routed task, or was sent more than 15 seconds earlier. A reply to it continues with the replacement, including a review's replacement reviewer and a thread chosen with `/threads`, never the model that ran out. The card keeps the model to the end: "Conductor task finished after recovery in codex (gpt-6-astra)."
+- Threads the gateway opens are called what they are, "Recovery", "Review PR #12", or the first line of a `/threads new` task ("2 attachments" when it came with files alone), instead of `Task recover:<uuid>:<uuid>`. Threads opened before this release read as "Recovery", "Review" or "Thread" in Telegram, the send receipt included, without being renamed. Naming a new thread no longer delays its task.
+- A lost create response is reconciled even when another tool tagged the new workspace's name in the meantime, and the router workspace is recognised the same way. A workspace the gateway is still creating is never adopted by discovery as someone else's work.
+- Renaming a topic that no longer exists no longer opens a new one, and no longer leaves a delivery blocked with the gateway reporting itself unready.
+
+### Changed
+- In a topic with more than one thread, each forwarded reply is labelled with its thread and model, such as `Recovery · gpt-6-astra`, synced workspaces included. The thread pickers use the same label, and an untitled thread reads "Untitled" everywhere.
+
+### Security
+- An error Conductor reports is scrubbed of credentialed remotes and tokens before it is relayed to Telegram.
+
 ## [0.14.1] - 2026-09-22
 
 ### Fixed

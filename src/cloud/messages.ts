@@ -3,6 +3,9 @@ import type {Provider} from "./engine.js";
 import { ConductorApiError, type ConductorApiClient, type ConductorApiMessage } from "../integrations/conductor-api.js";
 import { TerminalError } from "./telegram.js";
 
+/** Files sent without a word of instruction still reach the agent with one. */
+export const ATTACHMENTS_ONLY_PROMPT = "The owner sent the attached files without instructions. Open them, then respond to what they show.";
+
 export function messageEnvelope(content: unknown): Record<string, any> | undefined {
   if (typeof content === "string") {
     try { content = JSON.parse(content); } catch { return undefined; }
