@@ -11,7 +11,7 @@ import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge, gatewayHealth } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
 import { CloudGitHub, GitHubError } from "../src/cloud/catalog.js";
-import { enqueueTelegram, enqueueText, enqueueStatus, TelegramDelivery, processQueue, ingestTelegram, reportBlocked, safeDetail, ATTENTION_AFTER_MS } from "../src/cloud/telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, enqueueProgress, TelegramDelivery, processQueue, ingestTelegram, reportBlocked, safeDetail, ATTENTION_AFTER_MS } from "../src/cloud/telegram.js";
 import { ConductorApiError, type ConductorApiClient } from "../src/integrations/conductor-api.js";
 import { CloudCommands, repoTopicCandidates } from "../src/cloud/commands.js";
 import { readWorkspaceArtifact } from "../src/mcp/remote.js";
@@ -84,6 +84,93 @@ test("cloud launch sends over native API without a desktop database or checkout"
   assert.equal(f.store.row("launch")?.state, "done");
   assert.equal(JSON.parse(f.store.row("launch:created:0")!.payload).payload.disable_notification, true);
   assert.equal(JSON.parse(f.store.row("launch:sent:0")!.payload).payload.disable_notification, true);
+}));
+
+test("Telegram replies hide agent setup and attachment credentials but preserve the answer", () => fixture(async f => {
+  const boilerplate = "Download these user attachments before work:\nphoto.jpg (attachment ID 1234-abcd): https://bridge.example/v1/attachments/1234-abcd?token=private-token\n\nFor Telegram oversight use the conductor-telegram-mcp tools report_status, report_artifact and request_human when installed. Secret setup text.";
+  enqueueText(f.store, "internal-only", "42", boilerplate, {markdown: true});
+  assert.equal(f.store.row("internal-only:0"), undefined);
+  enqueueText(f.store, "answer", "42", `## Result\n- **Fixed** uploads\n\n${boilerplate}`, {markdown: true});
+  const job = JSON.parse(f.store.row("answer:0")!.payload);
+  assert.equal(job.payload.text, "<b>Result</b>\n• <b>Fixed</b> uploads");
+  assert.equal(job.payload.parse_mode, "HTML");
+  assert.deepEqual(job.payload.link_preview_options, {is_disabled: true});
+  enqueueText(f.store, "quoted-link", "42", "Download: https://bridge.example/v1/attachments/1234-abcd?token=private-token", {markdown: true});
+  assert.doesNotMatch(f.store.row("quoted-link:0")!.payload, /private-token/);
+}));
+
+test("commentary updates one rich progress bubble and final replies stay separate across restarts", () => fixture(async f => {
+  await f.launch();
+  const turn = f.store.get<any>("session:s1").sentMessageId;
+  function reply(id: string, phase: string, text: string) {
+    f.messages.push({id, sessionId: "s1", type: "agent", sessionIndex: f.messages.length, receivedAt: new Date().toISOString(),
+      content: {turnId: turn, rawPayload: {event: {type: "item.completed", item: {id, type: "agentMessage", phase, text}}}}});
+  }
+  reply("progress-1", "commentary", "**Reading** the files");
+  f.status("working");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const anchorId = "transcript:s1:progress-1:0";
+  const anchor = JSON.parse(f.store.row(anchorId)!.payload);
+  assert.equal(anchor.payload.text, "<b>Reading</b> the files");
+  assert.equal(anchor.payload.disable_notification, true);
+  f.store.finish(anchorId, {message_id: 100});
+  reply("progress-2", "commentary", "**Checking** the fix");
+  f.status("working");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  reply("progress-3", "commentary", "**Running** tests");
+  // Rebuild the engine; the progress receipt lives in SQLite, not memory.
+  const restarted = new CloudEngine(f.store, f.api as unknown as ConductorApiClient, f.bridge, f.engine.github);
+  f.status("working");
+  await restarted.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const older = f.store.row("transcript:s1:progress-2:edit")!;
+  assert.equal(older.state, "done");
+  assert.deepEqual(JSON.parse(older.result!), {supersededBy: "transcript:s1:progress-3:edit"});
+  const edit = JSON.parse(f.store.row("transcript:s1:progress-3:edit")!.payload);
+  assert.equal(edit.method, "editMessageText");
+  assert.equal(edit.statusOf, anchorId);
+  assert.equal(edit.payload.text, "<b>Running</b> tests");
+  reply("final", "final_answer", "## Done\n- Tests passed");
+  f.status("idle");
+  await restarted.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const final = JSON.parse(f.store.row("transcript:s1:final:0")!.payload);
+  assert.equal(final.method, "sendMessage");
+  assert.equal(final.payload.text, "<b>Done</b>\n• Tests passed");
+  assert.equal(final.payload.disable_notification, undefined);
+}));
+
+test("progress edits respect rate limits, keep reply routing and replace deleted bubbles once", () => fixture(async f => {
+  const calls: Array<{method: string; payload: any}> = [];
+  let refusal = 0;
+  const sender = new TelegramDelivery(f.store, async (method, payload) => {
+    calls.push({method, payload});
+    if (refusal) { const code = refusal; refusal = 0; throw {error_code: code, description: code === 429 ? "Too many requests" : "message to edit not found", parameters: {retry_after: 5}}; }
+    return {message_id: method === "editMessageText" ? payload.message_id : calls.length};
+  });
+  const options = {workspaceId: f.ws.id, sessionId: "s1"};
+  enqueueProgress(f.store, "first", "s1:turn", "42", "**Reading**", options);
+  await sender.tick();
+  enqueueProgress(f.store, "next", "s1:turn", "42", "**Checking**", options);
+  refusal = 429;
+  await sender.tick(Date.now() + 6000);
+  const callsBefore = calls.length;
+  await sender.tick();
+  assert.equal(calls.length, callsBefore, "a rate-limit wait is respected");
+  enqueueProgress(f.store, "newest", "s1:turn", "42", "**Testing**", options);
+  await sender.tick(Date.now() + 6000);
+  assert.equal(calls.at(-1)!.payload.text, "<b>Testing</b>");
+  assert.equal(calls.at(-1)!.payload.message_id, 1);
+  assert.equal(getWorkspaceMessageTarget("42", "1")?.sessionId, "s1");
+  enqueueProgress(f.store, "deleted", "s1:turn", "42", "**Finishing**", options);
+  refusal = 400;
+  await sender.tick(Date.now() + 6000);
+  await sender.tick(Date.now() + 6000);
+  const replacementId = calls.length;
+  assert.equal(calls.at(-1)!.method, "sendMessage");
+  assert.equal(calls.at(-1)!.payload.disable_notification, true);
+  enqueueProgress(f.store, "last", "s1:turn", "42", "**Ready**", options);
+  await sender.tick(Date.now() + 6000);
+  assert.equal(calls.at(-1)!.method, "editMessageText");
+  assert.equal(calls.at(-1)!.payload.message_id, replacementId);
 }));
 
 test("readiness ignores old polling errors only after the workspace is retired", () => fixture(async f => {
@@ -391,6 +478,70 @@ test("quota failure queues one fallback; an API outage never launches a replacem
   f.store.set(`poll-after:${f.ws.id}`, 0);
   await assert.rejects(f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!));
   assert.equal(f.sessions.length, 1);
+}));
+
+for (const legacy of [false, true]) test(`attachments survive repeated provider recovery${legacy ? " from pre-fix state" : ""}`, () => fixture(async f => {
+  const fileIds = ["photo.jpg", "notes.txt"].map(name => f.bridge.save(f.ws.id, name, Buffer.from(name)));
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1",
+    prompt: "Open the attached files", fileIds});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  if (legacy) {
+    const state = f.store.get<any>("session:s1");
+    delete state.fileIds;
+    f.store.set("session:s1", state);
+  }
+  // User messages may be absent from the tail (and transcriptText excludes them).
+  f.api.getSessionMessageTail = async () => [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    f.store.db.prepare("UPDATE gateway_file_links SET expires_at=0").run();
+    f.status("error", "You're out of usage credits. Switch to another model to continue.");
+    await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+    if (legacy && attempt === 0) {
+      const row = f.store.db.prepare("SELECT id,payload FROM gateway_queue WHERE id LIKE 'recover:%'").get() as {id: string; payload: string};
+      const action = JSON.parse(row.payload);
+      delete action.fileIds; // A recovery already queued before the upgrade.
+      f.store.db.prepare("UPDATE gateway_queue SET payload=? WHERE id=?").run(JSON.stringify(action), row.id);
+    }
+    await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+    const message = f.messages.at(-1)!;
+    assert.equal(message.sessionId, `s${attempt + 2}`);
+    const links = message.content.match(/http:\/\/127\.0\.0\.1\/v1\/attachments\/[^\s]+/g) ?? [];
+    assert.equal(links.length, 2, "replacement session receives both attachments without the original transcript");
+    assert.deepEqual(links.map((link: string) => {
+      const url = new URL(link);
+      return f.bridge.validLink(url.pathname.split("/").at(-1)!, url.searchParams.get("token")!)?.id;
+    }), fileIds, "replacement links are fresh and readable");
+    assert.deepEqual(f.store.get<any>(`session:${message.sessionId}`).fileIds, fileIds);
+    assert.match(message.content, /verify external effects before retrying/i);
+  }
+  assert.deepEqual(f.counts(), {creates: 1, sends: 3});
+  f.engine.queue("new-task", {type: "send", trackedId: f.ws.id, prompt: "A different task"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  f.status("error");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.doesNotMatch(f.messages.at(-1)!.content, /\(attachment ID /, "a new turn does not inherit the previous task's files");
+}));
+
+for (const sleeping of [false, true]) test(`attachments get fresh links on ${sleeping ? "wake" : "same-session resume"}`, () => fixture(async f => {
+  const fileId = f.bridge.save(f.ws.id, "evidence.txt", Buffer.from("evidence"));
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Read the file", fileIds: [fileId]});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  f.store.db.prepare("UPDATE gateway_file_links SET expires_at=0").run();
+  if (sleeping) {
+    f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: "sleeping"});
+    f.store.set("session:s1", {...f.store.get<any>("session:s1"), seenWorking: true});
+    f.status("idle");
+  } else f.status("error", "connection lost");
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.deepEqual(f.counts(), {creates: 1, sends: 2});
+  const message = f.messages.at(-1)!;
+  assert.equal(message.sessionId, "s1");
+  const links = message.content.match(/http:\/\/127\.0\.0\.1\/v1\/attachments\/[^\s]+/g) ?? [];
+  assert.equal(links.length, 1);
+  assert.ok(f.bridge.validLink(fileId, new URL(links[0]).searchParams.get("token")!));
+  assert.deepEqual(f.store.get<any>("session:s1").fileIds, [fileId]);
 }));
 
 test("transient disconnect attempts same-session continuation before provider replacement", () => fixture(async f => {

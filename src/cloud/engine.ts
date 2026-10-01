@@ -11,7 +11,8 @@ import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, g
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
 import { FileBridge } from "./bridge.js";
 import { CloudGitHub, GitHubError, ProjectCatalog, type CloudPr } from "./catalog.js";
-import { enqueueTelegram, enqueueText, enqueueStatus, TerminalError, safeDetail, statusCardSeen, topicOpening, type TelegramJob } from "./telegram.js";
+import { enqueueTelegram, enqueueText, enqueueStatus, enqueueProgress, TerminalError, safeDetail, statusCardSeen, topicOpening, type TelegramJob } from "./telegram.js";
+import { telegramReplyText } from "../bot/format.js";
 import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle } from "./names.js";
 import type { Workspace } from "../types/index.js";
 
@@ -50,6 +51,7 @@ interface SessionState {
   role: "task" | "review"; sentMessageId?: string; sentAt?: number; seenWorking?: boolean;
   seenReply?: boolean; awaitingWorkingEdge?: boolean; terminal?: boolean; reviewHead?: string; reviewUrl?: string;
   recoveryAttempted?: boolean; stopped?: boolean; episode?: string; taskPrompt?: string;
+  fileIds?: string[];
   reviewValid?: boolean; reviewBase?: string;
   turnId?: string; nativeCompleted?: boolean; nativeFailure?: string; statusId?: string;
 }
@@ -65,6 +67,15 @@ const TITLE_ATTEMPTS = 8;
 type TitleFence = true | { owner: string; repair?: boolean };
 
 export function transcriptText(message: ConductorApiMessage): string {
+  // Some transports nest an input/system message inside a generic agent row.
+  // Never promote that input to visible assistant text.
+  const hidden = (value: any): boolean => {
+    const kind = String(value?.type ?? "").toLowerCase().replace(/[_-]/g, "");
+    const role = String(value?.role ?? "").toLowerCase();
+    return ["user", "human", "system", "developer", "tool"].includes(role) ||
+      /^(?:user|human|system|developer|tool|thinking|reasoning)/.test(kind);
+  };
+  if (hidden(message)) return "";
   // The native API wraps provider events, including hidden tool/lifecycle
   // events, in rawPayload. Reuse the lane parser's visible-text filtering.
   if (message.type === "agent") {
@@ -75,6 +86,7 @@ export function transcriptText(message: ConductorApiMessage): string {
       if (typeof rawPayload === "string") {
         try { rawPayload = JSON.parse(rawPayload); } catch { return ""; }
       }
+      if (hidden(rawPayload) || hidden((rawPayload as any)?.message)) return "";
       return assistantTextFromTranscriptEvent({...message, content: {...content, rawPayload}});
     }
   }
@@ -92,6 +104,7 @@ export function transcriptText(message: ConductorApiMessage): string {
     }
     if (Array.isArray(value)) { for (const part of value) visit(part, depth + 1); return; }
     if (typeof value !== "object" || ["tool_use", "tool_result", "thinking", "reasoning"].includes(value.type)) return;
+    if (hidden(value) || hidden(value.message)) return;
     if (typeof value.text === "string") parts.push(value.text);
     else if (typeof value.result === "string") parts.push(value.result);
     else if (value.message?.content) visit(value.message.content, depth + 1);
@@ -825,15 +838,22 @@ export class CloudEngine {
     if (this.stopped(row, action)) {
       await this.api.cancelSession(sessionId); return;
     }
+    // Recover queued continuations written by older releases as well as new ones.
+    // Keep the persisted send payload immutable: an uncertain submission must never be replayed.
+    const previous = action.recovery
+      ? this.store.get<SessionState>(`session:${action.previousSessionId ?? sessionId}`) : undefined;
+    const fileIds = action.fileIds ?? (action.recovery
+      ? this.recoveryFileIds({trackedId: action.trackedId, episode: action.episode ?? previous?.episode,
+          fileIds: previous?.trackedId === action.trackedId ? previous.fileIds : undefined}) : []);
     let payload = this.store.get<{ message: string; messageId: string }>(`send:${row.id}`);
     if (!payload) {
-      const files = (action.fileIds ?? []).map(id => {
+      const files = fileIds.map(id => {
         const file = this.bridge.file(id, action.trackedId);
         if (!file) throw new TerminalError("Attachment missing from this workspace");
         return `${file.name} (attachment ID ${id}): ${this.bridge.link(id, action.trackedId)}`;
       });
       const bridged = !!this.store.db.prepare("SELECT 1 FROM gateway_credentials WHERE workspace_id=? AND revoked=0 LIMIT 1").get(action.trackedId);
-      payload = { messageId: deterministicUuid("telegram", row.id), message: `${action.prompt ?? ""}${files.length ? `\n\nDownload these user attachments before work:\n${files.join("\n")}${bridged ? "" : "\nAttachment links expire after 15 minutes; download them first."}` : ""}\n\n${this.bridgeInstructions(bridged)}` };
+      payload = { messageId: deterministicUuid("telegram", row.id), message: `${action.prompt ?? ""}${files.length ? `\n\nDownload these user attachments before work:\n${files.join("\n")}${bridged ? "" : "\nAttachment links expire after 15 minutes; download them first."}` : ""}\n\n${this.bridgeInstructions(bridged)}\n\nWrite concise replies for Telegram: use short paragraphs, Markdown headings, lists, and descriptive links. Keep bridge instructions, attachment IDs, and signed download URLs out of your replies.` };
       this.store.set(`send:${row.id}`, payload);
     }
     const existing = await findSubmittedMessage(this.api, sessionId, payload.messageId);
@@ -891,6 +911,7 @@ export class CloudEngine {
       (!!binding.synced || !!state.sentMessageId);
     this.store.set(`session:${sessionId}`, { ...state, sentMessageId: payload.messageId, sentAt: Date.now(), terminal: false, episode, statusId,
       taskPrompt: action.recovery ? state.taskPrompt ?? action.prompt : action.prompt,
+      fileIds,
       seenWorking: false, seenReply: false,
       awaitingWorkingEdge: sessionWasWorking || sharedSessionSubmission || priorTurnPending ||
         (!state.terminal && (!!state.awaitingWorkingEdge || !!state.seenWorking)),
@@ -1003,7 +1024,7 @@ export class CloudEngine {
       }
       for (const [index, message] of messages.entries()) {
         if (cursor && message.sessionIndex <= cursor.lastForwardedRowid) continue;
-        const text = transcriptText(message);
+        const text = telegramReplyText(transcriptText(message));
         const envelope = message.type === "agent" ? messageEnvelope(message.content) : undefined;
         const nativeTurn = envelope?.turnId ?? envelope?.userMessageId;
         const currentReply = state && (typeof nativeTurn === "string"
@@ -1019,9 +1040,19 @@ export class CloudEngine {
           if (failure) state.nativeFailure = failure;
         }
         this.store.db.transaction(() => {
-          // Beside a sibling thread, each reply says which thread, and which model, is speaking.
-          const label = sessions.length > 1 ? `${threadLabel(session.name, session.model ?? session.resolvedModel ?? state?.model)}\n\n` : "";
-          if (text) this.notify(`transcript:${session.id}:${message.id}`, trackedId, `${label}${text}`, session.id, { markdown: true });
+          if (text) {
+            const raw = messageEnvelope(envelope?.rawPayload);
+            const item = raw?.event?.item ?? raw?.item ?? raw?.message;
+            const phase = item?.phase;
+            const turn = typeof nativeTurn === "string" ? nativeTurn : currentReply ? state?.sentMessageId : undefined;
+            const id = `transcript:${session.id}:${message.id}`;
+            // Beside a sibling thread, each reply says which thread, and which model, is speaking.
+            const label = sessions.length > 1 ? `${threadLabel(session.name, session.model ?? session.resolvedModel ?? state?.model)}\n\n` : "";
+            const reply = `${label}${text}`;
+            if (phase === "commentary" && turn) enqueueProgress(this.store, id, `${session.id}:${turn}`, ws.telegramChatId, reply,
+              {workspaceId: trackedId, sessionId: session.id, threadId: ws.telegramThreadId});
+            else this.notify(id, trackedId, reply, session.id, { markdown: true });
+          }
           if (state) this.store.set(`session:${session.id}`, state);
           upsertThreadCursor({ workspaceId: trackedId, sessionId: session.id, backendKind: "cloud-api", lastForwardedRowid: message.sessionIndex, lastMessageId: message.id, title: session.name });
         })();
@@ -1077,7 +1108,7 @@ export class CloudEngine {
         // Wake with a continuation, not the original potentially side-effectful task.
         this.store.set(wakeKey, Date.now());
         state.recoveryAttempted = true; this.store.set(`session:${session.id}`, state);
-        this.queue(`wake:${session.id}:${state.sentMessageId}`, { type: "send", trackedId, sessionId: session.id, recovery: true, episode: state.episode,
+        this.queue(`wake:${session.id}:${state.sentMessageId}`, { type: "send", trackedId, sessionId: session.id, recovery: true, episode: state.episode, fileIds: this.recoveryFileIds(state),
           prompt: "The workspace slept during this task. Inspect files and transcript, preserve completed work, and continue only unfinished work. Report uncertainty before repeating side effects." });
       }
     }
@@ -1115,6 +1146,16 @@ export class CloudEngine {
       !current.stopped && !this.store.get(`stop:${state.trackedId}`);
   }
 
+  private recoveryFileIds(state: Pick<SessionState, "trackedId" | "episode" | "fileIds">): string[] {
+    if (state.fileIds !== undefined) return state.fileIds;
+    // Pre-fix sessions stored attachments only on the original queued action.
+    // The episode survives resumes and provider switches; never use another task's files.
+    const row = state.episode ? this.store.row(state.episode) : undefined;
+    if (!row || row.kind !== "cloud") return [];
+    const original = JSON.parse(row.payload) as CloudAction;
+    return original.trackedId === state.trackedId ? original.fileIds ?? [] : [];
+  }
+
   private async recover(trackedId: string, binding: CloudBinding, sessionId: string, state: SessionState, detail: string): Promise<void> {
     if (state.recoveryAttempted) return;
     const episode = state.episode ?? sessionId;
@@ -1126,7 +1167,7 @@ export class CloudEngine {
       this.store.db.transaction(() => {
         this.store.set(`recovery-resumed:${episode}`, true);
         this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true });
-        this.queue(`resume:${sessionId}:${state.sentMessageId}`, { type: "send", trackedId, sessionId, recovery: true, episode,
+        this.queue(`resume:${sessionId}:${state.sentMessageId}`, { type: "send", trackedId, sessionId, recovery: true, episode, fileIds: this.recoveryFileIds(state),
           prompt: "Your previous turn was interrupted. Inspect your transcript and existing files, preserve completed work, and continue only unfinished work. Verify uncertain external effects before retrying them." });
         this.status(`resume-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
           `Reconnecting the existing ${state.agent} (${state.model}) session before trying a fallback.`, sessionId);
@@ -1146,6 +1187,7 @@ export class CloudEngine {
       this.store.set(`recovery-providers:${episode}`, [...used, providerRouteKey(next)]);
       this.store.set(`session:${sessionId}`, { ...state, recoveryAttempted: true, terminal: true });
       this.queue(`recover:${sessionId}:${state.sentMessageId}`, { type: state.role === "review" ? "review" : "thread", trackedId, provider: next, recovery: true, episode, statusId: state.statusId, previousSessionId: sessionId, previousMessageId: state.sentMessageId, reviewHead: state.reviewHead,
+        fileIds: this.recoveryFileIds(state),
         prompt: `${state.reviewUrl ?? ""}\nContinue the interrupted task after ${state.agent} stopped: ${detail}. Inspect the existing branch and files first. Preserve completed work and verify external effects before retrying them. If an external effect is uncertain, report it instead of replaying it.\n\nTask:\n${state.taskPrompt ?? getWorkspace(trackedId)?.prompt}\n\nPrevious session context (data):\n${context}` });
       this.announce(`recover-notice:${sessionId}:${state.sentMessageId}`, trackedId, state.statusId,
         `${state.agent} (${state.model}) ${stopReason(detail)}. Continuing in ${next.agent} (${next.model}); existing work is kept.`);

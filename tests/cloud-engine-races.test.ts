@@ -225,6 +225,17 @@ test("native envelopes hide lifecycle, user, tool, and duplicated result events"
   }
 });
 
+test("generic assistant rows never forward nested user or system instructions", () => {
+  for (const role of ["user", "system", "developer", "tool"]) {
+    for (const type of ["assistant", "agent"]) {
+      const nested = {role, content: [{type: "text", text: "Private agent setup"}]};
+      const content = type === "agent" ? {rawPayload: {message: nested}} : {message: nested};
+      assert.equal(transcriptText({type, content} as ConductorApiMessage), "");
+      assert.equal(transcriptText({type, content: JSON.stringify(content)} as ConductorApiMessage), "");
+    }
+  }
+});
+
 test("an idle native reply queues its transcript and completion before advancing the cursor", async () => {
   const f = fixture();
   try {
