@@ -188,7 +188,20 @@ export class GatewayStore {
       // Matched with the separator, so a row id that merely prefixes another cannot hold its keys.
       const perFile = (prefix: string, offset: number): number => this.db.prepare(`DELETE FROM gateway_state WHERE key LIKE '${prefix}:%' AND NOT EXISTS
         (SELECT 1 FROM gateway_queue q WHERE q.state IN ('pending','running') AND substr(gateway_state.key,${offset},length(q.id)+1)=q.id||':')`).run().changes;
-      return albums + members + perFile("media-transcript", 18) + perFile("media-file", 12);
+      // Progress anchors and deleted-card replacement receipts are only useful while a recent edit can still arrive.
+      // Keep them bounded even when a turn ends without a terminal callback or the process restarts.
+      const telegram = this.db.prepare(`DELETE FROM gateway_state WHERE
+        (key LIKE 'telegram-progress:%' OR key LIKE 'telegram-replacement:%')
+        AND COALESCE(CAST(json_extract(value,'$.updatedAt') AS INTEGER), 0) < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM gateway_queue q
+          WHERE q.state IN ('pending','running')
+            AND (q.id = json_extract(gateway_state.value,'$.anchorId')
+              OR json_extract(q.payload,'$.statusOf') = CASE
+                WHEN gateway_state.key LIKE 'telegram-replacement:%' THEN substr(gateway_state.key,22)
+                ELSE json_extract(gateway_state.value,'$.anchorId') END)
+        )`).run(now - 24 * 60 * 60_000).changes;
+      return albums + members + telegram + perFile("media-transcript", 18) + perFile("media-file", 12);
     })();
   }
 

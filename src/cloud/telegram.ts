@@ -140,7 +140,7 @@ function enqueueEdit(store: GatewayStore, id: string,
   })();
 }
 
-/** One quiet progress bubble per turn, with paced, coalesced edits and durable receipts. */
+/** One quiet progress bubble per short turn update, with paced, coalesced edits and durable receipts. */
 export function enqueueProgress(store: GatewayStore, id: string, turnKey: string, chatId: string, text: string,
   options: {workspaceId: string; sessionId: string; threadId?: number | null}): void {
   text = telegramReplyText(text);
@@ -154,10 +154,10 @@ export function enqueueProgress(store: GatewayStore, id: string, turnKey: string
     if (prior?.text === chunks[0]) return;
     if (!prior) {
       enqueueText(store, id, chatId, text, {...options, markdown: true, silent: true});
-      store.set(key, {anchorId: `${id}:0`, text: chunks[0]});
+      store.set(key, {anchorId: `${id}:0`, text: chunks[0], updatedAt: Date.now()});
     } else {
       enqueueEdit(store, `${id}:edit`, {...options, chatId, anchorId: prior.anchorId, text: chunks[0]}, 10);
-      store.set(key, {...prior, text: chunks[0]});
+      store.set(key, {...prior, text: chunks[0], updatedAt: Date.now()});
     }
   })();
 }
@@ -222,7 +222,9 @@ export class TelegramDelivery {
           durableJob.workspaceId,
           durableJob.sessionId,
         );
-        if (result?.message_id && durableJob.replacementOf) this.store.set(`telegram-replacement:${durableJob.replacementOf}`, {message_id: result.message_id});
+        if (result?.message_id && durableJob.replacementOf) this.store.set(`telegram-replacement:${durableJob.replacementOf}`, {
+          message_id: result.message_id, anchorId: durableJob.replacementOf, updatedAt: Date.now(),
+        });
         if (result?.message_id && job.decisionId) this.store.linkDecision(String(payload.chat_id), result.message_id, job.decisionId);
         if (result?.message_thread_id && job.method === "createForumTopic" && job.workspaceId) {
           updateWorkspaceThreadId(job.workspaceId, result.message_thread_id);

@@ -97,6 +97,8 @@ test("Telegram replies hide agent setup and attachment credentials but preserve 
   assert.deepEqual(job.payload.link_preview_options, {is_disabled: true});
   enqueueText(f.store, "quoted-link", "42", "Download: https://bridge.example/v1/attachments/1234-abcd?token=private-token", {markdown: true});
   assert.doesNotMatch(f.store.row("quoted-link:0")!.payload, /private-token/);
+  enqueueText(f.store, "listed-internals", "42", "- For Telegram oversight use the conductor-telegram-mcp tools report_status\n1. Write concise replies for Telegram: use short paragraphs, Markdown headings, lists, and descriptive links.", {markdown: true});
+  assert.equal(f.store.row("listed-internals:0"), undefined);
 }));
 
 test("commentary updates one rich progress bubble and final replies stay separate across restarts", () => fixture(async f => {
