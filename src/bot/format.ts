@@ -152,10 +152,10 @@ export function btn(text: string, callbackData: string): InlineButton {
 export function telegramReplyText(text: string): string {
   return text
     .replace(/<telegram-internal-context>[\s\S]*?(?:<\/telegram-internal-context>|$)/g, "")
-    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?Download these user attachments before work:\r?\n(?:[^\n]*\(attachment ID [\w-]+\):[^\n]*(?:\n|$))+(?:Attachment links expire after 15 minutes; download them first\.\s*)?/gm, "")
-    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?For Telegram oversight use the conductor-telegram-mcp tools[^\n]*(?:\n|$)/gm, "")
-    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?Your replies in this session are forwarded to Telegram\.[^\n]*(?:\n|$)/gm, "")
-    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?Write concise replies for Telegram: use short paragraphs,[^\n]*(?:\n|$)/gm, "")
+    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:\*\*|__)?Download these user attachments before work:\r?\n(?:[^\n]*\(attachment ID [\w-]+\):[^\n]*(?:\n|$))+(?:Attachment links expire after 15 minutes; download them first\.\s*)?/gm, "")
+    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:\*\*|__)?For Telegram oversight use the conductor-telegram-mcp tools[^\n]*(?:\n|$)/gm, "")
+    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:\*\*|__)?Your replies in this session are forwarded to Telegram\.[^\n]*(?:\n|$)/gm, "")
+    .replace(/^[ \t>]*(?:(?:[-*+]|\d+\.)[ \t]+)?(?:\*\*|__)?Write concise replies for Telegram: use short paragraphs,[^\n]*(?:\n|$)/gm, "")
     .replace(/https?:\/\/[^\s<>()[\]]+\/v1\/attachments\/[\w-]+\?token=[\w-]+/g, "[attachment link]")
     .trim();
 }

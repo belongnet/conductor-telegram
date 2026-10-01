@@ -29,6 +29,7 @@ All notable changes to conductor-telegram are documented here.
 
 ### Fixed
 - Attachments remain available when a provider is recovered or replaced, including after a restart, sleep, or an older queued recovery action. Fresh signed links are generated instead of replaying expired ones.
+- Telegram's durable progress and replacement state is pruned after delivery settles, and setup text remains hidden even when an agent wraps it in a list or emphasis.
 
 ## [0.14.1] - 2026-09-22
 
