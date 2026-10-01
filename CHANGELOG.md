@@ -18,6 +18,18 @@ All notable changes to conductor-telegram are documented here.
 ### Security
 - An error Conductor reports is scrubbed of credentialed remotes and tokens before it is relayed to Telegram.
 
+## [0.15.0] - 2026-10-01
+
+### Added
+- Telegram replies now render lists, checkboxes, quotes, tables, links, and emphasis in a compact format that works on a phone.
+- Commentary updates for one turn reuse a quiet, editable progress message while final answers remain separate.
+
+### Changed
+- Agent setup instructions and signed attachment links are removed from forwarded replies, and link previews are disabled for cleaner Telegram messages.
+
+### Fixed
+- Attachments remain available when a provider is recovered or replaced, including after a restart, sleep, or an older queued recovery action. Fresh signed links are generated instead of replaying expired ones.
+
 ## [0.14.1] - 2026-09-22
 
 ### Fixed
