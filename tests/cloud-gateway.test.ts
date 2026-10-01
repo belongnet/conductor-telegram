@@ -101,6 +101,8 @@ test("Telegram replies hide agent setup and attachment credentials but preserve 
   assert.equal(f.store.row("listed-internals:0"), undefined);
   enqueueText(f.store, "bold-internals", "42", "**For Telegram oversight use the conductor-telegram-mcp tools report_status**", {markdown: true});
   assert.equal(f.store.row("bold-internals:0"), undefined);
+  enqueueText(f.store, "heading-internals", "42", "### For Telegram oversight use the conductor-telegram-mcp tools report_status", {markdown: true});
+  assert.equal(f.store.row("heading-internals:0"), undefined);
 }));
 
 test("commentary updates one rich progress bubble and final replies stay separate across restarts", () => fixture(async f => {
