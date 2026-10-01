@@ -40,3 +40,18 @@ test("decision replies remain chat-scoped after restart", () => {
     assert.equal(restarted.decisionForMessage("b", 5), undefined);
   } finally { db.close(); }
 });
+
+test("turn progress and replacement receipts are pruned after delivery settles", () => {
+  const db = new Database(":memory:");
+  try {
+    const s = new GatewayStore(db);
+    s.set("telegram-progress:s1:turn", {anchorId: "progress:0", text: "old", updatedAt: 1});
+    s.set("telegram-replacement:status:0", {anchorId: "status:0", message_id: 9, updatedAt: 1});
+    s.set("telegram-progress:s1:live", {anchorId: "live:0", text: "new", updatedAt: 86_400_000});
+    s.enqueue("telegram", "42:0", {method: "editMessageText", statusOf: "status:0", payload: {}}, "pending-edit");
+    assert.equal(s.pruneTurnState(10, 2 * 86_400_000), 1);
+    assert.equal(s.get("telegram-progress:s1:turn"), undefined);
+    assert.ok(s.get("telegram-replacement:status:0"));
+    assert.ok(s.get("telegram-progress:s1:live"));
+  } finally { db.close(); }
+});

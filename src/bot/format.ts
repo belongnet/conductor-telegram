@@ -148,6 +148,18 @@ export function btn(text: string, callbackData: string): InlineButton {
 
 // ── Markdown → Telegram HTML ─────────────────────────────────
 
+/** Gateway instructions belong to the agent, never to the operator's reply. */
+export function telegramReplyText(text: string): string {
+  return text
+    .replace(/<telegram-internal-context>[\s\S]*?(?:<\/telegram-internal-context>|$)/g, "")
+    .replace(/^[ \t>]*(?:(?:(?:[-*+]|\d+\.)[ \t]+|#{1,6}[ \t]+))?(?:\*\*|__)?Download these user attachments before work:\r?\n(?:[^\n]*\(attachment ID [\w-]+\):[^\n]*(?:\n|$))+(?:Attachment links expire after 15 minutes; download them first\.\s*)?/gm, "")
+    .replace(/^[ \t>]*(?:(?:(?:[-*+]|\d+\.)[ \t]+|#{1,6}[ \t]+))?(?:\*\*|__)?For Telegram oversight use the conductor-telegram-mcp tools[^\n]*(?:\n|$)/gm, "")
+    .replace(/^[ \t>]*(?:(?:(?:[-*+]|\d+\.)[ \t]+|#{1,6}[ \t]+))?(?:\*\*|__)?Your replies in this session are forwarded to Telegram\.[^\n]*(?:\n|$)/gm, "")
+    .replace(/^[ \t>]*(?:(?:(?:[-*+]|\d+\.)[ \t]+|#{1,6}[ \t]+))?(?:\*\*|__)?Write concise replies for Telegram: use short paragraphs,[^\n]*(?:\n|$)/gm, "")
+    .replace(/https?:\/\/[^\s<>()[\]]+\/v1\/attachments\/[\w-]+\?token=[\w-]+/g, "[attachment link]")
+    .trim();
+}
+
 /**
  * Convert markdown (as produced by Claude / LLMs) to Telegram-compatible HTML.
  *
@@ -174,6 +186,35 @@ export function markdownToTelegramHtml(md: string): string {
     protect(`<code>${escHtml(code)}</code>`)
   );
 
+  // Telegram has no table entity. Present each row as a compact labelled record.
+  const lines = s.split("\n");
+  const cells = (line: string) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(cell => cell.trim());
+  const records: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const headings = cells(lines[i]);
+    const separator = cells(lines[i + 1] ?? "");
+    if (headings.length < 2 || separator.length !== headings.length || !separator.every(cell => /^:?-{3,}:?$/.test(cell))) {
+      records.push(lines[i]); continue;
+    }
+    i++;
+    const rows: string[] = [];
+    while (i + 1 < lines.length && lines[i + 1].includes("|") && cells(lines[i + 1]).length === headings.length) {
+      const row = cells(lines[++i]);
+      rows.push(`**${row[0]}**\n${row.slice(1).map((value, index) => `• **${headings[index + 1]}:** ${value}`).join("\n")}`);
+    }
+    records.push(rows.length ? rows.join("\n\n") : headings.join(" · "));
+  }
+  s = records.join("\n");
+
+  // Protect destinations before parsing emphasis, including underscores in URLs.
+  s = s.replace(/\[([^\]\n]+)\]\(([^\s)]+)\)/g, (_m, label: string, href: string) => {
+    let valid = false;
+    try { valid = ["http:", "https:", "tg:", "mailto:"].includes(new URL(href).protocol); } catch {}
+    if (!valid) return `${label} (${protect(escHtml(href))})`;
+    return `${protect(`<a href="${escHtml(href).replace(/"/g, "&quot;")}">`)}${label}${protect("</a>")}`;
+  });
+  s = s.replace(/https?:\/\/[^\s<>\x00]+/g, url => protect(escHtml(url)));
+
   // 3. Escape remaining literal text
   s = escHtml(s);
 
@@ -186,22 +227,13 @@ export function markdownToTelegramHtml(md: string): string {
   // 6. Strikethrough  ~~…~~
   s = s.replace(/~~(.+?)~~/g, "<s>$1</s>");
 
-  // 7. Links  [text](url)
-  s = s.replace(
-    /\[(.+?)\]\((.+?)\)/g,
-    (_m, label: string, href: string) => {
-      // Agent replies also link local checkout paths. Keep those readable;
-      // Telegram cannot turn a local path into a usable inline link.
-      try {
-        if (!["http:", "https:", "tg:", "mailto:"].includes(new URL(href).protocol)) {
-          return `${label} (${href})`;
-        }
-      } catch {
-        return `${label} (${href})`;
-      }
-      return `<a href="${href.replace(/"/g, "&quot;")}">${label}</a>`;
-    }
-  );
+  s = s.replace(/(?<!\w)__(\S(?:.*?\S)?)__(?!\w)/g, "<b>$1</b>");
+  s = s.replace(/(?<![\w_])_(\S(?:.*?\S)?)_(?![\w_])/g, "<i>$1</i>");
+
+  s = s.replace(/^(\s*)[-*+] \[([ xX])\]\s+/gm, (_m, indent, checked) => `${indent}${checked === " " ? "☐" : "☑"} `);
+  s = s.replace(/^(\s*)[-*+]\s+/gm, "$1• ");
+  s = s.replace(/^(?:&gt;[^\n]*(?:\n|$))+/gm, quote =>
+    `<blockquote>${quote.trimEnd().replace(/^&gt; ?/gm, "")}</blockquote>${quote.endsWith("\n") ? "\n" : ""}`);
 
   // 8. Headings  # … → bold line
   s = s.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
@@ -229,7 +261,7 @@ export function splitTelegramHtml(html: string, maxLength = 3900): string[] {
   const closingTags = () => rendered.map(tag => `</${tag.name}>`).reverse().join("");
   for (const [token] of html.matchAll(/<[^>]*>|&(?:amp|lt|gt|quot);|[\s\S]/gu)) {
     if (token.startsWith("<")) {
-      const tag = token.match(/^<(\/?)(b|i|s|pre|code|a)(?: href="[^"<>]*")?>$/);
+      const tag = token.match(/^<(\/?)(b|i|s|pre|code|a|blockquote)(?: href="[^"<>]*")?>$/);
       if (!tag) throw new Error("Unsupported Telegram HTML tag");
       const [, close, name] = tag;
       if (close) {

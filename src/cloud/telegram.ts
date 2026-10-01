@@ -2,7 +2,7 @@ import type { GatewayStore, QueueRow } from "./store.js";
 import { linkTelegramMessage, updateWorkspaceThreadId, getWorkspace } from "../store/queries.js";
 import type { Workspace } from "../types/index.js";
 import { createReadStream } from "node:fs";
-import { escHtml, markdownToTelegramChunks } from "../bot/format.js";
+import { escHtml, markdownToTelegramChunks, telegramReplyText } from "../bot/format.js";
 import {ConductorApiError} from "../integrations/conductor-api.js";
 
 export type TelegramCall = (method: string, payload: Record<string, any>) => Promise<any>;
@@ -15,6 +15,8 @@ export interface TelegramJob {
   filePath?: string;
   /** Queue row id of the delivered message this edit targets; resolved at delivery time. */
   statusOf?: string;
+  /** A replacement message becomes the durable target for later edits to this anchor. */
+  replacementOf?: string;
 }
 /** An edit waits this long for its acknowledgement before it is delivered as a message instead. */
 const STATUS_ANCHOR_WAIT_MS = 300_000;
@@ -88,6 +90,8 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
   options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean; silent?: boolean } = {}): void {
   const chunks: string[] = [];
   if (options.markdown) {
+    text = telegramReplyText(text);
+    if (!text) return;
     chunks.push(...markdownToTelegramChunks(text));
   } else {
     let current = "";
@@ -100,7 +104,7 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
   }
   chunks.forEach((chunk, i) => enqueueTelegram(store, `${id}:${i}`, {
     method: "sendMessage",
-    payload: { chat_id: chatId, text: chunk, parse_mode: "HTML",
+    payload: { chat_id: chatId, text: chunk, parse_mode: "HTML", link_preview_options: {is_disabled: true},
       ...(options.threadId ? { message_thread_id: options.threadId } : {}),
       ...(options.silent ? { disable_notification: true } : {}),
       ...(i === chunks.length - 1 && options.replyMarkup ? { reply_markup: options.replyMarkup } : {}) },
@@ -115,6 +119,12 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
  */
 export function enqueueStatus(store: GatewayStore, id: string,
   input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown }): void {
+  enqueueEdit(store, id, {...input, text: escHtml(input.text)}, 0);
+}
+
+/** Only renderer-produced HTML reaches this internal helper. */
+function enqueueEdit(store: GatewayStore, id: string,
+  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown }, priority: number): void {
   store.db.transaction(() => {
     if (store.row(id)) return;
     store.assertWriter?.();
@@ -124,9 +134,31 @@ export function enqueueStatus(store: GatewayStore, id: string,
       .all(input.anchorId) as Array<{ id: string }>;
     for (const prior of pending) store.finish(prior.id, { supersededBy: id });
     const job: TelegramJob = { method: "editMessageText", statusOf: input.anchorId, workspaceId: input.workspaceId, sessionId: input.sessionId,
-      payload: { chat_id: chatId, text: escHtml(input.text), parse_mode: "HTML",
+      payload: { chat_id: chatId, text: input.text, parse_mode: "HTML", link_preview_options: {is_disabled: true},
         ...(input.replyMarkup ? { reply_markup: input.replyMarkup } : {}) } };
-    store.enqueue("telegram", anchor?.conversation ?? `${chatId}:0:control`, job, id, 0);
+    store.enqueue("telegram", anchor?.conversation ?? `${chatId}:0:control`, job, id, priority);
+  })();
+}
+
+/** One quiet progress bubble per short turn update, with paced, coalesced edits and durable receipts. */
+export function enqueueProgress(store: GatewayStore, id: string, turnKey: string, chatId: string, text: string,
+  options: {workspaceId: string; sessionId: string; threadId?: number | null}): void {
+  text = telegramReplyText(text);
+  if (!text) return;
+  const chunks = markdownToTelegramChunks(text);
+  // Long progress reports remain complete, using the normal multi-message path.
+  if (chunks.length !== 1) { enqueueText(store, id, chatId, text, {...options, markdown: true, silent: true}); return; }
+  store.db.transaction(() => {
+    const key = `telegram-progress:${turnKey}`;
+    const prior = store.get<{anchorId: string; text: string}>(key);
+    if (prior?.text === chunks[0]) return;
+    if (!prior) {
+      enqueueText(store, id, chatId, text, {...options, markdown: true, silent: true});
+      store.set(key, {anchorId: `${id}:0`, text: chunks[0], updatedAt: Date.now()});
+    } else {
+      enqueueEdit(store, `${id}:edit`, {...options, chatId, anchorId: prior.anchorId, text: chunks[0]}, 10);
+      store.set(key, {...prior, text: chunks[0], updatedAt: Date.now()});
+    }
   })();
 }
 
@@ -134,7 +166,7 @@ export function enqueueStatus(store: GatewayStore, id: string,
 function asMessage(job: TelegramJob): TelegramJob {
   const payload: Record<string, any> = { ...job.payload, disable_notification: true };
   delete payload.message_id;
-  const message: TelegramJob = { ...job, method: "sendMessage", payload };
+  const message: TelegramJob = { ...job, method: "sendMessage", payload, replacementOf: job.statusOf };
   delete message.statusOf;
   return message;
 }
@@ -153,7 +185,8 @@ export class TelegramDelivery {
     if (wait > 0) { this.store.retry(row.id, "paced", wait); return; }
     if (job.statusOf) {
       const anchor = this.store.row(job.statusOf);
-      const receipt = anchor?.state === "done" && anchor.result ? JSON.parse(anchor.result) : undefined;
+      const receipt = this.store.get<{message_id: number}>(`telegram-replacement:${job.statusOf}`) ??
+        (anchor?.state === "done" && anchor.result ? JSON.parse(anchor.result) : undefined);
       if (receipt?.message_id) job.payload.message_id = receipt.message_id;
       else if (anchor && ["pending", "running"].includes(anchor.state) && now - row.created_at < STATUS_ANCHOR_WAIT_MS) {
         this.store.retry(row.id, "Waiting for the acknowledgement", 1000); return;
@@ -189,6 +222,9 @@ export class TelegramDelivery {
           durableJob.workspaceId,
           durableJob.sessionId,
         );
+        if (result?.message_id && durableJob.replacementOf) this.store.set(`telegram-replacement:${durableJob.replacementOf}`, {
+          message_id: result.message_id, anchorId: durableJob.replacementOf, updatedAt: Date.now(),
+        });
         if (result?.message_id && job.decisionId) this.store.linkDecision(String(payload.chat_id), result.message_id, job.decisionId);
         if (result?.message_thread_id && job.method === "createForumTopic" && job.workspaceId) {
           updateWorkspaceThreadId(job.workspaceId, result.message_thread_id);

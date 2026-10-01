@@ -87,3 +87,24 @@ test("invalid Telegram HTML is rejected before it can enter the delivery queue",
     "<code><b>nested markup</b></code>",
   ]) assert.throws(() => splitTelegramHtml(html), /Telegram HTML/);
 });
+
+test("Telegram renders lists, quotes and Markdown tables for a phone screen", () => {
+  assert.deepEqual(markdownToTelegramChunks("## Result\n- **Fixed** attachments\n- [x] Tests passed\n\n> Ready to ship"),
+    ["<b>Result</b>\n• <b>Fixed</b> attachments\n☑ Tests passed\n\n<blockquote>Ready to ship</blockquote>"]);
+  assert.deepEqual(markdownToTelegramChunks("| Check | Result |\n| --- | --- |\n| Tests | **Passed** |\n| Build | `ok` |"),
+    ["<b>Tests</b>\n• <b>Result:</b> <b>Passed</b>\n\n<b>Build</b>\n• <b>Result:</b> <code>ok</code>"]);
+});
+
+test("URLs stay intact through emphasis parsing, while labels and underscore emphasis render", () => {
+  assert.deepEqual(markdownToTelegramChunks("__Done__ _now_ [**report**](https://example.com/a_*literal*_b)"),
+    ['<b>Done</b> <i>now</i> <a href="https://example.com/a_*literal*_b"><b>report</b></a>']);
+  assert.deepEqual(markdownToTelegramChunks("task_id and https://example.com/a_*literal*_b"),
+    ["task_id and https://example.com/a_*literal*_b"]);
+});
+
+test("long quotes split with balanced tags and retain their content", () => {
+  const chunks = markdownToTelegramChunks(`> ${"q".repeat(8000)}`);
+  assert.equal(chunks.length, 3);
+  for (const chunk of chunks) assert.match(chunk, /^<blockquote>q+<\/blockquote>$/);
+  assert.equal(chunks.map(visibleText).join(""), "q".repeat(8000));
+});

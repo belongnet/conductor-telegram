@@ -34,6 +34,10 @@ The bot polls local Conductor sessions every 5 seconds and Cloud sessions every 
 
 In cloud-only mode, agent replies, questions, progress reports, and artifact links render Markdown as Telegram rich text, including bold, italics, strikethrough, inline code, code blocks, and clickable web links. Long replies keep their formatting across messages; answer buttons appear on the last message of a long question. Local file links remain readable as a label and path, and formatting that cannot be rendered safely falls back to literal text.
 
+Lists, checkboxes, and quotes use Telegram formatting; Markdown tables become compact labelled records for phone screens. Link previews are disabled. Known bridge setup instructions and signed attachment download links are filtered from agent replies.
+
+When Conductor identifies a message as commentary, updates for that turn reuse one quiet progress bubble. Pending edits coalesce and follow the usual Telegram pacing and rate-limit retries; final answers arrive separately. This updates on the Cloud polling cadence, not token by token: the current Conductor worker does not forward Codex text deltas. Replies without a commentary phase and long progress reports retain normal delivery.
+
 Each message that starts, continues, or controls Cloud work gets one status card. The acknowledgement arrives silently and is edited in place as the task is handed to the agent and when it finishes. Failures update the card to `Not done: …`; a failure reported more than 15 seconds after the acknowledgement also sends a notification. A fallback to another model names the model that stopped, why, and the one taking over, and is also posted silently in the workspace's topic when the card is elsewhere or more than 15 seconds old. Agents in workspaces the gateway created are told about the Telegram MCP tools; agents in workspaces discovered from Conductor are asked to answer inline instead.
 
 ## Architecture
