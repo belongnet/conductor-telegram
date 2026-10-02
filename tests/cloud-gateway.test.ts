@@ -2490,25 +2490,103 @@ test("blocked gateway rows answer in the chat that asked, and a raw update repor
   assert.equal(update.chat_id, "42"); assert.equal(update.message_thread_id, undefined);
 }));
 
-test("a workspace Conductor deletes during provisioning fails the launch once, with Conductor's reason", () => fixture(async f => {
+/** Runs a row again now, as the queue would once its wait is over. */
+async function again(f: ReturnType<typeof createFixture>, id = "launch"): Promise<void> {
+  f.store.db.prepare("UPDATE gateway_queue SET available_at=0 WHERE id=?").run(id);
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+}
+/** Why Conductor destroyed a workspace it was still creating, as it reports it. */
+const destroyed = {workspaceId: "w1", status: "deleted",
+  errorMessage: "Failed to create workspace branch conductor/x: fatal: token ghp_abcdefghij123456 https://github.com/org/repo\n\t.conductor/settings.local.toml"};
+
+test("a workspace Conductor deletes during provisioning fails the launch once, with Conductor's reason, and no topic was opened for it", () => fixture(async f => {
   f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
   let statusReads = 0;
-  f.api.getWorkspaceStatus = (async () => { statusReads++; return {workspaceId: "w1", status: "deleted",
-    errorMessage: "Failed to create workspace branch conductor/x: fatal: token ghp_abcdefghij123456 https://github.com/org/repo\n\t.conductor/settings.local.toml"}; }) as any;
+  f.api.getWorkspaceStatus = (async () => ++statusReads === 1 ? {workspaceId: "w1", status: "initializing"} : destroyed) as any;
   await f.launch();
+  assert.equal(f.store.row("launch")!.state, "pending", "Conductor is still preparing it");
+  await again(f);
   const row = f.store.row("launch")!;
-  assert.equal(row.state, "blocked"); assert.equal(row.attempts, 1);
+  assert.equal(row.state, "blocked"); assert.equal(row.attempts, 2);
   assert.match(row.error!, /^Conductor could not create the workspace: Failed to create workspace branch.+settings\.local\.toml$/);
   assert.doesNotMatch(row.error!, /ghp_|deploy:/, "relayed git output is scrubbed");
   const ws = getWorkspace(f.ws.id)!;
   assert.equal(ws.status, "failed"); assert.ok(ws.archivedAt);
   assert.equal((f.store.db.prepare("SELECT revoked FROM gateway_credentials WHERE workspace_id=?").get(f.ws.id) as any).revoked, 1);
-  // Telegram had not opened the topic yet: it is cancelled with everything waiting for it, rather than left to hold the lane.
-  assert.equal(f.store.row(`create-topic:${f.ws.id}`)!.state, "done");
-  assert.equal(f.store.row("launch:created:0")!.state, "done");
-  assert.equal(f.store.row(`retire-topic:${f.ws.id}`), undefined);
+  // A topic is opened for a workspace that exists. This one never did, so there is nothing to open, announce or close.
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE json_extract(payload,'$.method') LIKE '%ForumTopic'").get() as any).n, 0);
+  assert.equal(f.store.get(`topic-required:${f.ws.id}`), undefined);
+  assert.equal(f.store.row("launch:created:0"), undefined);
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
-  assert.equal(statusReads, 1, "a retired workspace is no longer polled");
+  assert.equal(statusReads, 2, "a retired workspace is no longer polled");
+}));
+
+test("a workspace's topic opens once Conductor has it ready, and its link is announced there once", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  enqueueText(f.store, "cmd:reply", "-42", "Task received and queued.", {priority: 0, silent: true});
+  let ready = false;
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: ready ? "ready" : "initializing"})) as any;
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix the bug", statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row(`create-topic:${f.ws.id}`), undefined, "nothing is opened while Conductor may still fail to create it");
+  assert.equal(f.store.get(`topic-required:${f.ws.id}`), undefined);
+  assert.equal(f.store.row("launch:created:0"), undefined);
+  // The card is the only place to reach the workspace from until its topic exists.
+  assert.equal(JSON.parse(f.store.row("launch:provisioning")!.payload).payload.text, "Conductor is preparing the workspace.\nconductor://w1");
+  ready = true;
+  await again(f);
+  const topic = JSON.parse(f.store.row(`create-topic:${f.ws.id}`)!.payload);
+  assert.equal(topic.method, "createForumTopic"); assert.equal(topic.payload.name, "test");
+  assert.equal(f.store.get(`topic-required:${f.ws.id}`), true);
+  assert.equal(JSON.parse(f.store.row("launch:created:0")!.payload).payload.text, "Conductor workspace created: conductor://w1");
+  const order = (f.store.db.prepare("SELECT id FROM gateway_queue WHERE id IN (?, 'launch:created:0') ORDER BY rowid").all(`create-topic:${f.ws.id}`) as any[]).map(r => r.id);
+  assert.deepEqual(order, [`create-topic:${f.ws.id}`, "launch:created:0"], "the topic is asked for before anything that waits for it");
+  assert.deepEqual(f.counts(), {creates: 1, sends: 1});
+  assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined, "the link is kept only until it is announced");
+}));
+
+test("a workspace destroyed mid-launch is reported by its launch, never by the poller as work that went away", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  let gone = false;
+  f.api.getWorkspaceStatus = (async () => gone ? destroyed : {workspaceId: "w1", status: "initializing"}) as any;
+  await f.launch();
+  // The poller comes round before the launch's next attempt.
+  gone = true;
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(getWorkspace(f.ws.id)!.archivedAt, null, "left to its launch");
+  assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined);
+  assert.ok(f.store.get<number>(`poll-after:${f.ws.id}`)! - Date.now() <= 5_000, "and looked at again soon");
+  await again(f);
+  assert.match(f.store.row("launch")!.error!, /^Conductor could not create the workspace: Failed to create workspace branch/);
+  assert.equal(getWorkspace(f.ws.id)!.status, "failed");
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined, "said once, by the launch");
+}));
+
+test("bound work in a forum gets its topic from its next message when its launch never asked for one", () => fixture(async f => {
+  await f.launch();
+  // As after a launch that stopped short of its topic: bound in Conductor, living in a forum, no topic.
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  f.engine.queue("next", {type: "send", trackedId: f.ws.id, prompt: "next"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(JSON.parse(f.store.row(`create-topic:${f.ws.id}`)!.payload).method, "createForumTopic");
+  assert.equal(f.store.get(`topic-required:${f.ws.id}`), true);
+}));
+
+test("retiring a workspace never closes its topic once newer work has moved into it", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 77);
+  // /run in that topic rolled it onto new work.
+  const next = createWorkspace({name: "Next task", prompt: "Next task", repoPath: "conductor-project:p1", telegramChatId: "-42"});
+  updateWorkspaceThreadId(next.id, 77);
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: "archived"})) as any;
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.ok(getWorkspace(f.ws.id)!.archivedAt);
+  assert.equal(f.store.row(`retire-topic:${f.ws.id}`), undefined);
 }));
 
 test("a workspace that disappears later is retired, and only a topic this gateway opened is closed", () => fixture(async f => {

@@ -348,8 +348,89 @@ test("native rename cycles retain unique operations and archived work closes its
   f.workspaces.length = 0;
   f.api.getWorkspaceStatus = async () => ({workspaceId: "native-1", status: "archived"});
   await f.sync.sync(); assert.ok(getWorkspace(id)?.archivedAt);
-  assert.equal(JSON.parse(f.store.row(`sync-close:${id}`)!.payload).method, "closeForumTopic");
+  assert.equal(JSON.parse(f.store.row(`retire-topic:${id}`)!.payload).method, "closeForumTopic");
   assert.equal(f.store.bindings().length, 1); assert.equal(getThreadCursor(id, "recent")?.lastMessageId, "baseline");
+}));
+
+/** Conductor no longer lists the workspace, and says it is archived. */
+function archiveInConductor(f: ReturnType<typeof makeFixture>): void {
+  f.workspaces.length = 0;
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "native-1", status: "archived"});
+}
+const closes = (f: ReturnType<typeof makeFixture>) =>
+  (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE json_extract(payload,'$.method')='closeForumTopic'").get() as {n: number}).n;
+
+test("a workspace Conductor is still creating is not attached, so one that never exists leaves no topic behind", () => fixture(async f => {
+  f.workspaces[0].state = "initializing";
+  await f.sync.sync();
+  assert.equal(f.store.bindings().length, 0);
+  assert.equal(f.store.db.prepare("SELECT 1 FROM gateway_queue WHERE kind='telegram'").get(), undefined, "no topic, no connection note");
+  // Conductor could not create it after all.
+  const failed = f.workspaces.pop();
+  await f.sync.sync();
+  assert.equal(f.store.bindings().length, 0);
+  assert.equal(f.store.db.prepare("SELECT 1 FROM gateway_queue WHERE kind='telegram'").get(), undefined);
+  // One that does come up is attached on the next scan.
+  f.workspaces.push({...failed, state: "ready"});
+  await f.sync.sync();
+  const [{id}] = f.store.bindings();
+  assert.ok(f.store.row(`create-topic:${id}`));
+}));
+
+test("discovery leaves a workspace this gateway is still launching to its launch: no topic, no rename, no close", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Fix the login bug");
+  f.engine.queue("launching", {type: "launch", trackedId: ws.id, projectId: "project", prompt: "Fix the login bug"});
+  f.workspaces[0].name = "Named by Conductor";
+  await f.sync.sync();
+  assert.equal(f.store.get(`cloud-synced:${ws.id}`), undefined);
+  assert.equal(f.store.row(`create-topic:${ws.id}`), undefined, "its launch opens the topic once the workspace exists");
+  assert.equal(getWorkspace(ws.id)?.name, "Fix the login bug");
+  // Conductor destroys it before its launch has looked again. The launch reports that, with Conductor's reason.
+  archiveInConductor(f);
+  await f.sync.sync();
+  assert.equal(getWorkspace(ws.id)?.archivedAt, null);
+  assert.equal(closes(f), 0);
+}));
+
+test("once its launch is over, a gateway workspace is followed like any other", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Fix the login bug");
+  f.engine.queue("launching", {type: "launch", trackedId: ws.id, projectId: "project", prompt: "Fix the login bug"});
+  f.store.finish("launching");
+  await f.sync.sync();
+  assert.equal(f.store.get(`cloud-synced:${ws.id}`), true);
+  assert.ok(f.store.row(`create-topic:${ws.id}`), "bound work with no topic gets one");
+}));
+
+test("an archived workspace living in a repository topic, or in one the gateway did not open, closes nothing", () => fixture(async f => {
+  upsertRepoTopic({chatId: "-42", repoPath: "/Users/legacy/repos/repo", repoName: "repo", telegramThreadId: 7});
+  const {ws} = gatewayWorkspace(f, "Fix the login bug", 7);
+  await f.sync.sync();
+  assert.equal(f.store.get(`cloud-synced:${ws.id}`), true);
+  archiveInConductor(f);
+  await f.sync.sync();
+  assert.ok(getWorkspace(ws.id)?.archivedAt);
+  assert.equal(closes(f), 0, "the repository's topic stays open");
+}));
+
+test("an archived workspace living in a topic the owner made closes nothing", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Fix the login bug");
+  updateWorkspaceThreadId(ws.id, 9); // Started with /run inside a topic the owner created.
+  await f.sync.sync();
+  archiveInConductor(f);
+  await f.sync.sync();
+  assert.ok(getWorkspace(ws.id)?.archivedAt);
+  assert.equal(closes(f), 0);
+}));
+
+test("a discovered workspace archived before its topic opened never gets one", () => fixture(async f => {
+  await f.sync.sync(); const [{id}] = f.store.bindings();
+  assert.equal(f.store.row(`create-topic:${id}`)!.state, "pending");
+  archiveInConductor(f);
+  await f.sync.sync();
+  assert.ok(getWorkspace(id)?.archivedAt);
+  assert.match(f.store.row(`create-topic:${id}`)!.result!, /suppressed/, "the topic is cancelled, not opened and then closed");
+  assert.match(f.store.row("sync-intro:native-1:0")!.result!, /suppressed/, "and nothing is left waiting for it");
+  assert.equal(closes(f), 0);
 }));
 
 test("a gateway workspace's creation key is never shown as its name, whatever tag surrounds it", () => fixture(async f => {

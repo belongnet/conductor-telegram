@@ -3,7 +3,7 @@ import {repositoryRemoteIdentity} from "../lanes/repository-identity.js";
 import {createWorkspace, getWorkspace, updateWorkspaceConductorBinding, upsertThreadCursor} from "../store/queries.js";
 import {CloudEngine, transcriptText} from "./engine.js";
 import {nativeSessionProvider} from "./messages.js";
-import {creationKey, threadName, workspaceName} from "./names.js";
+import {clip, creationKey, threadName, workspaceName} from "./names.js";
 import {enqueueTelegram} from "./telegram.js";
 
 /** Discovery only attaches existing work; it never sends, wakes, cancels, or creates native work. */
@@ -56,6 +56,8 @@ export class CloudWorkspaceSync {
 
   private async attach(remote: ConductorApiWorkspace, projects: ConductorApiProject[]): Promise<void> {
     const {store, api} = this.engine;
+    // Conductor is still creating it. It is followed once it exists, and one that never does leaves no topic behind.
+    if (remote.state === "initializing") return;
     const identity = repositoryRemoteIdentity(remote.repoUrl ?? "");
     const candidates = projects.filter(p => identity && repositoryRemoteIdentity(p.gitRemote) === identity && (!remote.projectId || remote.projectId === p.id));
     if (candidates.length !== 1) throw new Error("Workspace requires a unique verified native project and repository identity");
@@ -66,7 +68,9 @@ export class CloudWorkspaceSync {
     if (matches.length > 1) throw new Error("Workspace has multiple persisted bindings; reconcile before syncing");
     if (matches.length) {
       const {id} = matches[0], ws = getWorkspace(id);
-      if (!ws || ws.telegramChatId !== this.chatId || store.get(`stop:${id}`) || ws.archivedAt) return;
+      // A workspace this gateway is still launching is its launch's: that opens its topic, and reports it if Conductor
+      // destroys it first.
+      if (!ws || ws.telegramChatId !== this.chatId || store.get(`stop:${id}`) || ws.archivedAt || this.engine.launching(id)) return;
       store.set(`cloud-synced:${id}`, true);
       // A workspace the gateway created is called by its creation key until it takes its first thread's title.
       // The key is never a name to show, whatever tag an outside renamer put around it.
@@ -130,17 +134,13 @@ export class CloudWorkspaceSync {
     if (!ws || ws.telegramThreadId) return;
     this.engine.store.set(`topic-required:${id}`, true);
     enqueueTelegram(this.engine.store, `create-topic:${id}`, {method: "createForumTopic", workspaceId: id,
-      payload: {chat_id: this.chatId, name: name.slice(0, 128)}}, 20);
+      payload: {chat_id: this.chatId, name: clip(name, 128)}}, 20);
   }
 
+  /** Retired as the engine retires any workspace, so only a topic the gateway opened for it, and still its own, is closed. */
   private close(id: string): void {
-    const {store} = this.engine, ws = getWorkspace(id);
-    if (!ws || ws.archivedAt || store.get(`stop:${id}`)) return;
-    store.assertWriter?.();
-    store.db.transaction(() => {
-      store.db.prepare("UPDATE workspaces SET status='archived',archived_at=? WHERE id=?").run(new Date().toISOString(), id);
-      if (ws.telegramThreadId) enqueueTelegram(store, `sync-close:${id}`, {method: "closeForumTopic", workspaceId: id,
-        payload: {chat_id: this.chatId, message_thread_id: ws.telegramThreadId}}, 20);
-    })();
+    const ws = getWorkspace(id);
+    if (!ws || ws.archivedAt || this.engine.store.get(`stop:${id}`)) return;
+    this.engine.retire(id, "archived");
   }
 }
