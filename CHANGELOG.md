@@ -2,7 +2,7 @@
 
 All notable changes to conductor-telegram are documented here.
 
-## [Unreleased]
+## [0.15.1] - 2026-10-02
 
 ### Fixed
 - Workspaces started from Telegram are called by their task again, in Conductor and in their topic. The gateway creates each one under a `telegram-<id>` key, which it needs to recover a lost create response, and Conductor never titles a workspace created with a name, so the minute-by-minute sync copied that key over the task's first line and topics ended up called `[agents] telegram-b9bed051-9e94-…`. The key now stays out of sight: the topic opens under the task's first line, and as soon as Conductor has titled the workspace's first thread, which it does from the task even when the agent's first turn fails, the workspace takes that title in Conductor and in its topic. A tag another tool put around the key, such as `[agents] `, is kept. A name given with `/rename` or in Conductor since creation is never replaced, including by a title rename that was already on its way.
