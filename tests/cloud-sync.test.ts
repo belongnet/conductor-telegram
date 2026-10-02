@@ -368,6 +368,37 @@ test("a gateway workspace's creation key is never shown as its name, whatever ta
   assert.equal(JSON.parse(f.store.row(`sync-rename:${ws.id}:1`)!.payload).payload.name, "[agents] Login fix");
 }));
 
+test("a status tag another tool flips on a name is not a rename, so the topic keeps its name", () => fixture(async f => {
+  f.workspaces[0].name = "[agents] Media acquisition strategy";
+  await f.sync.sync(); const [{id}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
+  for (const name of ["[!] [agents] Media acquisition strategy", "[agents] Media acquisition strategy", "[!] [agents] Media acquisition strategy"]) {
+    f.workspaces[0].name = name; await f.sync.sync();
+  }
+  assert.equal(f.store.db.prepare("SELECT 1 FROM gateway_queue WHERE id LIKE 'sync-rename:%'").get(), undefined);
+  assert.equal(getWorkspace(id)?.name, "[agents] Media acquisition strategy");
+  // A real rename is still mirrored, without the status in front of it.
+  f.workspaces[0].name = "[!] [agents] Media acquisition plan";
+  await f.sync.sync();
+  assert.equal(getWorkspace(id)?.name, "[agents] Media acquisition plan");
+  assert.equal(getWorkspace(id)?.conductorWorkspaceName, "[agents] Media acquisition plan");
+  assert.equal(JSON.parse(f.store.row(`sync-rename:${id}:1`)!.payload).payload.name, "[agents] Media acquisition plan");
+}));
+
+test("a workspace discovered while flagged is connected under its name, and a record that kept a flag is corrected once", () => fixture(async f => {
+  f.workspaces[0].name = "[!] [events] Source recovery";
+  await f.sync.sync(); const [{id}] = f.store.bindings();
+  assert.equal(getWorkspace(id)?.name, "[events] Source recovery");
+  assert.equal(getWorkspace(id)?.conductorWorkspaceName, "[events] Source recovery");
+  assert.equal(JSON.parse(f.store.row(`create-topic:${id}`)!.payload).payload.name, "[events] Source recovery");
+  assert.match(JSON.parse(f.store.row("sync-intro:native-1:0")!.payload).payload.text, /^Connected to \[events\] Source recovery\n/);
+  // A record written by an earlier release still holds the flag.
+  updateWorkspaceThreadId(id, 7);
+  f.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run("[!] [events] Source recovery", "[!] [events] Source recovery", id);
+  await f.sync.sync(); await f.sync.sync();
+  const renames = f.store.db.prepare("SELECT json_extract(payload,'$.payload.name') AS name FROM gateway_queue WHERE id LIKE 'sync-rename:%'").all() as Array<{name: string}>;
+  assert.deepEqual(renames.map(rename => rename.name), ["[events] Source recovery"]);
+}));
+
 /** A workspace this gateway launched, not one discovery found: bound to the Conductor workspace it created, "recent" its first thread. */
 function gatewayWorkspace(f: ReturnType<typeof makeFixture>, name: string, threadId?: number) {
   const ws = createWorkspace({name, prompt: name, repoPath: "conductor-project:project", telegramChatId: "-42"});

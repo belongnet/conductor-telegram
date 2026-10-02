@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle } from "../src/cloud/names.js";
+import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle, workspaceName } from "../src/cloud/names.js";
 import { recoverableProviderError, stopReason } from "../src/cloud/engine.js";
 
 test("a task is called by its first line, cut at a word", () => {
@@ -84,6 +84,20 @@ test("a thread's title is taken as data: one line, no tags, nothing invisible, n
   // Scripts that need joiners keep them.
   assert.equal(threadTitle("می‌خواهم"), "می‌خواهم");
   assert.equal(threadTitle(`${"a".repeat(99)} ${"b".repeat(20)}`), "a".repeat(99));
+});
+
+test("a leading tag of marks alone is a status, not part of a workspace's name", () => {
+  assert.equal(workspaceName("[!] [checkin] Outage Alerts Investigation"), "[checkin] Outage Alerts Investigation");
+  assert.equal(workspaceName("[events] Resume Instagram organizer backfill"), "[events] Resume Instagram organizer backfill");
+  assert.equal(workspaceName("[!][agents] Media acquisition strategy"), "[agents] Media acquisition strategy");
+  assert.equal(workspaceName("  [!]  [?] Login fix"), "Login fix");
+  // A tag with a letter or a digit in it is identity that other tools read.
+  assert.equal(workspaceName("[final:L1a:codex:r3] Review"), "[final:L1a:codex:r3] Review");
+  assert.equal(workspaceName("[2] Second attempt"), "[2] Second attempt");
+  assert.equal(workspaceName("Fix [!] in the parser"), "Fix [!] in the parser", "only a tag in front is a status");
+  // A name that is nothing but a status keeps it: no name at all would be worse.
+  assert.equal(workspaceName("[!]"), "[!]");
+  assert.equal(workspaceName(""), "");
 });
 
 test("a real name shaped like a gateway key keeps its name", () => {

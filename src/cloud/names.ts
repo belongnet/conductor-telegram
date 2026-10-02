@@ -29,6 +29,15 @@ export function taskTitle(text: string, fallback: string, max = 60): string {
   return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
+/**
+ * A leading tag of marks alone, such as "[!]", is a status another tool switches on and off, not part of the name:
+ * mirrored, it would rename the topic on every flip. A tag with a letter or digit in it, such as "[agents]", is
+ * identity that other tools read, and stays.
+ */
+export function workspaceName(name: string): string {
+  return name.replace(/^(?:\s*\[[^\]\p{L}\p{N}]*\])+\s*/u, "") || name;
+}
+
 /** A thread the gateway opened is created under "Task" or "Review" and the queue row that opened it. */
 const THREAD_KEY = /^(Task|Review) ((update|route|recover):\S*)$/;
 

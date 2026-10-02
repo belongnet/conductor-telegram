@@ -3,7 +3,7 @@ import {repositoryRemoteIdentity} from "../lanes/repository-identity.js";
 import {createWorkspace, getWorkspace, updateWorkspaceConductorBinding, upsertThreadCursor} from "../store/queries.js";
 import {CloudEngine, transcriptText} from "./engine.js";
 import {nativeSessionProvider} from "./messages.js";
-import {creationKey, threadName} from "./names.js";
+import {creationKey, threadName, workspaceName} from "./names.js";
 import {enqueueTelegram} from "./telegram.js";
 
 /** Discovery only attaches existing work; it never sends, wakes, cancels, or creates native work. */
@@ -60,6 +60,8 @@ export class CloudWorkspaceSync {
     const candidates = projects.filter(p => identity && repositoryRemoteIdentity(p.gitRemote) === identity && (!remote.projectId || remote.projectId === p.id));
     if (candidates.length !== 1) throw new Error("Workspace requires a unique verified native project and repository identity");
     const project = candidates[0];
+    // What the workspace is called here: a status tag another tool flips is not a rename, so it is never mirrored.
+    const name = workspaceName(remote.name);
     const matches = store.bindings().filter(({binding}) => binding.workspaceId === remote.id);
     if (matches.length > 1) throw new Error("Workspace has multiple persisted bindings; reconcile before syncing");
     if (matches.length) {
@@ -69,15 +71,15 @@ export class CloudWorkspaceSync {
       // A workspace the gateway created is called by its creation key until it takes its first thread's title.
       // The key is never a name to show, whatever tag an outside renamer put around it.
       const keyed = remote.name.includes(creationKey(id));
-      if (!keyed && ws.name !== remote.name) {
+      if (!keyed && ws.name !== name) {
         store.db.transaction(() => {
           const revision = (store.get<number>(`sync-revision:${id}`) ?? 0) + 1;
           store.set(`sync-revision:${id}`, revision);
           // A rename made in Conductor is mirrored into the record and the topic.
-          this.engine.retitle(id, remote.name, `sync-rename:${id}:${revision}`);
+          this.engine.retitle(id, name, `sync-rename:${id}:${revision}`);
         })();
       }
-      this.topic(id, keyed ? ws.name : remote.name);
+      this.topic(id, keyed ? ws.name : name);
       return;
     }
     // A workspace this gateway created carries its creation key until it is titled. Its launch binds it, even after a
@@ -100,24 +102,24 @@ export class CloudWorkspaceSync {
     // Network reads can overlap a gateway launch. Recheck the canonical identity before inserting.
     if (store.bindings().some(({binding}) => binding.workspaceId === remote.id)) return;
     store.db.transaction(() => {
-      const ws = createWorkspace({name: remote.name, prompt: "Existing Conductor cloud workspace", repoPath: `conductor-project:${project.id}`, telegramChatId: this.chatId});
+      const ws = createWorkspace({name, prompt: "Existing Conductor cloud workspace", repoPath: `conductor-project:${project.id}`, telegramChatId: this.chatId});
       store.bind(ws.id, {workspaceId: remote.id, projectId: project.id, repoUrl: project.gitRemote,
         repoSlug: identity!.replace(/^github.com\//, ""), branch: null, prUrl: null, sessionId: selected.session.id, ...provider, stopped: false, synced: true});
       updateWorkspaceConductorBinding(ws.id, {workspaceId: remote.id, sessionId: selected.session.id, backendKind: "cloud-api"});
       store.db.prepare("UPDATE workspaces SET conductor_workspace_name=?,status=? WHERE id=?")
-        .run(remote.name, snapshots.some(s => s.status.status === "working") ? "running" : "done", ws.id);
+        .run(name, snapshots.some(s => s.status.status === "working") ? "running" : "done", ws.id);
       store.set(`cloud-synced:${ws.id}`, true);
       for (const {session, tail} of snapshots) {
         const last = tail.at(-1);
         upsertThreadCursor({workspaceId: ws.id, sessionId: session.id, backendKind: "cloud-api",
           lastForwardedRowid: last?.sessionIndex ?? -1, lastMessageId: last?.id ?? null, title: session.name});
       }
-      this.topic(ws.id, remote.name);
+      this.topic(ws.id, name);
       const input = store.get("cloud-sync-input") === "commands"
         ? `During migration use /send@${store.get<string>("telegram-bot-username")} <text> and /threads@${store.get<string>("telegram-bot-username")} to select a thread. Ordinary text and voice replies activate after the old gateway is disabled.`
         : "Use /threads to choose a thread for Telegram. In a workspace with multiple threads, your first message waits for a thread choice. Replying to a forwarded message targets that message’s exact thread. Telegram’s selection is separate from the tab open in Conductor.";
       this.engine.notify(`sync-intro:${remote.id}`, ws.id,
-        `Connected to ${remote.name}\n${remote.deepLink}\n\nLatest context: ${threadName(selected.session.name, selected.session.id)} (${provider.model})\n${input}\nExisting work continues unchanged.`, selected.session.id, {silent: true});
+        `Connected to ${name}\n${remote.deepLink}\n\nLatest context: ${threadName(selected.session.name, selected.session.id)} (${provider.model})\n${input}\nExisting work continues unchanged.`, selected.session.id, {silent: true});
       const latest = [...selected.tail].reverse().find(m => transcriptText(m));
       if (latest) this.engine.notify(`sync-snapshot:${remote.id}`, ws.id, `Latest Conductor reply\n\n${transcriptText(latest)}`, selected.session.id, {silent: true});
     })();

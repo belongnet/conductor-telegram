@@ -13,7 +13,7 @@ import { FileBridge } from "./bridge.js";
 import { CloudGitHub, GitHubError, ProjectCatalog, type CloudPr } from "./catalog.js";
 import { enqueueTelegram, enqueueText, enqueueStatus, enqueueProgress, TerminalError, safeDetail, statusCardSeen, topicOpening, type TelegramJob } from "./telegram.js";
 import { telegramReplyText } from "../bot/format.js";
-import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle } from "./names.js";
+import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle, workspaceName } from "./names.js";
 import type { Workspace } from "../types/index.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
@@ -420,7 +420,7 @@ export class CloudEngine {
         this.store.bind(ws.id, binding!);
         updateWorkspaceConductorBinding(ws.id, { workspaceId: created.workspaceId, sessionId: created.sessionId, backendKind: "cloud-api" });
         // The creation key is not a name. Until the first thread's title replaces it, the workspace goes by its task.
-        if (!remote.name.includes(name)) this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(remote.name, ws.id);
+        if (!remote.name.includes(name)) this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(workspaceName(remote.name), ws.id);
         this.store.set(`session:${created.sessionId}`, { trackedId: ws.id, ...provider, role: "task" } satisfies SessionState);
       })();
       this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${created.deepLink}`, undefined, { silent: true });
@@ -474,11 +474,12 @@ export class CloudEngine {
 
   /**
    * A workspace has one name: its record, its last known Conductor name and, when an edit is asked for, its topic. A
-   * repo topic keeps its repository's name.
+   * repo topic keeps its repository's name. A status tag in front of the name stays in Conductor, where it changes.
    */
   retitle(trackedId: string, name: string, topicJobId?: string): void {
     const ws = getWorkspace(trackedId);
     if (!ws) return;
+    name = workspaceName(name);
     this.store.assertWriter?.();
     this.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(name, name, trackedId);
     if (topicJobId && ws.telegramThreadId && !getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) enqueueTelegram(this.store, topicJobId, {method: "editForumTopic", workspaceId: trackedId,

@@ -639,6 +639,24 @@ test("a launched workspace takes its first thread's Conductor title once, keepin
   assert.equal(f.renames.length, 1, "the title is adopted once");
 }));
 
+test("a status tag in front of the key stays in Conductor and out of the workspace's name in Telegram", () => fixture(async f => {
+  await keyedLaunch(f);
+  // The owner's renamer flags a workspace that is waiting on them, on and off all day.
+  f.remote.name = `[!] [agents] telegram-${f.ws.id}`;
+  f.sessions[0].name = "Auxiliary LLM Error Fix";
+  await poll(f);
+  assert.deepEqual(f.renames, ["[!] [agents] Auxiliary LLM Error Fix"], "Conductor's name keeps every tag around the key");
+  assert.equal(getWorkspace(f.ws.id)?.name, "[agents] Auxiliary LLM Error Fix");
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, "[agents] Auxiliary LLM Error Fix");
+  assert.equal(JSON.parse(f.store.row(`title-topic:${f.ws.id}`)!.payload).payload.name, "[agents] Auxiliary LLM Error Fix");
+}));
+
+test("a name Conductor returns at creation is recorded without a status tag", () => fixture(async f => {
+  f.remote.name = "[!] Named at creation";
+  await f.launch();
+  assert.equal(getWorkspace(f.ws.id)?.conductorWorkspaceName, "Named at creation");
+}));
+
 test("a name given since creation stands, and /rename outranks a thread title that arrives later", () => fixture(async f => {
   await keyedLaunch(f);
   f.engine.queue("update:5:action", {type: "rename", trackedId: f.ws.id, prompt: "Customer billing"});

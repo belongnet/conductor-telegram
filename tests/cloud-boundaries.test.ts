@@ -127,6 +127,18 @@ test("a routed new task's workspace is named by its first line, and the task is 
   assert.equal(proposed.action.prompt, text);
 }));
 
+test("the classifier and the confirmation name a workspace without its status tag", () => fixture(async f => {
+  // A stopped record sync no longer revisits can still hold a flag from an earlier release.
+  f.store.db.prepare("UPDATE workspaces SET name=? WHERE id=?").run("[!] [events] Source recovery", f.ws.id);
+  const row = f.routeRow();
+  await f.router.route(row);
+  assert.doesNotMatch(f.sends[0].message, /\[!\]/);
+  assert.match(f.sends[0].message, /"name":"\[events\] Source recovery"/);
+  f.messages.push({type: "assistant", content: JSON.stringify({action: "existing", workspaceId: f.ws.id, prompt: "Keep the request"})});
+  await f.router.route(row);
+  assert.match(JSON.parse(f.store.row("route-job:confirm:0")!.payload).payload.text, /^Send this to \[events\] Source recovery\?/);
+}));
+
 test("native router rejects unknown project IDs and workspaces from another chat", () => fixture(async f => {
   const foreign = createWorkspace({name: "Other chat", prompt: "private", repoPath: "x", telegramChatId: "99"});
   f.store.bind(foreign.id, f.binding);
