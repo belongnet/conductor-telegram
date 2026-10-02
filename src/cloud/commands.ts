@@ -7,7 +7,7 @@ import { CloudEngine, type CloudAction, type Provider } from "./engine.js";
 import { GitHubError, githubSlug } from "./catalog.js";
 import { gatewayHealth } from "./bridge.js";
 import { enqueueTelegram, enqueueText, telegramFailure, TerminalError, type TelegramCall } from "./telegram.js";
-import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getAllWorkspacesForChat,
+import { createWorkspace, getWorkspace, getWorkspaceByThreadId, getWorkspaceMessageTarget, getRetiredWorkspace, getAllWorkspacesForChat,
   getRepoTopicByThreadId, updateWorkspaceThreadId, getDecision, answerDecision, getPendingDecisionsForChat, linkTelegramMessage } from "../store/queries.js";
 import { transcribeVoiceMessage } from "../bot/ai-router.js";
 import {nativeSessionProvider, ATTACHMENTS_ONLY_PROMPT} from "./messages.js";
@@ -420,6 +420,11 @@ export class CloudCommands {
       }
     }
     if (!target && !launchProject) {
+      // A message addressed to work that is gone, by its topic or by a reply, is answered. Routed, it would be
+      // handed to other work on a guess, and the owner would be asked to confirm a target they never meant.
+      if (getRetiredWorkspace(chatId, msg.reply_to_message ? String(msg.reply_to_message.message_id) : undefined, threadId)) {
+        reply("That workspace is no longer in Conductor, so your message was not sent anywhere. Start new work with /run <project> <task>."); return;
+      }
       if (voiceNote) {
         this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId, statusId }, `${row.id}:media`);
         reply("Voice note received. Transcribing it before target confirmation."); return;

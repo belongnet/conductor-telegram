@@ -2550,6 +2550,42 @@ test("a message for a retired workspace's closed topic is dropped instead of blo
   assert.equal(f.store.backlog().blocked, 0);
 }));
 
+test("a message for work that is gone is answered where it was sent, never routed to other work", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  updateWorkspaceThreadId(f.ws.id, 77);
+  // The owner's task message in General, linked to the workspace Conductor then failed to create.
+  linkTelegramMessage("-42", "500", f.ws.id);
+  f.store.db.prepare("UPDATE workspaces SET status='failed',archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+  const sent = [
+    {message_id: 1, message_thread_id: 77, text: "Continue"},
+    {message_id: 2, message_thread_id: 77, voice: {file_id: "voice"}},
+    {message_id: 3, message_thread_id: 77, document: {file_id: "doc", file_name: "notes.pdf"}},
+    {message_id: 4, reply_to_message: {message_id: 500}, text: "try again"},
+  ];
+  for (const [i, message] of sent.entries()) {
+    f.store.ingest([{update_id: i + 1, message: {chat: {id: -42}, from: {id: 9}, ...message}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    const reply = JSON.parse(f.store.row(`update:${i + 1}:reply:0`)!.payload).payload;
+    assert.equal(reply.text, "That workspace is no longer in Conductor, so your message was not sent anywhere. Start new work with /run &lt;project&gt; &lt;task&gt;.");
+    assert.equal(reply.message_thread_id, message.message_thread_id, "said where the owner wrote");
+  }
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind IN ('route','media','cloud')").get() as any).n, 0,
+    "nothing is routed, transcribed or sent");
+  // /run starts new work in that topic, and from then on the topic's messages are that work's.
+  f.store.ingest([{update_id: 10, message: {message_id: 10, chat: {id: -42}, from: {id: 9}, message_thread_id: 77, text: "/run p1 Fix it properly"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const launch = JSON.parse(f.store.row("update:10:action")!.payload);
+  assert.equal(launch.type, "launch"); assert.notEqual(launch.trackedId, f.ws.id);
+  f.store.ingest([{update_id: 11, message: {message_id: 11, chat: {id: -42}, from: {id: 9}, message_thread_id: 77, text: "and add a test"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(JSON.parse(f.store.row("update:11:action")!.payload).trackedId, launch.trackedId, "live work wins over the retired workspace");
+  // A message that names no work at all is still the router's to place.
+  f.store.ingest([{update_id: 12, message: {message_id: 12, chat: {id: -42}, from: {id: 9}, text: "Fix the login bug in repo"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:12:route")?.kind, "route");
+}));
+
 test("a topic that opens after its workspace was retired is closed again", () => fixture(async f => {
   f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42',status='failed',archived_at=datetime('now') WHERE id=?").run(f.ws.id);
   enqueueTelegram(f.store, `create-topic:${f.ws.id}`, {method: "createForumTopic", workspaceId: f.ws.id, payload: {chat_id: "-42", name: "task"}}, 0);

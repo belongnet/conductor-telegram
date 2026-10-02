@@ -604,6 +604,39 @@ export function getWorkspaceMessageTarget(
     : undefined;
 }
 
+/**
+ * The retired work a message is addressed to: the workspace its replied-to
+ * message belongs to, else the last one its topic carried. Callers look for
+ * live work first; this only says why there is none to send to.
+ */
+export function getRetiredWorkspace(
+  chatId: string,
+  replyToMessageId: string | undefined,
+  threadId: number | undefined
+): Workspace | undefined {
+  const db = getDb();
+  const linked = replyToMessageId
+    ? db
+        .prepare(
+          `SELECT w.*
+           FROM telegram_message_links tml
+           JOIN workspaces w ON w.id = tml.workspace_id
+           WHERE tml.chat_id = ? AND tml.telegram_message_id = ? AND w.archived_at IS NOT NULL`
+        )
+        .get(chatId, replyToMessageId)
+    : undefined;
+  const row =
+    linked ??
+    (threadId
+      ? db
+          .prepare(
+            "SELECT * FROM workspaces WHERE archived_at IS NOT NULL AND telegram_chat_id = ? AND telegram_thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1"
+          )
+          .get(chatId, threadId)
+      : undefined);
+  return row ? mapWorkspaceRow(row as any) : undefined;
+}
+
 // ── Meta ────────────────────────────────────────────────────
 
 export function getMetaValue(key: string): string | null {
