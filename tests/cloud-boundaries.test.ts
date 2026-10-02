@@ -139,6 +139,38 @@ test("the classifier and the confirmation name a workspace without its status ta
   assert.match(JSON.parse(f.store.row("route-job:confirm:0")!.payload).payload.text, /^Send this to \[events\] Source recovery\?/);
 }));
 
+test("a message the classifier cannot place is declined: nothing is proposed, and the owner is told how to place it", () => fixture(async f => {
+  f.store.enqueue("route", "router", {text: "Continue", chatId: "42", threadId: 9}, "route-unclear");
+  const row = f.store.row("route-unclear")!;
+  await f.router.route(row);
+  const prompt: string = f.sends[0].message;
+  assert.match(prompt, /\{"action":"unclear"\} when choosing either would be a guess/);
+  assert.match(prompt, /Never choose by a workspace's place in the list or by a mark in its name/);
+  assert.match(prompt, /\{"action":"new","projectId":"\.\.\."\}.+\{"action":"existing","workspaceId":"\.\.\."\}/, "the answer is a choice of ID, not an echo of the request");
+  f.messages.push({type: "assistant", content: "```json\n{\"action\":\"unclear\"}\n```\n"});
+  await f.router.route(row);
+  const notice = JSON.parse(f.store.row("route-unclear:unclear:0")!.payload).payload;
+  assert.equal(notice.text, "I can't tell which project or workspace this is for, so nothing was sent. Use /run &lt;project&gt; &lt;task&gt; or reply in a workspace topic.");
+  assert.equal(notice.message_thread_id, 9, "said where the owner wrote");
+  assert.equal(f.store.row("route-unclear:confirm:0"), undefined);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'route:%'").get() as any).n, 0, "no target is offered for confirmation");
+  // Reading the same answer again after a restart says nothing twice.
+  await f.router.route(row);
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='telegram'").get() as any).n, 1);
+}));
+
+test("the classifier's answer is read from a fenced block however it is spaced, and as bare JSON", () => fixture(async f => {
+  const answer = JSON.stringify({action: "existing", workspaceId: f.ws.id});
+  for (const [i, reply] of [`\`\`\`json\n${answer}\n\`\`\`\n`, `\`\`\`JSON\n${answer}\n\`\`\``, `\`\`\`\n${answer}\n\`\`\`  `, `  ${answer}\n`].entries()) {
+    f.store.enqueue("route", "router", {text: "Send this on", chatId: "42"}, `route-fenced-${i}`);
+    const row = f.store.row(`route-fenced-${i}`)!;
+    await f.router.route(row);
+    f.messages.push({type: "assistant", content: reply});
+    await f.router.route(row);
+    assert.ok(f.store.row(`route-fenced-${i}:confirm:0`), JSON.stringify(reply));
+  }
+}));
+
 test("native router rejects unknown project IDs and workspaces from another chat", () => fixture(async f => {
   const foreign = createWorkspace({name: "Other chat", prompt: "private", repoPath: "x", telegramChatId: "99"});
   f.store.bind(foreign.id, f.binding);
