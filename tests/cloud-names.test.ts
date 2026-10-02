@@ -95,6 +95,13 @@ test("a leading tag of marks alone is a status, not part of a workspace's name",
   assert.equal(workspaceName("[final:L1a:codex:r3] Review"), "[final:L1a:codex:r3] Review");
   assert.equal(workspaceName("[2] Second attempt"), "[2] Second attempt");
   assert.equal(workspaceName("Fix [!] in the parser"), "Fix [!] in the parser", "only a tag in front is a status");
+  // A letter or digit in any script is identity. A mark in any script is a status.
+  assert.equal(workspaceName("[задачи] Починить вход"), "[задачи] Починить вход");
+  assert.equal(workspaceName("[設計] ログイン修正"), "[設計] ログイン修正");
+  assert.equal(workspaceName("[\u26A0\uFE0F] Deploy check"), "Deploy check");
+  assert.equal(workspaceName("[\u{1F534}][agents] Media plan"), "[agents] Media plan");
+  assert.equal(workspaceName("[ ] Todo"), "Todo");
+  assert.equal(workspaceName("[agents] [!] After the tag"), "[agents] [!] After the tag", "only a status in front is dropped");
   // A name that is nothing but a status keeps it: no name at all would be worse.
   assert.equal(workspaceName("[!]"), "[!]");
   assert.equal(workspaceName(""), "");

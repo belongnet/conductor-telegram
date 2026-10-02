@@ -391,6 +391,13 @@ export class CloudCommands {
       launchProject = chosen; target = undefined; sessionId = undefined;
     }
     const repoTopic = !target && threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
+    // A message addressed to work that is gone is answered. Routed, it would be handed to other work on a guess, and
+    // the owner asked to confirm a target they never meant. A reply to one of its messages addresses it anywhere; so
+    // does the topic that was its own. A repository topic outlives the work it carries, so a plain message there still
+    // starts new work, and /run starts new work wherever it is sent.
+    if (!target && !chosen && getRetiredWorkspace(chatId, msg.reply_to_message ? String(msg.reply_to_message.message_id) : undefined, repoTopic ? undefined : threadId)) {
+      reply("That workspace is no longer in Conductor, so your message was not sent anywhere. Start new work with /run <project> <task>."); return;
+    }
     let linked = ""; let adopted = false;
     if (repoTopic) {
       const key = topicProjectKey(chatId, threadId!);
@@ -420,11 +427,6 @@ export class CloudCommands {
       }
     }
     if (!target && !launchProject) {
-      // A message addressed to work that is gone, by its topic or by a reply, is answered. Routed, it would be
-      // handed to other work on a guess, and the owner would be asked to confirm a target they never meant.
-      if (getRetiredWorkspace(chatId, msg.reply_to_message ? String(msg.reply_to_message.message_id) : undefined, threadId)) {
-        reply("That workspace is no longer in Conductor, so your message was not sent anywhere. Start new work with /run <project> <task>."); return;
-      }
       if (voiceNote) {
         this.store.enqueue("media", `${chatId}:${threadId ?? 0}`, { ...media, text: prompt, chatId, threadId, statusId }, `${row.id}:media`);
         reply("Voice note received. Transcribing it before target confirmation."); return;

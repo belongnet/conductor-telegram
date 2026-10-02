@@ -113,6 +113,10 @@ test("native routing preserves the request and requires owner confirmation, with
   assert.equal(f.sends.length, 1, "only the classifier prompt was sent");
 }));
 
+// Extended by /ship coverage audit with the answer that names a project and nothing else.
+// Value: protects=an answer naming a project and nothing else, as the classifier is now asked to give it, proposes new work with the owner's own words;
+//   fails_when=the new-work choice goes back to requiring a prompt, or any field the classifier is no longer asked for;
+//   why_new=every new-work answer in the suite still carries a prompt, so only the workspace choice is read without one; seam=none
 test("a routed new task's workspace is named by its first line, and the task is kept whole", () => fixture(async f => {
   const text = "Migrate the billing webhooks to the new event bus\nKeep the old endpoint alive until Friday.";
   f.store.enqueue("route", "router", {text, chatId: "42"}, "route-new");
@@ -125,6 +129,16 @@ test("a routed new task's workspace is named by its first line, and the task is 
   assert.equal(getWorkspace(proposed.action.trackedId)?.name, "Migrate the billing webhooks to the new event bus");
   assert.equal(getWorkspace(proposed.action.trackedId)?.prompt, text);
   assert.equal(proposed.action.prompt, text);
+  // The classifier is asked for the project alone. Its answer carries no task, and the owner's is still the one proposed.
+  f.store.enqueue("route", "router", {text, chatId: "42"}, "route-new-bare");
+  const bare = f.store.row("route-new-bare")!;
+  await f.router.route(bare);
+  f.messages.push({type: "assistant", content: "```json\n{\"action\":\"new\",\"projectId\":\"p1\"}\n```\n"});
+  await f.router.route(bare);
+  const offer = JSON.parse(f.store.row("route-new-bare:confirm:0")!.payload).payload;
+  assert.equal(offer.text, `Start this task in conductor-telegram?\n\n${text}`);
+  const offered = f.store.get<{action: {type: string; projectId: string; prompt: string}}>(offer.reply_markup.inline_keyboard[0][0].callback_data)!;
+  assert.deepEqual([offered.action.type, offered.action.projectId, offered.action.prompt], ["launch", "p1", text]);
 }));
 
 test("the classifier and the confirmation name a workspace without its status tag", () => fixture(async f => {
@@ -144,13 +158,15 @@ test("a message the classifier cannot place is declined: nothing is proposed, an
   const row = f.store.row("route-unclear")!;
   await f.router.route(row);
   const prompt: string = f.sends[0].message;
+  assert.match(prompt, /Answer with one fenced json block/, "so Conductor shows the answer as written");
   assert.match(prompt, /\{"action":"unclear"\} when choosing either would be a guess/);
   assert.match(prompt, /Never choose by a workspace's place in the list or by a mark in its name/);
   assert.match(prompt, /\{"action":"new","projectId":"\.\.\."\}.+\{"action":"existing","workspaceId":"\.\.\."\}/, "the answer is a choice of ID, not an echo of the request");
   f.messages.push({type: "assistant", content: "```json\n{\"action\":\"unclear\"}\n```\n"});
   await f.router.route(row);
   const notice = JSON.parse(f.store.row("route-unclear:unclear:0")!.payload).payload;
-  assert.equal(notice.text, "I can't tell which project or workspace this is for, so nothing was sent. Use /run &lt;project&gt; &lt;task&gt; or reply in a workspace topic.");
+  // The message is quoted, as a proposal quotes it: for a voice note this is the only place its transcript is shown.
+  assert.equal(notice.text, "I can't tell which project or workspace this is for, so nothing was sent. Use /run &lt;project&gt; &lt;task&gt; or reply in a workspace topic.\n\nContinue");
   assert.equal(notice.message_thread_id, 9, "said where the owner wrote");
   assert.equal(f.store.row("route-unclear:confirm:0"), undefined);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'route:%'").get() as any).n, 0, "no target is offered for confirmation");
@@ -171,6 +187,17 @@ test("the classifier's answer is read from a fenced block however it is spaced, 
   }
 }));
 
+test("a classifier answer padded with a long run of whitespace is read without rescanning it", () => fixture(async f => {
+  const row = f.routeRow(); await f.router.route(row);
+  // Still one of the three choices, so it is accepted. The answer is untrusted: its length must not stall the gateway.
+  const padded = JSON.stringify({action: "existing", workspaceId: f.ws.id}).replace(",", "," + " ".repeat(200_000));
+  f.messages.push({type: "assistant", content: ["```json", padded, "```"].join("\n")});
+  const started = performance.now();
+  await f.router.route(row);
+  assert.ok(performance.now() - started < 1_000, "the fences are cut off the ends, not searched for");
+  assert.ok(f.store.row("route-job:confirm:0"), "and the answer is still read");
+}));
+
 test("native router rejects unknown project IDs and workspaces from another chat", () => fixture(async f => {
   const foreign = createWorkspace({name: "Other chat", prompt: "private", repoPath: "x", telegramChatId: "99"});
   f.store.bind(foreign.id, f.binding);
@@ -181,6 +208,29 @@ test("native router rejects unknown project IDs and workspaces from another chat
   }
   assert.equal(f.store.row("route-job:confirm:0"), undefined);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='cloud'").get() as any).n, 0);
+}));
+
+// Generated by /ship coverage audit
+// Value: protects=an answer that is none of the router's three choices is refused at once, with the two ways to place the message, and proposes nothing;
+//   fails_when=the parse failure is swallowed or made retryable, or a looser schema or fence strip lets a non-choice through as a target;
+//   why_new=the suite's refused answers are well-formed choices naming bad IDs, so nothing reaches the catch around the answer's parse; seam=none
+test("an answer that is none of the classifier's three choices is refused at once, with the two ways to place the message", () => fixture(async f => {
+  const row = f.routeRow(); await f.router.route(row);
+  const answers = [
+    "This reads like a follow-up to the Task workspace.",
+    JSON.stringify({action: "guess", workspaceId: f.ws.id}),
+    JSON.stringify({action: "existing"}),
+    JSON.stringify({action: "new"}),
+  ];
+  for (const answer of answers) {
+    f.messages.push({type: "assistant", content: answer});
+    // A terminal error blocks the row on this attempt, and its text is what the owner reads.
+    await assert.rejects(f.router.route(row), {name: "TerminalError",
+      message: /did not return a usable target\. Use \/run <project> <task> or reply in a workspace topic\.$/}, answer);
+  }
+  assert.equal(f.store.row("route-job:confirm:0"), undefined);
+  assert.equal(f.store.row("route-job:unclear:0"), undefined, "an unreadable answer is a failure, not the router declining");
+  assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_state WHERE key LIKE 'route:%'").get() as any).n, 0, "no target is offered for confirmation");
 }));
 
 test("native router reconciles a lost send receipt using the same message ID and exact bytes", () => fixture(async f => {

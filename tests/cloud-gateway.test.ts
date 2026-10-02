@@ -82,7 +82,7 @@ test("cloud launch sends over native API without a desktop database or checkout"
   assert.equal(f.store.binding(f.ws.id)?.repoSlug, "org/repo");
   assert.equal(getWorkspace(f.ws.id)?.conductorBackendKind, "cloud-api");
   assert.equal(f.store.row("launch")?.state, "done");
-  assert.equal(JSON.parse(f.store.row("launch:created:0")!.payload).payload.disable_notification, true);
+  assert.equal(JSON.parse(f.store.row(`created:${f.ws.id}:0`)!.payload).payload.disable_notification, true);
   assert.equal(JSON.parse(f.store.row("launch:sent:0")!.payload).payload.disable_notification, true);
 }));
 
@@ -288,6 +288,28 @@ test("stop during creation prevents the first prompt from being sent", () => fix
   await f.launch();
   assert.equal(f.counts().sends, 0);
   assert.equal(f.store.get(`stop:${f.ws.id}`), true);
+}));
+
+test("a launch stopped while Conductor creates the workspace still says where the workspace is, and opens no topic", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  const original = f.api.createWorkspace;
+  f.api.createWorkspace = async () => { const created = await original(); f.engine.queue("stop", { type: "stop", trackedId: f.ws.id }); return created; };
+  await f.launch();
+  assert.equal(f.store.row(`created:${f.ws.id}:0`), undefined, "the launch itself says nothing: it never reached a topic");
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.counts().sends, 0);
+  const said = JSON.parse(f.store.row(`created:${f.ws.id}:0`)!.payload).payload;
+  assert.equal(said.text, "Conductor workspace created: conductor://w1");
+  assert.equal(said.message_thread_id, undefined);
+  assert.equal(f.store.row(`create-topic:${f.ws.id}`), undefined);
+  assert.equal(f.store.get(`topic-required:${f.ws.id}`), undefined, "so the link is delivered rather than left waiting for a topic");
+  assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined);
+}));
+
+test("a launched workspace's topic name is cut at Telegram's limit without splitting a character", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42',name=? WHERE id=?").run(`${"a".repeat(127)}\u{1F680} launch`, f.ws.id);
+  await f.launch();
+  assert.equal(JSON.parse(f.store.row(`create-topic:${f.ws.id}`)!.payload).payload.name, "a".repeat(127));
 }));
 
 test("a lost native send receipt is reconciled through its distinct transcript row", () => fixture(async f => {
@@ -2516,7 +2538,8 @@ test("a workspace Conductor deletes during provisioning fails the launch once, w
   // A topic is opened for a workspace that exists. This one never did, so there is nothing to open, announce or close.
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE json_extract(payload,'$.method') LIKE '%ForumTopic'").get() as any).n, 0);
   assert.equal(f.store.get(`topic-required:${f.ws.id}`), undefined);
-  assert.equal(f.store.row("launch:created:0"), undefined);
+  assert.equal(f.store.row(`created:${f.ws.id}:0`), undefined);
+  assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined, "its link is forgotten with it");
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal(statusReads, 2, "a retired workspace is no longer polled");
 }));
@@ -2530,7 +2553,7 @@ test("a workspace's topic opens once Conductor has it ready, and its link is ann
   await processQueue(f.store, ["cloud"], r => f.engine.action(r));
   assert.equal(f.store.row(`create-topic:${f.ws.id}`), undefined, "nothing is opened while Conductor may still fail to create it");
   assert.equal(f.store.get(`topic-required:${f.ws.id}`), undefined);
-  assert.equal(f.store.row("launch:created:0"), undefined);
+  assert.equal(f.store.row(`created:${f.ws.id}:0`), undefined);
   // The card is the only place to reach the workspace from until its topic exists.
   assert.equal(JSON.parse(f.store.row("launch:provisioning")!.payload).payload.text, "Conductor is preparing the workspace.\nconductor://w1");
   ready = true;
@@ -2538,9 +2561,9 @@ test("a workspace's topic opens once Conductor has it ready, and its link is ann
   const topic = JSON.parse(f.store.row(`create-topic:${f.ws.id}`)!.payload);
   assert.equal(topic.method, "createForumTopic"); assert.equal(topic.payload.name, "test");
   assert.equal(f.store.get(`topic-required:${f.ws.id}`), true);
-  assert.equal(JSON.parse(f.store.row("launch:created:0")!.payload).payload.text, "Conductor workspace created: conductor://w1");
-  const order = (f.store.db.prepare("SELECT id FROM gateway_queue WHERE id IN (?, 'launch:created:0') ORDER BY rowid").all(`create-topic:${f.ws.id}`) as any[]).map(r => r.id);
-  assert.deepEqual(order, [`create-topic:${f.ws.id}`, "launch:created:0"], "the topic is asked for before anything that waits for it");
+  assert.equal(JSON.parse(f.store.row(`created:${f.ws.id}:0`)!.payload).payload.text, "Conductor workspace created: conductor://w1");
+  const order = (f.store.db.prepare("SELECT id FROM gateway_queue WHERE id IN (?, ?) ORDER BY rowid").all(`create-topic:${f.ws.id}`, `created:${f.ws.id}:0`) as any[]).map(r => r.id);
+  assert.deepEqual(order, [`create-topic:${f.ws.id}`, `created:${f.ws.id}:0`], "the topic is asked for before anything that waits for it");
   assert.deepEqual(f.counts(), {creates: 1, sends: 1});
   assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined, "the link is kept only until it is announced");
 }));
@@ -2553,16 +2576,153 @@ test("a workspace destroyed mid-launch is reported by its launch, never by the p
   // The poller comes round before the launch's next attempt.
   gone = true;
   f.store.set(`poll-after:${f.ws.id}`, 0);
+  const before = Date.now();
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal(getWorkspace(f.ws.id)!.archivedAt, null, "left to its launch");
   assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined);
-  assert.ok(f.store.get<number>(`poll-after:${f.ws.id}`)! - Date.now() <= 5_000, "and looked at again soon");
+  const next = f.store.get<number>(`poll-after:${f.ws.id}`)!;
+  assert.ok(next >= before + 5_000 && next <= Date.now() + 5_000, "and looked at again in five seconds: not at once, not a minute on");
   await again(f);
   assert.match(f.store.row("launch")!.error!, /^Conductor could not create the workspace: Failed to create workspace branch/);
   assert.equal(getWorkspace(f.ws.id)!.status, "failed");
   f.store.set(`poll-after:${f.ws.id}`, 0);
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined, "said once, by the launch");
+}));
+
+// Generated by /ship coverage audit
+// Value: protects=a workspace its launch retires while the poller is reading its status is reported once, by the launch;
+//   fails_when=the poller acts on the record it read before the status call instead of reading it again, and adds a no-longer-available notice;
+//   why_new=the mid-launch test polls before the launch's attempt and after the retirement, never with the retirement inside the status read; seam=none
+test("a workspace its launch retires while the poller is reading its status is still reported once, by the launch", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  let gone = false, landed = false;
+  f.api.getWorkspaceStatus = (async () => {
+    if (!gone) return {workspaceId: "w1", status: "initializing"};
+    // The poller's read is still out when the launch's next attempt lands and retires the workspace.
+    if (!landed) { landed = true; await again(f); }
+    return destroyed;
+  }) as any;
+  await f.launch();
+  gone = true;
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.equal(f.store.row("launch")!.state, "blocked", "its launch found it destroyed while the poller waited");
+  assert.match(f.store.row("launch")!.error!, /^Conductor could not create the workspace: Failed to create workspace branch/);
+  assert.equal(getWorkspace(f.ws.id)!.status, "failed");
+  assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined, "the poller adds nothing to what the launch said");
+}));
+
+test("a poll that lands while the launch's own attempt is in flight leaves a destroyed workspace to that launch", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  let gone = false, polled = false;
+  f.api.getWorkspaceStatus = (async () => {
+    if (!gone) return {workspaceId: "w1", status: "initializing"};
+    // The launch's read is still out when the poller comes round: its row is running, not waiting.
+    if (!polled) { polled = true; f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!); }
+    return destroyed;
+  }) as any;
+  await f.launch();
+  gone = true;
+  await again(f);
+  assert.equal(polled, true);
+  assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined, "the poller adds nothing to what the launch says");
+  assert.match(f.store.row("launch")!.error!, /^Conductor could not create the workspace: Failed to create workspace branch/);
+  assert.equal(getWorkspace(f.ws.id)!.status, "failed");
+}));
+
+test("a launch stopped while Conductor is still preparing the workspace still says where the workspace is", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: "initializing"})) as any;
+  await f.launch();
+  assert.equal(f.store.row("launch")!.state, "pending", "Conductor is still preparing it");
+  // The stop lands between two attempts of the launch: the usual moment, since the wait is the long part.
+  f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
+  await again(f);
+  assert.equal(f.counts().sends, 0);
+  const said = JSON.parse(f.store.row(`created:${f.ws.id}:0`)!.payload).payload;
+  assert.equal(said.text, "Conductor workspace created: conductor://w1");
+  assert.equal(said.message_thread_id, undefined);
+  assert.equal(f.store.row(`create-topic:${f.ws.id}`), undefined, "stopped work that says nothing gets no topic");
+  assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined, "and the link is not left behind");
+}));
+
+test("a workspace stopped while Conductor prepared it gets a topic once it has something to say", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  let ready = false;
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: ready ? "ready" : "initializing"})) as any;
+  await f.launch();
+  f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  ready = true;
+  await again(f);
+  assert.equal(f.store.row(`create-topic:${f.ws.id}`), undefined);
+  // The owner follows the link and carries on in Conductor.
+  f.messages.push({id: "a1", sessionId: "s1", type: "assistant", content: "Here is what I found.", sessionIndex: 0, receivedAt: new Date().toISOString()});
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  assert.ok(f.store.row("transcript:s1:a1:0"), "the reply is forwarded");
+  assert.ok(f.store.get(`topic-required:${f.ws.id}`) && f.store.row(`create-topic:${f.ws.id}`), "and waits for a topic of its own rather than landing in General");
+}));
+
+test("the card names the workspace again once Conductor answers after stumbling while preparing it", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  enqueueText(f.store, "cmd:reply", "-42", "Task received and queued.", {priority: 0, silent: true});
+  let failures = 0;
+  f.api.getWorkspaceStatus = (async () => { if (failures-- > 0) throw new ConductorApiError("timed out", 503, true); return {workspaceId: "w1", status: "initializing"}; }) as any;
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix the bug", statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  failures = 3;
+  for (let i = 0; i < 3; i++) await again(f);
+  const card = () => JSON.parse((f.store.db.prepare("SELECT payload FROM gateway_queue WHERE state='pending' AND json_extract(payload,'$.statusOf')='cmd:reply:0'").get() as {payload: string}).payload).payload.text;
+  assert.equal(card(), "Conductor is not answering yet. Still trying; nothing was lost.");
+  await again(f);
+  assert.equal(card(), "Conductor is preparing the workspace.\nconductor://w1", "the wait reads as a wait again, with the link");
+}));
+
+test("a reply to the notice that a launch failed is answered as retired work, not routed", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  f.api.getWorkspaceStatus = (async () => destroyed) as any;
+  await f.launch();
+  reportBlocked(f.store, "-42");
+  // The notice is about retired work, which has no topic to follow: it is said in the chat, and linked all the same.
+  const notice = JSON.parse(f.store.row("blocked:launch:0")!.payload);
+  assert.equal(notice.workspaceId, undefined); assert.equal(notice.about, f.ws.id);
+  await new TelegramDelivery(f.store, async () => ({message_id: 901})).tick();
+  assert.equal(JSON.parse(f.store.row("blocked:launch:0")!.result!).message_id, 901);
+  f.store.ingest([{update_id: 1, message: {message_id: 902, chat: {id: -42}, from: {id: 9}, reply_to_message: {message_id: 901}, text: "try again"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:1:route"), undefined, "never handed to the router");
+  assert.match(JSON.parse(f.store.row("update:1:reply:0")!.payload).payload.text, /^That workspace is no longer in Conductor/);
+}));
+
+test("a repository topic whose workspace is gone starts new work from a plain message, and answers a reply to the old work", () => fixture(async f => {
+  const commands = repoTopic(f, "repo");
+  f.store.ingest([{update_id: 1, message: {message_id: 101, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "first task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const first = JSON.parse(f.store.row("update:1:action")!.payload).trackedId;
+  // Conductor archived it, so the repository's topic carries nothing live.
+  f.store.db.prepare("UPDATE workspaces SET status='archived',archived_at=? WHERE id=?").run(new Date().toISOString(), first);
+  // A reply to the old work's message addresses that work, and is not started as a workspace called "Continue".
+  f.store.ingest([{update_id: 2, message: {message_id: 102, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, reply_to_message: {message_id: 101}, text: "Continue"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  assert.equal(f.store.row("update:2:action"), undefined);
+  assert.match(JSON.parse(f.store.row("update:2:reply:0")!.payload).payload.text, /^That workspace is no longer in Conductor/);
+  // A plain message addresses the repository, which outlives the work it carried.
+  f.store.ingest([{update_id: 3, message: {message_id: 103, chat: {id: -42}, from: {id: 9}, message_thread_id: 5, text: "second task"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const second = JSON.parse(f.store.row("update:3:action")!.payload);
+  assert.equal(second.type, "launch"); assert.notEqual(second.trackedId, first);
+  assert.match(JSON.parse(f.store.row("update:3:reply:0")!.payload).payload.text, /^Task received and queued/);
+}));
+
+test("a recovered topic's name is cut at Telegram's limit without splitting a character", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET name=? WHERE id=?").run(`${"a".repeat(127)}\u{1F680} launch`, f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 123);
+  enqueueTelegram(f.store, "active-message", {method: "sendMessage", workspaceId: f.ws.id, payload: {chat_id: "42", text: "Agent reply"}});
+  await new TelegramDelivery(f.store, async () => { throw {response: {error_code: 400, description: "Bad Request: TOPIC_ID_INVALID"}}; }).tick();
+  assert.equal(JSON.parse(f.store.row("topic-recover:active-message")!.payload).payload.name, "a".repeat(127));
 }));
 
 test("bound work in a forum gets its topic from its next message when its launch never asked for one", () => fixture(async f => {
@@ -2603,6 +2763,28 @@ test("a workspace that disappears later is retired, and only a topic this gatewa
   const notice = f.store.row(`unavailable:${f.ws.id}:0`)!;
   assert.equal(notice.conversation, close.conversation);
   assert.match(JSON.parse(notice.payload).payload.text, /no longer available\. Its history is retained/);
+}));
+
+// Generated by /ship coverage audit
+// Value: protects=finished work Conductor archives is retired without a notice, and the topic the gateway opened for it still closes;
+//   fails_when=the settled-status check in front of the no-longer-available notice is dropped or inverted, so archiving finished work rings the owner;
+//   why_new=the retirement tests archive only running work, where the notice is expected, so none takes the quiet branch; seam=none
+test("finished work that Conductor archives is retired without a notice, and its own topic still closes", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 77);
+  // Its task finished some time ago, and the owner has now archived it in Conductor.
+  f.store.db.prepare("UPDATE workspaces SET status='done' WHERE id=?").run(f.ws.id);
+  f.api.getWorkspaceStatus = (async () => ({workspaceId: "w1", status: "archived"})) as any;
+  const queued = () => (f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE kind='telegram'").get() as any).n;
+  const before = queued();
+  f.store.set(`poll-after:${f.ws.id}`, 0);
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const ws = getWorkspace(f.ws.id)!;
+  assert.equal(ws.status, "archived"); assert.ok(ws.archivedAt);
+  assert.equal(f.store.row(`unavailable:${f.ws.id}:0`), undefined, "nothing went away that the owner was waiting on");
+  assert.equal(JSON.parse(f.store.row(`retire-topic:${f.ws.id}`)!.payload).method, "closeForumTopic");
+  assert.equal(queued() - before, 1, "the close is all that is queued");
 }));
 
 test("an adopted topic is never closed when its workspace is retired", () => fixture(async f => {
@@ -2662,6 +2844,29 @@ test("a message for work that is gone is answered where it was sent, never route
   f.store.ingest([{update_id: 12, message: {message_id: 12, chat: {id: -42}, from: {id: 9}, text: "Fix the login bug in repo"}}]);
   await processQueue(f.store, ["update"], row => commands.handle(row));
   assert.equal(f.store.row("update:12:route")?.kind, "route");
+}));
+
+// Generated by /ship coverage audit
+// Value: protects=a message is answered for retired work only in the chat that work lived in;
+//   fails_when=the retired-work lookup stops matching the chat, so a message or topic number reused in another chat is answered for it;
+//   why_new=the retired-work test writes in one chat only, so nothing tells its numbers from another chat's; seam=none
+test("retired work in one chat never answers a message that only shares its numbers in another", () => fixture(async f => {
+  // Retired work in the synced forum: it lived in topic 77, and message 500 was its task.
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42',status='failed',archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+  updateWorkspaceThreadId(f.ws.id, 77);
+  linkTelegramMessage("-42", "500", f.ws.id);
+  // Telegram numbers messages and topics per chat, so the owner's own forum reuses both.
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-43", "9", "-42");
+  const sent = [
+    {message_id: 1, reply_to_message: {message_id: 500}, text: "Fix the login bug in repo"},
+    {message_id: 2, message_thread_id: 77, text: "Fix the login bug in repo"},
+  ];
+  for (const [i, message] of sent.entries()) {
+    f.store.ingest([{update_id: i + 1, message: {chat: {id: -43}, from: {id: 9}, ...message}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    assert.equal(f.store.row(`update:${i + 1}:route`)?.kind, "route", "still the router's to place");
+    assert.match(JSON.parse(f.store.row(`update:${i + 1}:reply:0`)!.payload).payload.text, /^Finding a target/);
+  }
 }));
 
 test("a topic that opens after its workspace was retired is closed again", () => fixture(async f => {

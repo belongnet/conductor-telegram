@@ -285,6 +285,8 @@ export class CloudEngine {
         this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(ws.id);
       }
       if (action.legacyTerminal) completePendingCloudTerminalIntent(ws.id, action.legacyTerminal);
+      // A workspace stopped before its topic was asked for is still somewhere the owner can go. An archived one is not.
+      if (action.type === "stop") this.announceCreated(ws.id); else this.store.clear(`created-link:${ws.id}`);
       this.status(`${row.id}:done`, ws.id, action.statusId, action.type === "archive" ? "Cloud workspace archived." : "All cloud threads stopped.");
       return;
     }
@@ -380,6 +382,19 @@ export class CloudEngine {
       payload: { chat_id: ws.telegramChatId, name: clip(ws.name, 128) } }, 0);
   }
 
+  /**
+   * Says, once, where a workspace Conductor created is. The link is held from creation until there is a place to say
+   * it: the workspace's topic once that is asked for, or the chat itself for a launch stopped before it had one.
+   */
+  private announceCreated(trackedId: string): void {
+    const key = `created-link:${trackedId}`, link = this.store.get<string>(key);
+    if (!link) return;
+    this.store.db.transaction(() => {
+      this.notify(`created:${trackedId}`, trackedId, `Conductor workspace created: ${link}`, undefined, { silent: true });
+      this.store.clear(key);
+    })();
+  }
+
   /** A workspace whose launch is still queued or running. Its launch opens its topic and reports what becomes of it. */
   launching(trackedId: string): boolean {
     return getWorkspace(trackedId)?.status === "starting" && !!this.store.db.prepare(
@@ -395,8 +410,6 @@ export class CloudEngine {
     if (this.stopped(row, action)) return;
     const provider = action.provider ?? this.providers[0];
     let binding = this.store.binding(ws.id);
-    // Kept from the moment the workspace is created until its topic can carry the announcement.
-    const linkKey = `created-link:${ws.id}`;
     if (!binding) {
       const name = creationKey(ws.id);
       let created: { workspaceId: string; sessionId: string; deepLink: string };
@@ -437,15 +450,18 @@ export class CloudEngine {
         // The creation key is not a name. Until the first thread's title replaces it, the workspace goes by its task.
         if (!remote.name.includes(name)) this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(workspaceName(remote.name), ws.id);
         this.store.set(`session:${created.sessionId}`, { trackedId: ws.id, ...provider, role: "task" } satisfies SessionState);
-        this.store.set(linkKey, created.deepLink);
+        // Said once there is a place to say it. The workspace's topic is not asked for until Conductor has it ready.
+        this.store.set(`created-link:${ws.id}`, created.deepLink);
       })();
     }
     if (this.stopped(row, action)) { this.queue(`stop-created:${row.id}`, { type: "stop", trackedId: ws.id }); return; }
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
-    const link = this.store.get<string>(linkKey);
     if (lifecycle.status === "initializing" || lifecycle.status === "updating") {
-      // Until the topic exists, the card is the one place the workspace can be reached from.
-      this.status(`${row.id}:provisioning`, ws.id, action.statusId, `Conductor is preparing the workspace.${link ? `\n${link}` : ""}`);
+      // Meanwhile the card carries the link. After a "not answering" card it is written once more, so the wait reads
+      // as a wait again as soon as Conductor answers.
+      const link = this.store.get<string>(`created-link:${ws.id}`);
+      this.status(`${row.id}:provisioning${this.store.row(`slow:${row.id}`) ? ":again" : ""}`, ws.id, action.statusId,
+        `Conductor is preparing the workspace.${link ? `\n${link}` : ""}`);
       this.store.retry(row.id, "Waiting for cloud provisioning", 5000); return;
     }
     if (["archived", "deleted"].includes(lifecycle.status)) {
@@ -454,12 +470,6 @@ export class CloudEngine {
       const detail = safeDetail(lifecycle.errorMessage);
       this.retire(ws.id, "failed");
       throw new TerminalError(detail ? `Conductor could not create the workspace: ${detail}` : `Conductor could not create the workspace. It was ${lifecycle.status} while provisioning.`);
-    }
-    // The workspace exists. Its topic is asked for first, so the announcement waits for it rather than landing in General.
-    this.openTopic(ws.id);
-    if (link) {
-      this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${link}`, undefined, { silent: true });
-      this.store.clear(linkKey);
     }
     const session = await this.api.getSessionStatus(binding.sessionId!);
     if (session.workspaceId !== binding.workspaceId) throw new TerminalError("Session belongs to another cloud workspace");
@@ -476,6 +486,7 @@ export class CloudEngine {
     this.store.assertWriter?.();
     this.store.db.transaction(() => {
       this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(trackedId);
+      this.store.clear(`created-link:${trackedId}`);
       // archived_at is what ends polling and frees the topic: a later message there is told the workspace is gone,
       // and /run starts new work in it.
       this.store.db.prepare("UPDATE workspaces SET status=?,archived_at=? WHERE id=?").run(status, new Date().toISOString(), trackedId);
@@ -867,8 +878,10 @@ export class CloudEngine {
     if (this.stopped(row, action)) {
       await this.api.cancelSession(sessionId); return;
     }
-    // Work being sent to has a topic for its replies, whether or not its launch got as far as asking for one.
+    // Work being sent to has a topic for its replies, and its link is said there. A launch reaches this once
+    // Conductor has the workspace ready, so one Conductor never finishes opens no topic.
     this.openTopic(action.trackedId);
+    this.announceCreated(action.trackedId);
     // Recover queued continuations written by older releases as well as new ones.
     // Keep the persisted send payload immutable: an uncertain submission must never be replayed.
     const previous = action.recovery
@@ -1086,6 +1099,9 @@ export class CloudEngine {
             // Beside a sibling thread, each reply says which thread, and which model, is speaking.
             const label = sessions.length > 1 ? `${threadLabel(session.name, session.model ?? session.resolvedModel ?? state?.model)}\n\n` : "";
             const reply = `${label}${text}`;
+            // A workspace that speaks has a topic to speak in, including one stopped before its launch asked for it.
+            this.openTopic(trackedId);
+            this.announceCreated(trackedId);
             if (phase === "commentary" && turn) enqueueProgress(this.store, id, `${session.id}:${turn}`, ws.telegramChatId, reply,
               {workspaceId: trackedId, sessionId: session.id, threadId: ws.telegramThreadId});
             else this.notify(id, trackedId, reply, session.id, { markdown: true });

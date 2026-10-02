@@ -107,11 +107,14 @@ export class CloudRouter {
     const text = messages.map(transcriptText).filter(Boolean).at(-1);
     if (!text) { await waitForReply(); return; }
     let answer: z.infer<typeof RouteSchema>;
-    // Asked for as a fenced block, which Conductor shows as written, and read as bare JSON too.
-    try { answer = RouteSchema.parse(JSON.parse(text.trim().replace(/^```[a-z]*\s*|\s*```$/gi, ""))); }
+    // Asked for as a fenced block, which Conductor shows as written, and read as bare JSON too. The fences are cut off
+    // the ends without scanning what lies between them: the answer is untrusted, and may be long.
+    const body = text.trim().replace(/^```[a-z]*/i, "");
+    try { answer = RouteSchema.parse(JSON.parse(body.endsWith("```") ? body.slice(0, -3) : body)); }
     catch { throw new TerminalError(`The router did not return a usable target. ${ROUTING_HINT}`); }
     if (answer.action === "unclear") {
-      enqueueText(store, `${row.id}:unclear`, input.chatId, `I can't tell which project or workspace this is for, so nothing was sent. ${ROUTING_HINT}`, { threadId: input.threadId });
+      // The message is quoted like a proposal's: for a voice note this is the one place its transcript is shown.
+      enqueueText(store, `${row.id}:unclear`, input.chatId, `I can't tell which project or workspace this is for, so nothing was sent. ${ROUTING_HINT}\n\n${input.text}`, { threadId: input.threadId });
       return;
     }
     const result = answer;

@@ -4,6 +4,7 @@ import type { Workspace } from "../types/index.js";
 import { createReadStream } from "node:fs";
 import { escHtml, markdownToTelegramChunks, telegramReplyText } from "../bot/format.js";
 import {ConductorApiError} from "../integrations/conductor-api.js";
+import { clip } from "./names.js";
 
 export type TelegramCall = (method: string, payload: Record<string, any>) => Promise<any>;
 export interface TelegramJob {
@@ -17,6 +18,8 @@ export interface TelegramJob {
   statusOf?: string;
   /** A replacement message becomes the durable target for later edits to this anchor. */
   replacementOf?: string;
+  /** The work this message is about when it is not sent to that work's topic. A reply to it is still about that work. */
+  about?: string;
 }
 /** An edit waits this long for its acknowledgement before it is delivered as a message instead. */
 const STATUS_ANCHOR_WAIT_MS = 300_000;
@@ -87,7 +90,7 @@ export function statusCardSeen(store: GatewayStore, anchor: QueueRow, ws: Worksp
 
 /** Agent Markdown is rendered before splitting; control messages stay literal. */
 export function enqueueText(store: GatewayStore, id: string, chatId: string, text: string,
-  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean; silent?: boolean } = {}): void {
+  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean; silent?: boolean; about?: string } = {}): void {
   const chunks: string[] = [];
   if (options.markdown) {
     text = telegramReplyText(text);
@@ -108,7 +111,7 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
       ...(options.threadId ? { message_thread_id: options.threadId } : {}),
       ...(options.silent ? { disable_notification: true } : {}),
       ...(i === chunks.length - 1 && options.replyMarkup ? { reply_markup: options.replyMarkup } : {}) },
-    workspaceId: options.workspaceId, sessionId: options.sessionId, decisionId: options.decisionId,
+    workspaceId: options.workspaceId, sessionId: options.sessionId, decisionId: options.decisionId, about: options.about,
   }, options.priority));
 }
 
@@ -118,13 +121,13 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
  * it, across pacing retries and restarts alike. A newer state replaces an undelivered older one.
  */
 export function enqueueStatus(store: GatewayStore, id: string,
-  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown }): void {
+  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown; about?: string }): void {
   enqueueEdit(store, id, {...input, text: escHtml(input.text)}, 0);
 }
 
 /** Only renderer-produced HTML reaches this internal helper. */
 function enqueueEdit(store: GatewayStore, id: string,
-  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown }, priority: number): void {
+  input: { anchorId: string; chatId: string; workspaceId?: string; sessionId?: string; text: string; replyMarkup?: unknown; about?: string }, priority: number): void {
   store.db.transaction(() => {
     if (store.row(id)) return;
     store.assertWriter?.();
@@ -133,7 +136,7 @@ function enqueueEdit(store: GatewayStore, id: string,
     const pending = store.db.prepare("SELECT id FROM gateway_queue WHERE kind='telegram' AND state='pending' AND json_extract(payload,'$.statusOf')=?")
       .all(input.anchorId) as Array<{ id: string }>;
     for (const prior of pending) store.finish(prior.id, { supersededBy: id });
-    const job: TelegramJob = { method: "editMessageText", statusOf: input.anchorId, workspaceId: input.workspaceId, sessionId: input.sessionId,
+    const job: TelegramJob = { method: "editMessageText", statusOf: input.anchorId, workspaceId: input.workspaceId, sessionId: input.sessionId, about: input.about,
       payload: { chat_id: chatId, text: input.text, parse_mode: "HTML", link_preview_options: {is_disabled: true},
         ...(input.replyMarkup ? { reply_markup: input.replyMarkup } : {}) } };
     store.enqueue("telegram", anchor?.conversation ?? `${chatId}:0:control`, job, id, priority);
@@ -216,10 +219,11 @@ export class TelegramDelivery {
           this.store.row(row.id)?.payload ?? row.payload,
         ) as TelegramJob;
         this.store.finish(row.id, result);
-        if (result?.message_id && durableJob.workspaceId) linkTelegramMessage(
+        const linked = durableJob.workspaceId ?? durableJob.about;
+        if (result?.message_id && linked) linkTelegramMessage(
           String(payload.chat_id),
           String(result.message_id),
-          durableJob.workspaceId,
+          linked,
           durableJob.sessionId,
         );
         if (result?.message_id && durableJob.replacementOf) this.store.set(`telegram-replacement:${durableJob.replacementOf}`, {
@@ -245,10 +249,11 @@ export class TelegramDelivery {
           this.store.finish(row.id, true);
           // Telegram returns an error rather than the edited Message when the prior attempt already
           // applied the same text. Restore the reply association from the resolved anchor receipt.
-          if (job.payload.message_id && durableJob.workspaceId) linkTelegramMessage(
+          const linked = durableJob.workspaceId ?? durableJob.about;
+          if (job.payload.message_id && linked) linkTelegramMessage(
             String(job.payload.chat_id),
             String(job.payload.message_id),
-            durableJob.workspaceId,
+            linked,
             durableJob.sessionId,
           );
         })();
@@ -268,7 +273,7 @@ export class TelegramDelivery {
         if (ws && !ws.archivedAt && ws.status !== "archived") {
           enqueueTelegram(this.store, `topic-recover:${row.id}`, {
             method: /TOPIC_CLOSED/i.test(failure.description) ? "reopenForumTopic" : "createForumTopic",
-            payload: { chat_id: ws.telegramChatId, name: (ws.conductorWorkspaceName ?? ws.name).slice(0, 128),
+            payload: { chat_id: ws.telegramChatId, name: clip(ws.conductorWorkspaceName ?? ws.name, 128),
               ...(/TOPIC_CLOSED/i.test(failure.description) ? { message_thread_id: ws.telegramThreadId } : {}) }, workspaceId: ws.id,
           }, 0);
           this.store.retry(row.id, failure.description, 5000, row.attempts > 5);
@@ -329,15 +334,17 @@ export function reportBlocked(store: GatewayStore, ownerChatId: string, now = Da
     const live = ws && !ws.archivedAt ? ws : undefined;
     const reason = row.error ?? "Operation failed";
     store.db.transaction(() => {
+      // Retired work has no topic to follow, yet what is said about it is still about it: a reply is answered as such.
+      const about = live ? undefined : ws?.id;
       if (anchor) enqueueStatus(store, `blocked-card:${row.id}`, { anchorId: anchor.id, chatId: ws?.telegramChatId ?? ownerChatId,
-        workspaceId: live?.id, text: `Not done: ${reason}` });
+        workspaceId: live?.id, about, text: `Not done: ${reason}` });
       // The anchor's age, not the row's: a system continuation is young when it blocks, yet nobody is watching its card.
       if (!anchor || now - anchor.created_at > ATTENTION_AFTER_MS) {
         // A gateway-built route or media row names the chat it answers. A raw update can come from any chat, so it reports to the owner.
         const chatId = ws?.telegramChatId ?? (row.kind !== "update" && payload.chatId ? String(payload.chatId) : ownerChatId);
         const threadId = ws ? live?.telegramThreadId : row.kind !== "update" && payload.chatId ? payload.threadId : undefined;
         enqueueText(store, `blocked:${row.id}`, chatId, `${ws ? "Operation" : "Telegram operation"} needs attention: ${reason}`,
-          { workspaceId: live?.id, threadId });
+          { workspaceId: live?.id, about, threadId });
       }
       store.set(`blocked-notified:${row.id}`, true);
     })();

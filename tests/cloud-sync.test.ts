@@ -382,7 +382,7 @@ test("discovery leaves a workspace this gateway is still launching to its launch
   f.engine.queue("launching", {type: "launch", trackedId: ws.id, projectId: "project", prompt: "Fix the login bug"});
   f.workspaces[0].name = "Named by Conductor";
   await f.sync.sync();
-  assert.equal(f.store.get(`cloud-synced:${ws.id}`), undefined);
+  assert.equal(f.store.get(`cloud-synced:${ws.id}`), true, "its topic takes the owner's input from the first scan");
   assert.equal(f.store.row(`create-topic:${ws.id}`), undefined, "its launch opens the topic once the workspace exists");
   assert.equal(getWorkspace(ws.id)?.name, "Fix the login bug");
   // Conductor destroys it before its launch has looked again. The launch reports that, with Conductor's reason.
@@ -390,6 +390,32 @@ test("discovery leaves a workspace this gateway is still launching to its launch
   await f.sync.sync();
   assert.equal(getWorkspace(ws.id)?.archivedAt, null);
   assert.equal(closes(f), 0);
+}));
+
+test("a launch started in the synced group can be stopped there while Conductor is still preparing it", () => fixture(async f => {
+  // This fixture's layout: the owner chat is private (42) and the forum (-42) is the synced group only.
+  // Conductor may list it as still initializing, or as ready with the launch not yet finished: either way it can be stopped.
+  for (const [update, state] of ["initializing", "ready"].entries()) {
+    const thread = 7 + update;
+    const {ws} = gatewayWorkspace(f, `Fix the login bug (${state})`, thread);
+    f.engine.queue(`launching-${state}`, {type: "launch", trackedId: ws.id, projectId: "project", prompt: "Fix the login bug"});
+    f.workspaces[0] = {...f.workspaces[0], state};
+    await f.sync.sync();
+    f.store.ingest([{update_id: update, message: {message_id: 10 + update, chat: {id: -42}, from: {id: 9}, message_thread_id: thread, text: "/stop"}}]);
+    await processQueue(f.store, ["update"], row => f.commands().handle(row));
+    assert.ok(f.store.row(`update:${update}:reply:0`), `${state}: the /stop is acknowledged, not dropped in silence`);
+    assert.equal(f.store.get(`stop:${ws.id}`), true, `${state}: stopped from the only chat that can address it`);
+    f.store.db.prepare("DELETE FROM gateway_bindings WHERE workspace_id=?").run(ws.id);
+  }
+}));
+
+test("discovery leaves a launching workspace to its launch even when an earlier release already marked it synced", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Fix the login bug");
+  f.engine.queue("launching", {type: "launch", trackedId: ws.id, projectId: "project", prompt: "Fix the login bug"});
+  f.store.set(`cloud-synced:${ws.id}`, true); // Written by the previous release's scan, mid-launch.
+  archiveInConductor(f);
+  await f.sync.sync();
+  assert.equal(getWorkspace(ws.id)?.archivedAt, null, "its launch reports why Conductor could not create it");
 }));
 
 test("once its launch is over, a gateway workspace is followed like any other", () => fixture(async f => {
@@ -420,6 +446,12 @@ test("an archived workspace living in a topic the owner made closes nothing", ()
   await f.sync.sync();
   assert.ok(getWorkspace(ws.id)?.archivedAt);
   assert.equal(closes(f), 0);
+}));
+
+test("a discovered workspace's topic name is cut at Telegram's limit without splitting a character", () => fixture(async f => {
+  f.workspaces[0].name = `${"a".repeat(127)}\u{1F680} launch`;
+  await f.sync.sync(); const [{id}] = f.store.bindings();
+  assert.equal(JSON.parse(f.store.row(`create-topic:${id}`)!.payload).payload.name, "a".repeat(127));
 }));
 
 test("a discovered workspace archived before its topic opened never gets one", () => fixture(async f => {

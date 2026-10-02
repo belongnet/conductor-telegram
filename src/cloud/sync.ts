@@ -56,8 +56,6 @@ export class CloudWorkspaceSync {
 
   private async attach(remote: ConductorApiWorkspace, projects: ConductorApiProject[]): Promise<void> {
     const {store, api} = this.engine;
-    // Conductor is still creating it. It is followed once it exists, and one that never does leaves no topic behind.
-    if (remote.state === "initializing") return;
     const identity = repositoryRemoteIdentity(remote.repoUrl ?? "");
     const candidates = projects.filter(p => identity && repositoryRemoteIdentity(p.gitRemote) === identity && (!remote.projectId || remote.projectId === p.id));
     if (candidates.length !== 1) throw new Error("Workspace requires a unique verified native project and repository identity");
@@ -68,10 +66,12 @@ export class CloudWorkspaceSync {
     if (matches.length > 1) throw new Error("Workspace has multiple persisted bindings; reconcile before syncing");
     if (matches.length) {
       const {id} = matches[0], ws = getWorkspace(id);
-      // A workspace this gateway is still launching is its launch's: that opens its topic, and reports it if Conductor
-      // destroys it first.
-      if (!ws || ws.telegramChatId !== this.chatId || store.get(`stop:${id}`) || ws.archivedAt || this.engine.launching(id)) return;
+      if (!ws || ws.telegramChatId !== this.chatId || store.get(`stop:${id}`) || ws.archivedAt) return;
+      // Its topic takes the owner's input from the first scan, so a launch can be stopped from where it was started.
       store.set(`cloud-synced:${id}`, true);
+      // The rest waits for a workspace Conductor is still creating, or this gateway is still launching: its launch
+      // opens its topic, and reports it if Conductor destroys it first.
+      if (remote.state === "initializing" || this.engine.launching(id)) return;
       // A workspace the gateway created is called by its creation key until it takes its first thread's title.
       // The key is never a name to show, whatever tag an outside renamer put around it.
       const keyed = remote.name.includes(creationKey(id));
@@ -90,6 +90,8 @@ export class CloudWorkspaceSync {
     // lost create response; discovery never adopts it as someone else's work.
     const own = remote.name.match(/telegram-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)?.[1];
     if (own && getWorkspace(own)) return;
+    // Conductor is still creating it. It is followed once it exists, and one that never does leaves no topic behind.
+    if (remote.state === "initializing") return;
     const sessions = (await api.listWorkspaceSessions(remote.id)).filter(s => !s.archivedAt);
     if (!sessions.length) return; // Provisioning may not have created the first session yet.
     const snapshots: Array<{session: ConductorApiSession; status: ConductorApiSessionStatus; tail: ConductorApiMessage[]}> = [];
@@ -137,10 +139,13 @@ export class CloudWorkspaceSync {
       payload: {chat_id: this.chatId, name: clip(name, 128)}}, 20);
   }
 
-  /** Retired as the engine retires any workspace, so only a topic the gateway opened for it, and still its own, is closed. */
+  /**
+   * Retired as the engine retires any workspace, so only a topic the gateway opened for it, and still its own, is
+   * closed. A workspace destroyed while it is still being launched is left to its launch, which says why.
+   */
   private close(id: string): void {
     const ws = getWorkspace(id);
-    if (!ws || ws.archivedAt || this.engine.store.get(`stop:${id}`)) return;
+    if (!ws || ws.archivedAt || this.engine.store.get(`stop:${id}`) || this.engine.launching(id)) return;
     this.engine.retire(id, "archived");
   }
 }
