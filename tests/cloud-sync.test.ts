@@ -60,6 +60,14 @@ test("discovery attaches one topic per native workspace without sending or repla
   assert.equal(JSON.parse(f.store.row("sync-snapshot:native-1:0")!.payload).payload.disable_notification, true);
 }));
 
+test("discovery does not attach a workspace returned outside the authenticated owner", () => fixture(async f => {
+  f.store.set("conductor-user-id", "owner");
+  f.workspaces[0].creatorId = "someone-else";
+  await f.sync.sync();
+  assert.equal(f.store.bindings().length, 0);
+  assert.equal(f.store.get<any>("cloud-sync-status")?.discovered, 0);
+}));
+
 test("new messages in an initially empty native session forward and replies retain that exact session after restart", () => fixture(async f => {
   await f.sync.sync(); const [{id, binding}] = f.store.bindings(); updateWorkspaceThreadId(id, 7);
   f.messages.push({id: "first-old", sessionId: "old", sessionIndex: 0, type: "assistant", content: "A new reply", receivedAt: new Date().toISOString()});
@@ -727,4 +735,41 @@ test("an addressed command acknowledgement precedes queued transcripts without l
     f.store.set("telegram-chat-after:-42", 0); await sender.tick();
   }
   assert.deepEqual(texts.slice(1), ["Earlier transcript 0", "Earlier transcript 1", "Earlier transcript 2"]);
+}));
+
+// Review fixes: discovery says where a workspace is when it opens its topic, and leaves retired work alone.
+test("a gateway workspace whose topic discovery opens is told where it is there", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Fix the login bug");
+  // Its launch created the workspace and held its link, then gave up before anything was sent.
+  f.engine.queue("launching", {type: "launch", trackedId: ws.id, projectId: "project", prompt: "Fix the login bug"});
+  f.store.retry("launching", "Session belongs to another cloud workspace", 0, true);
+  f.store.set(`created-link:${ws.id}`, "conductor://workspace?id=native-1");
+  await f.sync.sync();
+  assert.ok(f.store.row(`create-topic:${ws.id}`), "discovery opens its topic");
+  assert.equal(JSON.parse(f.store.row(`created:${ws.id}:0`)!.payload).payload.text, "Conductor workspace created: conductor://workspace?id=native-1");
+  assert.equal(f.store.get(`created-link:${ws.id}`), undefined);
+}));
+
+test("work already retired here is not asked about again on every scan", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Fix the login bug", 7);
+  f.store.set(`cloud-synced:${ws.id}`, true);
+  f.workspaces.length = 0;
+  let reads = 0; f.api.getWorkspaceStatus = async () => { reads++; return {workspaceId: "native-1", status: "archived"}; };
+  await f.sync.sync();
+  assert.equal(reads, 1); assert.ok(getWorkspace(ws.id)?.archivedAt, "found gone once");
+  await f.sync.sync(); await f.sync.sync();
+  assert.equal(reads, 1, "and not asked about again");
+}));
+
+test("a launch started from a synced-group topic takes /stop before discovery has scanned it", () => fixture(async f => {
+  const {ws} = gatewayWorkspace(f, "Earlier work", 7);
+  f.store.set(`cloud-synced:${ws.id}`, true);
+  f.store.ingest([{update_id: 1, message: {message_id: 10, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/run project Fix the login bug"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  const started = JSON.parse(f.store.row("update:1:action")!.payload).trackedId;
+  assert.notEqual(started, ws.id);
+  assert.equal(f.store.get(`cloud-synced:${started}`), true, "its topic takes the owner's input at once");
+  f.store.ingest([{update_id: 2, message: {message_id: 11, chat: {id: -42}, from: {id: 9}, message_thread_id: 7, text: "/stop"}}]);
+  await processQueue(f.store, ["update"], row => f.commands().handle(row));
+  assert.equal(JSON.parse(f.store.row("update:2:action")!.payload).type, "stop");
 }));

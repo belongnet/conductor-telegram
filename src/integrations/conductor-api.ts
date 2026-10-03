@@ -53,6 +53,8 @@ const WorkspaceSchema = z.object({
       "archived",
       "deleted",
       "updating",
+      // Created but never started. It exists, so it is followed like a sleeping workspace.
+      "unstarted",
     ])
     .optional(),
   archivedAt: z.string().nullable().optional(),
@@ -107,6 +109,7 @@ const WorkspaceStatusSchema = z.object({
     "archived",
     "deleted",
     "updating",
+    "unstarted",
   ]),
   lifecycleStep: z
     .enum(["building_snapshot", "preparing", "setting_up", "updating"])

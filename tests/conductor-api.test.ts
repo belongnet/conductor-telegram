@@ -811,3 +811,19 @@ test("large transcript tails locate the end without walking 10000 historical row
   assert.deepEqual(tail.map(m => m.id), Array.from({length: 20}, (_, n) => `message-${count - 20 + n}`));
   assert.ok(requests < 40, `tail lookup took ${requests} requests`);
 });
+
+// Approved in review: Conductor's API reports a seventh lifecycle state, and one such workspace must not fail a whole page.
+test("a workspace Conductor reports as unstarted is read like any other lifecycle state", async () => {
+  const fetcher = (async (url: string | URL | Request) =>
+    new Response(
+      JSON.stringify(
+        String(url).includes("/status")
+          ? { workspaceId: "w1", status: "unstarted", updatedAt: "2026-10-02T00:00:00Z" }
+          : { data: [{ id: "w1", name: "Draft", state: "unstarted", repoUrl: "https://github.com/org/repo", createdAt: "2026-10-02T00:00:00Z", deepLink: "conductor://w1" }], offset: 0, hasMore: false }
+      ),
+      { status: 200, headers: { "content-type": "application/json" } }
+    )) as typeof fetch;
+  const client = new ConductorApiClient(config(), fetcher);
+  assert.equal((await client.listWorkspaces({ mine: true }))[0]?.state, "unstarted");
+  assert.equal((await client.getWorkspaceStatus("w1")).status, "unstarted");
+});

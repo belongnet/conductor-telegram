@@ -14,7 +14,7 @@ import {nativeSessionProvider, ATTACHMENTS_ONLY_PROMPT} from "./messages.js";
 import { taskTitle, threadLabel, threadName } from "./names.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import type { ConductorApiProject } from "../integrations/conductor-api.js";
-import type { RepoTopic } from "../types/index.js";
+import type { RepoTopic, Workspace } from "../types/index.js";
 
 /** Telegram stamps `date` in seconds; one pasted list lands inside this window. */
 const BURST_SECONDS = 2;
@@ -56,6 +56,8 @@ export function repoTopicCandidates(repoName: string, projects: ConductorApiProj
 }
 
 const SHORTCUTS = new Set(["ship", "qa", "investigate", "retro", "health", "checkpoint", "document_release", "land_and_deploy", "office_hours", "design_review", "gstack", "skill"]);
+/** The answer to anything addressed to work that is gone: it is not routed to other work on a guess. */
+const RETIRED = "That workspace is no longer in Conductor, so your message was not sent anywhere. Start new work with /run <project> <task>.";
 /** Short spellings for skills whose own name is a mouthful to type on a phone. */
 const COMMAND_ALIASES: Record<string, string> = { land: "land_and_deploy", document: "document_release" };
 const HELP = "/projects or /repos — list Conductor repositories\n/run <project> <task> — start a task\n/link [project] — show or change which project a repo topic routes to\n/sync — refresh cloud workspace topics\n/send [workspace] <message> — follow up\n/review [PR number or URL] — native review in a separate thread\n/threads — list or select a thread\n/threads new <prompt> — start a thread\n/workspaces, /status, /ping — progress and health\n/prs — PR status\n/decisions — unanswered questions\n/stop, /archive — stop work\n/rename, /renamethread — rename\nReply to a forwarded message or use its workspace topic to target it. Photos, files, and voice notes are supported.";
@@ -143,11 +145,16 @@ export class CloudCommands {
     const voiceNote = files.length > 0 && files.every(file => file.voice);
     // A direct reply answers the owner's own message, so it never needs to ring. The acknowledgement doubles as the
     // turn's status card: actions carry its row id so later states edit it instead of posting again.
-    const reply = (text: string, suffix = "reply", markup?: unknown) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
-      { threadId, replyMarkup: markup, priority: 0, silent: true });
+    const reply = (text: string, suffix = "reply", markup?: unknown, about?: string) => enqueueText(this.store, `${row.id}:${suffix}`, chatId, text,
+      { threadId, replyMarkup: markup, priority: 0, silent: true, about });
     const statusId = `${row.id}:reply:0`;
     const replyTarget = msg.reply_to_message ? getWorkspaceMessageTarget(chatId, String(msg.reply_to_message.message_id)) : undefined;
-    let target = replyTarget?.workspace ?? (threadId ? getWorkspaceByThreadId(chatId, threadId) : undefined);
+    // A reply to retired work's message addresses that work wherever it is sent, even in a topic that has since moved
+    // on to other work. Its topic answers for it too, unless the topic is a repository's, which outlives its work.
+    const retiredReply = !callback && !replyTarget && msg.reply_to_message ? getRetiredWorkspace(chatId, String(msg.reply_to_message.message_id), undefined) : undefined;
+    const retiredHere = (): Workspace | undefined => retiredReply ??
+      (threadId && !getRepoTopicByThreadId(chatId, threadId) ? getRetiredWorkspace(chatId, undefined, threadId) : undefined);
+    let target = replyTarget?.workspace ?? (threadId && !retiredReply ? getWorkspaceByThreadId(chatId, threadId) : undefined);
     // A repo topic carries one workspace at a time, so a plain message continues the workspace
     // already there. Only preserved local work from before the cutover launches fresh instead:
     // testing the binding alone would miss a cloud workspace that has not finished launching,
@@ -350,7 +357,7 @@ export class CloudCommands {
       reply("This is preserved historical work with no Conductor Cloud session. Use /repos, then /run <project ID> <task> to start new work. Your message was not sent."); return;
     }
     if (command === "threads") {
-      if (!target) { reply("Use /threads inside a workspace topic or reply to its message."); return; }
+      if (!target) { const gone = retiredHere(); reply(gone ? RETIRED : "Use /threads inside a workspace topic or reply to its message.", "reply", undefined, gone?.id); return; }
       const binding = this.store.binding(target.id);
       if (!binding) { reply("This is historical local work. Start a cloud task with /run first."); return; }
       if (args.startsWith("new ") || (args === "new" && media)) {
@@ -368,7 +375,9 @@ export class CloudCommands {
     }
     if (command === "skills") { reply("Skills: ship, qa, investigate, retro, health, checkpoint, document_release (/document), land_and_deploy (/land), office_hours, design_review. Use /skill <name> [instructions] in a workspace topic."); return; }
     if (["stop", "archive", "rename", "renamethread", "review", "send"].includes(command ?? "") || SHORTCUTS.has(command ?? "")) {
-      if (!target) { reply("Reply to a workspace message, use its topic, or supply its workspace ID."); return; }
+      // A command for work that is gone is told so, like a message for it; the generic hint would send the owner back
+      // to the very topic they wrote in.
+      if (!target) { const gone = retiredHere(); reply(gone ? RETIRED : "Reply to a workspace message, use its topic, or supply its workspace ID.", "reply", undefined, gone?.id); return; }
       const type = SHORTCUTS.has(command!) ? "send" : command as CloudAction["type"];
       const prompt = SHORTCUTS.has(command!) ? `Use /${command === "skill" ? args : command!.replace(/_/g, "-")} ${command === "skill" ? "" : args}` : args;
       if (["send", "rename", "renamethread"].includes(type) && !prompt && !(type === "send" && media)) { reply("Please include a message or name."); return; }
@@ -392,12 +401,12 @@ export class CloudCommands {
     }
     const repoTopic = !target && threadId ? getRepoTopicByThreadId(chatId, threadId) : undefined;
     // A message addressed to work that is gone is answered. Routed, it would be handed to other work on a guess, and
-    // the owner asked to confirm a target they never meant. A reply to one of its messages addresses it anywhere; so
-    // does the topic that was its own. A repository topic outlives the work it carries, so a plain message there still
-    // starts new work, and /run starts new work wherever it is sent.
-    if (!target && !chosen && getRetiredWorkspace(chatId, msg.reply_to_message ? String(msg.reply_to_message.message_id) : undefined, repoTopic ? undefined : threadId)) {
-      reply("That workspace is no longer in Conductor, so your message was not sent anywhere. Start new work with /run <project> <task>."); return;
-    }
+    // the owner asked to confirm a target they never meant. A reply to one of its messages addresses it anywhere, even
+    // where other work now lives; so does the topic that was its own. A repository topic outlives the work it carries,
+    // so a plain message there still starts new work, and /run starts new work wherever it is sent. The answer is
+    // about that work: a reply to it is answered the same way, and it is never left waiting on a topic that is closed.
+    const gone = !target && !chosen ? retiredHere() : undefined;
+    if (gone) { reply(RETIRED, "reply", undefined, gone.id); return; }
     let linked = ""; let adopted = false;
     if (repoTopic) {
       const key = topicProjectKey(chatId, threadId!);
@@ -443,8 +452,10 @@ export class CloudCommands {
       if (!target) this.store.db.transaction(() => {
         target = createWorkspace({ name: taskTitle(prompt, unnamed), prompt, repoPath: `conductor-project:${launchProject!.id}`, telegramChatId: chatId });
         this.store.set(`update-workspace:${row.id}`, target.id);
-        // The workspace lives in the topic its task was sent from: one topic, one workspace.
+        // The workspace lives in the topic its task was sent from: one topic, one workspace. In the synced group that
+        // topic takes the owner's input at once, so the launch can be stopped from where it was started.
         if (threadId) updateWorkspaceThreadId(target.id, threadId);
+        if (chatId === this.syncChatId) this.store.set(`cloud-synced:${target.id}`, true);
         adopted = !!repoTopic;
       })();
     }

@@ -102,6 +102,9 @@ test("a leading tag of marks alone is a status, not part of a workspace's name",
   assert.equal(workspaceName("[\u{1F534}][agents] Media plan"), "[agents] Media plan");
   assert.equal(workspaceName("[ ] Todo"), "Todo");
   assert.equal(workspaceName("[agents] [!] After the tag"), "[agents] [!] After the tag", "only a status in front is dropped");
+  // A bracket inside a tag is not a tag: a cut never leaves half of one behind.
+  assert.equal(workspaceName("[[!]] Name"), "[[!]] Name");
+  assert.equal(workspaceName("[ [!] ] nested"), "[ [!] ] nested");
   // A name that is nothing but a status keeps it: no name at all would be worse.
   assert.equal(workspaceName("[!]"), "[!]");
   assert.equal(workspaceName(""), "");

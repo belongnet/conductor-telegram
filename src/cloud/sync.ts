@@ -27,12 +27,20 @@ export class CloudWorkspaceSync {
     const [projects, workspaces] = await Promise.all([this.engine.catalog.projects(true), api.listWorkspaces({mine: true})]);
     const routerId = store.get<{workspaceId: string}>("router-binding")?.workspaceId;
     const routerName = `telegram-routing-${store.get<number>("telegram-bot-id") ?? "unconfigured"}`;
+    // `mine` is an API filter, not a trust boundary: older servers may ignore
+    // it and the response schema keeps creatorId optional for compatibility.
+    // Once runtime identity is known, only that identity may be attached to a
+    // shared Telegram group; an absent identity keeps legacy test/offline mode
+    // from changing behavior before API startup has completed.
+    const ownerId = store.get<string>("conductor-user-id");
     // Matched as a word, so the router stays excluded when another tool tags its name.
-    const active = workspaces.filter(w => w.id !== routerId && !w.name.split(/\s+/).includes(routerName) && !w.archivedAt && !["archived", "deleted"].includes(w.state ?? ""));
+    const active = workspaces.filter(w => w.id !== routerId && (!ownerId || w.creatorId === ownerId) && !w.name.split(/\s+/).includes(routerName) && !w.archivedAt && !["archived", "deleted"].includes(w.state ?? ""));
     const seen = new Set(active.map(w => w.id));
     const jobs: Array<{id: string; run: () => Promise<void>}> = active.map(w => ({id: w.id, run: () => this.attach(w, projects)}));
     for (const {id, binding} of store.bindings()) {
-      if (getWorkspace(id)?.telegramChatId !== this.chatId || !store.get(`cloud-synced:${id}`) || seen.has(binding.workspaceId)) continue;
+      // Work already retired here is not asked about again: that was one status read a minute for good.
+      const local = getWorkspace(id);
+      if (local?.telegramChatId !== this.chatId || local.archivedAt || !store.get(`cloud-synced:${id}`) || seen.has(binding.workspaceId)) continue;
       jobs.push({id: binding.workspaceId, run: async () => {
         const lifecycle = await api.getWorkspaceStatus(binding.workspaceId);
         if (["archived", "deleted"].includes(lifecycle.status)) this.close(id);
@@ -83,7 +91,9 @@ export class CloudWorkspaceSync {
           this.engine.retitle(id, name, `sync-rename:${id}:${revision}`);
         })();
       }
-      this.topic(id, keyed ? ws.name : name);
+      // Opened through the engine, which also says where the workspace is: a launch that gave up after Conductor
+      // created the workspace still holds its link, and this is the topic it was waiting for.
+      this.engine.openTopic(id);
       return;
     }
     // A workspace this gateway created carries its creation key until it is titled. Its launch binds it, even after a

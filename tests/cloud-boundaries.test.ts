@@ -472,3 +472,20 @@ test("a Conductor rejection clears the router send fence and an uncertain failur
   await assert.rejects(f.router.route(f.store.row("route-uncertain")!), /receipt is uncertain.+network down/);
   assert.equal(f.sends.length, 0);
 }));
+
+test("the router's decline names the files it did not keep", () => fixture(async f => {
+  f.store.enqueue("route", "router", {text: "these two", chatId: "42", media: {files: [{fileId: "a", fileName: "a.pdf"}, {fileId: "b", fileName: "b.pdf"}]}}, "route-files");
+  const row = f.store.row("route-files")!;
+  await f.router.route(row);
+  f.messages.push({type: "assistant", content: "{\"action\":\"unclear\"}"});
+  await f.router.route(row);
+  assert.match(JSON.parse(f.store.row("route-files:unclear:0")!.payload).payload.text,
+    /so nothing was sent\. The 2 attached files were not kept: send them again with a target\. Use \/run/);
+  f.store.enqueue("route", "router", {text: "one", chatId: "42", media: {fileId: "legacy", fileName: "legacy.pdf"}}, "route-legacy-file");
+  const legacy = f.store.row("route-legacy-file")!;
+  await f.router.route(legacy);
+  f.messages.push({type: "assistant", content: "{\"action\":\"unclear\"}"});
+  await f.router.route(legacy);
+  assert.match(JSON.parse(f.store.row("route-legacy-file:unclear:0")!.payload).payload.text,
+    /The attached file was not kept: send it again with a target/);
+}));

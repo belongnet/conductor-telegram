@@ -6,7 +6,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { getDb, closeDb } from "../src/store/db.js";
-import { createWorkspace, getWorkspace, getDecision, answerDecision, getWorkspaceMessageTarget, getThreadCursor, updateWorkspaceThreadId, upsertRepoTopic, linkTelegramMessage } from "../src/store/queries.js";
+import { createWorkspace, getWorkspace, getDecision, answerDecision, getWorkspaceMessageTarget, getRetiredWorkspace, getThreadCursor, updateWorkspaceThreadId, upsertRepoTopic, linkTelegramMessage } from "../src/store/queries.js";
 import { GatewayStore } from "../src/cloud/store.js";
 import { FileBridge, startBridge, gatewayHealth } from "../src/cloud/bridge.js";
 import { CloudEngine, messageContainsExactText } from "../src/cloud/engine.js";
@@ -288,6 +288,32 @@ test("stop during creation prevents the first prompt from being sent", () => fix
   await f.launch();
   assert.equal(f.counts().sends, 0);
   assert.equal(f.store.get(`stop:${f.ws.id}`), true);
+}));
+
+test("a stop claimed while launch creation is in flight waits for the binding", async () => fixture(async f => {
+  let started!: () => void;
+  let release!: () => void;
+  const creationStarted = new Promise<void>(resolve => { started = resolve; });
+  const releaseCreation = new Promise<void>(resolve => { release = resolve; });
+  const original = f.api.createWorkspace;
+  f.api.createWorkspace = async () => {
+    started();
+    const created = await original();
+    await releaseCreation;
+    return created;
+  };
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix the bug"});
+  const launchRun = processQueue(f.store, ["cloud"], row => f.engine.action(row), 1);
+  await creationStarted;
+  f.engine.queue("stop-race", {type: "stop", trackedId: f.ws.id});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row), 1);
+  assert.equal(f.store.row("stop-race")!.state, "pending", "the control row waits instead of becoming a historical-work error");
+  release();
+  await launchRun;
+  f.store.db.prepare("UPDATE gateway_queue SET available_at=0 WHERE id LIKE 'stop-race%'").run();
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(f.store.row("stop-race")!.state, "done");
+  assert.equal(f.store.row("stop-race")!.error, null);
 }));
 
 test("a launch stopped while Conductor creates the workspace still says where the workspace is, and opens no topic", () => fixture(async f => {
@@ -1413,6 +1439,17 @@ test("a workspace still asleep when a message arrives is left for Conductor to w
   f.store.set("session:s1", {...f.store.get<any>("session:s1"), sentAt: Date.now() - 6 * 60_000});
   f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal(wakes(), 1);
+}));
+
+test("an unstarted workspace follows the same dormant recovery path as a sleeping one", () => fixture(async f => {
+  await f.launch();
+  f.api.getWorkspaceStatus = async () => ({workspaceId: "w1", status: "unstarted"});
+  const state = f.store.get<any>("session:s1");
+  f.store.set("session:s1", {...state, sentAt: Date.now() - 6 * 60_000});
+  await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
+  const wakes = f.store.db.prepare("SELECT * FROM gateway_queue WHERE id LIKE 'wake:%'").all() as any[];
+  assert.equal(wakes.length, 1);
+  assert.match(JSON.parse(wakes[0].payload).prompt, /slept during this task/);
 }));
 
 test("a retried native send recreates a status edit lost after its state was persisted", () => fixture(async f => {
@@ -2717,6 +2754,17 @@ test("a workspace whose launch never sent its task says where it is in the topic
   ]);
 }));
 
+test("archiving through Telegram retires the workspace and closes its gateway-owned topic", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 77);
+  f.engine.queue("archive-topic", {type: "archive", trackedId: f.ws.id});
+  await processQueue(f.store, ["cloud"], row => f.engine.action(row));
+  assert.equal(getWorkspace(f.ws.id)!.status, "archived");
+  assert.ok(getWorkspace(f.ws.id)!.archivedAt);
+  assert.equal(JSON.parse(f.store.row(`retire-topic:${f.ws.id}`)!.payload).method, "closeForumTopic");
+}));
+
 test("the card names the workspace again once Conductor answers after stumbling while preparing it", () => fixture(async f => {
   f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
   enqueueText(f.store, "cmd:reply", "-42", "Task received and queued.", {priority: 0, silent: true});
@@ -2831,6 +2879,53 @@ test("retiring a workspace never closes its topic once newer work has moved into
   assert.equal(f.store.row(`retire-topic:${f.ws.id}`), undefined);
 }));
 
+test("a queued topic close is suppressed if newer work adopts the topic first", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 77);
+  if (f.store.row(`create-topic:${f.ws.id}`)) f.store.finish(`create-topic:${f.ws.id}`, {suppressed: "test setup"});
+  const next = createWorkspace({name: "Next task", prompt: "Next task", repoPath: "conductor-project:p1", telegramChatId: "-42"});
+  updateWorkspaceThreadId(next.id, 77);
+  enqueueTelegram(f.store, "stale-close", {method: "closeForumTopic", workspaceId: f.ws.id,
+    payload: {chat_id: "-42", message_thread_id: 77}});
+  for (const row of f.store.db.prepare("SELECT id FROM gateway_queue WHERE kind='telegram' AND json_extract(payload,'$.workspaceId')=? AND state='pending'").all(f.ws.id) as Array<{id: string}>) {
+    if (row.id !== "stale-close") f.store.finish(row.id, {suppressed: "test setup"});
+  }
+  const calls: string[] = [];
+  await new TelegramDelivery(f.store, async method => { calls.push(method); return {message_id: 1}; }).tick();
+  assert.deepEqual(calls, [], JSON.stringify(f.store.db.prepare("SELECT id, payload, state FROM gateway_queue WHERE kind='telegram'").all()));
+  assert.match(f.store.row("stale-close")!.result!, /adopted by newer work/);
+}));
+
+test("a queued topic recovery is suppressed after its workspace is retired", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  await f.launch();
+  updateWorkspaceThreadId(f.ws.id, 77);
+  if (f.store.row(`create-topic:${f.ws.id}`)) f.store.finish(`create-topic:${f.ws.id}`, {suppressed: "test setup"});
+  f.engine.retire(f.ws.id, "archived");
+  enqueueTelegram(f.store, "stale-reopen", {method: "reopenForumTopic", workspaceId: f.ws.id,
+    payload: {chat_id: "-42", message_thread_id: 77}});
+  for (const row of f.store.db.prepare("SELECT id FROM gateway_queue WHERE kind='telegram' AND json_extract(payload,'$.workspaceId')=? AND state='pending'").all(f.ws.id) as Array<{id: string}>) {
+    if (row.id !== "stale-reopen") f.store.finish(row.id, {suppressed: "test setup"});
+  }
+  const calls: string[] = [];
+  await new TelegramDelivery(f.store, async method => { calls.push(method); return {message_id: 1}; }).tick();
+  assert.deepEqual(calls, []);
+  assert.match(f.store.row("stale-reopen")!.result!, /retired/);
+}));
+
+test("a retirement notice queued before topic assignment stays in General", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42', archived_at=datetime('now'), status='archived' WHERE id=?").run(f.ws.id);
+  enqueueText(f.store, "stale-notice", "-42", "workspace gone", {workspaceId: f.ws.id, allowRetired: true});
+  updateWorkspaceThreadId(f.ws.id, 77);
+  const next = createWorkspace({name: "Next task", prompt: "Next task", repoPath: "conductor-project:p1", telegramChatId: "-42"});
+  updateWorkspaceThreadId(next.id, 77);
+  const sent: any[] = [];
+  await new TelegramDelivery(f.store, async (_method, payload) => { sent.push(payload); return {message_id: 1}; }).tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].message_thread_id, undefined);
+}));
+
 test("a workspace that disappears later is retired, and only a topic this gateway opened is closed", () => fixture(async f => {
   f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
   await f.launch();
@@ -2845,6 +2940,11 @@ test("a workspace that disappears later is retired, and only a topic this gatewa
   const notice = f.store.row(`unavailable:${f.ws.id}:0`)!;
   assert.equal(notice.conversation, close.conversation);
   assert.match(JSON.parse(notice.payload).payload.text, /no longer available\. Its history is retained/);
+  const sent: Array<{method: string; payload: any}> = [];
+  const delivery = new TelegramDelivery(f.store, async (method, payload) => { sent.push({method, payload}); return {message_id: sent.length}; });
+  for (let i = 0; i < 6; i++) { f.store.set("telegram-chat-after:-42", 0); await delivery.tick(); }
+  assert.match(sent.find(item => item.method === "sendMessage")?.payload.text ?? "", /no longer available/);
+  assert.ok(sent.some(item => item.method === "closeForumTopic"), "the topic closes after the notice is delivered");
 }));
 
 // Generated by /ship coverage audit
@@ -3240,4 +3340,153 @@ test("a workspace living in a repo topic never renames it", () => fixture(async 
   const renames = (f.store.db.prepare("SELECT payload FROM gateway_queue WHERE kind='telegram'").all() as any[])
     .map(row => JSON.parse(row.payload)).filter(job => job.method === "editForumTopic");
   assert.deepEqual(renames, []);
+}));
+
+// Review fixes: retired work is answered for wherever it is addressed, and never left waiting on a closed topic.
+test("a reply to retired work's message is answered even when its repository topic now carries newer work", () => fixture(async f => {
+  const commands = repoTopic(f, "repo");
+  const say = async (update_id: number, message: Record<string, unknown>) => {
+    f.store.ingest([{update_id, message: {chat: {id: -42}, from: {id: 9}, message_thread_id: 5, ...message}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+  };
+  await say(1, {message_id: 101, text: "first task"});
+  const first = JSON.parse(f.store.row("update:1:action")!.payload).trackedId;
+  f.store.db.prepare("UPDATE workspaces SET status='archived',archived_at=? WHERE id=?").run(new Date().toISOString(), first);
+  await say(2, {message_id: 102, text: "second task"});
+  const second = JSON.parse(f.store.row("update:2:action")!.payload).trackedId;
+  assert.notEqual(second, first, "a plain message in a repository topic starts new work");
+  await say(3, {message_id: 103, reply_to_message: {message_id: 101}, text: "Continue"});
+  assert.equal(f.store.row("update:3:action"), undefined, "not handed to the newer workspace");
+  const answer = JSON.parse(f.store.row("update:3:reply:0")!.payload);
+  assert.match(answer.payload.text, /^That workspace is no longer in Conductor/);
+  assert.equal(answer.about, first, "the answer is about the retired work, so a reply to it is answered the same way");
+  await say(4, {message_id: 104, text: "and then"});
+  assert.equal(JSON.parse(f.store.row("update:4:action")!.payload).trackedId, second, "a plain message still continues the newer work");
+}));
+
+test("a command for retired work is told the work is gone instead of being sent back to its topic", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  updateWorkspaceThreadId(f.ws.id, 77);
+  linkTelegramMessage("-42", "500", f.ws.id);
+  f.store.db.prepare("UPDATE workspaces SET status='failed',archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+  const say = async (update_id: number, message: Record<string, unknown>) => {
+    f.store.ingest([{update_id, message: {chat: {id: -42}, from: {id: 9}, ...message}}]);
+    await processQueue(f.store, ["update"], row => commands.handle(row));
+    return JSON.parse(f.store.row(`update:${update_id}:reply:0`)!.payload);
+  };
+  for (const [update_id, text] of [[1, "/send try again"], [2, "/ship"], [3, "/threads"]] as const) {
+    const answer = await say(update_id, {message_id: 100 + update_id, message_thread_id: 77, text});
+    assert.match(answer.payload.text, /^That workspace is no longer in Conductor/, text);
+    assert.equal(answer.about, f.ws.id, text);
+  }
+  const stop = await say(4, {message_id: 104, reply_to_message: {message_id: 500}, text: "/stop"});
+  assert.match(stop.payload.text, /^That workspace is no longer in Conductor/, "a reply addresses it from anywhere");
+  assert.equal(f.store.row("update:4:action"), undefined);
+}));
+
+test("the retired-work answer reaches the owner in General when its closed topic refuses it, and never blocks delivery", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  const commands = new CloudCommands(f.store, f.engine, async () => ({}), "-42", "9");
+  updateWorkspaceThreadId(f.ws.id, 77);
+  f.store.db.prepare("UPDATE workspaces SET status='archived',archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+  f.store.ingest([{update_id: 1, message: {message_id: 1, chat: {id: -42}, from: {id: 9}, message_thread_id: 77, text: "Continue"}}]);
+  await processQueue(f.store, ["update"], row => commands.handle(row));
+  const delivered: any[] = [];
+  const delivery = new TelegramDelivery(f.store, async (_method, payload) => {
+    if (payload.message_thread_id) throw {response: {error_code: 400, description: "Bad Request: TOPIC_CLOSED"}};
+    delivered.push(payload); return {message_id: 900};
+  });
+  for (let i = 0; i < 2; i++) { f.store.set("telegram-chat-after:-42", 0); await delivery.tick(); }
+  assert.equal(f.store.row("update:1:reply:0")!.state, "done");
+  assert.equal(f.store.backlog().blocked, 0);
+  assert.equal(delivered.length, 1); assert.equal(delivered[0].message_thread_id, undefined, "answered in General instead");
+  assert.match(delivered[0].text, /^That workspace is no longer in Conductor/);
+  assert.equal(getRetiredWorkspace("-42", "900", undefined)?.id, f.ws.id, "and a reply to that answer is answered the same way");
+}));
+
+test("a workspace whose launch never sent its task gets its topic, and its link, when its agent reports through the bridge", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  f.api.getSessionStatus = foreignSession;
+  await f.launch();
+  assert.equal(f.store.row("launch")!.state, "blocked");
+  assert.equal(f.store.row(`create-topic:${f.ws.id}`), undefined, "nothing was sent to it, so it has no topic yet");
+  f.bridge.event(f.ws.id, {id: randomUUID(), type: "status", payload: {status: "working", message: "Running the test suite"}});
+  f.engine.events();
+  assert.ok(f.store.get(`topic-required:${f.ws.id}`) && f.store.row(`create-topic:${f.ws.id}`), "the report waits for a topic of its own rather than landing in General");
+  assert.equal(JSON.parse(f.store.row(`created:${f.ws.id}:0`)!.payload).payload.text, "Conductor workspace created: conductor://w1");
+  assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined);
+}));
+
+test("a launch that stops short after Conductor created the workspace puts the workspace link on its card", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  enqueueText(f.store, "cmd:reply", "-42", "Task received and queued.", {priority: 0, silent: true});
+  f.api.getSessionStatus = foreignSession;
+  f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix the bug", statusId: "cmd:reply:0"});
+  await processQueue(f.store, ["cloud"], r => f.engine.action(r));
+  assert.equal(f.store.row("launch")!.state, "blocked");
+  reportBlocked(f.store, "-42");
+  assert.equal(JSON.parse(f.store.row("blocked-card:launch")!.payload).payload.text, "Not done: Session belongs to another cloud workspace\nconductor://w1");
+  assert.equal(f.store.get(`created-link:${f.ws.id}`), undefined, "said once, on the card");
+}));
+
+test("a late message for retired work that never got a topic is dropped rather than left waiting for one", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  f.store.set(`topic-required:${f.ws.id}`, true);
+  f.store.db.prepare("UPDATE workspaces SET status='failed',archived_at=? WHERE id=?").run(new Date().toISOString(), f.ws.id);
+  enqueueText(f.store, "late", "-42", "late notice", {workspaceId: f.ws.id});
+  enqueueText(f.store, "next", "-42", "for the owner", {priority: 0});
+  const sent: string[] = [];
+  const delivery = new TelegramDelivery(f.store, async (_method, payload) => { sent.push(payload.text); return {message_id: 1}; });
+  for (let i = 0; i < 2; i++) { f.store.set("telegram-chat-after:-42", 0); await delivery.tick(); }
+  assert.match(f.store.row("late:0")!.result!, /suppressed/);
+  assert.deepEqual(sent, ["for the owner"], "and the General lane moves on");
+}));
+
+test("retiring work drops a queued workspace message instead of leaking it into General", () => fixture(async f => {
+  f.store.db.prepare("UPDATE workspaces SET telegram_chat_id='-42' WHERE id=?").run(f.ws.id);
+  f.engine.openTopic(f.ws.id);
+  enqueueText(f.store, "late", "-42", "stale agent output", {workspaceId: f.ws.id});
+  f.engine.retire(f.ws.id, "archived");
+  const sent: any[] = [];
+  const delivery = new TelegramDelivery(f.store, async (_method, payload) => { sent.push(payload); return {message_id: 1}; });
+  for (let i = 0; i < 2; i++) { f.store.set("telegram-chat-after:-42", 0); await delivery.tick(); }
+  assert.equal(f.store.row("late:0")!.state, "done");
+  assert.match(f.store.row("late:0")!.result!, /suppressed/);
+  assert.deepEqual(sent, [], "retired workspace output is not sent to General");
+}));
+
+test("a status tag an earlier release stored in a workspace's name is dropped once at startup", () => fixture(async f => {
+  const tagged = createWorkspace({name: "[!] [agents] Media plan", prompt: "x", repoPath: "conductor-project:p1", telegramChatId: "42"});
+  const local = createWorkspace({name: "[!] Local task", prompt: "x", repoPath: "/Users/local/project", telegramChatId: "42"});
+  f.store.db.prepare("UPDATE workspaces SET conductor_backend_kind='cloud-api', conductor_workspace_name='[!] [agents] Media plan' WHERE id=?").run(tagged.id);
+  new GatewayStore(f.store.db);
+  const fixed = getWorkspace(tagged.id)!;
+  assert.equal(fixed.name, "[agents] Media plan"); assert.equal(fixed.conductorWorkspaceName, "[agents] Media plan");
+  assert.equal(getWorkspace(local.id)!.name, "[!] Local task", "local work keeps its own status marker");
+  assert.equal(getWorkspace(f.ws.id)!.name, "test", "a name without a tag is left as it is");
+}));
+
+// Approved in review: retired work leaves the poll rotation instead of taking a slot every minute for good.
+test("an archived workspace stops taking poller slots, so live work is still polled", () => fixture(async f => {
+  await f.launch();
+  for (let i = 0; i < 250; i++) {
+    const gone = createWorkspace({name: `old ${i}`, prompt: "x", repoPath: "conductor-project:p1", telegramChatId: "42"});
+    f.store.bind(gone.id, {...f.store.binding(f.ws.id)!, workspaceId: `gone-${i}`});
+    f.store.db.prepare("UPDATE workspaces SET status='archived',archived_at=? WHERE id=?").run(new Date().toISOString(), gone.id);
+  }
+  const visits = new Map<string, number>();
+  const real = f.engine.pollWorkspace.bind(f.engine);
+  f.engine.pollWorkspace = async (id, binding) => { visits.set(id, (visits.get(id) ?? 0) + 1); return real(id, binding); };
+  const poller = new CloudPoller(f.engine);
+  const base = Date.now();
+  for (let second = 0; second < 120; second++) { poller.tick(base + second * 1000); await poller.settled(); }
+  assert.ok((visits.get(f.ws.id) ?? 0) >= 2, `live work was polled ${visits.get(f.ws.id) ?? 0} times in two minutes`);
+  assert.ok([...visits].filter(([id]) => id !== f.ws.id).every(([, n]) => n === 1), "retired work is visited once, then parked");
+}));
+
+test("retiring a workspace parks its binding at once", () => fixture(async f => {
+  await f.launch();
+  f.engine.retire(f.ws.id, "archived");
+  assert.equal(f.store.get(`poll-after:${f.ws.id}`), Number.MAX_SAFE_INTEGER);
 }));

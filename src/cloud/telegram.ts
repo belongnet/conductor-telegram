@@ -1,5 +1,5 @@
 import type { GatewayStore, QueueRow } from "./store.js";
-import { linkTelegramMessage, updateWorkspaceThreadId, getWorkspace } from "../store/queries.js";
+import { linkTelegramMessage, updateWorkspaceThreadId, getWorkspace, getWorkspaceByThreadId } from "../store/queries.js";
 import type { Workspace } from "../types/index.js";
 import { createReadStream } from "node:fs";
 import { escHtml, markdownToTelegramChunks, telegramReplyText } from "../bot/format.js";
@@ -20,6 +20,8 @@ export interface TelegramJob {
   replacementOf?: string;
   /** The work this message is about when it is not sent to that work's topic. A reply to it is still about that work. */
   about?: string;
+  /** A retirement notice was queued before the workspace became terminal and may finish delivery afterward. */
+  allowRetired?: boolean;
 }
 /** An edit waits this long for its acknowledgement before it is delivered as a message instead. */
 const STATUS_ANCHOR_WAIT_MS = 300_000;
@@ -90,7 +92,7 @@ export function statusCardSeen(store: GatewayStore, anchor: QueueRow, ws: Worksp
 
 /** Agent Markdown is rendered before splitting; control messages stay literal. */
 export function enqueueText(store: GatewayStore, id: string, chatId: string, text: string,
-  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean; silent?: boolean; about?: string } = {}): void {
+  options: { threadId?: number | null; workspaceId?: string; sessionId?: string; decisionId?: number; replyMarkup?: unknown; priority?: number; markdown?: boolean; silent?: boolean; about?: string; allowRetired?: boolean } = {}): void {
   const chunks: string[] = [];
   if (options.markdown) {
     text = telegramReplyText(text);
@@ -111,7 +113,7 @@ export function enqueueText(store: GatewayStore, id: string, chatId: string, tex
       ...(options.threadId ? { message_thread_id: options.threadId } : {}),
       ...(options.silent ? { disable_notification: true } : {}),
       ...(i === chunks.length - 1 && options.replyMarkup ? { reply_markup: options.replyMarkup } : {}) },
-    workspaceId: options.workspaceId, sessionId: options.sessionId, decisionId: options.decisionId, about: options.about,
+    workspaceId: options.workspaceId, sessionId: options.sessionId, decisionId: options.decisionId, about: options.about, allowRetired: options.allowRetired,
   }, options.priority));
 }
 
@@ -196,16 +198,37 @@ export class TelegramDelivery {
       } else { this.fallback(row, job, "The acknowledgement was not delivered"); return; }
     }
     try {
+      if (job.workspaceId && job.payload.message_thread_id !== undefined) {
+        const owner = getWorkspaceByThreadId(String(job.payload.chat_id), Number(job.payload.message_thread_id));
+        if (owner && owner.id !== job.workspaceId) {
+          this.store.finish(row.id, { suppressed: "Topic was adopted by newer work" }); return;
+        }
+        if (getWorkspace(job.workspaceId)?.archivedAt && job.method !== "closeForumTopic" && !(job.allowRetired && job.method === "sendMessage")) {
+          this.store.finish(row.id, { suppressed: "Workspace retired before topic operation" }); return;
+        }
+      }
       const payload = { ...job.payload };
       if (job.workspaceId && job.method !== "editMessageText" && !/ForumTopic/.test(job.method)) {
         const workspace = getWorkspace(job.workspaceId);
         if (job.decisionId && (workspace?.archivedAt || ["done", "stopped", "failed", "archived"].includes(workspace?.status ?? ""))) {
           this.store.finish(row.id, {suppressed: "Question belongs to terminal work; retained in decision history"}); return;
         }
+        // A workspace-targeted message cannot safely fall back to General after the workspace is retired or missing.
+        // Owner replies use `about` instead, so they can still fall back when their closed topic refuses delivery.
+        if (!workspace || (workspace.archivedAt && !job.allowRetired)) { this.store.finish(row.id, {suppressed: "Workspace retired before delivery"}); return; }
         if (topicOpening(this.store, job.workspaceId, workspace?.telegramThreadId)) {
           this.store.retry(row.id, "Waiting for workspace topic", 1000); return;
         }
-        if (workspace?.telegramThreadId) payload.message_thread_id = workspace.telegramThreadId;
+        // A retirement notice may have been queued before this workspace got
+        // a topic. Do not retarget that stale notice into a topic adopted by
+        // newer work; it remains a General message instead.
+        if (workspace?.telegramThreadId && !(job.allowRetired && workspace.archivedAt && job.payload.message_thread_id === undefined)) {
+          payload.message_thread_id = workspace.telegramThreadId;
+          const owner = getWorkspaceByThreadId(String(payload.chat_id), Number(payload.message_thread_id));
+          if (owner && owner.id !== job.workspaceId) {
+            this.store.finish(row.id, { suppressed: "Topic was adopted by newer work" }); return;
+          }
+        }
       }
       if (job.filePath) payload.document = { source: createReadStream(job.filePath), filename: payload.filename };
       delete payload.filename;
@@ -261,7 +284,8 @@ export class TelegramDelivery {
       }
       // The card was deleted or cannot be edited; its state still has to reach the topic.
       if (job.method === "editMessageText" && failure.permanent) { this.fallback(row, job, failure.description); return; }
-      if (/message thread not found|message_thread_not_found|topic_deleted|TOPIC_ID_INVALID|TOPIC_CLOSED/i.test(failure.description) && job.workspaceId) {
+      const topicOf = job.workspaceId ?? job.about;
+      if (/message thread not found|message_thread_not_found|topic_deleted|TOPIC_ID_INVALID|TOPIC_CLOSED/i.test(failure.description) && topicOf) {
         // A topic that is gone takes no new name. Opening one only to rename it would bring back a topic the owner
         // deleted, and the edit would still point at the old one. A message that needs the topic opens it, under the
         // workspace's current name.
@@ -269,8 +293,8 @@ export class TelegramDelivery {
           this.store.finish(row.id, { suppressed: "Topic no longer exists" }); return;
         }
         // Recover through the same durable topic-operation queue. Do not leak into General.
-        const ws = getWorkspace(job.workspaceId);
-        if (ws && !ws.archivedAt && ws.status !== "archived") {
+        const ws = getWorkspace(topicOf);
+        if (ws && !ws.archivedAt && ws.status !== "archived" && job.workspaceId) {
           enqueueTelegram(this.store, `topic-recover:${row.id}`, {
             method: /TOPIC_CLOSED/i.test(failure.description) ? "reopenForumTopic" : "createForumTopic",
             payload: { chat_id: ws.telegramChatId, name: clip(ws.conductorWorkspaceName ?? ws.name, 128),
@@ -279,8 +303,12 @@ export class TelegramDelivery {
           this.store.retry(row.id, failure.description, 5000, row.attempts > 5);
           return;
         }
-        // Retired work keeps its history. A late message for its closed topic is dropped, because a
-        // permanently blocked delivery row would hold gateway readiness down for good.
+        // An answer to the owner, written about retired work, reaches them in General when its closed topic
+        // refuses it: the owner asked and is owed a reply. Retired work's own late messages keep their history and
+        // are dropped, because a permanently blocked delivery row would hold gateway readiness down for good.
+        if (ws && !job.workspaceId && job.method === "sendMessage" && job.payload.message_thread_id) {
+          this.fallback(row, { ...job, payload: { ...job.payload, message_thread_id: undefined } }, "Topic closed; answering in General"); return;
+        }
         if (ws) { this.store.finish(row.id, { suppressed: "Topic closed for retired work" }); return; }
       }
       this.store.retry(row.id, failure.description, failure.delayMs, failure.permanent);
@@ -336,14 +364,17 @@ export function reportBlocked(store: GatewayStore, ownerChatId: string, now = Da
     store.db.transaction(() => {
       // Retired work has no topic to follow, yet what is said about it is still about it: a reply is answered as such.
       const about = live ? undefined : ws?.id;
+      // A launch that stopped short after Conductor created the workspace still owes the owner the way to it.
+      const link = live ? store.get<string>(`created-link:${live.id}`) : undefined;
+      if (link) store.clear(`created-link:${live!.id}`);
       if (anchor) enqueueStatus(store, `blocked-card:${row.id}`, { anchorId: anchor.id, chatId: ws?.telegramChatId ?? ownerChatId,
-        workspaceId: live?.id, about, text: `Not done: ${reason}` });
+        workspaceId: live?.id, about, text: `Not done: ${reason}${link ? `\n${link}` : ""}` });
       // The anchor's age, not the row's: a system continuation is young when it blocks, yet nobody is watching its card.
       if (!anchor || now - anchor.created_at > ATTENTION_AFTER_MS) {
         // A gateway-built route or media row names the chat it answers. A raw update can come from any chat, so it reports to the owner.
         const chatId = ws?.telegramChatId ?? (row.kind !== "update" && payload.chatId ? String(payload.chatId) : ownerChatId);
         const threadId = ws ? live?.telegramThreadId : row.kind !== "update" && payload.chatId ? payload.threadId : undefined;
-        enqueueText(store, `blocked:${row.id}`, chatId, `${ws ? "Operation" : "Telegram operation"} needs attention: ${reason}`,
+        enqueueText(store, `blocked:${row.id}`, chatId, `${ws ? "Operation" : "Telegram operation"} needs attention: ${reason}${!anchor && link ? `\n${link}` : ""}`,
           { workspaceId: live?.id, about, threadId });
       }
       store.set(`blocked-notified:${row.id}`, true);

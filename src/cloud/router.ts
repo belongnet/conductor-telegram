@@ -113,8 +113,12 @@ export class CloudRouter {
     try { answer = RouteSchema.parse(JSON.parse(body.endsWith("```") ? body.slice(0, -3) : body)); }
     catch { throw new TerminalError(`The router did not return a usable target. ${ROUTING_HINT}`); }
     if (answer.action === "unclear") {
-      // The message is quoted like a proposal's: for a voice note this is the one place its transcript is shown.
-      enqueueText(store, `${row.id}:unclear`, input.chatId, `I can't tell which project or workspace this is for, so nothing was sent. ${ROUTING_HINT}\n\n${input.text}`, { threadId: input.threadId });
+      // The message is quoted like a proposal's: for a voice note this is the one place its transcript is shown. Its
+      // files are not kept, so the owner is told to send them again rather than left to find that out.
+      const media = input.media as { files?: unknown[]; fileId?: string } | undefined;
+      const files = media?.files?.length ?? (media?.fileId ? 1 : 0);
+      const dropped = files ? ` The ${files === 1 ? "attached file was" : `${files} attached files were`} not kept: send ${files === 1 ? "it" : "them"} again with a target.` : "";
+      enqueueText(store, `${row.id}:unclear`, input.chatId, `I can't tell which project or workspace this is for, so nothing was sent.${dropped} ${ROUTING_HINT}\n\n${input.text}`, { threadId: input.threadId });
       return;
     }
     const result = answer;
