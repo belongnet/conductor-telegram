@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
+import { workspaceName } from "./names.js";
 
 export interface QueueRow {
   id: string;
@@ -67,6 +68,16 @@ export class GatewayStore {
     const columns = db.prepare("PRAGMA table_info(gateway_queue)").all() as Array<{name: string}>;
     if (!columns.some(c => c.name === "completed_at")) db.exec("ALTER TABLE gateway_queue ADD COLUMN completed_at INTEGER");
     db.exec("CREATE INDEX IF NOT EXISTS gateway_queue_completed ON gateway_queue(kind,completed_at)");
+    // A status tag an earlier release copied into a stored name is dropped once, so every message goes by the name
+    // without it, including for stopped work that discovery no longer revisits.
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspaces'").get()) {
+      const rows = db.prepare("SELECT id,name,conductor_workspace_name FROM workspaces WHERE conductor_backend_kind='cloud-api'").all() as Array<{id: string; name: string; conductor_workspace_name: string | null}>;
+      const fix = db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?");
+      for (const row of rows) {
+        const name = workspaceName(row.name), conductor = row.conductor_workspace_name === null ? null : workspaceName(row.conductor_workspace_name);
+        if (name !== row.name || conductor !== row.conductor_workspace_name) fix.run(name, conductor, row.id);
+      }
+    }
   }
 
   get<T>(key: string): T | undefined {

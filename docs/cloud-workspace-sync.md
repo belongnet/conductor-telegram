@@ -10,7 +10,7 @@ The runtime implementation is available in cloud-only mode. The guided setup des
 
 Set `TELEGRAM_CLOUD_SYNC_CHAT_ID` to a negative Telegram supergroup ID. The group must have Topics enabled, the bot must be an administrator with Manage Topics, and `OWNER_USER_ID` must be set. The gateway validates all of these conditions before it starts.
 
-Every minute, and whenever the owner runs `/sync`, the gateway reads the operator's unarchived Conductor Cloud workspaces. It excludes its own router workspace by binding and by name (`telegram-routing-…`). A workspace is attached only when its canonical Git remote identifies exactly one accessible Conductor project. Missing or ambiguous identities fail closed and appear as sync failures in readiness health.
+Every minute, and whenever the owner runs `/sync`, the gateway reads the operator's unarchived Conductor Cloud workspaces. It excludes its own router workspace by binding and by name (`telegram-routing-…`), and leaves a workspace Conductor is still creating until it exists, so one Conductor never finishes gets no topic. A workspace is attached only when its canonical Git remote identifies exactly one accessible Conductor project. Missing or ambiguous identities fail closed and appear as sync failures in readiness health.
 
 For each newly attached workspace, the gateway:
 
@@ -30,7 +30,9 @@ Discovered workspaces do not receive an MCP bridge credential. Their agents are 
 
 Discovery is read-only in Conductor: it does not create, wake, stop, archive, or send work. Text, documents, photos, and transcribed voice become work only after an authenticated owner sends them in a topic that this gateway explicitly attached. Telegram topic service messages never become prompts.
 
-Conductor workspace renames update the topic name. Archived or deleted workspaces close their topics while preserving Telegram history and the durable binding. The gateway does not take over existing repository launch topics.
+Conductor workspace renames update the topic name. A leading tag made only of marks, such as `[!]`, is read as a status another tool switches on and off rather than as part of the name: the topic and every message the gateway sends go by the name without it, so a flip renames nothing, and a stored name that still carries one is corrected once at startup. A tag with a letter or digit in it, such as `[agents]`, stays. `/fleet` lists Conductor's own names, tag included.
+
+Archived or deleted workspaces close their topics while preserving Telegram history and the durable binding. Only a topic the gateway opened for that workspace is closed: never a repository topic, a topic the owner made, or one newer work has moved into, and a topic still waiting to be opened is cancelled instead. Where the gateway takes the owner's input, a message addressed to a workspace that is gone is told so and is not routed to other work: a reply to one of its messages, including the notice that its launch failed, wherever that reply is sent, even from a topic that has since moved on to other work; a command such as `/send` or `/stop` addressed to it; or a message in the topic that was its own. When that closed topic refuses the answer, it is given in General. `/run <project> <task>` starts new work there. A repository topic outlives the work it carries, so a plain message in one still starts new work and only a reply to the old work's message is answered that way. A synced group that is not the owner chat takes input only in a topic with a live attached workspace, so there a topic whose workspace is gone takes none, as before. The gateway does not take over existing repository launch topics.
 
 A workspace the gateway creates carries a `telegram-<id>` creation key as its Conductor name until Conductor has titled its first thread, because the key is how a lost create response is reconciled and Conductor never titles a workspace created with a name. Sync never copies that key into a topic or local name, including when another tool has tagged it (`[agents] telegram-<id>`), and a workspace the gateway is still creating is left to its launch rather than attached as discovered work. Once the first thread has a title, the workspace takes it once, in Conductor and in the topic the gateway opened for it, keeping any tag around the key. A name set with `/rename` or in Conductor since creation is never replaced, and discovered workspaces are never renamed: discovery stays read-only in Conductor.
 
@@ -59,7 +61,7 @@ CLI setup should expose the same choices, persist `cloudSyncChatId` and `cloudSy
 
 ## Acceptance criteria
 
-- A workspace created outside Telegram appears once in the configured forum within 60 seconds, including when it starts asleep.
+- A workspace created outside Telegram appears once in the configured forum within 60 seconds of Conductor finishing its creation, including when it starts asleep. One Conductor never finishes creating gets no topic.
 - Restarting the gateway creates no duplicate topic, transcript replay, or Conductor task.
 - New messages from every Conductor session arrive; replying targets the original session after a restart.
 - A topic with multiple visible threads holds an ambiguous message and its prepared attachments until an explicit choice; the picker identifies each thread's model.
@@ -67,7 +69,9 @@ CLI setup should expose the same choices, persist `cloudSyncChatId` and `cloudSy
 - Recovery transfers an explicit selection only when replacing that selected session; recovery of another thread cannot silently redirect the next topic message.
 - Only `OWNER_USER_ID` can submit work, and only inside topics created or attached by this gateway.
 - Ambiguous repository identities, unknown models, missing sessions, permission loss, and API failures do not guess or create work.
-- A rename updates the topic; archive or deletion closes it without deleting history.
+- A rename updates the topic; a status tag flipped in front of the name renames nothing; archive or deletion closes a topic the gateway opened for that workspace, without deleting history, and never a repository topic or one newer work has moved into.
+- In the owner chat, a message addressed to a workspace that is gone is answered and sent nowhere; a plain message in a repository topic still starts new work.
+- A launch started in the synced group can be stopped from its topic while Conductor is still preparing the workspace.
 - A gateway workspace's creation key never becomes a topic name; the workspace takes its first thread's title once, and a name given since creation stands.
 - Commands-only migration mode prevents ordinary text, files, and voice from becoming tasks.
 - More than 100 visible workspaces are discovered with bounded concurrency and without overlapping scans.

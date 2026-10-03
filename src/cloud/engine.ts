@@ -6,14 +6,14 @@ import { assistantTextFromTranscriptEvent, GITHUB_PR_URL_RE, githubPrUrlMatchesR
 import { findSubmittedMessage, isSubmittedMessage, messageEnvelope, nativeTurnFailure, nativeSessionProvider, ATTACHMENTS_ONLY_PROMPT } from "./messages.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import { getWorkspace, updateWorkspaceConductorBinding, updateWorkspaceStatus, getNewEvents, getDecision, linkTelegramMessage,
-  upsertThreadCursor, getThreadCursor, archiveWorkspaceLocally, pendingCloudMessageCanSend, getRepoTopicByThreadId, getWorkspaceByThreadId,
+  upsertThreadCursor, getThreadCursor, pendingCloudMessageCanSend, getRepoTopicByThreadId, getWorkspaceByThreadId,
   completePendingCloudMessageDelivery, completePendingCloudTerminalIntent, type PendingCloudTerminalIntent } from "../store/queries.js";
 import { GatewayStore, type CloudBinding, type QueueRow } from "./store.js";
 import { FileBridge } from "./bridge.js";
 import { CloudGitHub, GitHubError, ProjectCatalog, type CloudPr } from "./catalog.js";
 import { enqueueTelegram, enqueueText, enqueueStatus, enqueueProgress, TerminalError, safeDetail, statusCardSeen, topicOpening, type TelegramJob } from "./telegram.js";
 import { telegramReplyText } from "../bot/format.js";
-import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle } from "./names.js";
+import { clip, creationKey, taskTitle, threadLabel, threadName, threadTitle, workspaceName } from "./names.js";
 import type { Workspace } from "../types/index.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
@@ -163,7 +163,7 @@ export class CloudEngine {
     this.catalog = new ProjectCatalog(api, store);
   }
 
-  notify(id: string, trackedId: string, text: string, sessionId?: string, options: { markdown?: boolean; silent?: boolean } = {}): void {
+  notify(id: string, trackedId: string, text: string, sessionId?: string, options: { markdown?: boolean; silent?: boolean; allowRetired?: boolean } = {}): void {
     const ws = getWorkspace(trackedId);
     if (ws) enqueueText(this.store, id, ws.telegramChatId, text, { workspaceId: trackedId, sessionId,
       threadId: ws.telegramThreadId, ...options });
@@ -253,7 +253,23 @@ export class CloudEngine {
     }
     if (action.type === "launch") return this.launch(row, action);
     const binding = this.store.binding(ws.id);
-    if (!binding) throw new TerminalError("This historical workspace has no verified cloud binding. Start a new task using /run <project>.");
+    if (!binding) {
+      // A control row can be claimed while launch is still waiting for the
+      // create response. Keep it behind that in-flight launch; once the stop
+      // fence made launch a no-op, there is no cloud work left to cancel.
+      if (action.type === "stop" || action.type === "archive") {
+        if (this.launching(ws.id)) {
+          this.store.retry(row.id, "Waiting for cloud workspace creation", 1000);
+          return;
+        }
+        if (action.type === "archive") this.retire(ws.id, "archived");
+        if (action.legacyTerminal) completePendingCloudTerminalIntent(ws.id, action.legacyTerminal);
+        this.status(`${row.id}:done`, ws.id, action.statusId,
+          action.type === "archive" ? "Cloud workspace archived." : "All cloud threads stopped.");
+        return;
+      }
+      throw new TerminalError("This historical workspace has no verified cloud binding. Start a new task using /run <project>.");
+    }
     if (action.type === "stop" || action.type === "archive") {
       // Include in-flight creations discovered after a lost response. A session can disappear
       // between the list and cancel calls; that one is already stopped, so keep settling the rest.
@@ -280,11 +296,10 @@ export class CloudEngine {
           if (!(conductorApiRejected(error) && [404, 410].includes(error.status ?? 0))) throw error;
         }
       }
-      if (action.type === "archive" && !ws.archivedAt) {
-        this.store.assertWriter?.(); archiveWorkspaceLocally(ws.id);
-        this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(ws.id);
-      }
+      if (action.type === "archive") this.retire(ws.id, "archived");
       if (action.legacyTerminal) completePendingCloudTerminalIntent(ws.id, action.legacyTerminal);
+      // A workspace stopped before its topic was asked for is still somewhere the owner can go. An archived one is not.
+      if (action.type === "stop") this.announceCreated(ws.id); else this.store.clear(`created-link:${ws.id}`);
       this.status(`${row.id}:done`, ws.id, action.statusId, action.type === "archive" ? "Cloud workspace archived." : "All cloud threads stopped.");
       return;
     }
@@ -368,13 +383,44 @@ export class CloudEngine {
     return sessionId;
   }
 
-  private async launch(row: QueueRow, action: CloudAction): Promise<void> {
-    const ws = getWorkspace(action.trackedId)!;
+  /**
+   * A forum workspace's topic is opened once Conductor has a workspace to put in it. Opened any earlier, a launch
+   * Conductor never finishes leaves a topic behind with nothing in it, to be closed again. Whoever asks for the
+   * topic also says where the workspace is, so the link lands in it: a launch when it sends, the poller when the
+   * workspace speaks, the bridge when its agent reports, and discovery when it finds the workspace without one.
+   */
+  openTopic(trackedId: string): void {
+    const ws = getWorkspace(trackedId);
+    if (!ws || ws.archivedAt) return;
     if (ws.telegramChatId.startsWith("-") && !ws.telegramThreadId) {
       this.store.set(`topic-required:${ws.id}`, true);
       enqueueTelegram(this.store, `create-topic:${ws.id}`, { method: "createForumTopic", workspaceId: ws.id,
-        payload: { chat_id: ws.telegramChatId, name: ws.name.slice(0, 128) } }, 0);
+        payload: { chat_id: ws.telegramChatId, name: clip(ws.name, 128) } }, 0);
     }
+    this.announceCreated(ws.id);
+  }
+
+  /**
+   * Says, once, where a workspace Conductor created is. The link is held from creation until there is a place to say
+   * it: the workspace's topic once that is asked for, or the chat itself for a launch stopped before it had one.
+   */
+  private announceCreated(trackedId: string): void {
+    const key = `created-link:${trackedId}`, link = this.store.get<string>(key);
+    if (!link) return;
+    this.store.db.transaction(() => {
+      this.notify(`created:${trackedId}`, trackedId, `Conductor workspace created: ${link}`, undefined, { silent: true });
+      this.store.clear(key);
+    })();
+  }
+
+  /** A workspace whose launch is still queued or running. Its launch opens its topic and reports what becomes of it. */
+  launching(trackedId: string): boolean {
+    return !!getWorkspace(trackedId) && !!this.store.db.prepare(
+      "SELECT 1 FROM gateway_queue WHERE kind='cloud' AND conversation=? AND state IN ('pending','running') AND json_extract(payload,'$.type')='launch' LIMIT 1").get(trackedId);
+  }
+
+  private async launch(row: QueueRow, action: CloudAction): Promise<void> {
+    const ws = getWorkspace(action.trackedId)!;
     // An unknown or ambiguous project is the same answer on every attempt. An API failure is not, and keeps its own retry policy.
     const project = await this.catalog.resolve(action.projectId ?? "").catch(error => {
       throw error instanceof ConductorApiError ? error : new TerminalError(error instanceof Error ? error.message : "Repository unavailable");
@@ -420,15 +466,20 @@ export class CloudEngine {
         this.store.bind(ws.id, binding!);
         updateWorkspaceConductorBinding(ws.id, { workspaceId: created.workspaceId, sessionId: created.sessionId, backendKind: "cloud-api" });
         // The creation key is not a name. Until the first thread's title replaces it, the workspace goes by its task.
-        if (!remote.name.includes(name)) this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(remote.name, ws.id);
+        if (!remote.name.includes(name)) this.store.db.prepare("UPDATE workspaces SET conductor_workspace_name=? WHERE id=?").run(workspaceName(remote.name), ws.id);
         this.store.set(`session:${created.sessionId}`, { trackedId: ws.id, ...provider, role: "task" } satisfies SessionState);
+        // Said once there is a place to say it. The workspace's topic is not asked for until Conductor has it ready.
+        this.store.set(`created-link:${ws.id}`, created.deepLink);
       })();
-      this.notify(`${row.id}:created`, ws.id, `Conductor workspace created: ${created.deepLink}`, undefined, { silent: true });
     }
     if (this.stopped(row, action)) { this.queue(`stop-created:${row.id}`, { type: "stop", trackedId: ws.id }); return; }
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
     if (lifecycle.status === "initializing" || lifecycle.status === "updating") {
-      this.status(`${row.id}:provisioning`, ws.id, action.statusId, "Conductor is preparing the workspace.");
+      // Meanwhile the card carries the link. After a "not answering" card it is written once more, so the wait reads
+      // as a wait again as soon as Conductor answers.
+      const link = this.store.get<string>(`created-link:${ws.id}`);
+      this.status(`${row.id}:provisioning${this.store.row(`slow:${row.id}`) ? ":again" : ""}`, ws.id, action.statusId,
+        `Conductor is preparing the workspace.${link ? `\n${link}` : ""}`);
       this.store.retry(row.id, "Waiting for cloud provisioning", 5000); return;
     }
     if (["archived", "deleted"].includes(lifecycle.status)) {
@@ -443,20 +494,30 @@ export class CloudEngine {
     await this.send(row, action, binding, binding.sessionId!, session.status === "working");
   }
 
-  /** A Conductor workspace that is gone stops being polled and stops owning its topic. Its history stays. */
-  private retire(trackedId: string, status: "failed" | "archived"): void {
+  /**
+   * A Conductor workspace that is gone stops being polled and stops owning its topic. Its history stays. Every way a
+   * workspace is found gone ends here, so one rule decides whether its topic is the gateway's to close.
+   */
+  retire(trackedId: string, status: "failed" | "archived"): void {
     const ws = getWorkspace(trackedId);
     if (!ws || ws.archivedAt) return;
     this.store.assertWriter?.();
     this.store.db.transaction(() => {
       this.store.db.prepare("UPDATE gateway_credentials SET revoked=1 WHERE workspace_id=?").run(trackedId);
-      // archived_at is what ends polling and frees the topic: a later message there is routed as a fresh request.
+      this.store.clear(`created-link:${trackedId}`);
+      // Nothing waits for a topic that will not open now: a late message for retired work is dropped at delivery.
+      this.store.clear(`topic-required:${trackedId}`);
+      // Nothing is archived twice, so the poller never needs this binding again.
+      this.store.set(`poll-after:${trackedId}`, Number.MAX_SAFE_INTEGER);
+      // archived_at is what ends polling and frees the topic: a later message there is told the workspace is gone,
+      // and /run starts new work in it.
       this.store.db.prepare("UPDATE workspaces SET status=?,archived_at=? WHERE id=?").run(status, new Date().toISOString(), trackedId);
-      // Only a topic this gateway opened for the workspace is touched, never an adopted or repository topic, and never by deletion.
+      // Only a topic this gateway opened for the workspace is touched, never an adopted or repository topic, never one
+      // newer work has moved into, and never by deletion.
       const opened = this.store.row(`create-topic:${trackedId}`);
       if (!opened) return;
       if (ws.telegramThreadId) {
-        if (getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) return;
+        if (getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId) || getWorkspaceByThreadId(ws.telegramChatId, ws.telegramThreadId)) return;
         // The close joins the topic's own message lane, so notices already queued for it are delivered first.
         this.store.enqueue("telegram", `${ws.telegramChatId}:${ws.telegramThreadId}`, { method: "closeForumTopic", workspaceId: trackedId,
           payload: { chat_id: ws.telegramChatId, message_thread_id: ws.telegramThreadId } }, `retire-topic:${trackedId}`, 20);
@@ -474,11 +535,12 @@ export class CloudEngine {
 
   /**
    * A workspace has one name: its record, its last known Conductor name and, when an edit is asked for, its topic. A
-   * repo topic keeps its repository's name.
+   * repo topic keeps its repository's name. A status tag in front of the name stays in Conductor, where it changes.
    */
   retitle(trackedId: string, name: string, topicJobId?: string): void {
     const ws = getWorkspace(trackedId);
     if (!ws) return;
+    name = workspaceName(name);
     this.store.assertWriter?.();
     this.store.db.prepare("UPDATE workspaces SET name=?,conductor_workspace_name=? WHERE id=?").run(name, name, trackedId);
     if (topicJobId && ws.telegramThreadId && !getRepoTopicByThreadId(ws.telegramChatId, ws.telegramThreadId)) enqueueTelegram(this.store, topicJobId, {method: "editForumTopic", workspaceId: trackedId,
@@ -838,6 +900,9 @@ export class CloudEngine {
     if (this.stopped(row, action)) {
       await this.api.cancelSession(sessionId); return;
     }
+    // Work being sent to has a topic for its replies, and its link is said there. A launch reaches this once
+    // Conductor has the workspace ready, so one Conductor never finishes opens no topic.
+    this.openTopic(action.trackedId);
     // Recover queued continuations written by older releases as well as new ones.
     // Keep the persisted send payload immutable: an uncertain submission must never be replayed.
     const previous = action.recovery
@@ -965,20 +1030,42 @@ export class CloudEngine {
   }
 
   async pollWorkspace(trackedId: string, binding: CloudBinding): Promise<void> {
-    const ws = getWorkspace(trackedId); if (!ws || ws.archivedAt) { this.store.set(`poll-after:${trackedId}`, Date.now() + 60_000); return; }
+    // Retired work is parked, not re-armed: each binding visited every minute takes one of the poller's slots for good,
+    // and sorts ahead of live work, which it would starve at a few hundred retirements.
+    const ws = getWorkspace(trackedId); if (!ws || ws.archivedAt) { this.store.set(`poll-after:${trackedId}`, Number.MAX_SAFE_INTEGER); return; }
     const due = this.store.get<number>(`poll-after:${trackedId}`) ?? 0;
     if (Date.now() < due) return;
     const lifecycle = await this.api.getWorkspaceStatus(binding.workspaceId);
+    // Retiring can happen while the status request is in flight. Do not let
+    // this stale poll re-arm a workspace that has already been parked.
+    if (getWorkspace(trackedId)?.archivedAt) {
+      this.store.set(`poll-after:${trackedId}`, Number.MAX_SAFE_INTEGER);
+      return;
+    }
     if (["deleted", "archived"].includes(lifecycle.status)) {
+      // A workspace destroyed while it is still being launched is its launch's to report: that says, once, why
+      // Conductor could not create it.
+      if (this.launching(trackedId)) {
+        // The status was read: this poll succeeded, so an earlier poll error cannot count the workspace as stalled.
+        this.store.set(`poll-success:${trackedId}`, Date.now());
+        this.store.set(`poll-after:${trackedId}`, Date.now() + 5_000); return;
+      }
       this.store.set(`poll-after:${trackedId}`, Date.now() + 60_000);
+      // Its launch may have retired it while the status was read.
+      const current = getWorkspace(trackedId);
+      if (!current || current.archivedAt) return;
       const detail = safeDetail(lifecycle.errorMessage);
-      if (!binding.stopped && !["done", "stopped", "archived", "failed"].includes(ws.status)) this.notify(`unavailable:${trackedId}`, trackedId,
-        `Conductor workspace is no longer available${detail ? `: ${detail}` : ""}. Its history is retained; no task has been replayed.`);
+      if (!binding.stopped && !["done", "stopped", "archived", "failed"].includes(current.status)) this.notify(`unavailable:${trackedId}`, trackedId,
+        `Conductor workspace is no longer available${detail ? `: ${detail}` : ""}. Its history is retained; no task has been replayed.`, undefined, {allowRetired: true});
       // Queued after the notice, in the same topic lane, so the notice is delivered before the topic closes.
       this.retire(trackedId, lifecycle.status === "deleted" && detail ? "failed" : "archived");
       return;
     }
     const sessions = await this.api.listWorkspaceSessions(binding.workspaceId);
+    if (getWorkspace(trackedId)?.archivedAt) {
+      this.store.set(`poll-after:${trackedId}`, Number.MAX_SAFE_INTEGER);
+      return;
+    }
     let active = false;
     let backlog = false;
     const reportedPrUrls = new Set<string>();
@@ -1013,6 +1100,10 @@ export class CloudEngine {
       }
       backlog ||= messages.length === 100;
       const status = await this.api.getSessionStatus(session.id);
+      if (getWorkspace(trackedId)?.archivedAt) {
+        this.store.set(`poll-after:${trackedId}`, Number.MAX_SAFE_INTEGER);
+        return;
+      }
       if (status.workspaceId !== binding.workspaceId) throw new Error("Polled session moved to another workspace");
       // A send or stop can commit while either upstream read waits. Apply the
       // transcript to that current turn, never write back the pre-read snapshot.
@@ -1049,6 +1140,8 @@ export class CloudEngine {
             // Beside a sibling thread, each reply says which thread, and which model, is speaking.
             const label = sessions.length > 1 ? `${threadLabel(session.name, session.model ?? session.resolvedModel ?? state?.model)}\n\n` : "";
             const reply = `${label}${text}`;
+            // A workspace that speaks has a topic to speak in, including one stopped before its launch asked for it.
+            this.openTopic(trackedId);
             if (phase === "commentary" && turn) enqueueProgress(this.store, id, `${session.id}:${turn}`, ws.telegramChatId, reply,
               {workspaceId: trackedId, sessionId: session.id, threadId: ws.telegramThreadId});
             else this.notify(id, trackedId, reply, session.id, { markdown: true });
@@ -1076,7 +1169,8 @@ export class CloudEngine {
       }
       if (!state || state.terminal || state.stopped || binding.stopped || this.store.get(`stop:${trackedId}`)) continue;
       const pendingQuestion = this.store.db.prepare("SELECT 1 FROM decisions WHERE workspace_id=? AND answered_at IS NULL LIMIT 1").get(trackedId);
-      if (status.status === "idle" && !state.nativeFailure && messages.length < 100 && !pendingQuestion && state.seenReply && (lifecycle.status !== "sleeping" || state.nativeCompleted)) {
+      const dormant = lifecycle.status === "sleeping" || lifecycle.status === "unstarted";
+      if (status.status === "idle" && !state.nativeFailure && messages.length < 100 && !pendingQuestion && state.seenReply && (!dormant || state.nativeCompleted)) {
         let staleReview = false;
         if (state.role === "review" && state.reviewUrl) {
           const current = await this.github.pr(binding.repoSlug, state.reviewUrl);
@@ -1094,7 +1188,7 @@ export class CloudEngine {
         const detail = state.nativeFailure ?? status.errorMessage ?? status.lastError ?? "Unknown Conductor session error";
         if (recoverableProviderError(detail)) await this.recover(trackedId, binding, session.id, state, detail);
         else this.notify(`error:${session.id}:${state.sentMessageId}`, trackedId, `Conductor reported an error: ${safeDetail(detail, 1000)}\nUse /send to continue after addressing it.`, session.id);
-      } else if (status.status === "idle" && lifecycle.status === "sleeping" && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted &&
+      } else if (status.status === "idle" && dormant && messages.length < 100 && !pendingQuestion && state.sentMessageId && !state.recoveryAttempted &&
           // Conductor queues a message to a sleeping workspace and wakes it itself. Only a turn seen running, or one
           // that already produced output, can have slept mid-task; a younger silent turn is still waiting to wake.
           (state.seenWorking || state.seenReply || Date.now() - (state.sentAt ?? 0) > WAKE_GRACE_MS)) {
@@ -1136,6 +1230,10 @@ export class CloudEngine {
     const awaitingTurn = !stopped && (pendingAction || states.some(state => !state.terminal && !state.stopped));
     // Last, after every reply is forwarded, and never while a backlog drains: naming delays nothing the owner waits for.
     if (!backlog) await this.adoptTitle(trackedId, binding, sessions);
+    if (getWorkspace(trackedId)?.archivedAt) {
+      this.store.set(`poll-after:${trackedId}`, Number.MAX_SAFE_INTEGER);
+      return;
+    }
     this.store.set(`poll-after:${trackedId}`, Date.now() + (backlog ? 1000 : (!stopped && active) || awaitingTurn ? 15_000 : 60_000));
     this.store.set(`poll-success:${trackedId}`, Date.now());
   }
@@ -1212,6 +1310,8 @@ export class CloudEngine {
       this.store.db.transaction(() => {
         if (ws) {
           const payload = JSON.parse(event.payload);
+          // What an agent reports through the bridge belongs in its workspace's topic, like what it says.
+          if (!ws.archivedAt) this.openTopic(ws.id);
           if (event.type === "human_request") {
             const decision = getDecision(payload.decisionId);
             if (decision && !decision.answeredAt && !ws.archivedAt && !["done", "stopped", "failed", "archived"].includes(ws.status)) enqueueText(this.store, `decision:${decision.id}`, ws.telegramChatId, `${ws.conductorWorkspaceName ?? ws.name} needs your input:\n\n${payload.question}`, {

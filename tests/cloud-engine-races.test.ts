@@ -190,6 +190,10 @@ test("raw assistant JSON survives transcript extraction while tool and reasoning
   const extract = (content: string) => transcriptText({type: "assistant", content} as ConductorApiMessage);
   const raw = '{"action":"new","projectId":"p1","prompt":"Keep the task"}';
   assert.equal(extract(raw), raw);
+  // The classifier's other answers, and the fenced block it is asked for, reach the router as written.
+  assert.equal(extract('{"action":"unclear"}'), '{"action":"unclear"}');
+  const fenced = '```json\n{"action":"existing","workspaceId":"w1"}\n```\n';
+  assert.equal(extract(fenced), fenced);
   assert.equal(extract('[1,{"answer":42}]'), '[1,{"answer":42}]');
   assert.equal(extract('{"message":{"content":[{"type":"text","text":"Visible"}]}}'), "Visible");
   for (const type of ["tool_use", "tool_result", "thinking", "reasoning"]) {
