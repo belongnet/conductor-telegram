@@ -32,7 +32,8 @@
       "policy": { "kind": "one_shot" },
       "delivery_adapter": {
         "kind": "github",
-        "required_checks": ["test"]
+        "required_checks": ["test"],
+        "check_allowlist": ["test"]
       },
       "merge_policy": {
         "method": "squash",

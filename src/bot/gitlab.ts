@@ -4,6 +4,8 @@ import {
   type GithubCommitChecksSnapshot,
   type GithubPrPolicySnapshot,
 } from "./github.js";
+import type { CheckObservation } from "../lanes/check-evidence.js";
+import type { PrChecksStatus } from "../types/index.js";
 
 const GIT_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
 
@@ -83,6 +85,87 @@ type GitlabNote = {
   created_at?: string;
 };
 
+type GitlabPipeline = {
+  id?: number;
+  sha?: string;
+  ref?: string;
+  status?: string;
+  source?: string;
+  tag?: boolean;
+};
+
+// Only a pipeline the project's own CI configuration ran for a push or a
+// merge request proves a commit. An external pipeline holds only commit
+// statuses that anyone with Developer access can post, a child pipeline is a
+// slice of its parent, and a pipeline started by hand, by API, trigger or
+// schedule can carry variables that change which jobs run.
+const CANONICAL_PIPELINE_SOURCES = new Set([
+  "push",
+  "merge_request_event",
+  "external_pull_request_event",
+]);
+// Newest first, a page at a time, until a pipeline that counts turns up.
+const PIPELINE_PAGE_SIZE = 100;
+const MAX_PIPELINE_PAGES = 20;
+// The pipeline list does not say whether a pipeline ran for a tag, so each
+// candidate is read in full. Past this many tag pipelines the gate waits.
+const MAX_PIPELINE_READS = 10;
+
+type GitlabJob = {
+  id?: number;
+  name?: string;
+  status?: string;
+  allow_failure?: boolean;
+};
+
+/**
+ * Only success passes and only failed asks for a repair. Skipped, manual,
+ * canceled and every unfinished state hold the gate: a canceled pipeline says
+ * nothing about the code, often only that a newer push superseded it.
+ */
+function pipelineStatus(value: string | undefined): PrChecksStatus {
+  const status = String(value ?? "").toLowerCase();
+  if (status === "success") return "passing";
+  if (status === "failed") return "failing";
+  return "pending";
+}
+
+/**
+ * A job weighed as GitLab weighs it for its pipeline: skipped passes, and a
+ * job allowed to fail passes failed, canceled or waiting on a manual start.
+ */
+function jobStatus(job: GitlabJob): PrChecksStatus {
+  const status = String(job.status ?? "").toLowerCase();
+  if (status === "skipped") return "passing";
+  if (job.allow_failure === true && ["failed", "canceled", "manual"].includes(status)) {
+    return "passing";
+  }
+  return pipelineStatus(status);
+}
+
+/**
+ * The last run of each job, retried runs included. A commit status posted
+ * under a job's name retires that job without ever listing among the jobs,
+ * so it can rewrite the pipeline's verdict but not its jobs' last runs.
+ */
+function lastJobRuns(jobs: readonly GitlabJob[]): Array<GitlabJob & { id: number; name: string }> {
+  const last = new Map<string, GitlabJob & { id: number; name: string }>();
+  for (const job of jobs) {
+    const name = String(job.name ?? "").trim();
+    if (!name || !Number.isSafeInteger(job.id) || job.id! <= 0) {
+      throw new GitlabApiError("GitLab returned a job without an id or name", 200, false);
+    }
+    const seen = last.get(name);
+    if (!seen || job.id! > seen.id) last.set(name, { ...job, id: job.id!, name });
+  }
+  return [...last.values()];
+}
+
+function namesOf(jobs: ReadonlyArray<{ name: string }>): string {
+  const shown = jobs.slice(0, 5).map((job) => job.name).join(", ");
+  return jobs.length > 5 ? `${shown} and ${jobs.length - 5} more` : shown;
+}
+
 export class GitlabApiError extends Error {
   constructor(
     message: string,
@@ -105,6 +188,20 @@ function statusAsRollup(status: GitlabStatus): Record<string, string> {
     status: conclusion ? "COMPLETED" : "IN_PROGRESS",
     conclusion,
   };
+}
+
+/**
+ * The commit a merge left at the tip of the target branch, which is the one
+ * its branch pipeline runs for. A squash merge under the merge-commit or
+ * semi-linear method records both a squash commit and the merge commit on top
+ * of it; only a fast-forward squash leaves the squash commit at the tip.
+ */
+function mergedTip(mergeRequest: GitlabMergeRequest): string | null {
+  return (
+    mergeRequest.merge_commit_sha?.toLowerCase() ??
+    mergeRequest.squash_commit_sha?.toLowerCase() ??
+    null
+  );
 }
 
 function markerHeadSha(body: string): string | null {
@@ -208,7 +305,7 @@ export class GitlabLaneGateway {
     throw new GitlabApiError("GitLab pagination exceeded 100 pages", 200, false);
   }
 
-  private projectPath(identity: GitlabMrIdentity): string {
+  private projectPath(identity: Pick<GitlabMrIdentity, "project">): string {
     return `/projects/${encodeURIComponent(identity.project)}`;
   }
 
@@ -274,10 +371,7 @@ export class GitlabLaneGateway {
           status: summarizeChecks([statusAsRollup(status)]).status,
         }))
         .filter((status) => Boolean(status.name)),
-      mergeCommitSha:
-        mergeRequest.squash_commit_sha?.toLowerCase() ??
-        mergeRequest.merge_commit_sha?.toLowerCase() ??
-        null,
+      mergeCommitSha: mergedTip(mergeRequest),
       reviews: notes
         .filter((note) => Boolean(note.body))
         .map((note) => ({
@@ -316,6 +410,152 @@ export class GitlabLaneGateway {
           status: summarizeChecks([statusAsRollup(status)]).status,
         }))
         .filter((status) => Boolean(status.name)),
+    };
+  }
+
+  /**
+   * The newest pipeline the canonical project ran for one exact commit, with
+   * the last run of each of its jobs. `ref` pins a merged commit to the
+   * canonical branch's own pipeline. The pipeline passes only when GitLab
+   * says it succeeded and every job's last run agrees; named checks pass only
+   * on a job's successful last run.
+   */
+  async commitPipeline(input: {
+    projectPath: string;
+    sha: string;
+    ref?: string;
+  }): Promise<CheckObservation> {
+    const sha = input.sha.toLowerCase();
+    if (!GIT_OID_RE.test(sha)) throw new Error("GitLab pipeline evidence requires a full SHA");
+    const identity = { baseUrl: "https://gitlab.com", project: input.projectPath };
+    const canonical = (pipeline: GitlabPipeline) =>
+      Number.isSafeInteger(pipeline.id) &&
+      pipeline.id! > 0 &&
+      pipeline.sha?.toLowerCase() === sha &&
+      (!input.ref || pipeline.ref === input.ref) &&
+      CANONICAL_PIPELINE_SOURCES.has(String(pipeline.source ?? ""));
+    const query = new URLSearchParams({
+      sha,
+      order_by: "id",
+      sort: "desc",
+      per_page: String(PIPELINE_PAGE_SIZE),
+    });
+    if (input.ref) query.set("ref", input.ref);
+    let latest: GitlabPipeline | undefined;
+    let reads = 0;
+    let cutShort: string | null = null;
+    let page = "1";
+    pages: for (let read = 0; ; read += 1) {
+      if (read >= MAX_PIPELINE_PAGES) {
+        cutShort = `${MAX_PIPELINE_PAGES} pages of pipelines`;
+        break;
+      }
+      query.set("page", page);
+      const response = await this.requestPage<GitlabPipeline[]>(
+        identity,
+        "GET",
+        `${this.projectPath(identity)}/pipelines?${query}`
+      );
+      if (!Array.isArray(response.payload)) {
+        throw new GitlabApiError("GitLab pipeline list was not an array", 200, false);
+      }
+      const candidates = response.payload
+        .filter((pipeline) => canonical(pipeline) && pipeline.tag !== true)
+        .sort((left, right) => right.id! - left.id!);
+      for (const candidate of candidates) {
+        if (reads >= MAX_PIPELINE_READS) {
+          cutShort = `${MAX_PIPELINE_READS} tag pipelines`;
+          break pages;
+        }
+        reads += 1;
+        const detail = await this.request<GitlabPipeline>(
+          identity,
+          "GET",
+          `${this.projectPath(identity)}/pipelines/${candidate.id}`
+        );
+        if (detail.id !== candidate.id || !canonical(detail) || typeof detail.tag !== "boolean") {
+          throw new GitlabApiError(
+            `GitLab pipeline ${candidate.id} did not match its list entry when read in full`,
+            200,
+            false
+          );
+        }
+        if (!detail.tag) {
+          latest = detail;
+          break pages;
+        }
+      }
+      if (!response.nextPage) break;
+      if (!/^\d+$/.test(response.nextPage) || Number(response.nextPage) <= Number(page)) {
+        throw new GitlabApiError("GitLab returned an invalid pagination cursor", 200, false);
+      }
+      page = response.nextPage;
+    }
+    const observed = {
+      source: "gitlab" as const,
+      projectPath: input.projectPath.toLowerCase(),
+      sha,
+    };
+    if (!latest) {
+      return {
+        ...observed,
+        pipelineId: null,
+        status: "pending",
+        // A search cut short never claims that no pipeline exists.
+        summary: cutShort
+          ? `GitLab pipeline search for ${sha.slice(0, 12)} stopped after ${cutShort}`
+          : `no GitLab pipeline for ${sha.slice(0, 12)}${reads > 0 ? " besides tag pipelines" : ""}`,
+        checks: [],
+      };
+    }
+    const pipelinePath = `${this.projectPath(identity)}/pipelines/${latest.id}`;
+    // A push can supply ci.variable options while still reporting source=push.
+    // Those variables can change which jobs the project's CI configuration runs.
+    const variables = await this.request<unknown>(identity, "GET", `${pipelinePath}/variables`);
+    if (!Array.isArray(variables)) {
+      throw new GitlabApiError("GitLab pipeline variables were not an array", 200, false);
+    }
+    if (variables.length > 0) {
+      return {
+        ...observed,
+        pipelineId: latest.id!,
+        status: "pending",
+        summary: `GitLab pipeline ${latest.id} supplied variables; CI evidence is untrusted`,
+        checks: [],
+      };
+    }
+    const [jobs, bridges] = await Promise.all([
+      this.paginated<GitlabJob>(identity, `${pipelinePath}/jobs?include_retried=true`),
+      this.paginated<GitlabJob>(identity, `${pipelinePath}/bridges`),
+    ]);
+    const runs = lastJobRuns([...jobs, ...bridges]);
+    const failed = runs.filter((job) => jobStatus(job) === "failing");
+    const waiting = runs.filter((job) => jobStatus(job) === "pending");
+    const verdict = pipelineStatus(latest.status);
+    const status: PrChecksStatus =
+      verdict === "failing" || failed.length > 0
+        ? "failing"
+        : verdict === "passing" && runs.length > 0 && waiting.length === 0
+          ? "passing"
+          : "pending";
+    const why =
+      failed.length > 0
+        ? `; jobs failed: ${namesOf(failed)}`
+        : verdict === "passing" && waiting.length > 0
+          ? `; jobs not finished: ${namesOf(waiting)}`
+          : runs.length === 0
+            ? "; no jobs"
+            : "";
+    return {
+      ...observed,
+      pipelineId: latest.id!,
+      status,
+      summary: `GitLab pipeline ${latest.id} ${latest.status ?? "unknown"}${why}`,
+      checks: runs.map((job) => ({
+        name: job.name,
+        status: pipelineStatus(job.status),
+        id: `gitlab-job-${job.id}`,
+      })),
     };
   }
 
@@ -409,10 +649,7 @@ export class GitlabLaneGateway {
       }
     );
     const after = await this.request<GitlabMergeRequest>(identity, "GET", endpoint);
-    const mergedSha =
-      after.squash_commit_sha?.toLowerCase() ??
-      after.merge_commit_sha?.toLowerCase() ??
-      null;
+    const mergedSha = mergedTip(after);
     if (
       after.state !== "merged" ||
       after.sha?.toLowerCase() !== input.expectedHeadSha.toLowerCase() ||
@@ -431,7 +668,7 @@ export function gitlabLaneGatewayFromEnv(
   const token = env.GITLAB_TOKEN?.trim();
   if (!token) {
     throw new Error(
-      "Manifest requires GitLab delivery but GITLAB_TOKEN is missing; add one read_api/api-capable token"
+      "Manifest requires GitLab delivery or canonical GitLab evidence but GITLAB_TOKEN is missing; add one read_api/api-capable token"
     );
   }
   return new GitlabLaneGateway(token);

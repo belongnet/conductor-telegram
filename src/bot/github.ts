@@ -96,7 +96,8 @@ export interface GithubCommitChecksSnapshot {
   sha: string;
   status: PrChecksStatus;
   summary: string;
-  checks?: Array<{ name: string; status: PrChecksStatus }>;
+  /** `id` names the check run or commit status the result came from. */
+  checks?: Array<{ name: string; status: PrChecksStatus; id?: string }>;
 }
 
 export interface PrRefreshResult {
@@ -144,9 +145,9 @@ export function requiredChecksGate(
     (name) => failed.includes(name) || pending.includes(name)
   );
   return {
-    // A configured manifest allowlist is exact and case-sensitive. Without
-    // one, preserve the legacy aggregate gate rather than turning an empty
-    // profile into a fail-open bypass for a failing host rollup.
+    // Configured required checks are exact and case-sensitive. A lane without
+    // named checks keeps the host's aggregate gate rather than turning an
+    // empty list into a fail-open bypass for a failing host rollup.
     passing:
       requiredChecks.length === 0
         ? policy.checksStatus === "passing"
@@ -395,36 +396,46 @@ export async function refreshCommitChecks(input: {
   } catch {
     throw new Error("GitHub returned malformed commit-check JSON.");
   }
-  const checks = summarizeChecks(
-    [
-      ...checkPages.flatMap((page) => page.check_runs ?? []),
-      ...statusPages.flatMap((page) => page.statuses ?? []),
-    ]
+  return commitChecksSnapshot(
+    { repoOwner: owner, repoName: repo, sha: input.sha.toLowerCase() },
+    checkPages.flatMap((page) => page.check_runs ?? []),
+    statusPages.flatMap((page) => page.statuses ?? [])
   );
+}
+
+export function commitChecksSnapshot(
+  identity: Pick<GithubCommitChecksSnapshot, "repoOwner" | "repoName" | "sha">,
+  checkRuns: unknown[],
+  statuses: unknown[]
+): GithubCommitChecksSnapshot {
+  const summary = summarizeChecks([...checkRuns, ...statuses]);
+  const check = (raw: unknown, kind: "check-run" | "status") => {
+    const value = raw as {
+      id?: unknown;
+      name?: string | null;
+      context?: string | null;
+      state?: string | null;
+      status?: string | null;
+      conclusion?: string | null;
+    };
+    const id =
+      typeof value.id === "number" && Number.isSafeInteger(value.id) && value.id > 0
+        ? `${kind}-${value.id}`
+        : undefined;
+    return {
+      name: String(value.name ?? value.context ?? "").trim(),
+      status: summarizeChecks([value]).status,
+      ...(id ? { id } : {}),
+    };
+  };
   return {
-    repoOwner: owner,
-    repoName: repo,
-    sha: input.sha.toLowerCase(),
-    status: checks.status,
-    summary: checks.summary,
+    ...identity,
+    status: summary.status,
+    summary: summary.summary,
     checks: [
-      ...checkPages.flatMap((page) => page.check_runs ?? []),
-      ...statusPages.flatMap((page) => page.statuses ?? []),
-    ]
-      .map((check) => {
-        const value = check as {
-          name?: string | null;
-          context?: string | null;
-          state?: string | null;
-          status?: string | null;
-          conclusion?: string | null;
-        };
-        return {
-          name: String(value.name ?? value.context ?? "").trim(),
-          status: summarizeChecks([value]).status,
-        };
-      })
-      .filter((check) => Boolean(check.name)),
+      ...checkRuns.map((raw) => check(raw, "check-run")),
+      ...statuses.map((raw) => check(raw, "status")),
+    ].filter((entry) => Boolean(entry.name)),
   };
 }
 

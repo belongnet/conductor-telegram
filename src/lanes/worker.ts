@@ -18,6 +18,7 @@ import { asConductorLaneGateway, LaneController } from "./controller.js";
 import {
   laneManifestRevisionId,
   loadLaneManifest,
+  manifestNeedsGitlab,
   type LaneManifestV2,
 } from "./manifest.js";
 import {
@@ -229,13 +230,11 @@ export async function runLaneWorker(options: LaneWorkerOptions = {}): Promise<vo
   }
   const manifest = loadLaneManifest(env);
   if (!manifest) throw new Error("Manifest v2 is missing; set LANES_MANIFEST");
-  const store = await createLaneStateStore(env);
-  const conductor = requiredConductorClient(env);
-  const gitlab = manifest.lanes.some(
-    (lane) => lane.delivery_adapter.kind === "gitlab"
-  )
+  const gitlab = manifestNeedsGitlab(manifest)
     ? gitlabLaneGatewayFromEnv(env)
     : undefined;
+  const store = await createLaneStateStore(env);
+  const conductor = requiredConductorClient(env);
   let lease: LaneLease | null = null;
   const notifier = new TelegramLaneNotifier(env, store, () => lease);
   const ownerId = `${site}:${os.hostname()}:${process.pid}`;

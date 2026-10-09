@@ -11,8 +11,18 @@ import {
   refreshPrByUrl,
   type GithubCommitChecksSnapshot,
   type GithubPrPolicySnapshot,
+  type RequiredChecksGate,
 } from "../bot/github.js";
 import { gitlabMrIdentity } from "../bot/gitlab.js";
+import {
+  buildCheckEvidence,
+  canonicalEvidenceIdentity,
+  githubCheckObservation,
+  laneRequiredChecks,
+  requiresExactCheckReceipt,
+  type CheckEvidence,
+  type CheckObservation,
+} from "./check-evidence.js";
 import {
   ConductorApiError,
   conductorWorkspaceIsArchived,
@@ -69,6 +79,7 @@ import type {
   LaneStateStore,
   LeaseCredentials,
 } from "./state-store.js";
+import { LaneStateStoreError } from "./state-store.js";
 import {
   rawExecutionReceipts,
   type RawExecutionReceipt,
@@ -161,6 +172,12 @@ export interface GithubLaneGateway {
     method: "squash" | "merge" | "rebase";
     expectedHeadSha: string;
   }): Promise<{ mergedSha: string }>;
+  /** GitLab only: the canonical project's newest pipeline for one exact commit. */
+  commitPipeline?(input: {
+    projectPath: string;
+    sha: string;
+    ref?: string;
+  }): Promise<CheckObservation>;
 }
 
 export const defaultGithubLaneGateway: GithubLaneGateway = {
@@ -620,6 +637,43 @@ function textHash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+// Command Center keeps check, mergeability and merged-CI evidence fresh for
+// 5 (merge) or 15 (validation) minutes from when the row was first written,
+// and answers a repeated key with that original row. Keying evidence to a
+// 4-minute window writes a new row at least that often, so an unchanged
+// green result never ages out while a gate waits on something else.
+const EVIDENCE_WINDOW_MS = 4 * 60_000;
+
+function evidenceWindow(at: Date): number {
+  return Math.floor(at.getTime() / EVIDENCE_WINDOW_MS);
+}
+
+function stateStoreConflictDetail(error: unknown): string | null {
+  if (!(error instanceof LaneStateStoreError) || !error.conflict) return null;
+  const detail =
+    error.body && typeof error.body === "object" && "detail" in error.body
+      ? String(error.body.detail)
+      : error.message;
+  return detail.replace(/^Command Center lane request rejected: /, "");
+}
+
+function mergeGateChanged(error: unknown): boolean {
+  return [
+    "required checks are not green",
+    "pull request is not currently mergeable",
+    "pull request is not mergeable",
+  ].includes(stateStoreConflictDetail(error) ?? "");
+}
+
+// A check gate rightly waits on slow CI, but it would wait silently forever
+// on CI that never decides: a commit that never reached the canonical
+// project, no runner, a job blocked on a manual start, a repository whose CI
+// never runs on its base branch. After this long one Telegram alert names the
+// commit; the gate keeps waiting.
+const CHECKS_STALL_ALERT_MS = 60 * 60_000;
+// Undecided gates this worker remembers; the oldest is forgotten first.
+const MAX_UNDECIDED_GATES = 256;
+
 export function validationActionBinding(
   lane: ManifestLane,
   run: LaneRunRecord,
@@ -681,6 +735,11 @@ export class LaneController {
   private readonly gitlab?: GithubLaneGateway;
   private readonly notify: (message: string, dedupeKey: string) => Promise<void>;
   private readonly now: () => Date;
+  /** When this worker first saw each run's check gate undecided. */
+  private readonly undecidedGates = new Map<
+    string,
+    { sha: string; since: number; alerted: boolean }
+  >();
 
   constructor(private readonly options: ControllerOptions) {
     this.github = options.github ?? defaultGithubLaneGateway;
@@ -709,6 +768,85 @@ export class LaneController {
     if (githubPrIdentity(prUrl)) return this.github;
     if (gitlabMrIdentity(prUrl) && this.gitlab) return this.gitlab;
     throw new Error(`No configured Git-host gateway accepts ${prUrl}`);
+  }
+
+  /**
+   * Check evidence for a lane with named checks or canonical evidence, read
+   * from the canonical host for one exact commit. On GitLab a merged commit
+   * is proven by a pipeline on the reviewed head branch before merge and the
+   * canonical base branch after merge. GitHub reads bind to the commit alone.
+   */
+  private async exactCheckEvidence(
+    lane: ManifestLane,
+    run: LaneRunRecord,
+    sha: string,
+    phase: "head" | "merged"
+  ): Promise<CheckEvidence> {
+    const identity = canonicalEvidenceIdentity(lane, run);
+    const required = laneRequiredChecks(lane);
+    let observation: CheckObservation;
+    if (identity.kind === "gitlab") {
+      if (!this.gitlab?.commitPipeline) {
+        throw new Error("GitLab check evidence is configured but its gateway is unavailable");
+      }
+      observation = await this.gitlab.commitPipeline({
+        projectPath: identity.projectPath,
+        sha,
+        ref: phase === "merged" ? identity.baseBranch : run.head_branch!,
+      });
+    } else {
+      const [owner, repo, ...rest] = identity.projectPath.split("/");
+      if (!owner || !repo || rest.length > 0) {
+        throw new Error("GitHub check evidence requires an owner/repository project path");
+      }
+      observation = githubCheckObservation(
+        await this.github.refreshCommitChecks({ repoOwner: owner, repoName: repo, sha }),
+        required
+      );
+    }
+    return buildCheckEvidence({ lane, run, sha, observation });
+  }
+
+  /**
+   * Alert once when CI has left a commit undecided, neither passing nor
+   * failed, for CHECKS_STALL_ALERT_MS of this worker's watch: an exact
+   * receipt's head or merged commit, or the merged commit of a lane without
+   * named checks. The clock restarts with the worker; the alert's key keeps
+   * it to one per commit.
+   */
+  private async alertOnStalledChecks(
+    lane: ManifestLane,
+    run: LaneRunRecord,
+    sha: string,
+    phase: "head" | "merged",
+    gate: RequiredChecksGate,
+    summary: unknown
+  ): Promise<void> {
+    const key = `${run.run_id}:${phase}`;
+    if (gate.passing || gate.failed.length > 0) {
+      this.undecidedGates.delete(key);
+      return;
+    }
+    const now = this.now().getTime();
+    const seen = this.undecidedGates.get(key);
+    if (!seen || seen.sha !== sha) {
+      this.undecidedGates.delete(key);
+      this.undecidedGates.set(key, { sha, since: now, alerted: false });
+      if (this.undecidedGates.size > MAX_UNDECIDED_GATES) {
+        this.undecidedGates.delete(this.undecidedGates.keys().next().value!);
+      }
+      return;
+    }
+    if (seen.alerted || now - seen.since < CHECKS_STALL_ALERT_MS) return;
+    seen.alerted = true;
+    const identity = canonicalEvidenceIdentity(lane, run);
+    const commit = phase === "head" ? "pull request head" : "merged commit";
+    await this.notify(
+      `Growth lane ${lane.id} has waited over ${CHECKS_STALL_ALERT_MS / 60_000} minutes for ${identity.kind} CI on ` +
+        `${identity.projectPath} to decide its ${commit} ${sha.slice(0, 12)}: ` +
+        `${String(summary)}. The gate keeps waiting.`,
+      `checks-stalled:${run.run_id}:${phase}:${sha}`
+    );
   }
 
   async tick(input: {
@@ -3035,7 +3173,16 @@ export class LaneController {
         };
       }
       const current = await this.freshRun(run.run_id);
-      const changed = await this.transition(lease, current.run, "merging", "merge");
+      let changed: LaneRunRecord;
+      try {
+        changed = await this.transition(lease, current.run, "merging", "merge");
+      } catch (error) {
+        if (!mergeGateChanged(error)) throw error;
+        // The durable store can see a newer CI verdict between the receipt
+        // read and this transition. Recheck on the next tick, without a worker
+        // restart or a merge intent.
+        return { acted: false, active: true, reason: "merge evidence changed", runId: run.run_id };
+      }
       return { acted: true, active: true, reason: "merge gates satisfied", runId: changed.run_id };
     }
     let attempt = activeAttempt(snapshot, run.run_id, role);
@@ -3197,39 +3344,85 @@ export class LaneController {
     lease: LeaseCredentials,
     run: LaneRunRecord,
     policy: GithubPrPolicySnapshot,
-    lane: ManifestLane
+    lane: ManifestLane,
+    stage: "final" | "merge" = "final"
   ): Promise<LaneControllerResult | null> {
-    const checksGate = requiredChecksGate(
-      policy,
-      lane.delivery_adapter.required_checks ?? []
-    );
-    const checksPayload = {
-      all_green: checksGate.passing,
-      pending: checksGate.missing.length + checksGate.pending.length,
-      failed: checksGate.failed.length,
-      summary: policy.checksSummary,
-      required_checks: lane.delivery_adapter.required_checks ?? [],
-      missing_required_checks: checksGate.missing,
-      nonpassing_required_checks: checksGate.notPassing,
-    };
+    const mergeable =
+      policy.mergeable?.toUpperCase() === "MERGEABLE" &&
+      ["CLEAN", "HAS_HOOKS"].includes(policy.mergeStateStatus?.toUpperCase() ?? "");
+    let checksGate: RequiredChecksGate | null = null;
+    let checksPayload: Record<string, unknown> | null = null;
+    if (!requiresExactCheckReceipt(lane)) {
+      checksGate = requiredChecksGate(policy, []);
+      checksPayload = {
+        all_green: checksGate.passing,
+        pending: checksGate.missing.length + checksGate.pending.length,
+        failed: checksGate.failed.length,
+        summary: policy.checksSummary,
+        required_checks: [],
+        missing_required_checks: checksGate.missing,
+        nonpassing_required_checks: checksGate.notPassing,
+      };
+    } else if (mergeable) {
+      // A receipt costs a read on the canonical host, so it waits until the
+      // pull request itself could merge. A host that reports mergeability
+      // without its CI (a GitHub mirror of GitLab CI, GitLab without
+      // "pipelines must succeed") is still read on every tick until then.
+      const exact = await this.exactCheckEvidence(lane, run, run.head_sha!, "head");
+      if (!exact.identityMatches) {
+        const changed = await this.quarantineRun(
+          lease,
+          run.run_id,
+          stage,
+          "pre-merge check response identity mismatch"
+        );
+        return {
+          acted: true,
+          active: true,
+          reason: "quarantined mismatched pre-merge checks",
+          runId: changed.run_id,
+        };
+      }
+      await this.alertOnStalledChecks(
+        lane,
+        run,
+        run.head_sha!,
+        "head",
+        exact.gate,
+        exact.payload.summary
+      );
+      checksGate = exact.gate;
+      checksPayload = exact.payload;
+    }
+    if (
+      stage === "merge" &&
+      !(mergeable && checksGate?.passing && policy.state === "open" && !policy.isDraft)
+    ) {
+      // At the merge stage only a passing gate is recorded. A failing row
+      // written between two passing ones in the same evidence window would
+      // stay the newest row: the second passing row is answered with the
+      // first, and the merge intent would be refused against the failure.
+      return { acted: false, active: true, reason: "merge gate changed", runId: run.run_id };
+    }
     const mergeabilityPayload = {
-      mergeable:
-        policy.mergeable?.toUpperCase() === "MERGEABLE" &&
-        ["CLEAN", "HAS_HOOKS"].includes(
-          policy.mergeStateStatus?.toUpperCase() ?? ""
-        ),
+      mergeable,
       mergeable_state: policy.mergeable,
       merge_state_status: policy.mergeStateStatus,
     };
+    const window = evidenceWindow(this.now());
     const evidence = [
-      {
-        type: "required_checks",
-        key: `git-checks:${run.run_id}:${run.head_sha}:${textHash(JSON.stringify(checksPayload))}`,
-        payload: checksPayload,
-      },
+      ...(checksPayload
+        ? [
+            {
+              type: "required_checks",
+              key: `git-checks:${run.run_id}:${run.head_sha}:${window}:${textHash(JSON.stringify(checksPayload))}`,
+              payload: checksPayload,
+            },
+          ]
+        : []),
       {
         type: "mergeability",
-        key: `git-mergeability:${run.run_id}:${run.head_sha}:${textHash(JSON.stringify(mergeabilityPayload))}`,
+        key: `git-mergeability:${run.run_id}:${run.head_sha}:${window}:${textHash(JSON.stringify(mergeabilityPayload))}`,
         payload: mergeabilityPayload,
       },
     ];
@@ -3246,8 +3439,8 @@ export class LaneController {
         evidence: item.payload,
       });
       const expectedAccepted =
-        (item.type === "required_checks" && checksGate.passing) ||
-        (item.type === "mergeability" && mergeabilityPayload.mergeable);
+        (item.type === "required_checks" && Boolean(checksGate?.passing)) ||
+        (item.type === "mergeability" && mergeable);
       if (expectedAccepted && !evidenceWasAccepted(recorded)) {
         await this.pauseForSafety(
           lease,
@@ -3262,7 +3455,7 @@ export class LaneController {
         };
       }
     }
-    if (!checksGate.passing) {
+    if (checksGate && !checksGate.passing) {
       const detail = checksGate.missing.length
         ? `missing ${checksGate.missing.join(", ")}`
         : checksGate.notPassing.length
@@ -3278,10 +3471,7 @@ export class LaneController {
         runId: run.run_id,
       };
     }
-    if (
-      policy.mergeable?.toUpperCase() !== "MERGEABLE" ||
-      !["CLEAN", "HAS_HOOKS"].includes(policy.mergeStateStatus?.toUpperCase() ?? "")
-    ) {
+    if (!mergeable) {
       return { acted: false, active: true, reason: "PR not mergeable", runId: run.run_id };
     }
     return null;
@@ -3322,38 +3512,41 @@ export class LaneController {
         });
         return { acted: true, active: true, reason: `adopted merge ${execution.action.status}`, runId: run.run_id };
       }
-      if (
-        policy.state !== "open" ||
-        policy.isDraft ||
-        policy.headSha !== run.head_sha ||
-        !requiredChecksGate(
-          policy,
-          lane.delivery_adapter.required_checks ?? []
-        ).passing ||
-        policy.mergeable?.toUpperCase() !== "MERGEABLE" ||
-        !["CLEAN", "HAS_HOOKS"].includes(policy.mergeStateStatus?.toUpperCase() ?? "")
-      ) {
+      if (policy.state !== "open" || policy.isDraft || policy.headSha !== run.head_sha) {
         return { acted: false, active: true, reason: "merge gate changed", runId: run.run_id };
       }
-      const execution = await this.performAction({
-        lease,
-        run,
-        stage: "merge",
-        actionType: "merge_pr",
-        request: {
-          pr_url: run.pr_url,
-          expected_head_sha: run.head_sha,
-          method: lane.merge_policy.method,
-        },
-        mutate: async () => {
-          const merged = await gitHost.merge({
-            prUrl: run.pr_url!,
+      // Record the gate's evidence again, so the merge intent is checked
+      // against a fresh exact-head receipt however long the run waited here.
+      const held = await this.recordMergeEvidence(lease, run, policy, lane, "merge");
+      if (held) return held;
+      const current = await this.freshRun(run.run_id);
+      let execution: ActionExecution;
+      let mergeMutationStarted = false;
+      try {
+        execution = await this.performAction({
+          lease,
+          run: current.run,
+          stage: "merge",
+          actionType: "merge_pr",
+          request: {
+            pr_url: run.pr_url,
+            expected_head_sha: run.head_sha,
             method: lane.merge_policy.method,
-            expectedHeadSha: run.head_sha!,
-          });
-          return { merged_sha: merged.mergedSha, external_ref: run.pr_url! };
-        },
-      });
+          },
+          mutate: async () => {
+            mergeMutationStarted = true;
+            const merged = await gitHost.merge({
+              prUrl: run.pr_url!,
+              method: lane.merge_policy.method,
+              expectedHeadSha: run.head_sha!,
+            });
+            return { merged_sha: merged.mergedSha, external_ref: run.pr_url! };
+          },
+        });
+      } catch (error) {
+        if (mergeMutationStarted || !mergeGateChanged(error)) throw error;
+        return { acted: false, active: true, reason: "merge evidence changed", runId: run.run_id };
+      }
       return { acted: true, active: true, reason: `merge ${execution.action.status}`, runId: run.run_id };
     }
     const noticeTag = `[lane-merge:${run.run_id}:${run.merged_sha}]`;
@@ -3434,16 +3627,56 @@ export class LaneController {
     if (!run.merged_sha || !FULL_SHA_RE.test(run.merged_sha)) {
       throw new Error("validation requires merged SHA");
     }
-    const checks = await this.gitHostForLane(lane).refreshCommitChecks({
-      repoOwner: run.repo_owner,
-      repoName: run.repo_name,
-      sha: run.merged_sha,
-    });
-    if (
-      checks.repoOwner !== run.repo_owner.toLowerCase() ||
-      checks.repoName !== run.repo_name.toLowerCase() ||
-      checks.sha.toLowerCase() !== run.merged_sha.toLowerCase()
-    ) {
+    let checksGate: RequiredChecksGate;
+    let ciPayload: Record<string, unknown>;
+    let identityMatches: boolean;
+    if (requiresExactCheckReceipt(lane)) {
+      const exact = await this.exactCheckEvidence(lane, run, run.merged_sha, "merged");
+      checksGate = exact.gate;
+      ciPayload = exact.payload;
+      identityMatches = exact.identityMatches;
+    } else {
+      const checks = await this.gitHostForLane(lane).refreshCommitChecks({
+        repoOwner: run.repo_owner,
+        repoName: run.repo_name,
+        sha: run.merged_sha,
+      });
+      identityMatches =
+        checks.repoOwner === run.repo_owner.toLowerCase() &&
+        checks.repoName === run.repo_name.toLowerCase() &&
+        checks.sha.toLowerCase() === run.merged_sha.toLowerCase();
+      checksGate = requiredChecksGate(
+        { checksStatus: checks.status, checks: checks.checks },
+        []
+      );
+      // Without named checks the gate lists nothing, so merged-commit CI that
+      // is still running or red would fall through to the rejected-evidence
+      // pause and stop every lane. It waits, or goes to repair, as a named
+      // check would.
+      if (checks.status === "pending" || checks.status === "unknown") {
+        checksGate = {
+          ...checksGate,
+          notPassing: ["merged commit checks"],
+          pending: ["merged commit checks"],
+        };
+      } else if (checks.status === "failing") {
+        checksGate = {
+          ...checksGate,
+          notPassing: ["merged commit checks"],
+          failed: ["merged commit checks"],
+        };
+      }
+      ciPayload = {
+        all_green: checksGate.passing,
+        pending: checksGate.missing.length + checksGate.pending.length,
+        failed: checksGate.failed.length,
+        summary: checks.summary,
+        required_checks: [],
+        missing_required_checks: checksGate.missing,
+        nonpassing_required_checks: checksGate.notPassing,
+      };
+    }
+    if (!identityMatches) {
       if (options.bounded) {
         await this.pauseAuthorizedValidation(
           lease,
@@ -3471,29 +3704,26 @@ export class LaneController {
         runId: changed.run_id,
       };
     }
-    const freshForCi = await this.freshRun(run.run_id);
-    const checksGate = requiredChecksGate(
-      { checksStatus: checks.status, checks: checks.checks },
-      lane.delivery_adapter.required_checks ?? []
+    await this.alertOnStalledChecks(
+      lane,
+      run,
+      run.merged_sha,
+      "merged",
+      checksGate,
+      ciPayload.summary
     );
-    const ciPayload = {
-      all_green: checksGate.passing,
-      pending: checksGate.missing.length + checksGate.pending.length,
-      failed: checksGate.failed.length,
-      summary: checks.summary,
-      required_checks: lane.delivery_adapter.required_checks ?? [],
-      missing_required_checks: checksGate.missing,
-      nonpassing_required_checks: checksGate.notPassing,
-    };
+    const freshForCi = await this.freshRun(run.run_id);
+    const ciWindow = evidenceWindow(this.now());
     const recordedCi = await this.store.recordEvidence(lease, run.run_id, {
       evidence_id: deterministicLaneId(
         "evidence",
         "merged-ci",
         run.run_id,
         run.merged_sha,
+        String(ciWindow),
         JSON.stringify(ciPayload)
       ),
-      external_key: `git-merged-ci:${run.run_id}:${run.merged_sha}:${textHash(JSON.stringify(ciPayload))}`,
+      external_key: `git-merged-ci:${run.run_id}:${run.merged_sha}:${ciWindow}:${textHash(JSON.stringify(ciPayload))}`,
       expected_run_version: freshForCi.run.row_version,
       evidence_type: "merged_ci",
       repo_owner: run.repo_owner,
@@ -3567,7 +3797,17 @@ export class LaneController {
     );
     if (completed) {
       const current = await this.freshRun(run.run_id);
-      const changed = await this.transition(lease, current.run, "validated", "terminal");
+      let changed: LaneRunRecord;
+      try {
+        changed = await this.transition(lease, current.run, "validated", "terminal");
+      } catch (error) {
+        if (stateStoreConflictDetail(error) !== "merged-SHA CI evidence is not green") {
+          throw error;
+        }
+        // An undecided row can remain newest when identical green evidence is
+        // deduplicated in this window. Wait for fresh evidence on a later tick.
+        return { acted: false, active: true, reason: "merged CI evidence changed", runId: run.run_id };
+      }
       return { acted: true, active: false, reason: "lane validated", runId: changed.run_id };
     }
     let attempt = activeAttempt(snapshot, run.run_id, "validation");

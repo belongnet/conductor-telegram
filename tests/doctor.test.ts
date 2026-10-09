@@ -117,57 +117,64 @@ test("doctor reports shipped defaults without usable config or a Conductor DB", 
   }
 });
 
+function writeDurableManifest(
+  dir: string,
+  deliveryAdapter: Record<string, unknown> = { kind: "github" }
+): string {
+  writeFileSync(path.join(dir, "L1.md"), "Do the bounded test task.\n");
+  const promptHash = createHash("sha256")
+    .update("Do the bounded test task.\n")
+    .digest("hex");
+  const manifestPath = path.join(dir, "manifest.v2.json");
+  writeFileSync(
+    manifestPath,
+    JSON.stringify({
+      version: 2,
+      global: {
+        provider_capacity: { claude: 3, codex: 2, cursor: 2 },
+        provider_models: {
+          claude: "fable-5-1",
+          codex: "gpt-6-astra",
+          cursor: "grok-4.7",
+        },
+      },
+      lanes: [
+        {
+          id: "L1",
+          repository: {
+            owner: "belongnet",
+            name: "example",
+            base_branch: "main",
+          },
+          prompt: { path: "L1.md", sha256: promptHash },
+          priority: 1,
+          preferred_providers: ["claude"],
+          fallback_providers: ["codex", "cursor"],
+          dependencies: [],
+          policy: { kind: "one_shot" },
+          delivery_adapter: deliveryAdapter,
+          merge_policy: {
+            method: "squash",
+            auto_merge: true,
+            deploy_notes: "",
+            replay_notes: "",
+          },
+          validation_profile: {
+            commands: [["npm", "test"]],
+            probes: [],
+          },
+          managed_tags: ["managed:growth", "lane:L1"],
+        },
+      ],
+    })
+  );
+  return manifestPath;
+}
+
 test("doctor validates the durable manifest, credentials, and Command Center connection", async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-doctor-lanes-"));
   try {
-    const promptPath = path.join(dir, "L1.md");
-    writeFileSync(promptPath, "Do the bounded test task.\n");
-    const promptHash = createHash("sha256")
-      .update("Do the bounded test task.\n")
-      .digest("hex");
-    const manifestPath = path.join(dir, "manifest.v2.json");
-    writeFileSync(
-      manifestPath,
-      JSON.stringify({
-        version: 2,
-        global: {
-          provider_capacity: { claude: 3, codex: 2, cursor: 2 },
-          provider_models: {
-            claude: "fable-5-1",
-            codex: "gpt-6-astra",
-            cursor: "grok-4.7",
-          },
-        },
-        lanes: [
-          {
-            id: "L1",
-            repository: {
-              owner: "belongnet",
-              name: "example",
-              base_branch: "main",
-            },
-            prompt: { path: "L1.md", sha256: promptHash },
-            priority: 1,
-            preferred_providers: ["claude"],
-            fallback_providers: ["codex", "cursor"],
-            dependencies: [],
-            policy: { kind: "one_shot" },
-            delivery_adapter: { kind: "github" },
-            merge_policy: {
-              method: "squash",
-              auto_merge: true,
-              deploy_notes: "",
-              replay_notes: "",
-            },
-            validation_profile: {
-              commands: [["npm", "test"]],
-              probes: [],
-            },
-            managed_tags: ["managed:growth", "lane:L1"],
-          },
-        ],
-      })
-    );
+    const manifestPath = writeDurableManifest(dir);
     const env: NodeJS.ProcessEnv = {
       LANES_MANIFEST: manifestPath,
       LANES_STATE_BACKEND: "http",
@@ -230,6 +237,185 @@ test("doctor validates the durable manifest, credentials, and Command Center con
     );
     assert.equal(implicit.ok, false);
     assert.match(implicit.detail, /explicit HTTP state backend/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Extended by /ship coverage audit with a GitLab-delivered lane's own project and an unreachable GitLab.
+// Value: protects=doctor reads every GitLab project a gate reads, a GitLab-delivered lane's own included, and fails closed when GitLab is unreachable;
+//   fails_when=gitlabEvidenceProjects drops GitLab delivery or a thrown GitLab read is skipped, so doctor passes a token the gate cannot use;
+//   why_new=only a canonical GitLab project answering 403/200 was probed; a GitLab-delivered lane and a failed fetch were never read; seam=none
+test("doctor requires a GitLab token when canonical CI evidence comes from GitLab", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-doctor-lanes-gitlab-"));
+  try {
+    const manifestPath = writeDurableManifest(dir, {
+      kind: "github",
+      canonical_evidence: {
+        kind: "gitlab",
+        project_path: "nomadhub/mvp",
+        base_branch: "dev",
+      },
+    });
+    const env: NodeJS.ProcessEnv = {
+      LANES_MANIFEST: manifestPath,
+      LANES_STATE_BACKEND: "http",
+      LANES_SITE: "ovh",
+      COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
+      COMMAND_CENTER_API_KEY: "service-key",
+      CONDUCTOR_API_KEY: "conductor-key",
+    };
+    let gitlabStatus = 200;
+    const gitlabReads: string[] = [];
+    const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).startsWith("https://gitlab.com/")) {
+        gitlabReads.push(String(url));
+        assert.equal((init?.headers as Record<string, string>)["PRIVATE-TOKEN"], "gitlab-token");
+        return new Response("[]", { status: gitlabStatus });
+      }
+      return new Response(JSON.stringify({ controller: { mode: "paused_safety" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const missing = await checkDurableLanes(null, env, fakeFetch);
+    assert.equal(missing.ok, false);
+    assert.match(missing.detail, /missing runtime credential\(s\): GITLAB_TOKEN/);
+    assert.deepEqual(gitlabReads, [], "a missing token is reported before any GitLab read");
+
+    gitlabStatus = 403;
+    const forbidden = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gitlab-token" }, fakeFetch);
+    assert.equal(forbidden.ok, false);
+    assert.match(forbidden.detail, /GITLAB_TOKEN cannot read nomadhub\/mvp pipelines \(HTTP 403\)/);
+
+    gitlabStatus = 200;
+    const ready = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gitlab-token" }, fakeFetch);
+    assert.equal(ready.ok, true);
+    assert.match(ready.detail, /mode=paused_safety/);
+    assert.equal(
+      gitlabReads.at(-1),
+      "https://gitlab.com/api/v4/projects/nomadhub%2Fmvp/pipelines?per_page=1"
+    );
+
+    // Without canonical evidence a GitLab-delivered lane's gates read its own
+    // project, and a GitLab that cannot be reached fails closed as well.
+    writeDurableManifest(dir, { kind: "gitlab" });
+    gitlabStatus = 404;
+    const delivery = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gitlab-token" }, fakeFetch);
+    assert.equal(delivery.ok, false);
+    assert.match(delivery.detail, /GITLAB_TOKEN cannot read belongnet\/example pipelines \(HTTP 404\)/);
+    assert.equal(
+      gitlabReads.at(-1),
+      "https://gitlab.com/api/v4/projects/belongnet%2Fexample/pipelines?per_page=1"
+    );
+    const unreachableFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).startsWith("https://gitlab.com/")) {
+        throw new Error("getaddrinfo ENOTFOUND gitlab.com");
+      }
+      return fakeFetch(url, init);
+    }) as typeof fetch;
+    const unreachable = await checkDurableLanes(
+      null,
+      { ...env, GITLAB_TOKEN: "gitlab-token" },
+      unreachableFetch
+    );
+    assert.equal(unreachable.ok, false);
+    assert.match(
+      unreachable.detail,
+      /GITLAB_TOKEN cannot read belongnet\/example pipelines \(getaddrinfo ENOTFOUND gitlab\.com\)/
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("doctor reads a GitLab-delivered lane's own project even when its CI is proven elsewhere", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-doctor-lanes-gitlab-delivery-"));
+  try {
+    for (const canonical of [
+      { kind: "gitlab", project_path: "nomadhub/mvp", base_branch: "dev" },
+      { kind: "github", project_path: "belongnet/canonical", base_branch: "main" },
+    ]) {
+      const manifestPath = writeDurableManifest(dir, { kind: "gitlab", canonical_evidence: canonical });
+      const gitlabReads: string[] = [];
+      const fakeFetch = (async (url: string | URL | Request) => {
+        if (String(url).startsWith("https://gitlab.com/")) {
+          gitlabReads.push(String(url));
+          // The token reads the canonical project but not the merge requests' own.
+          return new Response("[]", { status: String(url).includes("belongnet%2Fexample") ? 403 : 200 });
+        }
+        return new Response(JSON.stringify({ controller: { mode: "paused_safety" } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+      const result = await checkDurableLanes(
+        null,
+        {
+          LANES_MANIFEST: manifestPath,
+          LANES_STATE_BACKEND: "http",
+          LANES_SITE: "ovh",
+          COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
+          COMMAND_CENTER_API_KEY: "service-key",
+          CONDUCTOR_API_KEY: "conductor-key",
+          GITLAB_TOKEN: "gitlab-token",
+        },
+        fakeFetch
+      );
+      assert.equal(result.ok, false, JSON.stringify(canonical));
+      assert.match(result.detail, /GITLAB_TOKEN cannot read belongnet\/example pipelines \(HTTP 403\)/);
+      assert.ok(
+        gitlabReads.some((url) => url.includes("belongnet%2Fexample")),
+        "the merge requests' own project is read"
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("doctor checks access to GitLab pipeline variables used by the CI gate", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-doctor-lanes-gitlab-vars-"));
+  try {
+    const manifestPath = writeDurableManifest(dir, {
+      kind: "github",
+      canonical_evidence: {
+        kind: "gitlab",
+        project_path: "nomadhub/mvp",
+        base_branch: "dev",
+      },
+    });
+    const env: NodeJS.ProcessEnv = {
+      LANES_MANIFEST: manifestPath,
+      LANES_STATE_BACKEND: "http",
+      LANES_SITE: "ovh",
+      COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
+      COMMAND_CENTER_API_KEY: "service-key",
+      CONDUCTOR_API_KEY: "conductor-key",
+      GITLAB_TOKEN: "gitlab-token",
+    };
+    const reads: string[] = [];
+    let variablesStatus = 403;
+    const fakeFetch = (async (url: string | URL | Request) => {
+      const target = String(url);
+      reads.push(target);
+      if (target.endsWith("/pipelines?per_page=1")) {
+        return new Response(JSON.stringify([{ id: 42 }]));
+      }
+      if (target.endsWith("/pipelines/42/variables")) {
+        return new Response("[]", { status: variablesStatus });
+      }
+      return new Response(JSON.stringify({ controller: { mode: "paused_safety" } }));
+    }) as typeof fetch;
+
+    const denied = await checkDurableLanes(null, env, fakeFetch);
+    assert.equal(denied.ok, false);
+    assert.match(denied.detail, /pipeline variables HTTP 403/);
+    assert.ok(reads.some((url) => url.endsWith("/pipelines/42/variables")));
+
+    variablesStatus = 200;
+    const allowed = await checkDurableLanes(null, env, fakeFetch);
+    assert.equal(allowed.ok, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

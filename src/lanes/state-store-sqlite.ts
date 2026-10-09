@@ -2,10 +2,12 @@ import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { canonicalEvidenceIdentity, validPipelineId } from "./check-evidence.js";
 import {
   APPROVED_PROVIDER_MODELS,
   canonicalManifestJson,
   type LaneManifestV2,
+  type ManifestLane,
   type ManifestProvider,
 } from "./manifest.js";
 import type {
@@ -174,6 +176,106 @@ function sameExactStringSet(left: unknown, right: readonly string[]): boolean {
   const expected = [...right].sort();
   return actual.every((value, index) => value === expected[index]);
 }
+
+/** Python truthiness, as Command Center applies it to evidence fields. */
+function truthy(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.keys(value).length > 0;
+  return Boolean(value);
+}
+
+function exactGitHostReceipt(
+  evidence: Record<string, unknown>,
+  lane: ManifestLane,
+  run: LaneRunRecord,
+  commitSha: string
+): boolean {
+  const expected = canonicalEvidenceIdentity(lane, run);
+  return (
+    evidence.source === expected.kind &&
+    typeof evidence.project_path === "string" &&
+    evidence.project_path.toLowerCase() === expected.projectPath &&
+    evidence.base_branch === expected.baseBranch &&
+    evidence.commit_sha === commitSha &&
+    validPipelineId(evidence.pipeline_id)
+  );
+}
+
+/**
+ * Command Center's acceptance rule for `required_checks` and `merged_ci`
+ * evidence (belong-agents #537): named checks need an exact profile, the
+ * pre-merge gate needs per-check receipts from the canonical host, and
+ * canonical evidence needs the exact host/project/branch/commit/pipeline.
+ */
+export function checkEvidenceAccepted(
+  evidenceType: "required_checks" | "merged_ci",
+  evidence: Record<string, unknown>,
+  lane: ManifestLane,
+  run: LaneRunRecord,
+  commitSha: string
+): boolean {
+  // dict.get(key, []): only an absent key defaults; an explicit null stays null.
+  const field = (key: string): unknown =>
+    Object.hasOwn(evidence, key) ? evidence[key] : [];
+  const configured = lane.delivery_adapter.required_checks ?? [];
+  const reported = field("required_checks");
+  const missing = field("missing_required_checks");
+  const nonpassing = field("nonpassing_required_checks");
+  if (evidence.all_green !== true) return false;
+  if (configured.length > 0) {
+    if (
+      !Array.isArray(missing) ||
+      !Array.isArray(nonpassing) ||
+      !sameExactStringSet(reported, configured) ||
+      missing.length > 0 ||
+      nonpassing.length > 0
+    ) {
+      return false;
+    }
+  } else if (truthy(evidence.pending) || truthy(evidence.failed)) {
+    return false;
+  }
+  if (evidenceType === "required_checks") {
+    const allowlist = lane.delivery_adapter.check_allowlist ?? configured;
+    const receipts = field("checks");
+    if (
+      !Array.isArray(reported) ||
+      reported.length !== configured.length ||
+      reported.some((name, index) => name !== configured[index]) ||
+      truthy(missing) ||
+      truthy(nonpassing)
+    ) {
+      return false;
+    }
+    if (configured.length > 0) {
+      if (!exactGitHostReceipt(evidence, lane, run, commitSha)) return false;
+      if (!Array.isArray(receipts)) return false;
+      const named = receipts
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+        .map((item) => item.name);
+      if (
+        named.length !== configured.length ||
+        named.some((name, index) => name !== configured[index]) ||
+        receipts.some((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+          const receipt = item as Record<string, unknown>;
+          return (
+            !allowlist.includes(String(receipt.name)) ||
+            receipt.status !== "success" ||
+            receipt.commit_sha !== commitSha
+          );
+        })
+      ) {
+        return false;
+      }
+    }
+  }
+  return (
+    !lane.delivery_adapter.canonical_evidence ||
+    exactGitHostReceipt(evidence, lane, run, commitSha)
+  );
+}
+
 const ATTEMPT_STATUSES = new Set([
   "commissioned",
   "working",
@@ -2025,24 +2127,13 @@ export class SqliteLaneStateStore implements LaneStateStore {
       ) {
         accepted =
           accepted &&
-          input.evidence.all_green === true &&
-          !input.evidence.pending &&
-          !input.evidence.failed;
-        if (
-          input.evidence_type === "required_checks" ||
-          input.evidence_type === "merged_ci"
-        ) {
-          accepted =
-            accepted &&
-            sameExactStringSet(
-              input.evidence.required_checks ?? [],
-              lane!.delivery_adapter.required_checks ?? []
-            ) &&
-            Array.isArray(input.evidence.missing_required_checks ?? []) &&
-            ((input.evidence.missing_required_checks ?? []) as unknown[]).length === 0 &&
-            Array.isArray(input.evidence.nonpassing_required_checks ?? []) &&
-            ((input.evidence.nonpassing_required_checks ?? []) as unknown[]).length === 0;
-        }
+          checkEvidenceAccepted(
+            input.evidence_type,
+            input.evidence,
+            lane!,
+            run,
+            input.head_sha
+          );
       } else if (input.evidence_type === "mergeability") {
         accepted = accepted && input.evidence.mergeable === true;
       } else if (input.evidence_type === "deterministic_validation") {
