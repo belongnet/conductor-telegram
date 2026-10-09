@@ -2,6 +2,19 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.16.0] - 2026-10-09
+
+### Added
+- The lanes worker accepts the current Command Center manifest, including check allowlists and canonical GitLab evidence. It sends exact check and pipeline receipts for the reviewed head and merged commit, and `doctor` checks access to every GitLab project those lanes use.
+- A lane whose CI never decides a commit sends a Telegram alert after an hour while its gate stays closed.
+
+### Fixed
+- A failed merged commit sends only its lane to repair instead of pausing every lane. Brief CI or mergeability changes now wait for a fresh gate result instead of restarting the worker.
+- GitLab squash merges validate the commit left at the target branch tip. Recurring schedules the manifest accepts are also scheduled correctly.
+
+### Security
+- Canonical GitLab evidence ignores unrelated branches and pipeline sources, rejects pipelines with supplied variables, and checks every job's latest run before accepting a green pipeline. A posted commit status cannot turn a failed job into passing evidence.
+
 ## [0.15.1] - 2026-10-02
 
 ### Fixed
