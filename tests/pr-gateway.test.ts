@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { closeDb, getDb } from "../src/store/db.js";
@@ -17,6 +17,7 @@ import {
   buildExactHeadMergeArgs,
   canMergePr,
   githubPrIdentity,
+  mergePrByUrl,
   matchesExpectedPrHead,
   normalizePrState,
   requiredChecksGate,
@@ -225,6 +226,71 @@ test("GitHub merge command pins the confirmed head commit", () => {
       "a".repeat(40),
     ]
   );
+});
+
+test("GitHub lane merge checks branch binding before the command and in its receipt", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-merge-binding-"));
+  const priorPath = process.env.PATH;
+  const priorLog = process.env.TEST_MERGE_LOG;
+  const priorBase = process.env.TEST_BASE_REF;
+  const priorFlip = process.env.TEST_MERGE_FLIP;
+  const mergeLog = path.join(dir, "merge.log");
+  try {
+    const gh = path.join(dir, "gh");
+    writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "api" ]; then
+  case "$*" in
+    *merge_commit_sha*)
+      base_ref="$TEST_BASE_REF"
+      if [ "$TEST_MERGE_FLIP" = "1" ]; then base_ref="release"; fi
+      printf '{"merged":true,"merge_commit_sha":"${"b".repeat(40)}","head_sha":"${"a".repeat(40)}","head_ref":"managed/example","base_ref":"%s"}\\n' "$base_ref"
+      ;;
+    *)
+      printf '{"head_sha":"${"a".repeat(40)}","head_ref":"managed/example","base_ref":"%s"}\\n' "$TEST_BASE_REF"
+      ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  printf 'merge called\\n' >> "$TEST_MERGE_LOG"
+  exit 0
+fi
+exit 1
+`);
+    chmodSync(gh, 0o755);
+    process.env.PATH = `${dir}${path.delimiter}${priorPath ?? ""}`;
+    process.env.TEST_MERGE_LOG = mergeLog;
+    process.env.TEST_BASE_REF = "release";
+    const request = {
+      prUrl: "https://github.com/belongnet/example/pull/7",
+      method: "squash" as const,
+      expectedHeadSha: "a".repeat(40),
+      expectedHeadBranch: "managed/example",
+      expectedBaseBranch: "main",
+    };
+    await assert.rejects(
+      mergePrByUrl(request),
+      /merge gate changed/
+    );
+    assert.equal(existsSync(mergeLog), false, "the merge command is never run");
+    process.env.TEST_BASE_REF = "main";
+    assert.deepEqual(await mergePrByUrl(request), { mergedSha: "b".repeat(40) });
+    assert.equal(existsSync(mergeLog), true, "a matching PR can merge");
+    rmSync(mergeLog);
+    process.env.TEST_MERGE_FLIP = "1";
+    await assert.rejects(mergePrByUrl(request), /response was ambiguous/);
+    assert.equal(existsSync(mergeLog), true, "a branch changed during merge is detected afterward");
+  } finally {
+    if (priorPath === undefined) delete process.env.PATH;
+    else process.env.PATH = priorPath;
+    if (priorLog === undefined) delete process.env.TEST_MERGE_LOG;
+    else process.env.TEST_MERGE_LOG = priorLog;
+    if (priorBase === undefined) delete process.env.TEST_BASE_REF;
+    else process.env.TEST_BASE_REF = priorBase;
+    if (priorFlip === undefined) delete process.env.TEST_MERGE_FLIP;
+    else process.env.TEST_MERGE_FLIP = priorFlip;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("commissioned GitHub reviews are API reviews pinned to the exact head", () => {

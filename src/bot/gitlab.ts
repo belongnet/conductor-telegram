@@ -424,6 +424,8 @@ export class GitlabLaneGateway {
     projectPath: string;
     sha: string;
     ref?: string;
+    baseBranch?: string;
+    expectedMrIid?: number;
   }): Promise<CheckObservation> {
     const sha = input.sha.toLowerCase();
     if (!GIT_OID_RE.test(sha)) throw new Error("GitLab pipeline evidence requires a full SHA");
@@ -432,15 +434,52 @@ export class GitlabLaneGateway {
       Number.isSafeInteger(pipeline.id) &&
       pipeline.id! > 0 &&
       pipeline.sha?.toLowerCase() === sha &&
-      (!input.ref || pipeline.ref === input.ref) &&
       CANONICAL_PIPELINE_SOURCES.has(String(pipeline.source ?? ""));
+    const mergeRequestIid = (pipeline: GitlabPipeline): number | null => {
+      if (pipeline.source !== "merge_request_event" || !input.ref || !input.baseBranch) {
+        return null;
+      }
+      const match = /^refs\/merge-requests\/([1-9]\d*)\/head$/.exec(pipeline.ref ?? "");
+      const iid = Number(match?.[1]);
+      return match && Number.isSafeInteger(iid) &&
+        (input.expectedMrIid === undefined || iid === input.expectedMrIid)
+        ? iid
+        : null;
+    };
+    const possibleRef = (pipeline: GitlabPipeline) =>
+      !input.ref || pipeline.ref === input.ref || mergeRequestIid(pipeline) !== null;
+    const matchesRef = async (pipeline: GitlabPipeline): Promise<boolean> => {
+      if (!input.ref || pipeline.ref === input.ref) return true;
+      const iid = mergeRequestIid(pipeline);
+      if (iid === null) return false;
+      let mr: GitlabMergeRequest;
+      try {
+        mr = await this.request<GitlabMergeRequest>(
+          identity,
+          "GET",
+          `${this.projectPath(identity)}/merge_requests/${iid}`
+        );
+      } catch (error) {
+        if (error instanceof GitlabApiError && error.status === 404) return false;
+        throw error;
+      }
+      return (
+        mr.iid === iid &&
+        mr.state === "opened" &&
+        mr.source_branch === input.ref &&
+        mr.target_branch === input.baseBranch &&
+        mr.sha?.toLowerCase() === sha
+      );
+    };
     const query = new URLSearchParams({
       sha,
       order_by: "id",
       sort: "desc",
       per_page: String(PIPELINE_PAGE_SIZE),
     });
-    if (input.ref) query.set("ref", input.ref);
+    // The merged commit only accepts the canonical branch. A reviewed head
+    // also accepts an MR ref after the MR's branch, target and SHA are bound.
+    if (input.ref && !input.baseBranch) query.set("ref", input.ref);
     let latest: GitlabPipeline | undefined;
     let reads = 0;
     let cutShort: string | null = null;
@@ -460,7 +499,7 @@ export class GitlabLaneGateway {
         throw new GitlabApiError("GitLab pipeline list was not an array", 200, false);
       }
       const candidates = response.payload
-        .filter((pipeline) => canonical(pipeline) && pipeline.tag !== true)
+        .filter((pipeline) => canonical(pipeline) && possibleRef(pipeline) && pipeline.tag !== true)
         .sort((left, right) => right.id! - left.id!);
       for (const candidate of candidates) {
         if (reads >= MAX_PIPELINE_READS) {
@@ -473,14 +512,19 @@ export class GitlabLaneGateway {
           "GET",
           `${this.projectPath(identity)}/pipelines/${candidate.id}`
         );
-        if (detail.id !== candidate.id || !canonical(detail) || typeof detail.tag !== "boolean") {
+        if (
+          detail.id !== candidate.id ||
+          !canonical(detail) ||
+          !possibleRef(detail) ||
+          typeof detail.tag !== "boolean"
+        ) {
           throw new GitlabApiError(
             `GitLab pipeline ${candidate.id} did not match its list entry when read in full`,
             200,
             false
           );
         }
-        if (!detail.tag) {
+        if (!detail.tag && await matchesRef(detail)) {
           latest = detail;
           break pages;
         }
@@ -618,6 +662,8 @@ export class GitlabLaneGateway {
     prUrl: string;
     method: "squash" | "merge" | "rebase";
     expectedHeadSha: string;
+    expectedHeadBranch: string;
+    expectedBaseBranch: string;
   }): Promise<{ mergedSha: string }> {
     const identity = gitlabMrIdentity(input.prUrl);
     if (!identity || !GIT_OID_RE.test(input.expectedHeadSha)) {
@@ -633,6 +679,8 @@ export class GitlabLaneGateway {
       before.detailed_merge_status === "mergeable";
     if (
       before.sha?.toLowerCase() !== input.expectedHeadSha.toLowerCase() ||
+      before.source_branch !== input.expectedHeadBranch ||
+      before.target_branch !== input.expectedBaseBranch ||
       before.state !== "opened" ||
       !mergeable
     ) {
@@ -653,6 +701,8 @@ export class GitlabLaneGateway {
     if (
       after.state !== "merged" ||
       after.sha?.toLowerCase() !== input.expectedHeadSha.toLowerCase() ||
+      after.source_branch !== input.expectedHeadBranch ||
+      after.target_branch !== input.expectedBaseBranch ||
       !mergedSha ||
       !GIT_OID_RE.test(mergedSha)
     ) {

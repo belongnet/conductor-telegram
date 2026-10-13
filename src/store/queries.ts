@@ -3642,6 +3642,21 @@ export function getLaneDeliveryState<T>(laneId: string): T | null {
   }
 }
 
+export function listLaneDeliveryStates<T>(): Array<{ laneId: string; state: T }> {
+  const rows = getDb()
+    .prepare("SELECT lane_id, state_json FROM lane_delivery_state")
+    .all() as Array<{ lane_id: string; state_json: string }>;
+  return rows.map((row) => {
+    let state: T;
+    try {
+      state = JSON.parse(row.state_json) as T;
+    } catch {
+      throw new Error(`Invalid persisted lane delivery state for ${row.lane_id}`);
+    }
+    return { laneId: row.lane_id, state };
+  });
+}
+
 export function setLaneDeliveryState<T>(laneId: string, state: T): void {
   const now = new Date().toISOString();
   getDb()

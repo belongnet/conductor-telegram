@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   githubPrIdentity,
-  mergePrByUrl,
   postPrComment,
   postPrReviewComment,
   prHasCommentTag,
@@ -167,16 +166,13 @@ export interface GithubLaneGateway {
     tag: string,
     expectedBodyHash?: string
   ): Promise<boolean>;
-  merge(input: {
-    prUrl: string;
-    method: "squash" | "merge" | "rebase";
-    expectedHeadSha: string;
-  }): Promise<{ mergedSha: string }>;
   /** GitLab only: the canonical project's newest pipeline for one exact commit. */
   commitPipeline?(input: {
     projectPath: string;
     sha: string;
     ref?: string;
+    baseBranch?: string;
+    expectedMrIid?: number;
   }): Promise<CheckObservation>;
 }
 
@@ -186,7 +182,6 @@ export const defaultGithubLaneGateway: GithubLaneGateway = {
   postReview: postPrReviewComment,
   postComment: postPrComment,
   hasCommentTag: prHasCommentTag,
-  merge: mergePrByUrl,
 };
 
 export type LaneControllerResult = {
@@ -793,6 +788,11 @@ export class LaneController {
         projectPath: identity.projectPath,
         sha,
         ref: phase === "merged" ? identity.baseBranch : run.head_branch!,
+        ...(phase === "head" ? { baseBranch: identity.baseBranch } : {}),
+        ...(phase === "head" && lane.delivery_adapter.kind === "gitlab" &&
+          identity.projectPath === `${run.repo_owner}/${run.repo_name}`.toLowerCase()
+          ? { expectedMrIid: run.pr_number! }
+          : {}),
       });
     } else {
       const [owner, repo, ...rest] = identity.projectPath.split("/");
@@ -1908,10 +1908,16 @@ export class LaneController {
         const policy = await this.gitHostForUrl(String(request.pr_url)).refreshPr(
           String(request.pr_url)
         );
+        const run = (await this.freshRun(action.run_id)).run;
         const expectedHead = String(request.expected_head_sha ?? "").toLowerCase();
         found =
           policy.state === "merged" &&
           policy.headSha?.toLowerCase() === expectedHead &&
+          policy.repoOwner === run.repo_owner.toLowerCase() &&
+          policy.repoName === run.repo_name.toLowerCase() &&
+          policy.prNumber === run.pr_number &&
+          policy.headBranch === run.head_branch &&
+          policy.baseBranch === run.base_branch &&
           Boolean(policy.mergeCommitSha && FULL_SHA_RE.test(policy.mergeCommitSha));
         result = {
           reconciled: true,
@@ -3415,22 +3421,23 @@ export class LaneController {
         ? [
             {
               type: "required_checks",
-              key: `git-checks:${run.run_id}:${run.head_sha}:${window}:${textHash(JSON.stringify(checksPayload))}`,
+              locator: `git-checks:${run.run_id}:${run.head_sha}:${window}:${textHash(JSON.stringify(checksPayload))}`,
               payload: checksPayload,
             },
           ]
         : []),
       {
         type: "mergeability",
-        key: `git-mergeability:${run.run_id}:${run.head_sha}:${window}:${textHash(JSON.stringify(mergeabilityPayload))}`,
+        locator: `git-mergeability:${run.run_id}:${run.head_sha}:${window}:${textHash(JSON.stringify(mergeabilityPayload))}`,
         payload: mergeabilityPayload,
       },
     ];
     for (const item of evidence) {
+      const locator = item.locator;
       const fresh = await this.freshRun(run.run_id);
       const recorded = await this.store.recordEvidence(lease, run.run_id, {
-        evidence_id: deterministicLaneId("evidence", item.key),
-        external_key: item.key,
+        evidence_id: deterministicLaneId("evidence", locator),
+        external_key: locator,
         expected_run_version: fresh.run.row_version,
         evidence_type: item.type,
         repo_owner: run.repo_owner,
@@ -3487,6 +3494,24 @@ export class LaneController {
     if (!run.merged_sha) {
       const gitHost = this.gitHostForLane(lane);
       const policy = await gitHost.refreshPr(run.pr_url);
+      const identity = deliveryPrIdentity(lane, policy.url);
+      if (
+        !identity ||
+        identity.owner !== run.repo_owner.toLowerCase() ||
+        identity.repo !== run.repo_name.toLowerCase() ||
+        identity.number !== run.pr_number ||
+        policy.prNumber !== run.pr_number ||
+        policy.headBranch !== run.head_branch ||
+        policy.baseBranch !== run.base_branch
+      ) {
+        const changed = await this.quarantineRun(
+          lease,
+          run.run_id,
+          "merge",
+          "PR repository or branch identity changed before merge"
+        );
+        return { acted: true, active: true, reason: "quarantined PR identity drift", runId: changed.run_id };
+      }
       if (policy.state === "merged" && policy.mergeCommitSha) {
         if (policy.headSha !== run.head_sha) {
           const changed = await this.quarantineRun(
@@ -3515,39 +3540,24 @@ export class LaneController {
       if (policy.state !== "open" || policy.isDraft || policy.headSha !== run.head_sha) {
         return { acted: false, active: true, reason: "merge gate changed", runId: run.run_id };
       }
-      // Record the gate's evidence again, so the merge intent is checked
-      // against a fresh exact-head receipt however long the run waited here.
+      // Keep exact-head evidence fresh while the operator decides whether to merge.
       const held = await this.recordMergeEvidence(lease, run, policy, lane, "merge");
       if (held) return held;
-      const current = await this.freshRun(run.run_id);
-      let execution: ActionExecution;
-      let mergeMutationStarted = false;
-      try {
-        execution = await this.performAction({
-          lease,
-          run: current.run,
-          stage: "merge",
-          actionType: "merge_pr",
-          request: {
-            pr_url: run.pr_url,
-            expected_head_sha: run.head_sha,
-            method: lane.merge_policy.method,
-          },
-          mutate: async () => {
-            mergeMutationStarted = true;
-            const merged = await gitHost.merge({
-              prUrl: run.pr_url!,
-              method: lane.merge_policy.method,
-              expectedHeadSha: run.head_sha!,
-            });
-            return { merged_sha: merged.mergedSha, external_ref: run.pr_url! };
-          },
-        });
-      } catch (error) {
-        if (mergeMutationStarted || !mergeGateChanged(error)) throw error;
-        return { acted: false, active: true, reason: "merge evidence changed", runId: run.run_id };
-      }
-      return { acted: true, active: true, reason: `merge ${execution.action.status}`, runId: run.run_id };
+      await this.notify(
+        `Growth lane ${lane.id} is ready for an operator merge: ${run.pr_url}. ` +
+          `Verify the repository, source and target branches, head ${run.head_sha}, and required checks in the Git host before merging.`,
+        `manual-merge:${run.run_id}:${run.head_sha}`
+      );
+      // Neither GitHub nor GitLab binds the target branch in the merge mutation.
+      // A retarget between the read above and that mutation could merge into
+      // another branch. Hold here until an operator merges the reviewed PR;
+      // the merged-state path above can then adopt and validate its SHA.
+      return {
+        acted: false,
+        active: true,
+        reason: "automatic merge held: merge the reviewed PR manually",
+        runId: run.run_id,
+      };
     }
     const noticeTag = `[lane-merge:${run.run_id}:${run.merged_sha}]`;
     if (!Boolean(run.metadata_json.merge_notice_posted)) {
@@ -3714,6 +3724,7 @@ export class LaneController {
     );
     const freshForCi = await this.freshRun(run.run_id);
     const ciWindow = evidenceWindow(this.now());
+    const ciLocator = `git-merged-ci:${run.run_id}:${run.merged_sha}:${ciWindow}:${textHash(JSON.stringify(ciPayload))}`;
     const recordedCi = await this.store.recordEvidence(lease, run.run_id, {
       evidence_id: deterministicLaneId(
         "evidence",
@@ -3723,7 +3734,7 @@ export class LaneController {
         String(ciWindow),
         JSON.stringify(ciPayload)
       ),
-      external_key: `git-merged-ci:${run.run_id}:${run.merged_sha}:${ciWindow}:${textHash(JSON.stringify(ciPayload))}`,
+      external_key: ciLocator,
       expected_run_version: freshForCi.run.row_version,
       evidence_type: "merged_ci",
       repo_owner: run.repo_owner,

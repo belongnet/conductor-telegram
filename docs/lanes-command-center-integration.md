@@ -26,6 +26,14 @@ with the same contract), run its PostgreSQL scenario, and point
 `COMMAND_CENTER_API_BASE_URL` at that deployment. This worker repository does
 not silently apply SQL to the control plane and keeps production prepare-only.
 
+For the optional container-based OVH lanes unit, stage the manifest at
+`/etc/conductor-telegram/lanes.manifest.json` and its verified prompt files at
+`/etc/conductor-telegram/prompts/`. The unit mounts both paths read-only into
+the container; prompt paths such as `prompts/L3.md` resolve relative to the
+manifest. The native OVH systemd installation instead reads its manifest and
+prompts from `/var/lib/conductor-telegram/growth-lanes/`. Verify every prompt
+hash with `doctor` before resuming the worker.
+
 ## Required lane-safety contract
 
 The worker in this revision requires a matching Command Center deployment
@@ -161,7 +169,11 @@ for the exact commit, pinned to the reviewed head branch before merge and the
 canonical base branch after merge. A same-commit pipeline on another branch
 cannot stand in for it. The canonical project must run CI for the reviewed
 branch; otherwise the gate waits. Only a push or merge-request pipeline counts (source `push`,
-`merge_request_event` or `external_pull_request_event`). An external pipeline
+`merge_request_event` or `external_pull_request_event`). For a GitLab
+merge-request pipeline, the worker checks the merge request's source branch,
+target branch, and head SHA before accepting its MR ref. A GitLab-delivered
+lane also binds the MR number when the canonical project is its delivery
+project. An external pipeline
 only holds commit statuses, a child pipeline is a slice of its parent, and a
 pipeline started by hand, by API, trigger or schedule can carry variables that
 skip jobs. None of these count. The pipeline list does not say whether a
@@ -196,7 +208,7 @@ other lanes.
 
 A GitLab-proven lane needs `GITLAB_TOKEN`, even when it delivers through
 GitHub: read API access is enough for canonical evidence, while a
-GitLab-delivered lane also posts merge-request notes and merges, which needs
+GitLab-delivered lane also posts merge-request notes, which needs
 the `api` scope. The worker refuses to start without the token. For each such
 project, `doctor` checks pipeline listing and, if one exists, reads that
 pipeline's variables endpoint; it does not check write scope. A project with
@@ -206,9 +218,22 @@ its first pipeline.
 Command Center counts merge evidence as fresh for 5 minutes (merged-SHA CI for
 15) from when a row is first written, and answers a repeated key with that
 original row. The worker keys check, mergeability and merged-SHA CI evidence to
-a 4-minute window, and records the pre-merge evidence again just before it
-merges. A result that stays green while the merge waits on something else
-therefore never ages out.
+a 4-minute window, and records the pre-merge evidence again before it waits for
+an operator merge. A result that stays green while the merge waits therefore
+never ages out.
+
+The worker currently starts no automatic merges, including legacy delivery.
+GitHub and GitLab merge calls can bind the head commit but cannot bind the
+target branch in the same mutation. An operator must check the PR's repository,
+source branch, target branch, and head SHA, then merge it in the Git host. The
+worker adopts a matching external merge and continues merged-commit CI and
+validation. The manifest's `auto_merge` policy still describes which one-shot
+lanes reach the merge stage; it does not override this safety hold. Stop any
+legacy merge-agent session commissioned by an older worker before resuming it.
+The legacy scheduler cancels and archives any recorded pre-upgrade merge
+sessions at startup, including while paused. Persisted legacy runs without a
+recorded target branch stay inert until an operator reviews and resets them. The durable worker
+sends one notification per run and head SHA when the manual merge gate is ready.
 
 #### When CI never decides
 

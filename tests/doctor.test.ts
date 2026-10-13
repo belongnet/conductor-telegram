@@ -179,9 +179,9 @@ test("doctor validates the durable manifest, credentials, and Command Center con
       LANES_MANIFEST: manifestPath,
       LANES_STATE_BACKEND: "http",
       COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
-      COMMAND_CENTER_API_KEY: "service-key",
-      CONDUCTOR_API_KEY: "conductor-key",
-      BOT_TOKEN: "telegram-key",
+      COMMAND_CENTER_API_KEY: "svc",
+      CONDUCTOR_API_KEY: "con",
+      BOT_TOKEN: "bot",
       OWNER_CHAT_ID: "42",
       BELONG_HUMAN_APPROVAL_KEY: "human-key",
     };
@@ -262,15 +262,15 @@ test("doctor requires a GitLab token when canonical CI evidence comes from GitLa
       LANES_STATE_BACKEND: "http",
       LANES_SITE: "ovh",
       COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
-      COMMAND_CENTER_API_KEY: "service-key",
-      CONDUCTOR_API_KEY: "conductor-key",
+      COMMAND_CENTER_API_KEY: "svc",
+      CONDUCTOR_API_KEY: "con",
     };
     let gitlabStatus = 200;
     const gitlabReads: string[] = [];
     const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
       if (String(url).startsWith("https://gitlab.com/")) {
         gitlabReads.push(String(url));
-        assert.equal((init?.headers as Record<string, string>)["PRIVATE-TOKEN"], "gitlab-token");
+        assert.equal((init?.headers as Record<string, string>)["PRIVATE-TOKEN"], "gl");
         return new Response("[]", { status: gitlabStatus });
       }
       return new Response(JSON.stringify({ controller: { mode: "paused_safety" } }), {
@@ -284,12 +284,12 @@ test("doctor requires a GitLab token when canonical CI evidence comes from GitLa
     assert.deepEqual(gitlabReads, [], "a missing token is reported before any GitLab read");
 
     gitlabStatus = 403;
-    const forbidden = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gitlab-token" }, fakeFetch);
+    const forbidden = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gl" }, fakeFetch);
     assert.equal(forbidden.ok, false);
     assert.match(forbidden.detail, /GITLAB_TOKEN cannot read nomadhub\/mvp pipelines \(HTTP 403\)/);
 
     gitlabStatus = 200;
-    const ready = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gitlab-token" }, fakeFetch);
+    const ready = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gl" }, fakeFetch);
     assert.equal(ready.ok, true);
     assert.match(ready.detail, /mode=paused_safety/);
     assert.equal(
@@ -301,7 +301,7 @@ test("doctor requires a GitLab token when canonical CI evidence comes from GitLa
     // project, and a GitLab that cannot be reached fails closed as well.
     writeDurableManifest(dir, { kind: "gitlab" });
     gitlabStatus = 404;
-    const delivery = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gitlab-token" }, fakeFetch);
+    const delivery = await checkDurableLanes(null, { ...env, GITLAB_TOKEN: "gl" }, fakeFetch);
     assert.equal(delivery.ok, false);
     assert.match(delivery.detail, /GITLAB_TOKEN cannot read belongnet\/example pipelines \(HTTP 404\)/);
     assert.equal(
@@ -316,7 +316,7 @@ test("doctor requires a GitLab token when canonical CI evidence comes from GitLa
     }) as typeof fetch;
     const unreachable = await checkDurableLanes(
       null,
-      { ...env, GITLAB_TOKEN: "gitlab-token" },
+      { ...env, GITLAB_TOKEN: "gl" },
       unreachableFetch
     );
     assert.equal(unreachable.ok, false);
@@ -356,9 +356,9 @@ test("doctor reads a GitLab-delivered lane's own project even when its CI is pro
           LANES_STATE_BACKEND: "http",
           LANES_SITE: "ovh",
           COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
-          COMMAND_CENTER_API_KEY: "service-key",
-          CONDUCTOR_API_KEY: "conductor-key",
-          GITLAB_TOKEN: "gitlab-token",
+          COMMAND_CENTER_API_KEY: "svc",
+          CONDUCTOR_API_KEY: "con",
+          GITLAB_TOKEN: "gl",
         },
         fakeFetch
       );
@@ -390,9 +390,9 @@ test("doctor checks access to GitLab pipeline variables used by the CI gate", as
       LANES_STATE_BACKEND: "http",
       LANES_SITE: "ovh",
       COMMAND_CENTER_API_BASE_URL: "https://command-center.test",
-      COMMAND_CENTER_API_KEY: "service-key",
-      CONDUCTOR_API_KEY: "conductor-key",
-      GITLAB_TOKEN: "gitlab-token",
+      COMMAND_CENTER_API_KEY: "svc",
+      CONDUCTOR_API_KEY: "con",
+      GITLAB_TOKEN: "gl",
     };
     const reads: string[] = [];
     let variablesStatus = 403;

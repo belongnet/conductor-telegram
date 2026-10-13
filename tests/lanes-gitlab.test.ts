@@ -13,6 +13,8 @@ const MR_URL = "https://gitlab.com/nomadhub/platform/site/-/merge_requests/17";
 
 function gitlabFixture() {
   let head = HEAD;
+  let baseBranch = "dev";
+  let mergedBaseBranchOverride: string | null = null;
   let merged = false;
   let mergedHeadOverride: string | null = null;
   let noteId = 0;
@@ -29,7 +31,7 @@ function gitlabFixture() {
         state: merged ? "merged" : "opened",
         draft: false,
         source_branch: "managed/site",
-        target_branch: "dev",
+        target_branch: merged && mergedBaseBranchOverride ? mergedBaseBranchOverride : baseBranch,
         sha: merged && mergedHeadOverride ? mergedHeadOverride : head,
         merge_status: "can_be_merged",
         detailed_merge_status: "mergeable",
@@ -75,6 +77,12 @@ function gitlabFixture() {
     gateway: new GitlabLaneGateway("token", fetcher),
     setHead(value: string) {
       head = value;
+    },
+    setBaseBranch(value: string) {
+      baseBranch = value;
+    },
+    setMergedBaseBranch(value: string) {
+      mergedBaseBranchOverride = value;
     },
     setMergedHead(value: string) {
       mergedHeadOverride = value;
@@ -136,6 +144,8 @@ test("GitLab adapter binds exact head, publishes commissioned evidence, and veri
     prUrl: MR_URL,
     method: "squash",
     expectedHeadSha: HEAD,
+    expectedHeadBranch: "managed/site",
+    expectedBaseBranch: "dev",
   });
   assert.equal(merged.mergedSha, MERGED);
   assert.equal(fixture.mergeCalls(), 1);
@@ -165,6 +175,8 @@ test("a GitLab squash merge records the commit left at the tip of the target bra
         iid: 17,
         state: merged ? "merged" : "opened",
         sha: HEAD,
+        source_branch: "managed/site",
+        target_branch: "dev",
         merge_status: "can_be_merged",
         squash_commit_sha: merged ? MERGED : null,
         merge_commit_sha: merged ? MERGE_COMMIT : null,
@@ -184,7 +196,13 @@ test("a GitLab squash merge records the commit left at the tip of the target bra
     });
   };
   const gateway = new GitlabLaneGateway("token", fetcher);
-  const { mergedSha } = await gateway.merge({ prUrl: MR_URL, method: "squash", expectedHeadSha: HEAD });
+  const { mergedSha } = await gateway.merge({
+    prUrl: MR_URL,
+    method: "squash",
+    expectedHeadSha: HEAD,
+    expectedHeadBranch: "managed/site",
+    expectedBaseBranch: "dev",
+  });
   assert.equal(mergedSha, MERGE_COMMIT);
   assert.equal((await gateway.refreshPr(MR_URL)).mergeCommitSha, MERGE_COMMIT);
 });
@@ -197,10 +215,44 @@ test("GitLab exact-head merge fails closed before mutation when the head changed
       prUrl: MR_URL,
       method: "squash",
       expectedHeadSha: HEAD,
+      expectedHeadBranch: "managed/site",
+      expectedBaseBranch: "dev",
     }),
     /merge gate changed/
   );
   assert.equal(fixture.mergeCalls(), 0);
+});
+
+test("GitLab merge refuses a retargeted MR even when its head SHA is unchanged", async () => {
+  const fixture = gitlabFixture();
+  fixture.setBaseBranch("release");
+  await assert.rejects(
+    fixture.gateway.merge({
+      prUrl: MR_URL,
+      method: "squash",
+      expectedHeadSha: HEAD,
+      expectedHeadBranch: "managed/site",
+      expectedBaseBranch: "dev",
+    }),
+    /merge gate changed/
+  );
+  assert.equal(fixture.mergeCalls(), 0);
+});
+
+test("GitLab merge detects a target changed during the merge request", async () => {
+  const fixture = gitlabFixture();
+  fixture.setMergedBaseBranch("release");
+  await assert.rejects(
+    fixture.gateway.merge({
+      prUrl: MR_URL,
+      method: "squash",
+      expectedHeadSha: HEAD,
+      expectedHeadBranch: "managed/site",
+      expectedBaseBranch: "dev",
+    }),
+    /merged state is not proven/
+  );
+  assert.equal(fixture.mergeCalls(), 1, "the changed target is detected after the host mutation");
 });
 
 test("GitLab exact-head merge rejects a changed head in the post-merge receipt", async () => {
@@ -211,6 +263,8 @@ test("GitLab exact-head merge rejects a changed head in the post-merge receipt",
       prUrl: MR_URL,
       method: "squash",
       expectedHeadSha: HEAD,
+      expectedHeadBranch: "managed/site",
+      expectedBaseBranch: "dev",
     }),
     /merged state is not proven/
   );
@@ -267,6 +321,13 @@ function pipelineApi(state: {
   bridges?: Record<number, FakeJob[]>;
   variables?: Record<number, unknown>;
   details?: Record<number, unknown>;
+  mergeRequests?: Record<number, {
+    iid: number;
+    source_branch: string;
+    target_branch: string;
+    sha: string;
+    state: string;
+  }>;
 }) {
   const requests: URL[] = [];
   const fetcher: typeof fetch = async (rawUrl, init = {}) => {
@@ -274,6 +335,16 @@ function pipelineApi(state: {
     requests.push(url);
     assert.equal((init.headers as Record<string, string>)["PRIVATE-TOKEN"], "token");
     const headers: Record<string, string> = { "content-type": "application/json" };
+    const mergeRequest = url.pathname.match(
+      /^\/api\/v4\/projects\/nomadhub%2Fmvp\/merge_requests\/(\d+)$/
+    );
+    if (mergeRequest) {
+      const row = state.mergeRequests?.[Number(mergeRequest[1])];
+      return new Response(JSON.stringify(row ?? { message: "404 Not found" }), {
+        status: row ? 200 : 404,
+        headers,
+      });
+    }
     const pipeline = url.pathname.match(
       /^\/api\/v4\/projects\/nomadhub%2Fmvp\/pipelines(?:\/(\d+)(?:\/(jobs|bridges|variables))?)?$/
     );
@@ -344,6 +415,78 @@ test("a same-commit pipeline on another branch cannot prove the reviewed head", 
   const absent = await read();
   assert.equal(absent.pipelineId, null, "another branch's green CI proves nothing");
   assert.equal(absent.status, "pending");
+});
+
+test("a merge-request pipeline proves only its bound source branch, target and SHA", async () => {
+  const state: Parameters<typeof pipelineApi>[0] = {
+    pipelines: [{
+      id: 813,
+      sha: HEAD,
+      ref: "refs/merge-requests/17/head",
+      status: "success",
+      source: "merge_request_event",
+    }],
+    mergeRequests: {
+      17: {
+        iid: 17,
+        source_branch: "managed/site",
+        target_branch: "dev",
+        sha: HEAD,
+        state: "opened",
+      },
+    },
+  };
+  const { gateway, requests } = pipelineApi(state);
+  const read = () => gateway.commitPipeline({
+    projectPath: "nomadhub/mvp",
+    sha: HEAD,
+    ref: "managed/site",
+    baseBranch: "dev",
+    expectedMrIid: 17,
+  });
+  assert.equal((await read()).pipelineId, 813);
+  assert.equal((await read()).status, "passing");
+  assert.equal(
+    requests.some((url) => url.pathname.endsWith("/merge_requests/17")),
+    true,
+    "the MR identity must be checked before accepting its pipeline"
+  );
+  assert.equal((await gateway.commitPipeline({
+    projectPath: "nomadhub/mvp",
+    sha: HEAD,
+    ref: "managed/site",
+    baseBranch: "dev",
+    expectedMrIid: 18,
+  })).pipelineId, null, "another MR's matching branch and SHA cannot prove CI");
+
+  state.pipelines.push({
+    id: 814,
+    sha: HEAD,
+    ref: "refs/merge-requests/18/head",
+    status: "success",
+    source: "merge_request_event",
+  });
+  assert.equal((await read()).pipelineId, 813, "a newer unbound MR does not hide the bound pipeline");
+  state.pipelines.pop();
+
+  delete state.mergeRequests![17];
+  assert.equal((await read()).pipelineId, null, "a deleted MR cannot prove CI");
+  state.mergeRequests![17] = {
+    iid: 17,
+    source_branch: "managed/site",
+    target_branch: "dev",
+    sha: HEAD,
+    state: "opened",
+  };
+
+  state.mergeRequests![17]!.source_branch = "other-branch";
+  assert.equal((await read()).pipelineId, null, "another source branch cannot prove CI");
+  state.mergeRequests![17]!.source_branch = "managed/site";
+  state.mergeRequests![17]!.target_branch = "other-target";
+  assert.equal((await read()).pipelineId, null, "another target cannot prove CI");
+  state.mergeRequests![17]!.target_branch = "dev";
+  state.mergeRequests![17]!.sha = NEXT_HEAD;
+  assert.equal((await read()).pipelineId, null, "a stale MR cannot prove CI");
 });
 
 // Extended by /ship coverage audit with failed, canceled, skipped and manual canonical pipelines.

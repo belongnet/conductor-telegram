@@ -434,6 +434,8 @@ class FakeGithub implements GithubLaneGateway {
   readonly comments: string[] = [];
   merged = false;
   headSha = HEAD;
+  headBranch = "managed/example";
+  baseBranch = "main";
   prUrl = PR_URL;
   private loseReviewResponseOnce: boolean;
 
@@ -453,8 +455,8 @@ class FakeGithub implements GithubLaneGateway {
       prNumber: 7,
       state: this.merged ? "merged" : "open",
       isDraft: false,
-      headBranch: "managed/example",
-      baseBranch: "main",
+      headBranch: this.headBranch,
+      baseBranch: this.baseBranch,
       headSha: this.headSha,
       reviewDecision: null,
       mergeStateStatus: this.mergeStateStatus,
@@ -548,7 +550,7 @@ class FakeGithub implements GithubLaneGateway {
 }
 
 class FakeGitlabCi implements GithubLaneGateway {
-  readonly reads: Array<{ projectPath: string; sha: string; ref?: string }> = [];
+  readonly reads: Array<{ projectPath: string; sha: string; ref?: string; baseBranch?: string; expectedMrIid?: number }> = [];
   status: CheckObservation["status"] = "passing";
   /** The last run of each of the pipeline's jobs. */
   jobs: CheckObservation["checks"] = [];
@@ -563,6 +565,8 @@ class FakeGitlabCi implements GithubLaneGateway {
     projectPath: string;
     sha: string;
     ref?: string;
+    baseBranch?: string;
+    expectedMrIid?: number;
   }): Promise<CheckObservation> {
     this.reads.push({ ...input });
     const sha = this.answerSha ?? input.sha;
@@ -626,6 +630,8 @@ class FakeGitlabDelivery extends FakeGithub {
     projectPath: string;
     sha: string;
     ref?: string;
+    baseBranch?: string;
+    expectedMrIid?: number;
   }): Promise<CheckObservation> {
     return this.ci.commitPipeline(input);
   }
@@ -920,6 +926,10 @@ test("disposable canary traverses create → review → two finals → merge →
         github.headSha = FINAL_HEAD;
         changedAfterFinals = true;
       }
+      if (state.runs[0]?.status === "merging" && !github.merged) {
+        assert.equal(github.mutations.includes("merge_pr"), false);
+        github.merged = true; // The operator merges after the worker reaches the hold.
+      }
       if (state.runs[0]?.status === "validated") {
         validated = true;
         break;
@@ -1026,7 +1036,7 @@ test("disposable canary traverses create → review → two finals → merge →
     assert.ok(conductor.mutations.includes("create_workspace"));
     assert.ok(conductor.mutations.includes("archive_workspace"));
     assert.ok(github.mutations.includes("post_attestation"));
-    assert.ok(github.mutations.includes("merge_pr"));
+    assert.equal(github.mutations.includes("merge_pr"), false);
     assert.match(github.comments[0] ?? "", /^MERGED BY AGENTS/m);
     assert.match(github.comments[0] ?? "", /Copy\/product notes:\n- /);
     assert.match(github.comments[0] ?? "", /Deployment notes: none/);
@@ -1070,18 +1080,14 @@ test("archive rechecks sessions after intent and recovers with fresh evidence", 
       status: "applied",
     });
     const conductor = new FakeConductor(store);
+    const github = new FakeGithub(store);
     const controller = new LaneController({
       store,
       conductor,
-      github: new FakeGithub(store),
+      github,
       now: () => clock,
     });
-
-    for (let tick = 0; tick < 100; tick += 1) {
-      await controller.tick({ lease, manifest });
-      snapshot = await store.snapshot();
-      if (snapshot.runs[0]?.status === "validated") break;
-    }
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
 
     clock = new Date(clock.getTime() + 2 * 60 * 60 * 1000);
@@ -1412,6 +1418,7 @@ test("validation summary without exact raw execution receipts cannot complete", 
           expected_controller_version: snapshot.controller!.row_version,
           status: "applied",
         });
+        const github = new FakeGithub(store);
         const controller = new LaneController({
           store,
           conductor: new FakeConductor(
@@ -1421,13 +1428,16 @@ test("validation summary without exact raw execution receipts cannot complete", 
             false,
             receiptMode
           ),
-          github: new FakeGithub(store),
+          github,
         });
 
         let rejected = false;
         for (let tick = 0; tick < 100; tick += 1) {
           await controller.tick({ lease, manifest });
           snapshot = await store.snapshot();
+          if (snapshot.runs[0]?.status === "merging" && !github.merged) {
+            github.merged = true;
+          }
           const validation = snapshot.attempts.find(
             (attempt) =>
               attempt.role === "validation" && Boolean(attempt.progress_cursor)
@@ -1480,6 +1490,7 @@ test("Claude/Cursor Bash tool receipts can prove deterministic validation", asyn
       expected_controller_version: snapshot.controller!.row_version,
       status: "applied",
     });
+    const github = new FakeGithub(store);
     const controller = new LaneController({
       store,
       conductor: new FakeConductor(
@@ -1489,14 +1500,9 @@ test("Claude/Cursor Bash tool receipts can prove deterministic validation", asyn
         false,
         "bash_tool"
       ),
-      github: new FakeGithub(store),
+      github,
     });
-
-    for (let tick = 0; tick < 100; tick += 1) {
-      await controller.tick({ lease, manifest });
-      snapshot = await store.snapshot();
-      if (snapshot.runs[0]?.status === "validated") break;
-    }
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
     const validation = snapshot.attempts.find(
       (attempt) => attempt.role === "validation"
@@ -2045,7 +2051,8 @@ test("unresolved external intent takes precedence over pending controls", async 
   }
 });
 
-test("an ambiguous merge is never reconciled against a different head", async () => {
+for (const drift of ["head", "base"] as const) {
+test(`a pre-upgrade ambiguous merge is never reconciled against a different ${drift}`, async () => {
   const { root, manifest } = canaryFixture();
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
   let clock = new Date();
@@ -2078,7 +2085,7 @@ test("an ambiguous merge is never reconciled against a different head", async ()
       status: "applied",
     });
     const conductor = new FakeConductor(store);
-    const github = new FakeGithub(store, true);
+    const github = new FakeGithub(store);
     const controller = new LaneController({
       store,
       conductor,
@@ -2086,15 +2093,30 @@ test("an ambiguous merge is never reconciled against a different head", async ()
       now: () => clock,
     });
 
-    for (let tick = 0; tick < 100; tick += 1) {
-      await controller.tick({ lease, manifest });
-      snapshot = await store.snapshot();
-      if (snapshot.ambiguous_actions.some((action) => action.action_type === "merge_pr")) {
-        break;
-      }
-    }
+    snapshot = await tickUntil(controller, store, lease, manifest, "merging", 100);
+    assert.equal(snapshot.runs[0]?.status, "merging");
+    assert.equal(github.mutations.includes("merge_pr"), false, "the current worker does not merge");
+    const run = snapshot.runs[0]!;
+    const action = await store.beginAction(lease, run.run_id, {
+      action_id: `pre-upgrade-merge-${drift}`,
+      deterministic_tag: `pre-upgrade-merge-${drift}`,
+      expected_run_version: run.row_version,
+      stage: "merge",
+      action_type: "merge_pr",
+      request: { pr_url: run.pr_url, expected_head_sha: run.head_sha },
+    });
+    const currentRun = (await store.snapshot()).runs[0]!;
+    await store.finishAction(lease, action.action_id, {
+      expected_action_version: action.row_version,
+      expected_run_version: currentRun.row_version,
+      status: "ambiguous",
+      error: "pre-upgrade response was lost",
+    });
+    github.merged = true;
+    snapshot = await store.snapshot();
     assert.equal(snapshot.ambiguous_actions.length, 1);
-    github.headSha = UPDATED_HEAD;
+    if (drift === "head") github.headSha = UPDATED_HEAD;
+    else github.baseBranch = "release";
     clock = new Date(
       Date.parse(snapshot.ambiguous_actions[0]!.started_at!) + (LANE_ACTION_SETTLE_SECONDS + 1) * 1_000
     );
@@ -2113,6 +2135,7 @@ test("an ambiguous merge is never reconciled against a different head", async ()
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+}
 
 test("structured deterministic validation failure creates a repair transition", async () => {
   const { root, manifest } = canaryFixture();
@@ -2145,14 +2168,18 @@ test("structured deterministic validation failure creates a repair transition", 
       expected_controller_version: snapshot.controller!.row_version,
       status: "applied",
     });
+    const github = new FakeGithub(store);
     const controller = new LaneController({
       store,
       conductor: new FakeConductor(store, new Set(), false, true),
-      github: new FakeGithub(store),
+      github,
     });
     for (let tick = 0; tick < 100; tick += 1) {
       await controller.tick({ lease, manifest });
       snapshot = await store.snapshot();
+      if (snapshot.runs[0]?.status === "merging" && !github.merged) {
+        github.merged = true;
+      }
       if (snapshot.runs[0]?.status === "rework") break;
     }
     assert.equal(snapshot.runs[0]?.status, "rework");
@@ -2269,9 +2296,10 @@ async function activateCanary(
     createdBy: "test",
   });
   await store.activateManifest(lease, "canary-v2", 1);
+  const dedupe = `${label}-cutover`;
   const cutover = await store.createControl({
     control_id: `control-${label}-cutover`,
-    idempotency_key: `${label}-cutover`,
+    idempotency_key: dedupe,
     kind: "cutover",
     requested_by: "human:test",
     payload: { revision_id: "canary-v2" },
@@ -2318,12 +2346,17 @@ async function tickUntil(
   lease: Awaited<ReturnType<typeof activateCanary>>,
   manifest: ReturnType<typeof canaryFixture>["manifest"],
   status: string,
-  limit: number
+  limit: number,
+  externalMerge?: { merged: boolean }
 ) {
   let snapshot = await store.snapshot();
   for (let tick = 0; tick < limit && snapshot.runs[0]?.status !== status; tick += 1) {
     await controller.tick({ lease, manifest });
     snapshot = await store.snapshot();
+    if (externalMerge && snapshot.runs[0]?.status === "merging" && !externalMerge.merged) {
+      assert.equal(externalMerge.merged, false, "the worker must not have merged the PR");
+      externalMerge.merged = true;
+    }
   }
   return snapshot;
 }
@@ -2358,7 +2391,7 @@ test("named GitHub checks merge and validate only on Command Center's exact rece
       conductor: new FakeConductor(store),
       github,
     });
-    const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100);
+    const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.equal(github.merged, true);
     assert.ok(github.commitCheckReads.includes(HEAD), "pre-merge checks read the exact head");
@@ -2452,7 +2485,7 @@ test("GitLab canonical evidence gates merge and validation on the canonical pipe
     assert.equal(github.merged, false);
 
     gitlab.status = "passing";
-    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.equal(github.merged, true);
     assert.equal(
@@ -2462,13 +2495,15 @@ test("GitLab canonical evidence gates merge and validation on the canonical pipe
     );
     assert.ok(
       gitlab.reads.some(
-        (read) => read.projectPath === "nomadhub/mvp" && read.sha === HEAD && read.ref === "managed/example"
+        (read) => read.projectPath === "nomadhub/mvp" && read.sha === HEAD &&
+          read.ref === "managed/example" && read.baseBranch === "dev"
       ),
-      "the head pipeline is bound to the reviewed branch in the canonical project"
+      "the head pipeline is bound to the reviewed branch and canonical target"
     );
     assert.ok(
       gitlab.reads.some(
-        (read) => read.projectPath === "nomadhub/mvp" && read.sha === MERGED && read.ref === "dev"
+        (read) => read.projectPath === "nomadhub/mvp" && read.sha === MERGED &&
+          read.ref === "dev" && read.baseBranch === undefined
       ),
       "the merged pipeline is read from the canonical base branch"
     );
@@ -2479,6 +2514,36 @@ test("GitLab canonical evidence gates merge and validation on the canonical pipe
     assert.equal(mergedCi?.evidence.project_path, "nomadhub/mvp");
     assert.equal(mergedCi?.evidence.base_branch, "dev");
     assert.equal(mergedCi?.evidence.commit_sha, MERGED);
+  } finally {
+    await store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a retargeted PR is quarantined before its stored CI receipt can merge it", async () => {
+  const { root, manifest } = canaryFixture();
+  const store = new SqliteLaneStateStore(path.join(root, "state.db"));
+  try {
+    const lease = await activateCanary(store, manifest, "retargeted-pr");
+    const github = new FakeGithub(store);
+    const notifications = new Map<string, string>();
+    const controller = new LaneController({
+      store,
+      conductor: new FakeConductor(store),
+      github,
+      notify: async (message, key) => { notifications.set(key, message); },
+    });
+    const before = await tickUntil(controller, store, lease, manifest, "merging", 100);
+    assert.equal(before.runs[0]?.status, "merging");
+    await tickTimes(controller, lease, manifest, 2);
+    assert.equal(notifications.size, 1, "the operator receives one stable manual-merge alert key");
+    assert.match([...notifications.values()][0]!, /Verify the repository, source and target branches/);
+    github.baseBranch = "release";
+    await tickTimes(controller, lease, manifest, 3);
+    const after = await store.snapshot();
+    assert.equal(after.runs[0]?.status, "quarantined");
+    assert.equal(github.merged, false);
+    assert.equal(github.mutations.includes("merge_pr"), false);
   } finally {
     await store.close();
     fs.rmSync(root, { recursive: true, force: true });
@@ -2523,7 +2588,7 @@ test("a red canonical pipeline holds the merge recheck and sends a red merged co
 
     gitlab.status = "passing";
     assert.equal(
-      (await tickUntil(controller, store, lease, manifest, "validating", 100)).runs[0]?.status,
+      (await tickUntil(controller, store, lease, manifest, "validating", 100, github)).runs[0]?.status,
       "validating"
     );
     assert.equal(github.merged, true);
@@ -2604,7 +2669,7 @@ test("named GitLab jobs gate a canonical lane on each job's own receipt", async 
       { name: "lint-and-test", status: "passing", id: "gitlab-job-3" },
       { name: "deploy-review", status: "failing", id: "gitlab-job-4" },
     ];
-    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated", "an unnamed failing job never blocks");
     const preMerge = storedCheckEvidence(root).find(
       (item) => item.type === "required_checks" && item.accepted
@@ -2632,7 +2697,7 @@ test("GitHub canonical evidence reads checks only from the canonical repository"
     const github = new FakeGithub(store);
     github.commitChecks = [{ name: "ci", status: "passing", id: "check-run-5" }];
     const controller = new LaneController({ store, conductor: new FakeConductor(store), github });
-    const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100);
+    const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.ok(github.commitCheckRepositories.length > 0);
     assert.ok(
@@ -2659,14 +2724,15 @@ test("a merged-commit receipt for another commit quarantines an exact-receipt la
   try {
     const lease = await activateCanary(store, manifest, "gitlab-merged-mismatch");
     const gitlab = new FakeGitlabCi();
+    const github = new FakeGithub(store);
     const controller = new LaneController({
       store,
       conductor: new FakeConductor(store),
-      github: new FakeGithub(store),
+      github,
       gitlab,
     });
     assert.equal(
-      (await tickUntil(controller, store, lease, manifest, "validating", 100)).runs[0]?.status,
+      (await tickUntil(controller, store, lease, manifest, "validating", 100, github)).runs[0]?.status,
       "validating"
     );
     gitlab.answerSha = UPDATED_HEAD;
@@ -2718,7 +2784,7 @@ test("a legacy lane waits for merged-commit CI instead of pausing every lane", a
     const controller = new LaneController({ store, conductor: new FakeConductor(store), github });
     github.commitChecksStatus = "unknown";
     assert.equal(
-      (await tickUntil(controller, store, lease, manifest, "validating", 100)).runs[0]?.status,
+      (await tickUntil(controller, store, lease, manifest, "validating", 100, github)).runs[0]?.status,
       "validating"
     );
     let snapshot = await store.snapshot();
@@ -2732,7 +2798,7 @@ test("a legacy lane waits for merged-commit CI instead of pausing every lane", a
     }
 
     github.commitChecksStatus = "passing";
-    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
   } finally {
     await store.close();
@@ -2771,7 +2837,7 @@ test("an unchanged green receipt stays fresh while the merge waits on GitHub", a
     assert.ok(renewed);
     lease = renewed;
     github.mergeStateStatus = "CLEAN";
-    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.equal(github.merged, true);
   } finally {
@@ -2798,6 +2864,9 @@ test("merged-commit CI evidence stays fresh while a long validation runs", async
       tick += 1
     ) {
       await controller.tick({ lease, manifest });
+      if ((await store.snapshot()).runs[0]?.status === "merging" && !github.merged) {
+        github.merged = true;
+      }
     }
     let snapshot = await store.snapshot();
     assert.equal(snapshot.runs[0]?.status, "validating", "merged CI is first recorded as validation begins");
@@ -2837,6 +2906,9 @@ test("a green to pending to green merged CI flap waits without restarting valida
     for (let tick = 0; tick < 100; tick += 1) {
       await controller.tick({ lease, manifest });
       snapshot = await store.snapshot();
+      if (snapshot.runs[0]?.status === "merging" && !github.merged) {
+        github.merged = true;
+      }
       if (
         snapshot.runs[0]?.status === "validating" &&
         snapshot.attempts.some((attempt) => attempt.role === "validation" && attempt.status === "completed")
@@ -2919,7 +2991,7 @@ test("a blocked pull request holds an exact-receipt lane without reading its can
     assert.equal(storedCheckEvidence(root).length, 0, "no receipt is recorded for a PR that cannot merge");
 
     github.mergeStateStatus = "CLEAN";
-    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.equal(github.merged, true);
     assert.equal(
@@ -2933,7 +3005,7 @@ test("a blocked pull request holds an exact-receipt lane without reading its can
   }
 });
 
-test("a moment of unmergeability while merging never blocks the merge", async () => {
+test("a moment of unmergeability while merging never triggers an automatic merge", async () => {
   const { root, manifest } = canaryFixture();
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
   try {
@@ -2949,20 +3021,23 @@ test("a moment of unmergeability while merging never blocks the merge", async ()
     await controller.tick({ lease, manifest });
     github.mergeStateStatus = "CLEAN";
     await controller.tick({ lease, manifest });
-    assert.equal(github.merged, true, "the merge goes ahead once the PR is clean again");
+    assert.equal(github.merged, false, "the worker keeps the manual merge hold");
+    assert.equal(github.mutations.includes("merge_pr"), false);
+    github.merged = true;
+    const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50);
+    assert.equal(snapshot.runs[0]?.status, "validated");
   } finally {
     await store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("a durable merge gate refusal waits and retries without restarting the worker", async () => {
+test("a durable merge gate refusal retries without issuing a merge action", async () => {
   const { root, manifest } = canaryFixture();
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
   try {
     const lease = await activateCanary(store, manifest, "merge-gate-race");
     let transitionRefused = false;
-    let actionRefused = false;
     const racingStore = new Proxy(store, {
       get(target, property) {
         if (property === "transitionRun") {
@@ -2976,23 +3051,6 @@ test("a durable merge gate refusal waits and retries without restarting the work
               throw new LaneStateStoreError("required checks are not green", 409);
             }
             return target.transitionRun(actionLease, runId, input);
-          };
-        }
-        if (property === "beginAction") {
-          return async (
-            actionLease: Parameters<LaneStateStore["beginAction"]>[0],
-            runId: Parameters<LaneStateStore["beginAction"]>[1],
-            input: Parameters<LaneStateStore["beginAction"]>[2]
-          ) => {
-            if (input.action_type === "merge_pr" && !actionRefused) {
-              actionRefused = true;
-              throw new LaneStateStoreError(
-                "Command Center lane request rejected: pull request is not currently mergeable",
-                409,
-                { detail: "pull request is not currently mergeable" }
-              );
-            }
-            return target.beginAction(actionLease, runId, input);
           };
         }
         const value = Reflect.get(target, property, target) as unknown;
@@ -3012,18 +3070,18 @@ test("a durable merge gate refusal waits and retries without restarting the work
     assert.equal((await store.snapshot()).runs[0]?.status, "finals");
     assert.equal((await tickUntil(controller, store, lease, manifest, "merging", 5)).runs[0]?.status, "merging");
     await controller.tick({ lease, manifest });
-    assert.equal(actionRefused, true);
-    assert.equal(github.merged, false, "no GitHub mutation follows a refused intent");
+    assert.equal(github.merged, false, "the worker never starts a GitHub merge");
     assert.equal((await store.snapshot()).pending_actions.length, 0);
-    await controller.tick({ lease, manifest });
-    assert.equal(github.merged, true);
+    github.merged = true;
+    const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50);
+    assert.equal(snapshot.runs[0]?.status, "validated");
   } finally {
     await store.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("a run that waits in merging past freshness records its receipt again and merges", async (t) => {
+test("a run that waits in merging past freshness refreshes its receipt before manual merge", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const { root, manifest } = canaryFixture({ kind: "github", required_checks: ["gitlab/lint-and-test"] });
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
@@ -3048,6 +3106,9 @@ test("a run that waits in merging past freshness records its receipt again and m
     assert.ok(renewed, "the lease is claimed again after the wait");
     lease = renewed;
     github.mergeStateStatus = "CLEAN";
+    await controller.tick({ lease, manifest });
+    assert.equal(github.merged, false);
+    github.merged = true;
     const snapshot = await tickUntil(controller, store, lease, manifest, "validated", 50);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.equal(github.merged, true);
@@ -3066,7 +3127,7 @@ test("a legacy lane sends a red merged commit to repair instead of pausing every
     const controller = new LaneController({ store, conductor: new FakeConductor(store), github });
     github.commitChecksStatus = "pending";
     assert.equal(
-      (await tickUntil(controller, store, lease, manifest, "validating", 100)).runs[0]?.status,
+      (await tickUntil(controller, store, lease, manifest, "validating", 100, github)).runs[0]?.status,
       "validating"
     );
     github.commitChecksStatus = "failing";
@@ -3105,10 +3166,11 @@ test("canonical CI that never decides a commit raises one alert an hour in", asy
     const gitlab = new FakeGitlabCi();
     gitlab.missing = true;
     const alerts: Array<{ message: string; key: string }> = [];
+    const github = new FakeGithub(store);
     const controller = new LaneController({
       store,
       conductor: new FakeConductor(store),
-      github: new FakeGithub(store),
+      github,
       gitlab,
       notify: async (message, key) => {
         alerts.push({ message, key });
@@ -3137,9 +3199,9 @@ test("canonical CI that never decides a commit raises one alert an hour in", asy
       `Growth lane CANARY has waited over 60 minutes for gitlab CI on nomadhub/mvp to decide its pull request head ${HEAD.slice(0, 12)}: no GitLab pipeline for ${HEAD.slice(0, 12)}. The gate keeps waiting.`
     );
 
-    // The pipeline arrives and the lane merges; the merged commit's never does.
+    // The pipeline arrives; the operator merges, but merged-commit CI never does.
     gitlab.missing = false;
-    snapshot = await tickUntil(controller, store, lease, manifest, "validating", 100);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validating", 100, github);
     assert.equal(snapshot.runs[0]?.status, "validating");
     gitlab.missing = true;
     await tickTimes(controller, lease, manifest, 3);
@@ -3178,16 +3240,17 @@ test("a GitLab-delivered lane gates its merge request on its own project's named
     assert.equal(gitlab.merged, false);
 
     gitlab.ci.jobs = [{ name: "lint-and-test", status: "passing", id: "gitlab-job-2" }];
-    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100);
+    snapshot = await tickUntil(controller, store, lease, manifest, "validated", 100, gitlab);
     assert.equal(snapshot.runs[0]?.status, "validated");
     assert.equal(gitlab.merged, true);
     assert.deepEqual(github.mutations, [], "nothing is delivered through GitHub");
     assert.equal(github.commitCheckReads.length + gitlab.commitCheckReads.length, 0);
     assert.ok(
       gitlab.ci.reads.some(
-        (read) => read.projectPath === "belongnet/example" && read.sha === HEAD && read.ref === "managed/example"
+        (read) => read.projectPath === "belongnet/example" && read.sha === HEAD &&
+          read.ref === "managed/example" && read.expectedMrIid === 7
       ),
-      "the head is read from the merge request's own project"
+      "the head is bound to the delivery merge request in its own project"
     );
     assert.ok(
       gitlab.ci.reads.some(
@@ -3216,6 +3279,38 @@ test("a GitLab-delivered lane gates its merge request on its own project's named
     assert.ok(
       evidence.some((item) => item.type === "merged_ci" && item.accepted && item.sha === MERGED),
       "merged CI is accepted for the exact merged commit"
+    );
+  } finally {
+    await store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a different canonical GitLab project does not inherit the delivery MR number", async () => {
+  const { root, manifest } = canaryFixture({
+    kind: "gitlab",
+    canonical_evidence: { kind: "gitlab", project_path: "nomadhub/mvp", base_branch: "dev" },
+  });
+  const store = new SqliteLaneStateStore(path.join(root, "state.db"));
+  try {
+    const lease = await activateCanary(store, manifest, "cross-project-gitlab");
+    const conductor = new FakeConductor(store);
+    conductor.gitRemote = "https://gitlab.com/belongnet/example";
+    conductor.deliveryUrl = MR_URL;
+    const gitlab = new FakeGitlabDelivery(store);
+    const controller = new LaneController({
+      store,
+      conductor,
+      github: new FakeGithub(store),
+      gitlab,
+    });
+    await tickTimes(controller, lease, manifest, 60);
+    assert.ok(gitlab.ci.reads.some((read) => read.sha === HEAD));
+    assert.ok(
+      gitlab.ci.reads.filter((read) => read.sha === HEAD).every((read) =>
+        read.projectPath === "nomadhub/mvp" && read.expectedMrIid === undefined
+      ),
+      "a canonical project has its own merge request numbering"
     );
   } finally {
     await store.close();
@@ -3333,7 +3428,7 @@ test("a lane without named checks whose merged commit never gets CI raises the s
     // A repository whose CI runs only on pull requests: the merged commit never gets a check.
     github.commitChecksStatus = "unknown";
     assert.equal(
-      (await tickUntil(controller, store, lease, manifest, "validating", 100)).runs[0]?.status,
+      (await tickUntil(controller, store, lease, manifest, "validating", 100, github)).runs[0]?.status,
       "validating"
     );
     await tickTimes(controller, lease, manifest, 3);

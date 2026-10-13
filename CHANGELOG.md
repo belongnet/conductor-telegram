@@ -2,7 +2,7 @@
 
 All notable changes to conductor-telegram are documented here.
 
-## [0.16.0] - 2026-10-09
+## [0.16.0] - 2026-10-13
 
 ### Added
 - The lanes worker accepts the current Command Center manifest, including check allowlists and canonical GitLab evidence. It sends exact check and pipeline receipts for the reviewed head and merged commit, and `doctor` checks access to every GitLab project those lanes use.
@@ -11,9 +11,12 @@ All notable changes to conductor-telegram are documented here.
 ### Fixed
 - A failed merged commit sends only its lane to repair instead of pausing every lane. Brief CI or mergeability changes now wait for a fresh gate result instead of restarting the worker.
 - GitLab squash merges validate the commit left at the target branch tip. Recurring schedules the manifest accepts are also scheduled correctly.
+- The optional OVH container lanes unit mounts the manifest's prompts directory, so a current manifest can start while the lanes remain paused.
+- Pre-upgrade merge-agent sessions are retired before lane work resumes, including sessions for lanes removed from the manifest.
 
 ### Security
 - Canonical GitLab evidence ignores unrelated branches and pipeline sources, rejects pipelines with supplied variables, and checks every job's latest run before accepting a green pipeline. A posted commit status cannot turn a failed job into passing evidence.
+- Merge execution requires an operator. GitHub PR identity and base branch, and GitLab merge-request identity, are checked before external merge results or CI evidence are adopted.
 
 ## [0.15.1] - 2026-10-02
 

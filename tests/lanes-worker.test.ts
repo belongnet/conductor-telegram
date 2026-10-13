@@ -63,13 +63,13 @@ test("the worker refuses GitLab-proven lanes without GITLAB_TOKEN before claimin
       runLaneWorker({
         env: {
           LANES_SITE: "ovh",
-          BOT_TOKEN: "synthetic-bot",
+          BOT_TOKEN: "bot",
           OWNER_CHAT_ID: "1",
           LANES_MANIFEST: manifestPath,
           LANES_STATE_BACKEND: "sqlite",
           LANES_STANDALONE: "1",
           LANES_SQLITE_PATH: statePath,
-          CONDUCTOR_API_KEY: "synthetic-conductor",
+          CONDUCTOR_API_KEY: "con",
         },
         // Even if the refusal regressed, an aborted worker never enters its loop.
         signal: AbortSignal.abort(),

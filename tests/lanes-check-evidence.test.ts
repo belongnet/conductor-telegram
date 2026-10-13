@@ -170,6 +170,25 @@ test("GitHub named checks produce Command Center's exact pre-merge receipt", () 
   }
 });
 
+test("a skipped or neutral named GitHub check cannot become a successful receipt", () => {
+  const lane = laneWith({ kind: "github", required_checks: ["test"] });
+  for (const conclusion of ["skipped", "neutral"]) {
+    const snapshot = commitChecksSnapshot(
+      { repoOwner: "belongnet", repoName: "example", sha: HEAD },
+      [{ id: 81, name: "test", status: "completed", conclusion }],
+      []
+    );
+    const observation = githubCheckObservation(snapshot, ["test"]);
+    const evidence = buildCheckEvidence({ lane, run: RUN, sha: HEAD, observation });
+    assert.equal(evidence.gate.passing, false, conclusion);
+    assert.deepEqual(evidence.gate.pending, ["test"], conclusion);
+    assert.deepEqual(evidence.payload.checks, [
+      { name: "test", status: "pending", commit_sha: HEAD },
+    ]);
+    assert.equal(checkEvidenceAccepted("required_checks", evidence.payload, lane, RUN, HEAD), false);
+  }
+});
+
 test("receipts follow manifest order and unrelated failing checks never block", () => {
   const lane = laneWith({
     kind: "github",
