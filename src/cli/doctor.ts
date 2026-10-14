@@ -27,6 +27,8 @@ import {
   laneManifestPath,
   laneManifestRevisionId,
   loadLaneManifest,
+  manifestNeedsGitlab,
+  type LaneManifestV2,
 } from "../lanes/manifest.js";
 
 const noColor =
@@ -423,9 +425,7 @@ export async function checkDurableLanes(
     !headlessStandby &&
       !env.BELONG_HUMAN_APPROVAL_KEY?.trim() &&
       "BELONG_HUMAN_APPROVAL_KEY",
-    manifest.lanes.some((lane) => lane.delivery_adapter.kind === "gitlab") &&
-      !env.GITLAB_TOKEN?.trim() &&
-      "GITLAB_TOKEN",
+    manifestNeedsGitlab(manifest) && !env.GITLAB_TOKEN?.trim() && "GITLAB_TOKEN",
   ].filter((value): value is string => Boolean(value));
   if (missing.length > 0) {
     return {
@@ -436,6 +436,7 @@ export async function checkDurableLanes(
     };
   }
 
+  let controllerMode: string;
   try {
     const response = await fetchImpl(
       `${baseUrl!.replace(/\/+$/, "")}/api/conductor/lanes/status?since_event_seq=0`,
@@ -455,13 +456,7 @@ export async function checkDurableLanes(
     const payload = (await response.json()) as {
       controller?: { mode?: string } | null;
     };
-    return {
-      name: "Durable lanes",
-      ok: true,
-      detail:
-        `${laneManifestRevisionId(manifest)} valid; Command Center connected; ` +
-        `mode=${payload.controller?.mode ?? "disabled"}`,
-    };
+    controllerMode = payload.controller?.mode ?? "disabled";
   } catch (error) {
     return {
       name: "Durable lanes",
@@ -472,6 +467,83 @@ export async function checkDurableLanes(
       fix: "Restore Command Center/Postgres connectivity before cutover",
     };
   }
+
+  // A token that is set but cannot read a project the gates depend on would
+  // only fail once a lane reached its merge gate.
+  for (const project of gitlabEvidenceProjects(manifest)) {
+    let status: string;
+    try {
+      const projectUrl = `https://gitlab.com/api/v4/projects/${encodeURIComponent(project)}`;
+      const requestOptions: RequestInit = {
+        headers: { Accept: "application/json", "PRIVATE-TOKEN": env.GITLAB_TOKEN!.trim() },
+        redirect: "error",
+        signal: AbortSignal.timeout(10_000),
+      };
+      const response = await fetchImpl(
+        `${projectUrl}/pipelines?per_page=1`,
+        requestOptions
+      );
+      if (!response.ok) {
+        status = `HTTP ${response.status}`;
+      } else {
+        const pipelines: unknown = await response.json();
+        if (!Array.isArray(pipelines)) throw new Error("invalid pipeline list");
+        const latest: unknown = pipelines[0];
+        const id = typeof latest === "object" && latest !== null && "id" in latest
+          ? latest.id
+          : undefined;
+        if (latest !== undefined && (!Number.isSafeInteger(id) || (id as number) <= 0)) {
+          throw new Error("invalid pipeline ID");
+        }
+        if (id === undefined) continue;
+        const variablesResponse = await fetchImpl(
+          `${projectUrl}/pipelines/${id}/variables`,
+          { ...requestOptions, signal: AbortSignal.timeout(10_000) }
+        );
+        if (!variablesResponse.ok) {
+          status = `pipeline variables HTTP ${variablesResponse.status}`;
+        } else {
+          const variables: unknown = await variablesResponse.json();
+          if (!Array.isArray(variables)) throw new Error("invalid pipeline variables response");
+          continue;
+        }
+      }
+    } catch (error) {
+      status = error instanceof Error ? error.message : String(error);
+    }
+    return {
+      name: "Durable lanes",
+      ok: false,
+      detail: `GITLAB_TOKEN cannot read ${project} pipelines (${status})`,
+      fix:
+        "Give GITLAB_TOKEN read_api access to every GitLab project the gates read, and the api scope for GitLab-delivered lanes",
+    };
+  }
+
+  return {
+    name: "Durable lanes",
+    ok: true,
+    detail:
+      `${laneManifestRevisionId(manifest)} valid; Command Center connected; ` +
+      `mode=${controllerMode}`,
+  };
+}
+
+/**
+ * GitLab projects the lanes read: a GitLab-delivered lane's own project (its
+ * merge requests, notes and pipelines) and any canonical GitLab project.
+ */
+function gitlabEvidenceProjects(manifest: LaneManifestV2): string[] {
+  const projects = manifest.lanes.flatMap((lane) => {
+    const canonical = lane.delivery_adapter.canonical_evidence;
+    return [
+      ...(lane.delivery_adapter.kind === "gitlab"
+        ? [`${lane.repository.owner}/${lane.repository.name}`]
+        : []),
+      ...(canonical?.kind === "gitlab" ? [canonical.project_path] : []),
+    ];
+  });
+  return [...new Set(projects)];
 }
 
 

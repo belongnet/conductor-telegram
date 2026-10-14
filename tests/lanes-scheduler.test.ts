@@ -27,11 +27,14 @@ import {
 } from "../src/integrations/conductor-api.js";
 import { closeDb, getDb } from "../src/store/db.js";
 import {
+  getLaneDeliveryState,
   getLatestLaneAction,
   isLanesPaused,
+  setLaneDeliveryState,
   setLanesLastTickAt,
   setLanesPaused,
 } from "../src/store/queries.js";
+import type { LaneDeliveryState } from "../src/lanes/pipeline.js";
 import type { LanesConfig } from "../src/lanes/config.js";
 
 const realFetch = globalThis.fetch;
@@ -195,6 +198,7 @@ function lanesConfig(): LanesConfig {
 function resetLanesDb(): void {
   const db = getDb();
   db.exec("DELETE FROM lane_actions");
+  db.exec("DELETE FROM lane_delivery_state");
   db.exec("DELETE FROM meta WHERE key LIKE 'lanes_%'");
 }
 
@@ -217,6 +221,42 @@ function workspacePage(entries: Array<{ id: string; name: string }>) {
     hasMore: false,
   };
 }
+
+test("a paused scheduler retires an old merge session before its first interval", async () => {
+  resetLanesDb();
+  setLanesPaused(true);
+  setLaneDeliveryState("removed-lane", {
+    merge: { workspaceId: "old-merge-workspace" },
+  } as LaneDeliveryState);
+  const calls: string[] = [];
+  globalThis.fetch = (async (rawUrl: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(String(rawUrl));
+    calls.push(`${init.method ?? "GET"} ${url.pathname}`);
+    if (url.pathname === "/v0/workspaces/old-merge-workspace/sessions") {
+      return json({
+        data: [{ id: "old-merge-session", deepLink: "https://conductor.test/old-merge-session" }],
+        offset: 0,
+        hasMore: false,
+      });
+    }
+    if (url.pathname === "/v0/sessions/old-merge-session/cancel") {
+      return json({ workspaceId: "old-merge-workspace", sessionId: "old-merge-session", status: "idle", canceledQueuedMessages: 0 });
+    }
+    if (url.pathname === "/v0/sessions/old-merge-session/archive") {
+      return json({ workspaceId: "old-merge-workspace", sessionId: "old-merge-session", status: "archived", canceledQueuedMessages: 0 });
+    }
+    return json({ userMessage: `unexpected ${url.pathname}` }, 404);
+  }) as typeof fetch;
+  const result = await runLanesTick({ notify: async () => undefined, force: false });
+  assert.equal(result.skipped, true);
+  assert.deepEqual(calls, [
+    "GET /v0/workspaces/old-merge-workspace/sessions",
+    "POST /v0/sessions/old-merge-session/cancel",
+    "POST /v0/sessions/old-merge-session/archive",
+  ]);
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("removed-lane")?.merge, undefined);
+  resetLanesDb();
+});
 
 test("listing failure does not look like an empty index", async () => {
   const fetcher = (async () =>

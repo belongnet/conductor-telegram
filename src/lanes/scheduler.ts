@@ -16,6 +16,7 @@ import {
   getLanesLastTickAt,
   getLatestLaneActions,
   isLanesPaused,
+  listLaneDeliveryStates,
   observeLaneSession,
   recordLaneAction,
   recordLaneSessionNudge,
@@ -47,6 +48,7 @@ import {
   getLaneStageView,
   mergeDependencyBlockers,
   parseRateLimitReset,
+  retireLegacyMergeSessions,
   runDeliveryPipeline,
   runLaneHygiene,
   type LaneDeliveryState,
@@ -91,6 +93,8 @@ let lastInvalidConfigLog = { message: "", at: 0 };
 export function startLanesScheduler(options: {
   notify: LanesNotify;
 }): { stop: () => void } {
+  // Retire merge agents from pre-upgrade state as soon as the gateway starts.
+  void runLanesTick({ notify: options.notify, force: false });
   const timer = supervisedInterval(
     "lanes",
     async () => {
@@ -137,6 +141,15 @@ async function runLanesTickUnlocked(options: {
   notify: LanesNotify;
   force: boolean;
 }): Promise<LanesTickResult> {
+  // A paused or newly armed scheduler still has to stop pre-upgrade merge
+  // agents. The old sessions run independently of this scheduler's tick.
+  if (listLaneDeliveryStates<LaneDeliveryState>().some(({ state }) => Boolean(state?.merge))) {
+    const retirementClient = createConductorApiClientFromEnv();
+    if (!retirementClient) {
+      throw new Error("Conductor Cloud API is required to retire legacy merge sessions");
+    }
+    await retireLegacyMergeSessions(retirementClient);
+  }
   let config: LanesConfig | null;
   try {
     config = loadLanesConfig();
@@ -458,6 +471,7 @@ export async function forceLaneMergeAttempt(options: {
     if (!client) {
       return { attempted: false, reason: "Conductor Cloud API is not configured." };
     }
+    await retireLegacyMergeSessions(client);
     const workspaces = await loadWorkspaceIndex(client, config);
     const snapshots = await resolveLaneSnapshots(client, config, workspaces);
     const states = new Map(

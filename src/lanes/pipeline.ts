@@ -18,6 +18,7 @@ import {
 } from "../integrations/conductor-api.js";
 import {
   getLaneDeliveryState,
+  listLaneDeliveryStates,
   getLaneProviderOutages,
   observeLaneSession,
   recordLaneAction,
@@ -75,6 +76,7 @@ export type LaneDeliveryState = {
   prRepo: string;
   prNumber: number;
   headBranch: string;
+  baseBranch?: string;
   headSha: string;
   authorProvider: string;
   authorTurnAt: string;
@@ -373,6 +375,25 @@ function stageAfter(
   return "complete";
 }
 
+/** Stop merge agents commissioned by older releases, including removed lanes. */
+export async function retireLegacyMergeSessions(client: ConductorApiClient): Promise<void> {
+  // Keep the state on any API failure so a later startup or tick retries.
+  for (const { laneId, state } of listLaneDeliveryStates<LaneDeliveryState>()) {
+    if (!state?.merge) continue;
+    const sessions = await client.listWorkspaceSessions(
+      state.merge.workspaceId,
+      { includeArchived: true },
+    );
+    for (const session of sessions.filter((entry) => !entry.archivedAt)) {
+      await client.cancelSession(session.id);
+      await client.archiveSession(session.id);
+    }
+    state.merge = undefined;
+    state.mergeHeadSha = undefined;
+    setLaneDeliveryState(laneId, state);
+  }
+}
+
 export async function runDeliveryPipeline(input: {
   client: ConductorApiClient;
   config: LanesConfig;
@@ -387,19 +408,21 @@ export async function runDeliveryPipeline(input: {
     sha: string;
   }) => Promise<GithubCommitChecksSnapshot>;
 }): Promise<void> {
+  await retireLegacyMergeSessions(input.client);
   const states = new Map<string, LaneDeliveryState | null>(
-    input.config.lanes.map((lane) => [
-      lane.id,
-      getLaneDeliveryState<LaneDeliveryState>(lane.id),
-    ]),
+    listLaneDeliveryStates<LaneDeliveryState>().map(({ laneId, state }) => [laneId, state]),
   );
+  for (const lane of input.config.lanes) {
+    if (!states.has(lane.id)) states.set(lane.id, null);
+  }
   const occupied = new Set(
     input.snapshots
       .filter((snapshot) => snapshot.state === "working")
       .map((snapshot) => snapshot.assignedProvider)
       .filter((provider): provider is string => Boolean(provider)),
   );
-  for (const state of states.values()) {
+  for (const lane of input.config.lanes) {
+    const state = states.get(lane.id);
     if (!state) continue;
     const runs = [
       state.review,
@@ -463,6 +486,7 @@ export async function runDeliveryPipeline(input: {
         prRepo: identity.repo,
         prNumber: identity.number,
         headBranch: policy.headBranch,
+        baseBranch: policy.baseBranch,
         headSha: policy.headSha,
         authorProvider:
           snapshot.assignedProvider ??
@@ -489,6 +513,8 @@ export async function runDeliveryPipeline(input: {
         currentPolicy.repoOwner === state.prOwner &&
         currentPolicy.repoName === state.prRepo &&
         currentPolicy.headBranch === state.headBranch &&
+        Boolean(state.baseBranch) &&
+        currentPolicy.baseBranch === state.baseBranch &&
         githubPrUrlMatchesRepo(currentPolicy.url, lane.repoUrl);
       if (!identityStable || !currentPolicy.headSha) {
         // Repository/branch identity drift is quarantined by inaction. The
@@ -564,6 +590,8 @@ function prBindingMatches(
       policy.repoOwner === state.prOwner &&
       policy.repoName === state.prRepo &&
       policy.headBranch === state.headBranch &&
+      Boolean(state.baseBranch) &&
+      policy.baseBranch === state.baseBranch &&
       policy.headSha === state.headSha &&
       githubPrUrlMatchesRepo(policy.url, lane.repoUrl) &&
       githubPrUrlMatchesRepo(state.prUrl, lane.repoUrl)
@@ -866,34 +894,10 @@ async function advanceMerge(
   if (!canMergePr(policy, { attestedApproval }) || !attestedApproval) {
     return;
   }
-  if (!state.merge) {
-    state.mergeHeadSha = policy.headSha ?? undefined;
-    state.merge = await ensureRun({
-      ...input,
-      lane,
-      author,
-      state,
-      role: "merge",
-      stage: lane.delivery!.merge!,
-      occupied,
-      exclude: new Set([state.authorProvider]),
-    });
-    if (state.merge) saveState(state, states);
-    return;
-  }
-  const observation = await observeRun(input.client, state.merge, lane.id);
-  if (observation.status === "working") {
-    occupied.add(state.merge.provider);
-    return;
-  }
-  await keepRunAlive(
-    input,
-    lane,
-    state.merge,
-    observation,
-    `Re-check the open PR ${state.prUrl}. Merge only if policy allows, or report MERGE BLOCKED with the reason.`,
-    occupied,
-  );
+  // This delivery path commissions an agent to merge. The host cannot bind
+  // the target branch atomically to that mutation, so an operator must merge
+  // the reviewed PR. The merged-state path above still adopts the result.
+  return;
 }
 
 export function hasCurrentFinalApprovals(

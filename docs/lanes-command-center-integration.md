@@ -8,6 +8,7 @@ the control-plane repository, not this worker repository:
 - [Pinned `conductor_lanes.py` implementation](https://github.com/belongnet/belong-agents/blob/2571748be708615e03eb54283aea2142b93fdf5c/belong-agent-center/backend/conductor_lanes.py)
 - [Pinned PostgreSQL scenario](https://github.com/belongnet/belong-agents/blob/2571748be708615e03eb54283aea2142b93fdf5c/belong-agent-center/tests/postgres_conductor_lanes_scenario.py)
 - [Pinned isolated HTTP/Postgres canary evidence](https://github.com/belongnet/belong-agents/pull/427#issuecomment-5592869350)
+- [Control-plane PR #537](https://github.com/belongnet/belong-agents/pull/537), which adds check receipts and canonical CI evidence; this worker revision is checked against [`conductor_lanes.py` at c71ae7b](https://github.com/belongnet/belong-agents/blob/c71ae7b2ab430ee7bca6eb24618705d1530c36fc/belong-agent-center/backend/conductor_lanes.py)
 
 That pinned implementation defines the deployed `conductor_lane_runs` and
 `conductor_lane_actions` tables in `PG_SCHEMA`. Its `finish_action` transaction
@@ -24,6 +25,14 @@ Before enabling the HTTP worker, land the control-plane PR (or a newer commit
 with the same contract), run its PostgreSQL scenario, and point
 `COMMAND_CENTER_API_BASE_URL` at that deployment. This worker repository does
 not silently apply SQL to the control plane and keeps production prepare-only.
+
+For the optional container-based OVH lanes unit, stage the manifest at
+`/etc/conductor-telegram/lanes.manifest.json` and its verified prompt files at
+`/etc/conductor-telegram/prompts/`. The unit mounts both paths read-only into
+the container; prompt paths such as `prompts/L3.md` resolve relative to the
+manifest. The native OVH systemd installation instead reads its manifest and
+prompts from `/var/lib/conductor-telegram/growth-lanes/`. Verify every prompt
+hash with `doctor` before resuming the worker.
 
 ## Required lane-safety contract
 
@@ -110,7 +119,148 @@ receipt. A `required_checks` receipt must have `all_green == true` with empty
 `verdict` or `receipt_summary`. Merge-only, failed, and empty packets are
 rejected.
 
-For `required_checks` and `merged_ci`, Command Center accepts only the exact
-case-sensitive manifest allowlist, compared order-independently, with no
-missing or non-passing required checks. Unrelated check failures are outside an
-explicit allowlist; an empty allowlist retains the host aggregate result.
+For `required_checks` and `merged_ci` evidence of a lane with named
+`required_checks`, Command Center accepts only that exact, case-sensitive list
+with no missing or non-passing check: in manifest order for pre-merge
+`required_checks`, in any order for `merged_ci`. Checks outside the list never
+fail that evidence, though the Git host's own mergeability (GitHub's `UNSTABLE`,
+for example) can still hold the merge. A lane without named checks uses the host's aggregate result, the
+canonical host's when `canonical_evidence` is set.
+
+### Check receipts and canonical CI evidence
+
+Roll this contract out in order. A Command Center with #537 refuses check
+evidence without receipts, which a worker older than this revision writes for
+every lane with named checks; the old worker then pauses every lane. A Command
+Center older than #537 refuses the new manifest fields. So run this worker
+revision on every active OVH lease holder before any lane with
+named checks runs against a #537 Command Center, and add `check_allowlist` or
+`canonical_evidence` to the manifest only once both are in place.
+
+Since [belong-agents #537](https://github.com/belongnet/belong-agents/pull/537),
+a lane's `delivery_adapter` may also carry `check_allowlist` and
+`canonical_evidence` (`{ kind, project_path, base_branch }`, where `kind` is
+`github` or `gitlab`). `check_allowlist` names the checks a named-check receipt
+may carry. It defaults to `required_checks` and must include every one of them,
+so it constrains receipts. It does not filter the aggregate result of a lane
+without named checks, as in Command Center. For these delivery fields the
+worker refuses whatever Command Center would refuse (check names, blank values,
+canonical projects), and also a GitHub canonical project that is not exactly
+`owner/repository`. The same holds for the rest of a lane: blank or overlong
+branches, titles, tags and command arguments, a validation script or package
+path outside the repository, a probe URL that is not public (local names,
+cloud metadata, private, loopback, link-local, reserved, multicast or
+unspecified addresses, in every Python release's sense of those), and a
+recurring schedule longer than a year.
+
+For a lane with named required checks, the pre-merge `required_checks`
+evidence is an exact receipt read from the canonical host for the exact head
+commit: `source`, `project_path`, `base_branch`, `commit_sha`, a `pipeline_id`
+(a positive number or a short string), and `checks`, one
+`{ name, status: "success", commit_sha }` per required check in manifest
+order. GitHub has no single pipeline, so its `pipeline_id` names the check
+runs and commit statuses behind the result, such as `github-status-81`.
+Summary-only evidence is rejected.
+
+A lane with `canonical_evidence` is proven by that host and project only, for
+both the pre-merge gate and merged-SHA CI, and a green GitHub mirror never
+counts. On GitLab the worker reads the newest pipeline the project's own CI ran
+for the exact commit, pinned to the reviewed head branch before merge and the
+canonical base branch after merge. A same-commit pipeline on another branch
+cannot stand in for it. The canonical project must run CI for the reviewed
+branch; otherwise the gate waits. Only a push or merge-request pipeline counts (source `push`,
+`merge_request_event` or `external_pull_request_event`). For a GitLab
+merge-request pipeline, the worker checks the merge request's source branch,
+target branch, and head SHA before accepting its MR ref. A GitLab-delivered
+lane also binds the MR number when the canonical project is its delivery
+project. An external pipeline
+only holds commit statuses, a child pipeline is a slice of its parent, and a
+pipeline started by hand, by API, trigger or schedule can carry variables that
+skip jobs. None of these count. The pipeline list does not say whether a
+pipeline ran for a tag, so the worker reads each candidate in full and skips
+tag pipelines; past ten of them on one commit the gate waits.
+Even a push pipeline can carry variables supplied through Git push options.
+The worker checks the pipeline's supplied variables and holds the gate if any
+are present. It never includes their names or values in a receipt or alert.
+
+GitLab's own verdict on a pipeline is not enough on its own. Anyone with
+Developer access can post a commit status under a job's name, which retires
+that job and can turn a red pipeline green. So the worker also reads the last
+run of every job, retried runs and bridges to downstream pipelines included.
+Without named checks a pipeline passes only when GitLab says it succeeded and
+every job's last run agrees. A job agrees when it succeeded or was skipped, or
+when it is allowed to fail and failed, was canceled or waits on a manual start.
+A failed job or pipeline holds the pre-merge gate and asks for a repair after
+the merge. Anything still running, canceled, skipped or manual holds the gate,
+and so does a green pipeline with no jobs. With named checks, those jobs' last
+runs alone decide, each only on its own success, and the rest of the pipeline
+is not consulted. A GitLab-delivered lane with named checks is proven the same
+way, from its own project's newest pipeline, rather than from commit statuses
+as before. Jobs inside downstream pipelines and external statuses therefore no
+longer satisfy a named check, though the bridge job that starts a downstream
+pipeline does. Green checks that cannot be tied to a pipeline hold the gate
+instead of merging.
+
+A lane with neither named checks nor canonical evidence keeps the Git host's
+aggregate result. On its merged commit, checks that are missing or still
+running hold validation, and red checks ask for a repair; neither pauses the
+other lanes.
+
+A GitLab-proven lane needs `GITLAB_TOKEN`, even when it delivers through
+GitHub: read API access is enough for canonical evidence, while a
+GitLab-delivered lane also posts merge-request notes, which needs
+the `api` scope. The worker refuses to start without the token. For each such
+project, `doctor` checks pipeline listing and, if one exists, reads that
+pipeline's variables endpoint; it does not check write scope. A project with
+no pipelines leaves variables-endpoint access untested until the worker reads
+its first pipeline.
+
+Command Center counts merge evidence as fresh for 5 minutes (merged-SHA CI for
+15) from when a row is first written, and answers a repeated key with that
+original row. The worker keys check, mergeability and merged-SHA CI evidence to
+a 4-minute window, and records the pre-merge evidence again before it waits for
+an operator merge. A result that stays green while the merge waits therefore
+never ages out.
+
+The worker currently starts no automatic merges, including legacy delivery.
+GitHub and GitLab merge calls can bind the head commit but cannot bind the
+target branch in the same mutation. An operator must check the PR's repository,
+source branch, target branch, and head SHA, then merge it in the Git host. The
+worker adopts a matching external merge and continues merged-commit CI and
+validation. The manifest's `auto_merge` policy still describes which one-shot
+lanes reach the merge stage; it does not override this safety hold. Stop any
+legacy merge-agent session commissioned by an older worker before resuming it.
+The legacy scheduler cancels and archives any recorded pre-upgrade merge
+sessions at startup, including while paused. Persisted legacy runs without a
+recorded target branch stay inert until an operator reviews and resets them. The durable worker
+sends one notification per run and head SHA when the manual merge gate is ready.
+
+#### When CI never decides
+
+A check gate waits as long as CI does. That suits slow CI, but not CI that
+never decides: a commit that never reached the canonical project (a broken
+mirror), no runner picking up its jobs, a job blocked on a manual start, or a
+repository whose CI never runs on its base branch. Once a gate has seen the
+same commit undecided, neither passing nor failed, for an hour, the worker
+sends one Telegram alert naming the lane, the CI project and the commit. That
+covers the pull request head and merged commit of an exact-receipt lane, and
+the merged commit of a lane without named checks. The gate keeps waiting.
+The hour is counted by the worker holding the lease and restarts with it, so
+after a restart or failover the alert can take up to an hour longer. Command Center's notification key keeps it to one alert per run,
+phase and commit. A pull request that cannot merge is not read at all, since
+its receipt waits until it could merge, so it raises no alert. A missing
+commit is alerted on only for GitLab, which answers with no pipeline. A GitHub
+canonical repository that lacks the commit answers the checks read with an
+error instead, and the worker restarts, as on any Git-host error, until the
+commit arrives.
+
+To act on the alert, check that the commit exists in the canonical project and
+that a push or merge-request pipeline ran for it
+(`GET /projects/:id/pipelines?sha=<commit>`). A pipeline started by hand, API,
+trigger or schedule does not count, nor does one for a tag. Run the pipeline
+the way the project's CI expects, or fix the runner. A merged commit that a
+mirror pushed together with newer ones never gets a branch pipeline of its own,
+because GitLab runs one only for the newest commit of a push. Hold that lane,
+then retire its merged run with `conductor-telegram lanes retire` once the
+change is verified another way. To stop any lane instead, hold it with
+`conductor-telegram lanes hold <lane> --reason "..."`.

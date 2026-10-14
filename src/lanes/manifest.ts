@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { BlockList, isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -49,6 +50,50 @@ const Id = z
   .regex(/^[A-Za-z0-9][A-Za-z0-9_.:@/-]*$/);
 const Provider = z.enum(PROVIDERS);
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
+// Command Center refuses values that Python's str.strip() empties, a set
+// that differs from JavaScript's trim() (it includes \x1c-\x1f and \x85).
+const PYTHON_SPACE =
+  "\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const PYTHON_BLANK = new RegExp(`^[${PYTHON_SPACE}]*$`);
+export function blankForCommandCenter(value: string): boolean {
+  return PYTHON_BLANK.test(value);
+}
+const NonBlank = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine((value) => !blankForCommandCenter(value), "must not be blank");
+// Command Center accepts only these check names, so a manifest that it would
+// refuse is refused here before it can be staged.
+const CheckName = z
+  .string()
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9_.:/ -]{0,254}$/,
+    "must be a check name of letters, digits, spaces and _.:/-"
+  );
+const PROJECT_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}$/;
+const CanonicalEvidence = z
+  .object({
+    kind: z.enum(["github", "gitlab"]),
+    project_path: NonBlank(512).refine(
+      (value) => {
+        const segments = value.split("/");
+        return (
+          segments.length >= 2 &&
+          segments.every((segment) => PROJECT_PATH_SEGMENT.test(segment))
+        );
+      },
+      "must be a group/project path of at least two safe segments"
+    ),
+    base_branch: NonBlank(255),
+  })
+  .strict();
+const DeliveryChecks = {
+  required_checks: z.array(CheckName).optional(),
+  check_allowlist: z.array(CheckName).optional(),
+  canonical_evidence: CanonicalEvidence.optional(),
+};
 
 function isSafePromptPath(value: string): boolean {
   if (
@@ -67,15 +112,34 @@ function isSafePromptPath(value: string): boolean {
 
 const SAFE_VALIDATION_SCRIPT =
   /^(?:test(?::[A-Za-z0-9_.-]+)?|lint(?::[A-Za-z0-9_.-]+)?|typecheck(?::[A-Za-z0-9_.-]+)?|check(?::[A-Za-z0-9_.-]+)?|verify(?::[A-Za-z0-9_.-]+)?|build(?::[A-Za-z0-9_.-]+)?|qa|ci)$/i;
+// Command Center matches these with Python's re.IGNORECASE. The u flag folds
+// the long s ("puſh") the same way; Python also folds a dotless or dotted I
+// into i, which no JavaScript flag does, so those are folded first.
 const UNSAFE_VALIDATION_TOKEN =
-  /(?:^|[:/_-])(?:deploy|publish|release|push|destroy|apply|secret|outreach|spend)(?:$|[:/_-])/i;
+  /(?:^|[:/_-])(?:deploy|publish|release|push|destroy|apply|secret|outreach|spend)(?:$|[:/_-])/iu;
+
+function hasUnsafeToken(argument: string): boolean {
+  return UNSAFE_VALIDATION_TOKEN.test(argument.replace(/[\u0130\u0131]/g, "i"));
+}
+
+// Package-manager options that name a directory or package.
+const PACKAGE_PATH_OPTIONS = ["--prefix", "--filter", "--workspace", "--cwd", "--dir", "-C"];
+
+/** A path Command Center accepts as a script or package location. */
+function isContainedRelativePath(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return (
+    !normalized.startsWith("/") &&
+    normalized.split("/").every((part) => part !== "" && part !== "." && part !== "..")
+  );
+}
 
 function isSafeValidationCommand(argv: readonly string[]): boolean {
   if (
     argv.length === 0 ||
     argv.some(
       (argument) =>
-        /[\r\n\0]/.test(argument) || UNSAFE_VALIDATION_TOKEN.test(argument)
+        /[\r\n\0]/.test(argument) || hasUnsafeToken(argument)
     )
   ) {
     return false;
@@ -90,6 +154,7 @@ function isSafeValidationCommand(argv: readonly string[]): boolean {
   }
   if (["bash", "sh"].includes(executable)) {
     if (!args[0] || args[0] === "-c" || args[0].startsWith("-")) return false;
+    if (!isContainedRelativePath(args[0])) return false;
     const script = path.posix.basename(args[0]);
     return (
       /(?:test|check|lint|verify|qa)/i.test(script) ||
@@ -99,11 +164,22 @@ function isSafeValidationCommand(argv: readonly string[]): boolean {
   if (["npm", "pnpm", "bun", "yarn"].includes(executable)) {
     const positional: string[] = [];
     for (let index = 0; index < args.length; index += 1) {
-      if (["--prefix", "--filter", "--workspace", "--cwd", "--dir", "-C"].includes(args[index]!)) {
+      const argument = args[index]!;
+      if (PACKAGE_PATH_OPTIONS.includes(argument)) {
         index += 1;
+        if (index < args.length && !isContainedRelativePath(args[index]!)) return false;
         continue;
       }
-      if (!args[index]!.startsWith("-")) positional.push(args[index]!);
+      // Command Center reads only the spaced form; a path joined to its
+      // option (--dir=x, -Cx) must stay inside the repository too.
+      const joined = PACKAGE_PATH_OPTIONS.find((option) =>
+        option === "-C" ? argument.startsWith(option) : argument.startsWith(`${option}=`)
+      );
+      if (joined) {
+        if (!isContainedRelativePath(argument.slice(joined.length).replace(/^=/, ""))) return false;
+        continue;
+      }
+      if (!argument.startsWith("-")) positional.push(argument);
     }
     if (positional[0] === "run") positional.shift();
     return Boolean(positional[0] && SAFE_VALIDATION_SCRIPT.test(positional[0]));
@@ -119,6 +195,117 @@ function isSafeValidationCommand(argv: readonly string[]): boolean {
     return targets.length > 0 && targets.every((target) => SAFE_VALIDATION_SCRIPT.test(target));
   }
   return false;
+}
+
+// Command Center's _safe_validation_probe_url: no local, cloud-metadata or
+// non-public address. The ranges are every one Python's ipaddress calls
+// private, loopback, link-local, reserved, multicast or unspecified, in any
+// Python release Command Center may run on.
+const UNSAFE_PROBE_HOSTS = new Set([
+  "localhost",
+  "localhost.localdomain",
+  "metadata.google.internal",
+  "metadata",
+]);
+const UNSAFE_PROBE_HOST_SUFFIXES = [".localhost", ".local", ".internal", ".home.arpa"];
+// One list per family: a BlockList checks an IPv4 address against IPv6
+// rules too, in its ::ffff:0:0/96 form, which ::/8 covers.
+const UNSAFE_PROBE_IPV4 = new BlockList();
+const UNSAFE_PROBE_IPV6 = new BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.0.0.0", 24],
+  ["192.0.2.0", 24],
+  ["192.168.0.0", 16],
+  ["198.18.0.0", 15],
+  ["198.51.100.0", 24],
+  ["203.0.113.0", 24],
+  ["224.0.0.0", 4],
+  ["240.0.0.0", 4],
+] as const) {
+  UNSAFE_PROBE_IPV4.addSubnet(network, prefix, "ipv4");
+}
+for (const [network, prefix] of [
+  ["::", 8],
+  ["100::", 8],
+  ["200::", 7],
+  ["400::", 6],
+  ["800::", 5],
+  ["1000::", 4],
+  ["2001::", 23],
+  ["2001:db8::", 32],
+  ["2002::", 16],
+  ["3fff::", 20],
+  ["4000::", 3],
+  ["6000::", 3],
+  ["8000::", 3],
+  ["a000::", 3],
+  ["c000::", 3],
+  ["e000::", 4],
+  ["f000::", 5],
+  ["f800::", 6],
+  ["fc00::", 7],
+  ["fe00::", 9],
+  ["fe80::", 10],
+  ["ff00::", 8],
+] as const) {
+  UNSAFE_PROBE_IPV6.addSubnet(network, prefix, "ipv6");
+}
+// Python and WHATWG URL parsers agree on the host only for a URL that starts
+// with the scheme and two slashes and holds no backslash, space or control
+// character; Command Center reads the host the Python way.
+const PROBE_URL_SHAPE = new RegExp(
+  `^https?://[^/\\\\${PYTHON_SPACE}\\x00-\\x20\\x7f][^\\\\${PYTHON_SPACE}\\x00-\\x20\\x7f]*$`,
+  "i"
+);
+
+function isSafeProbeUrl(value: string): boolean {
+  if (!PROBE_URL_SHAPE.test(value)) return false;
+  let hostname: string;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    hostname = parsed.hostname;
+  } catch {
+    return false;
+  }
+  const host = hostname.replace(/^\[(.*)\]$/, "$1").replace(/\.+$/, "").toLowerCase();
+  if (!host || UNSAFE_PROBE_HOSTS.has(host)) return false;
+  if (UNSAFE_PROBE_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix))) return false;
+  const family = isIP(host);
+  if (family === 4) return !UNSAFE_PROBE_IPV4.check(host, "ipv4");
+  if (family === 6) return !UNSAFE_PROBE_IPV6.check(host, "ipv6");
+  return true;
+}
+
+// Command Center's _recurrence_interval: daily, weekly, or every n minutes,
+// hours or days up to a year, read after Python's strip() and lower().
+const RECURRING_SCHEDULE = new RegExp(
+  `^(?:daily|@daily|weekly|@weekly|every[${PYTHON_SPACE}]+([1-9][0-9]*)[${PYTHON_SPACE}]*([mhd]))$`
+);
+const PYTHON_STRIP = new RegExp(`^[${PYTHON_SPACE}]+|[${PYTHON_SPACE}]+$`, "g");
+const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 } as const;
+const MAX_RECURRENCE_MS = 365 * UNIT_MS.d;
+
+/**
+ * A recurring schedule's interval, or null for one Command Center refuses.
+ * The manifest and the scheduler both read schedules with this, so every
+ * accepted schedule runs.
+ */
+export function recurrenceIntervalMs(schedule: string): number | null {
+  const normalized = schedule.replace(PYTHON_STRIP, "").toLowerCase();
+  const match = normalized.match(RECURRING_SCHEDULE);
+  if (!match) return null;
+  const interval = match[1]
+    ? Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS]
+    : normalized.endsWith("weekly")
+      ? 7 * UNIT_MS.d
+      : UNIT_MS.d;
+  return interval <= MAX_RECURRENCE_MS ? interval : null;
 }
 
 const ManifestSchema = z
@@ -147,20 +334,17 @@ const ManifestSchema = z
         z
           .object({
             id: Id,
-            title: z.string().min(1).max(240).optional(),
+            title: NonBlank(240).optional(),
             repository: z
               .object({
                 owner: Id,
                 name: Id,
-                base_branch: z.string().min(1).max(255),
+                base_branch: NonBlank(255),
               })
               .strict(),
             prompt: z
               .object({
-                path: z
-                  .string()
-                  .min(1)
-                  .max(1024)
+                path: NonBlank(1024)
                   .refine(
                     isSafePromptPath,
                     "must be a relative path contained by the manifest directory"
@@ -187,32 +371,16 @@ const ManifestSchema = z
                 .object({
                   kind: z.literal("recurring"),
                   enabled: z.boolean().default(false),
-                  schedule: z
-                    .string()
-                    .min(1)
-                    .refine(
-                      (value) =>
-                        /^(?:daily|@daily|weekly|@weekly|every\s+[1-9]\d*\s*[mhd])$/i.test(
-                          value.trim()
-                        ),
-                      "unsupported recurring schedule; use daily, weekly, or every <positive integer><m|h|d>"
-                    ),
+                  schedule: NonBlank(4096).refine(
+                    (value) => recurrenceIntervalMs(value) !== null,
+                    "unsupported recurring schedule; use daily, weekly, or every <positive integer><m|h|d> of at most a year"
+                  ),
                 })
                 .strict(),
             ]),
             delivery_adapter: z.discriminatedUnion("kind", [
-              z
-                .object({
-                  kind: z.literal("github"),
-                  required_checks: z.array(z.string().min(1)).optional(),
-                })
-                .strict(),
-              z
-                .object({
-                  kind: z.literal("gitlab"),
-                  required_checks: z.array(z.string().min(1)).optional(),
-                })
-                .strict(),
+              z.object({ kind: z.literal("github"), ...DeliveryChecks }).strict(),
+              z.object({ kind: z.literal("gitlab"), ...DeliveryChecks }).strict(),
             ]),
             merge_policy: z
               .object({
@@ -224,25 +392,15 @@ const ManifestSchema = z
               .strict(),
             validation_profile: z
               .object({
-                commands: z.array(z.array(z.string().min(1)).min(1)).default([]),
+                commands: z.array(z.array(NonBlank(4096)).min(1)).default([]),
                 probes: z
                   .array(
                     z
                       .object({
-                        url: z
-                          .string()
-                          .url()
-                          .refine(
-                            (value) => {
-                              try {
-                                const protocol = new URL(value).protocol;
-                                return protocol === "http:" || protocol === "https:";
-                              } catch {
-                                return false;
-                              }
-                            },
-                            "must be a read-only HTTP(S) URL"
-                          ),
+                        url: NonBlank(4096).refine(
+                          isSafeProbeUrl,
+                          "must be a public, read-only HTTP(S) URL"
+                        ),
                         method: z.literal("GET").default("GET"),
                       })
                       .strict()
@@ -254,7 +412,7 @@ const ManifestSchema = z
                 (value) => value.commands.length > 0 || value.probes.length > 0,
                 "validation profile requires a deterministic command or read-only probe"
               ),
-            managed_tags: z.array(z.string().min(1).max(128)).min(1),
+            managed_tags: z.array(NonBlank(128)).min(1),
           })
           .strict()
       )
@@ -318,6 +476,34 @@ const ManifestSchema = z
           code: z.ZodIssueCode.custom,
           path: ["lanes", index, "delivery_adapter", "required_checks"],
           message: "required check names must be unique",
+        });
+      }
+      const checkAllowlist = lane.delivery_adapter.check_allowlist;
+      if (checkAllowlist && new Set(checkAllowlist).size !== checkAllowlist.length) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery_adapter", "check_allowlist"],
+          message: "allowed check names must be unique",
+        });
+      }
+      const unlisted = requiredChecks.filter(
+        (name) => checkAllowlist && !checkAllowlist.includes(name)
+      );
+      if (unlisted.length > 0) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery_adapter", "check_allowlist"],
+          message: `must include every required check; missing ${unlisted.join(", ")}`,
+        });
+      }
+      // Command Center accepts any group depth, but a GitHub repository is
+      // always owner/repo; anything else could never be read at a gate.
+      const canonical = lane.delivery_adapter.canonical_evidence;
+      if (canonical?.kind === "github" && canonical.project_path.split("/").length !== 2) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["lanes", index, "delivery_adapter", "canonical_evidence", "project_path"],
+          message: "GitHub canonical evidence must name exactly owner/repository",
         });
       }
       for (const [commandIndex, command] of lane.validation_profile.commands.entries()) {
@@ -408,6 +594,15 @@ export type LaneManifestV2 = z.infer<typeof ManifestSchema> & {
 };
 export type ManifestLane = LaneManifestV2["lanes"][number];
 export type ManifestProvider = (typeof PROVIDERS)[number];
+
+/** GitLab delivery, or GitHub delivery proven by GitLab CI, needs a GitLab token. */
+export function manifestNeedsGitlab(manifest: Pick<LaneManifestV2, "lanes">): boolean {
+  return manifest.lanes.some(
+    (lane) =>
+      lane.delivery_adapter.kind === "gitlab" ||
+      lane.delivery_adapter.canonical_evidence?.kind === "gitlab"
+  );
+}
 
 export const DEFAULT_LANE_MANIFEST_PATH = path.join(
   os.homedir(),

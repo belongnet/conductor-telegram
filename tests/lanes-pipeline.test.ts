@@ -553,10 +553,10 @@ test("fixture markers require GitHub policy before merge and exact GitHub SHA af
     refreshPr,
     refreshMergedChecks,
   });
-  assert.equal(mergeCreated, true);
+  assert.equal(mergeCreated, false, "the legacy worker holds for an operator merge");
   assert.equal(
     getLaneDeliveryState<LaneDeliveryState>("L2")?.mergeHeadSha,
-    headSha,
+    undefined,
   );
 
   merged = true;
@@ -743,10 +743,10 @@ test("GitHub conflict returns the lane to its author without trusting transcript
   );
 });
 
-test("ordinary conflict and rebase prose cannot trigger the conflict transition", async () => {
+test("pre-upgrade merge sessions are cancelled before a dependency-blocked merge", async () => {
   const config = lanesConfig();
-  const lane = { ...config.lanes[0], id: "L6" };
-  config.lanes = [lane];
+  const lane = { ...config.lanes[0], id: "L6", after: ["L0"] };
+  config.lanes = [laneConfig({ id: "L0", delivery: undefined }), lane];
   const state = approvedFinalState("L6");
   state.mergeHeadSha = "1111111111111111111111111111111111111111";
   state.merge = {
@@ -760,6 +760,7 @@ test("ordinary conflict and rebase prose cannot trigger the conflict transition"
     commissionedHeadSha: state.headSha,
   };
   setLaneDeliveryState("L6", state);
+  const stopped: string[] = [];
   const client = {
     listWorkspaceSessions: async () => [
       {
@@ -785,6 +786,14 @@ test("ordinary conflict and rebase prose cannot trigger the conflict transition"
       messageId: input.messageId,
       state: "queued" as const,
     }),
+    cancelSession: async (id: string) => {
+      stopped.push(`cancel:${id}`);
+      return { workspaceId: "merge-workspace", sessionId: id, status: "idle", canceledQueuedMessages: 0 };
+    },
+    archiveSession: async (id: string) => {
+      stopped.push(`archive:${id}`);
+      return { workspaceId: "merge-workspace", sessionId: id, status: "archived", canceledQueuedMessages: 0 };
+    },
   } as unknown as ConductorApiClient;
   await runDeliveryPipeline({
     client,
@@ -797,6 +806,77 @@ test("ordinary conflict and rebase prose cannot trigger the conflict transition"
     refreshPr: async () => prPolicy(),
   });
   assert.equal(getLaneDeliveryState<LaneDeliveryState>("L6")?.stage, "merge");
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L6")?.merge, undefined);
+  assert.deepEqual(stopped, ["cancel:merge-session", "archive:merge-session"]);
+});
+
+test("a removed legacy lane still retires its commissioned merge session", async () => {
+  const config = lanesConfig();
+  config.lanes = [laneConfig({ id: "L9", delivery: undefined })];
+  const orphan = deliveryState({
+    laneId: "L10",
+    stage: "merge",
+    merge: {
+      role: "merge",
+      workspaceId: "orphan-merge-workspace",
+      sessionId: "orphan-merge-session",
+      provider: "validator",
+      model: "validation-model",
+      startedAt: NOW.toISOString(),
+      nonce: "orphan-merge",
+      commissionedHeadSha: "1".repeat(40),
+    },
+  });
+  setLaneDeliveryState("L10", orphan);
+  let failCancel = true;
+  const stopped: string[] = [];
+  const client = {
+    listWorkspaceSessions: async () => [{ id: "orphan-merge-session", createdAt: NOW.toISOString() }],
+    cancelSession: async (id: string) => {
+      if (failCancel) throw new Error("cancel unavailable");
+      stopped.push(`cancel:${id}`);
+      return { workspaceId: "orphan-merge-workspace", sessionId: id, status: "idle", canceledQueuedMessages: 0 };
+    },
+    archiveSession: async (id: string) => {
+      stopped.push(`archive:${id}`);
+      return { workspaceId: "orphan-merge-workspace", sessionId: id, status: "archived", canceledQueuedMessages: 0 };
+    },
+  } as unknown as ConductorApiClient;
+  const input = { client, config, snapshots: [], workspaces: [], notify: async () => undefined };
+  await assert.rejects(runDeliveryPipeline(input), /cancel unavailable/);
+  assert.ok(getLaneDeliveryState<LaneDeliveryState>("L10")?.merge, "failure keeps the retirement pending");
+  failCancel = false;
+  await runDeliveryPipeline(input);
+  assert.deepEqual(stopped, ["cancel:orphan-merge-session", "archive:orphan-merge-session"]);
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L10")?.merge, undefined);
+});
+
+test("legacy adoption holds a retargeted or unbound merged PR", async () => {
+  const config = lanesConfig();
+  const lane = { ...config.lanes[0], id: "L8" };
+  config.lanes = [lane];
+  const state = approvedFinalState("L8");
+  setLaneDeliveryState("L8", state);
+  const client = {} as ConductorApiClient;
+  const input = {
+    client,
+    config,
+    snapshots: [{ ...authorSnapshot(NOW.toISOString()), id: "L8" }],
+    workspaces: [],
+    notify: async () => undefined,
+  };
+  await runDeliveryPipeline({
+    ...input,
+    refreshPr: async () => prPolicy({ state: "merged", baseBranch: "release", mergeCommitSha: "2".repeat(40) }),
+  });
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L8")?.mergedSha, undefined);
+  delete state.baseBranch;
+  setLaneDeliveryState("L8", state);
+  await runDeliveryPipeline({
+    ...input,
+    refreshPr: async () => prPolicy({ state: "merged", mergeCommitSha: "2".repeat(40) }),
+  });
+  assert.equal(getLaneDeliveryState<LaneDeliveryState>("L8")?.mergedSha, undefined);
 });
 
 test("GitHub policy blocks merge workspace creation while checks are pending", async () => {
@@ -865,6 +945,7 @@ function deliveryState(
     prRepo: "example-repo",
     prNumber: 1,
     headBranch: "managed/L1",
+    baseBranch: "main",
     headSha: "1111111111111111111111111111111111111111",
     authorProvider: "author",
     authorTurnAt: "2026-09-03T08:00:00.000Z",

@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import type { ManifestLane, ManifestProvider, LaneManifestV2 } from "./manifest.js";
+import {
+  recurrenceIntervalMs,
+  type LaneManifestV2,
+  type ManifestLane,
+  type ManifestProvider,
+} from "./manifest.js";
 import type {
   LaneAttemptRecord,
   LaneRunRecord,
@@ -187,18 +192,6 @@ export function sortedActionableRuns(snapshot: LaneSnapshotV2): LaneRunRecord[] 
     });
 }
 
-export function recurringIntervalMs(schedule: string): number | null {
-  const normalized = schedule.trim().toLowerCase();
-  if (normalized === "daily" || normalized === "@daily") return 86_400_000;
-  if (normalized === "weekly" || normalized === "@weekly") return 604_800_000;
-  const duration = normalized.match(/^every\s+(\d+)\s*(m|h|d)$/);
-  if (!duration) return null;
-  const value = Number(duration[1]);
-  const multiplier =
-    duration[2] === "m" ? 60_000 : duration[2] === "h" ? 3_600_000 : 86_400_000;
-  return value > 0 ? value * multiplier : null;
-}
-
 export function laneGenerationDue(input: {
   lane: ManifestLane;
   runs: readonly LaneRunRecord[];
@@ -217,7 +210,7 @@ export function laneGenerationDue(input: {
   if (!input.lane.policy.enabled) {
     return { due: false, generation: next, recurring: true };
   }
-  const interval = recurringIntervalMs(input.lane.policy.schedule);
+  const interval = recurrenceIntervalMs(input.lane.policy.schedule);
   if (interval === null) return { due: false, generation: next, recurring: true };
   const latest = laneRuns[0];
   if (!latest) return { due: true, generation: next, recurring: true };

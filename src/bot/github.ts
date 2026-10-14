@@ -96,7 +96,8 @@ export interface GithubCommitChecksSnapshot {
   sha: string;
   status: PrChecksStatus;
   summary: string;
-  checks?: Array<{ name: string; status: PrChecksStatus }>;
+  /** `id` names the check run or commit status the result came from. */
+  checks?: Array<{ name: string; status: PrChecksStatus; id?: string }>;
 }
 
 export interface PrRefreshResult {
@@ -144,9 +145,9 @@ export function requiredChecksGate(
     (name) => failed.includes(name) || pending.includes(name)
   );
   return {
-    // A configured manifest allowlist is exact and case-sensitive. Without
-    // one, preserve the legacy aggregate gate rather than turning an empty
-    // profile into a fail-open bypass for a failing host rollup.
+    // Configured required checks are exact and case-sensitive. A lane without
+    // named checks keeps the host's aggregate gate rather than turning an
+    // empty list into a fail-open bypass for a failing host rollup.
     passing:
       requiredChecks.length === 0
         ? policy.checksStatus === "passing"
@@ -395,36 +396,50 @@ export async function refreshCommitChecks(input: {
   } catch {
     throw new Error("GitHub returned malformed commit-check JSON.");
   }
-  const checks = summarizeChecks(
-    [
-      ...checkPages.flatMap((page) => page.check_runs ?? []),
-      ...statusPages.flatMap((page) => page.statuses ?? []),
-    ]
+  return commitChecksSnapshot(
+    { repoOwner: owner, repoName: repo, sha: input.sha.toLowerCase() },
+    checkPages.flatMap((page) => page.check_runs ?? []),
+    statusPages.flatMap((page) => page.statuses ?? [])
   );
+}
+
+export function commitChecksSnapshot(
+  identity: Pick<GithubCommitChecksSnapshot, "repoOwner" | "repoName" | "sha">,
+  checkRuns: unknown[],
+  statuses: unknown[]
+): GithubCommitChecksSnapshot {
+  const summary = summarizeChecks([...checkRuns, ...statuses]);
+  const check = (raw: unknown, kind: "check-run" | "status") => {
+    const value = raw as {
+      id?: unknown;
+      name?: string | null;
+      context?: string | null;
+      state?: string | null;
+      status?: string | null;
+      conclusion?: string | null;
+    };
+    const id =
+      typeof value.id === "number" && Number.isSafeInteger(value.id) && value.id > 0
+        ? `${kind}-${value.id}`
+        : undefined;
+    return {
+      name: String(value.name ?? value.context ?? "").trim(),
+      // A neutral or skipped run may satisfy GitHub's rollup, but it did not
+      // execute a named check and cannot supply a successful exact receipt.
+      status: ["NEUTRAL", "SKIPPED"].includes(String(value.conclusion ?? "").toUpperCase())
+        ? "pending" as const
+        : summarizeChecks([value]).status,
+      ...(id ? { id } : {}),
+    };
+  };
   return {
-    repoOwner: owner,
-    repoName: repo,
-    sha: input.sha.toLowerCase(),
-    status: checks.status,
-    summary: checks.summary,
+    ...identity,
+    status: summary.status,
+    summary: summary.summary,
     checks: [
-      ...checkPages.flatMap((page) => page.check_runs ?? []),
-      ...statusPages.flatMap((page) => page.statuses ?? []),
-    ]
-      .map((check) => {
-        const value = check as {
-          name?: string | null;
-          context?: string | null;
-          state?: string | null;
-          status?: string | null;
-          conclusion?: string | null;
-        };
-        return {
-          name: String(value.name ?? value.context ?? "").trim(),
-          status: summarizeChecks([value]).status,
-        };
-      })
-      .filter((check) => Boolean(check.name)),
+      ...checkRuns.map((raw) => check(raw, "check-run")),
+      ...statuses.map((raw) => check(raw, "status")),
+    ].filter((entry) => Boolean(entry.name)),
   };
 }
 
@@ -542,12 +557,42 @@ export async function mergePrByUrl(input: {
   prUrl: string;
   method: "squash" | "merge" | "rebase";
   expectedHeadSha: string;
+  expectedHeadBranch: string;
+  expectedBaseBranch: string;
 }): Promise<{ mergedSha: string }> {
-  if (!githubPrIdentity(input.prUrl)) {
+  const identity = githubPrIdentity(input.prUrl);
+  if (!identity) {
     throw new Error("Merge requires a canonical GitHub PR URL.");
   }
   if (!GIT_OID_RE.test(input.expectedHeadSha)) {
     throw new Error("Merge requires a full expected Git object ID.");
+  }
+  const binding = await runGh(
+    [
+      "api",
+      `repos/${identity.owner}/${identity.repo}/pulls/${identity.number}`,
+      "--method",
+      "GET",
+      "--jq",
+      "{head_sha: .head.sha, head_ref: .head.ref, base_ref: .base.ref}",
+    ],
+    { timeoutMs: 15_000 }
+  );
+  if (binding.code !== 0) {
+    throw new Error(`Could not verify GitHub PR binding before merge: ${compactError(binding)}`);
+  }
+  let before: { head_sha?: string; head_ref?: string; base_ref?: string };
+  try {
+    before = JSON.parse(binding.stdout) as typeof before;
+  } catch {
+    throw new Error("GitHub returned malformed PR binding before merge.");
+  }
+  if (
+    before.head_sha?.toLowerCase() !== input.expectedHeadSha.toLowerCase() ||
+    before.head_ref !== input.expectedHeadBranch ||
+    before.base_ref !== input.expectedBaseBranch
+  ) {
+    throw new Error("GitHub merge gate changed before exact-head merge");
   }
   const methodFlag =
     input.method === "merge"
@@ -569,7 +614,6 @@ export async function mergePrByUrl(input: {
   if (result.code !== 0) {
     throw new Error(`GitHub merge did not return success: ${compactError(result)}`);
   }
-  const identity = githubPrIdentity(input.prUrl)!;
   const verify = await runGh(
     [
       "api",
@@ -577,7 +621,7 @@ export async function mergePrByUrl(input: {
       "--method",
       "GET",
       "--jq",
-      "{merged: .merged, merge_commit_sha: .merge_commit_sha, head_sha: .head.sha}",
+      "{merged: .merged, merge_commit_sha: .merge_commit_sha, head_sha: .head.sha, head_ref: .head.ref, base_ref: .base.ref}",
     ],
     { timeoutMs: 15_000 }
   );
@@ -590,6 +634,8 @@ export async function mergePrByUrl(input: {
     merged?: boolean;
     merge_commit_sha?: string | null;
     head_sha?: string | null;
+    head_ref?: string | null;
+    base_ref?: string | null;
   };
   try {
     receipt = JSON.parse(verify.stdout) as typeof receipt;
@@ -600,7 +646,9 @@ export async function mergePrByUrl(input: {
     receipt.merged !== true ||
     !receipt.merge_commit_sha ||
     !GIT_OID_RE.test(receipt.merge_commit_sha) ||
-    receipt.head_sha?.toLowerCase() !== input.expectedHeadSha.toLowerCase()
+    receipt.head_sha?.toLowerCase() !== input.expectedHeadSha.toLowerCase() ||
+    receipt.head_ref !== input.expectedHeadBranch ||
+    receipt.base_ref !== input.expectedBaseBranch
   ) {
     throw new Error("GitHub merge response was ambiguous; merged state is not yet proven.");
   }
