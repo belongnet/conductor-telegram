@@ -103,7 +103,7 @@ import {
 } from "./media.js";
 import { existsSync } from "node:fs";
 import { refreshWorkspacePr } from "./github.js";
-import { loggableMessagePreview } from "./lane-approvals.js";
+import { claimedForApproval, loggableMessagePreview } from "./lane-approvals.js";
 import { formatPrCard, prKeyboard } from "./pr-ui.js";
 import {
   advanceCloudSessionCycle,
@@ -183,10 +183,13 @@ bot.use((ctx, next) => {
 
 // Auth: only respond to the owner
 bot.use(
-  authGuard(() => ({
-    ownerChatId: getOwnerChatId(),
-    ownerUserId: getOwnerUserId(),
-  }))
+  authGuard(
+    () => ({
+      ownerChatId: getOwnerChatId(),
+      ownerUserId: getOwnerUserId(),
+    }),
+    { approvalTraffic: claimedForApproval }
+  )
 );
 
 // Register commands

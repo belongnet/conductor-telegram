@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   APPROVAL_TEXT,
   LaneApprovals,
+  claimedForApproval,
   MAX_WAITING_CONTROLS,
   approvalMessageFrom,
   isWithheldApprovalMessage,
@@ -469,8 +470,10 @@ test("possible codes are withheld from durable storage and from the update log",
     assert.equal(withholdApprovalText(ordinary, BOT), ordinary);
     const command = { update_id: 11, message: message("/lanes status", { id: 501 }).raw };
     assert.equal(withholdApprovalText(command, BOT), command, "commands stay commands");
-    const otherBot = { update_id: 12, message: { ...message("123456").raw, reply_to_message: { message_id: 3, from: { id: 1, is_bot: true }, text: PROMPT } } };
-    assert.equal(withholdApprovalText(otherBot, BOT), otherBot, "another bot's look-alike is not ours");
+    const otherBot = { update_id: 12, message: { ...message("sure").raw, reply_to_message: { message_id: 3, from: { id: 1, is_bot: true }, text: PROMPT } } };
+    assert.equal(withholdApprovalText(otherBot, BOT), otherBot, "another bot's look-alike prompt is not ours");
+    const sixAnywhere = { update_id: 13, message: { ...message("123456").raw, reply_to_message: { message_id: 3, from: { id: 1, is_bot: true }, text: PROMPT } } };
+    assert.doesNotMatch(JSON.stringify(withholdApprovalText(sixAnywhere, BOT)), /123456/, "the owner's six digits are withheld wherever they reply");
   } finally {
     setLaneApprovals(undefined);
   }
@@ -505,16 +508,21 @@ test("captions, files and codes in other shapes never leave the approval flow", 
   // While the code is awaited, anything with digits is held; a message that could hold six of them is removed too.
   const shaped = message("code: 123456");
   assert.equal(await h.approvals.handleReply(owner, shaped.view), true);
-  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.heldWhileWaiting);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.bareCode);
   assert.equal(owner.deletes.at(-1), shaped.raw.message_id);
-  const deletes = owner.deletes.length;
+  const split = message("code: 123 456");
+  assert.equal(await h.approvals.handleReply(owner, split.view), true, "held: it carries digits while a code is awaited");
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.heldWhileWaiting);
+  assert.equal(owner.deletes.at(-1), split.raw.message_id, "six digits in all could be the code, so it is removed");
+  const deletesBefore = owner.deletes.length;
   const ordinary = message("deploy v2 to staging");
   assert.equal(await h.approvals.handleReply(owner, ordinary.view), true, "held: it carries a digit");
+  assert.equal(owner.deletes.length, deletesBefore);
   assert.equal(owner.replies.at(-1), APPROVAL_TEXT.heldWhileWaiting);
   const screenshot = message("");
   screenshot.raw = { ...screenshot.raw, text: undefined, photo: [{ file_id: "s" }], caption: "screenshot 2" } as never;
   assert.equal(await h.approvals.handleReply(owner, screenshot.view), true);
-  assert.equal(owner.deletes.length, deletes, "too few digits to be the code, so they stay in the chat");
+  assert.equal(owner.deletes.length, deletesBefore, "too few digits to be the code, so they stay in the chat");
   assert.equal(await h.approvals.handleReply(owner, message("deploy now").view), false, "no digits, no hold");
   assert.equal(await h.approvals.handleReply(chat({ userId: "777" }), message("deploy v2", undefined, "777").view), false, "only the owner's digits");
 
@@ -534,11 +542,14 @@ test("six digits alone are never routed, even after a restart forgot the request
   topic.raw = { ...topic.raw, message_thread_id: 7, is_topic_message: true, reply_to_message: { message_id: 7, forum_topic_created: { name: "repo" } } } as never;
   assert.equal(await h.approvals.handleReply(owner, topic.view), true, "a forum topic's opening message is not a reply");
   assert.equal(await h.approvals.handleReply(chat({ userId: "777" }), message("123456", undefined, "777").view), false, "only the owner's");
-  assert.equal(await h.approvals.handleReply(owner, message("123456", { id: 42, prompt: false }).view), false, "an answer to other work stays with it");
-  assert.equal(await h.approvals.handleReply(owner, message("1234567").view), false);
+  const answer = message("123456", { id: 42, prompt: false });
+  assert.equal(await h.approvals.handleReply(owner, answer.view), true, "six digits are claimed even as an answer to other work");
+  assert.equal(owner.deletes.at(-1), answer.raw.message_id);
+  assert.equal(await h.approvals.handleReply(owner, message("1234567").view), false, "seven digits are not a code's shape");
   const photo = message("");
   photo.raw = { ...photo.raw, text: undefined, photo: [{ file_id: "p" }], caption: "123456" } as never;
-  assert.equal(await h.approvals.handleReply(owner, photo.view), false, "a captioned photo alone is not a code");
+  assert.equal(await h.approvals.handleReply(owner, photo.view), true, "captions count as text");
+  assert.equal(owner.deletes.at(-1), photo.raw.message_id);
   assert.equal(h.cc.verifies.length, 0);
 });
 
@@ -561,6 +572,180 @@ test("a refused control is reported in fixed words, never Command Center's own",
     assert.equal(owner.replies.at(-1), `Lane control cutover growth-v2-abc was not applied: ${wording}.`);
   }
   assert.ok(owner.replies.every((reply) => !reply.includes("xxxxx")), "no detail text reaches the chat");
+});
+
+const GROUP = "-1001234567";
+const telegramError = (code: number, description: string) => Object.assign(new Error(description), { response: { error_code: code, description } });
+
+test("a group owner gets the prompt in a private chat and answers it only there", async () => {
+  const h = harness({ OWNER_CHAT_ID: GROUP, OWNER_USER_ID: OWNER });
+  const reached: string[] = [];
+  const privatePrompts: Array<{ userId: string; text: string }> = [];
+  const group = chat({
+    chatId: GROUP,
+    reachPrivately: async (userId) => {
+      reached.push(userId);
+    },
+    promptPrivately: async (userId, text) => {
+      privatePrompts.push({ userId, text });
+      return 900;
+    },
+  });
+  const cutover = control();
+  await h.approvals.submit(group, cutover);
+  assert.deepEqual(reached, [OWNER], "the private chat is checked before a code is spent");
+  assert.deepEqual(privatePrompts, [{ userId: OWNER, text: PROMPT }]);
+  assert.deepEqual(group.prompts, [], "no prompt where other bots can read it");
+  assert.deepEqual(group.replies, [APPROVAL_TEXT.promptSentPrivately]);
+
+  const inGroup = message("042317");
+  assert.equal(await h.approvals.handleReply(group, inGroup.view), true);
+  assert.equal(group.replies.at(-1), APPROVAL_TEXT.bareCodeElsewhere);
+  assert.equal(group.deletes.at(-1), inGroup.raw.message_id);
+  const replyInGroup = message("042317", { id: 900 });
+  assert.equal(await h.approvals.handleReply(group, replyInGroup.view), true);
+  assert.equal(group.deletes.at(-1), replyInGroup.raw.message_id);
+  assert.equal(h.cc.verifies.length, 0, "a code is accepted only in the private chat");
+
+  const dm = chat({ chatId: OWNER });
+  await h.approvals.handleReply(dm, message("042317", { id: 900 }).view);
+  assert.deepEqual(h.cc.verifies, [{ challenge_id: "ch_1", code: "042317" }]);
+  assert.equal(cutover.submissions.length, 1);
+  assert.deepEqual(dm.replies, [
+    "Code accepted. Approvals open until 12:30 UTC.",
+    "Lane control queued: cutover growth-v2-abc. The lease holder will apply it.",
+  ]);
+});
+
+test("a group owner the bot cannot reach privately is told how, and nothing is applied", async () => {
+  let privatePrompts = 0;
+  const promptPrivately = async (): Promise<number> => {
+    privatePrompts++;
+    return 900;
+  };
+  const cases: Array<[Partial<ApprovalChat>, string, number]> = [
+    [{ promptPrivately, reachPrivately: async () => { throw telegramError(403, "Forbidden: bot can't initiate conversation with a user"); } }, APPROVAL_TEXT.openPrivateChat, 0],
+    [{ promptPrivately, reachPrivately: async () => { throw telegramError(403, "Forbidden: bot was blocked by the user"); } }, APPROVAL_TEXT.openPrivateChat, 0],
+    [{ promptPrivately, reachPrivately: async () => { throw telegramError(400, "Bad Request: chat not found"); } }, APPROVAL_TEXT.openPrivateChat, 0],
+    [{ promptPrivately, reachPrivately: async () => { throw telegramError(429, "Too Many Requests: retry after 5"); } }, APPROVAL_TEXT.privateChatUnavailable, 0],
+    [{}, APPROVAL_TEXT.openPrivateChat, 0],
+    [
+      {
+        reachPrivately: async () => undefined,
+        promptPrivately: async () => { throw telegramError(403, "Forbidden: bot can't initiate conversation with a user"); },
+      },
+      APPROVAL_TEXT.openPrivateChat,
+      1,
+    ],
+  ];
+  for (const [operations, wording, codesSent] of cases) {
+    const h = harness({ OWNER_CHAT_ID: GROUP, OWNER_USER_ID: OWNER });
+    const group = chat({ chatId: GROUP, ...operations });
+    const cutover = control();
+    await h.approvals.submit(group, cutover);
+    assert.deepEqual(group.replies, [wording]);
+    assert.equal(h.cc.sends.length, codesSent);
+    assert.equal(cutover.submissions.length, 0, "nothing is applied");
+    assert.equal(await h.approvals.handleReply(chat({ chatId: OWNER }), message("123456", { id: 900 }).view), true);
+    assert.equal(h.cc.verifies.length, 0, "and no code can complete it");
+  }
+  assert.equal(privatePrompts, 0, "an unreachable owner is never prompted");
+  assert.equal(APPROVAL_TEXT.openPrivateChat, "To approve, open a private chat with this bot, send /start, then send the lane control again.");
+});
+
+test("six digits in a row from the owner are removed and never routed, in every chat, pending or not", async () => {
+  const h = harness();
+  const owner = chat();
+  const elsewhere = chat({ chatId: "-100999" });
+  for (const [where, text] of [[owner, "order 123456 shipped"], [elsewhere, "123456"], [owner, `code ${String.fromCharCode(0x661, 0x662, 0x663, 0x664, 0x665, 0x666)}`]] as const) {
+    const sent = message(text);
+    assert.equal(await h.approvals.handleReply(where, sent.view), true, text);
+    assert.equal(where.deletes.at(-1), sent.raw.message_id, text);
+  }
+  assert.equal(owner.replies[0], APPROVAL_TEXT.sixDigits);
+  assert.equal(elsewhere.replies[0], APPROVAL_TEXT.stale);
+  const caption = message("");
+  caption.raw = { ...caption.raw, text: undefined, document: { file_id: "f" }, caption: "invoice 654321" } as never;
+  assert.equal(await h.approvals.handleReply(owner, caption.view), true, "captions count as text");
+  assert.equal(owner.deletes.at(-1), caption.raw.message_id);
+  for (const text of ["1234567", "12345", "123 456", "v2 build 12 34"]) {
+    assert.equal(await h.approvals.handleReply(owner, message(text).view), false, `${text} is not a code's shape`);
+  }
+
+  owner.failDeletes = 3;
+  const stuck = message("my code was 222222");
+  await h.approvals.handleReply(owner, stuck.view);
+  assert.deepEqual(owner.deletes.slice(-3), [stuck.raw.message_id, stuck.raw.message_id, stuck.raw.message_id], "three tries");
+  assert.deepEqual(owner.replies.slice(-2), [APPROVAL_TEXT.sixDigits, APPROVAL_TEXT.deleteFailed], "a failed delete is reported");
+  assert.equal(h.cc.verifies.length, 0);
+});
+
+test("forwarded, inline-bot and on-behalf messages are never the owner", async () => {
+  const h = harness();
+  const owner = chat();
+  const cutover = control();
+  await h.approvals.submit(owner, cutover);
+  const prompt = owner.promptIds[0];
+
+  const viaBot = message("042317", { id: prompt });
+  viaBot.raw = { ...viaBot.raw, via_bot: { id: 55, is_bot: true } } as never;
+  assert.equal(viaBot.view.relayed, true);
+  assert.equal(await h.approvals.handleReply(owner, viaBot.view), true);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.relayed);
+  assert.equal(owner.deletes.at(-1), viaBot.raw.message_id);
+
+  const forwarded = message("042317");
+  forwarded.raw = { ...forwarded.raw, forward_origin: { type: "hidden_user", sender_user_name: "x", date: 1 }, forward_date: 1 } as never;
+  assert.equal(await h.approvals.handleReply(owner, forwarded.view), true, "a forwarded code is still kept out of the chat's routing");
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.relayed);
+  assert.equal(owner.deletes.at(-1), forwarded.raw.message_id);
+
+  const anonymous = chat({ userId: "1087968824" });
+  const onBehalf = message("042317", { id: prompt }, "1087968824");
+  onBehalf.raw = { ...onBehalf.raw, sender_chat: { id: Number(GROUP), type: "supergroup" } } as never;
+  assert.equal(await h.approvals.handleReply(anonymous, onBehalf.view), true, "a reply to the prompt is the flow's, whoever sends it");
+  assert.deepEqual(anonymous.replies, [], "but an anonymous admin is never the owner");
+  assert.equal(h.cc.verifies.length, 0, "none of them is relayed as a code");
+
+  const relayedControl = chat({ relayed: true });
+  const forwardedCutover = control("cutover forwarded");
+  await h.approvals.submit(relayedControl, forwardedCutover);
+  assert.deepEqual(relayedControl.replies, [APPROVAL_TEXT.ownerOnly], "a forwarded control asks for nothing");
+
+  await h.approvals.handleReply(owner, message("042317", { id: prompt }).view);
+  assert.equal(cutover.submissions.length, 1);
+  assert.equal(forwardedCutover.submissions.length, 0);
+});
+
+test("the owner's private chat lets approval traffic through and nothing else", async () => {
+  const { authGuard } = await import("../src/bot/middleware.js");
+  const h = harness({ OWNER_CHAT_ID: GROUP, OWNER_USER_ID: OWNER });
+  setLaneApprovals(h.approvals);
+  try {
+    const guard = authGuard(() => ({ ownerChatId: GROUP, ownerUserId: OWNER }), { approvalTraffic: claimedForApproval });
+    const passes = async (chatId: string, chatType: string, fromId: string, msg: Record<string, unknown>) => {
+      let passed = false;
+      await guard(
+        { chat: { id: Number(chatId), type: chatType }, from: { id: Number(fromId), is_bot: false }, message: { message_id: 1, ...msg } } as never,
+        async () => {
+          passed = true;
+        }
+      );
+      return passed;
+    };
+    assert.equal(await passes(GROUP, "supergroup", OWNER, { text: "deploy" }), true, "the owner chat is unchanged");
+    assert.equal(await passes(OWNER, "private", OWNER, { text: "123456" }), true, "a code in the private chat");
+    assert.equal(await passes(OWNER, "private", OWNER, { text: "ok", reply_to_message: message("x", { id: 900 }).raw.reply_to_message }), true, "a reply to a prompt");
+    assert.equal(await passes(OWNER, "private", OWNER, { text: "deploy the fix" }), false, "ordinary private messages stay refused");
+    assert.equal(await passes(OWNER, "private", OWNER, { text: "/lanes cutover v2" }), false, "commands stay refused there");
+    assert.equal(await passes("777", "private", "777", { text: "123456" }), false, "someone else's private chat");
+    const withoutOption = authGuard(() => ({ ownerChatId: GROUP, ownerUserId: OWNER }));
+    let passed = false;
+    await withoutOption({ chat: { id: Number(OWNER), type: "private" }, from: { id: Number(OWNER) }, message: { message_id: 1, text: "123456" } } as never, async () => { passed = true; });
+    assert.equal(passed, false);
+  } finally {
+    setLaneApprovals(undefined);
+  }
 });
 
 test("the Telegram bot posts the prompt as a forced reply and intercepts the code before routing", async () => {
@@ -657,7 +842,7 @@ test("the cloud gateway never writes an approval code to its database", async ()
   const dir = mkdtempSync(path.join(os.tmpdir(), "ct-approval-"));
   const backend = process.env.LANES_STATE_BACKEND;
   process.env.LANES_STATE_BACKEND = "http";
-  const h = harness({ OWNER_CHAT_ID: "42", OWNER_USER_ID: "9" });
+  const h = harness({ OWNER_CHAT_ID: "9", OWNER_USER_ID: "9" });
   setLaneApprovals(h.approvals);
   closeDb();
   try {
@@ -669,7 +854,7 @@ test("the cloud gateway never writes an approval code to its database", async ()
       return method === "sendMessage" ? { message_id: 77 } : true;
     };
     const created: Array<Record<string, unknown>> = [];
-    const commands = new CloudCommands(store, {} as CloudEngine, telegram, "42", "9");
+    const commands = new CloudCommands(store, {} as CloudEngine, telegram, "9", "9");
     commands.openLaneStore = async () =>
       ({
         createControl: async (input: Record<string, unknown>) => {
@@ -680,29 +865,29 @@ test("the cloud gateway never writes an approval code to its database", async ()
       }) as unknown as LaneStateStore;
     const handle = () => processQueue(store, ["update"], (row) => commands.handle(row));
 
-    store.ingest([{ update_id: 1, message: { message_id: 10, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 1, text: "/lanes cutover growth-v2-abc" } }]);
+    store.ingest([{ update_id: 1, message: { message_id: 10, chat: { id: 9, type: "private" }, from: { id: 9 }, date: 1, text: "/lanes cutover growth-v2-abc" } }]);
     await handle();
     assert.equal(h.cc.sends.length, 1);
     const prompt = calls.find((call) => call.method === "sendMessage")!;
     assert.equal(prompt.payload.text, PROMPT);
-    assert.equal(prompt.payload.chat_id, "42");
+    assert.equal(prompt.payload.chat_id, "9");
     assert.deepEqual(prompt.payload.reply_parameters, { message_id: 10, allow_sending_without_reply: true });
     assert.deepEqual(prompt.payload.reply_markup, { force_reply: true, selective: true });
     assert.equal(created.length, 0);
 
     // A code typed without a reply while one is awaited is withheld and goes nowhere else.
-    store.ingest([{ update_id: 2, message: { message_id: 11, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 2, text: "555555" } }]);
+    store.ingest([{ update_id: 2, message: { message_id: 11, chat: { id: 9, type: "private" }, from: { id: 9 }, date: 2, text: "555555" } }]);
     await handle();
     assert.equal(store.row("update:2:route"), undefined, "never offered to the router");
     assert.equal(store.row("update:2:action"), undefined);
     assert.match(JSON.parse(store.row("update:2:approval:0:0")!.payload).payload.text, /reply to the approval prompt/);
 
     // A captioned photo answering the prompt is stored without its caption and never fetched or routed.
-    store.ingest([{ update_id: 3, message: { message_id: 13, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, photo: [{ file_id: "shot" }],
+    store.ingest([{ update_id: 3, message: { message_id: 13, chat: { id: 9, type: "private" }, from: { id: 9 }, date: 3, photo: [{ file_id: "shot" }],
       caption: "999999", caption_entities: [], reply_to_message: { message_id: 77, from: { id: BOT, is_bot: true }, text: PROMPT } } }]);
     assert.doesNotMatch(store.row("update:3")!.payload, /999999|caption/);
     // Ordinary words with a digit are held while the code is awaited, not routed.
-    store.ingest([{ update_id: 4, message: { message_id: 14, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, text: "deploy v2 now" } }]);
+    store.ingest([{ update_id: 4, message: { message_id: 14, chat: { id: 9, type: "private" }, from: { id: 9 }, date: 3, text: "deploy v2 now" } }]);
     assert.doesNotMatch(store.row("update:4")!.payload, /deploy v2/);
     await handle();
     await handle(); // one update per conversation per pass, in order
@@ -711,15 +896,15 @@ test("the cloud gateway never writes an approval code to its database", async ()
     assert.equal(JSON.parse(store.row("update:3:approval:0:0")!.payload).payload.text, APPROVAL_TEXT.digitsOnly);
     assert.match(JSON.parse(store.row("update:4:approval:0:0")!.payload).payload.text, /^Messages with digits are held/);
 
-    store.ingest([{ update_id: 5, message: { message_id: 12, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, text: "042317",
+    store.ingest([{ update_id: 5, message: { message_id: 12, chat: { id: 9, type: "private" }, from: { id: 9 }, date: 3, text: "042317",
       reply_to_message: { message_id: 77, from: { id: BOT, is_bot: true }, text: PROMPT } } }]);
     assert.doesNotMatch(store.row("update:5")!.payload, /042317/, "the stored update has no code");
     await handle();
     assert.deepEqual(h.cc.verifies, [{ challenge_id: "ch_1", code: "042317" }]);
     assert.deepEqual(calls.filter((call) => call.method === "deleteMessage").map((call) => call.payload), [
-      { chat_id: "42", message_id: 11 },
-      { chat_id: "42", message_id: 13 },
-      { chat_id: "42", message_id: 12 },
+      { chat_id: "9", message_id: 11 },
+      { chat_id: "9", message_id: 13 },
+      { chat_id: "9", message_id: 12 },
     ], "the words with one digit stay in the chat; everything that could hold the code is removed");
     assert.equal(created.length, 1);
     assert.deepEqual(created[0].approval, { channelKey: KEY, grant: GRANT });
@@ -741,5 +926,133 @@ test("the cloud gateway never writes an approval code to its database", async ()
     rmSync(dir, { recursive: true, force: true });
     if (backend === undefined) delete process.env.LANES_STATE_BACKEND;
     else process.env.LANES_STATE_BACKEND = backend;
+  }
+});
+
+test("the cloud gateway prompts a group owner privately and reads codes only there", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-approval-group-"));
+  const backend = process.env.LANES_STATE_BACKEND;
+  process.env.LANES_STATE_BACKEND = "http";
+  const h = harness({ OWNER_CHAT_ID: "-42", OWNER_USER_ID: "9" });
+  setLaneApprovals(h.approvals);
+  closeDb();
+  try {
+    const store = new GatewayStore(getDb(path.join(dir, "state.db")));
+    store.set("telegram-bot-id", BOT);
+    const calls: Array<{ method: string; payload: Record<string, any> }> = [];
+    let unreachable = false;
+    const telegram = async (method: string, payload: Record<string, any>) => {
+      calls.push({ method, payload });
+      if (method === "sendChatAction" && unreachable) {
+        throw Object.assign(new Error("Forbidden"), { response: { error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" } });
+      }
+      return method === "sendMessage" ? { message_id: 77 } : true;
+    };
+    const created: Array<Record<string, unknown>> = [];
+    const commands = new CloudCommands(store, {} as CloudEngine, telegram, "-42", "9");
+    commands.openLaneStore = async () =>
+      ({
+        createControl: async (input: Record<string, unknown>) => {
+          created.push(input);
+          return { kind: input.kind, lane_id: null };
+        },
+        close: async () => undefined,
+      }) as unknown as LaneStateStore;
+    const handle = async () => {
+      for (let pass = 0; pass < 4; pass++) await processQueue(store, ["update"], (row) => commands.handle(row));
+    };
+    const group = { id: -42, type: "supergroup" };
+    const direct = { id: 9, type: "private" };
+    const text = (rows: string) =>
+      (store.db.prepare(`SELECT payload FROM gateway_queue WHERE id LIKE ? ORDER BY id`).all(rows) as Array<{ payload: string }>)
+        .map((row) => JSON.parse(row.payload).payload);
+
+    store.ingest([{ update_id: 1, message: { message_id: 10, chat: group, from: { id: 9 }, date: 1, text: "/lanes rollback" } }]);
+    await handle();
+    assert.deepEqual(calls.slice(0, 2).map((call) => [call.method, call.payload.chat_id]), [["sendChatAction", "9"], ["sendMessage", "9"]]);
+    assert.equal(calls[1].payload.text, PROMPT);
+    assert.deepEqual(calls[1].payload.reply_markup, { force_reply: true });
+    assert.deepEqual(text("update:1:approval:%").map((payload) => [payload.chat_id, payload.text]), [["-42", APPROVAL_TEXT.promptSentPrivately]]);
+
+    store.ingest([
+      { update_id: 2, message: { message_id: 11, chat: group, from: { id: 9 }, date: 2, text: "042317" } },
+      { update_id: 3, message: { message_id: 12, chat: direct, from: { id: 9 }, date: 2, text: "deploy the fix" } },
+    ]);
+    assert.doesNotMatch(store.row("update:2")!.payload, /042317/);
+    await handle();
+    assert.deepEqual(calls.filter((call) => call.method === "deleteMessage").map((call) => call.payload), [{ chat_id: "-42", message_id: 11 }]);
+    assert.equal(text("update:2:approval:%")[0].text, APPROVAL_TEXT.bareCodeElsewhere);
+    const followUps = store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'update:3:%'").get() as { n: number };
+    assert.equal(followUps.n, 0, "anything else in the private chat is ignored");
+    assert.equal(h.cc.verifies.length, 0);
+
+    store.ingest([{ update_id: 4, message: { message_id: 13, chat: direct, from: { id: 9 }, date: 3, text: "042317",
+      reply_to_message: { message_id: 77, from: { id: BOT, is_bot: true }, text: PROMPT } } }]);
+    assert.doesNotMatch(store.row("update:4")!.payload, /042317/);
+    await handle();
+    assert.deepEqual(h.cc.verifies, [{ challenge_id: "ch_1", code: "042317" }]);
+    assert.deepEqual(calls.filter((call) => call.method === "deleteMessage").at(-1)!.payload, { chat_id: "9", message_id: 13 });
+    assert.equal(created.length, 1);
+    assert.deepEqual(created[0].approval, { channelKey: KEY, grant: GRANT });
+    assert.deepEqual(text("update:4:approval:%").map((payload) => [payload.chat_id, payload.text]), [
+      ["9", "Code accepted. Approvals open until 12:30 UTC."],
+      ["9", "Lane control queued: rollback. The lease holder will apply it."],
+    ]);
+
+    // An owner who never started the bot is told how, and no code is spent.
+    h.advance(31 * 60_000);
+    unreachable = true;
+    const sends = h.cc.sends.length;
+    store.ingest([{ update_id: 5, message: { message_id: 14, chat: group, from: { id: 9 }, date: 4, text: "/lanes rollback" } }]);
+    await handle();
+    assert.equal(text("update:5:approval:%")[0].text, APPROVAL_TEXT.openPrivateChat);
+    assert.equal(h.cc.sends.length, sends);
+    assert.equal(created.length, 1);
+    assert.doesNotMatch(JSON.stringify(store.db.prepare("SELECT * FROM gateway_queue").all()), /042317/);
+  } finally {
+    setLaneApprovals(undefined);
+    closeDb();
+    rmSync(dir, { recursive: true, force: true });
+    if (backend === undefined) delete process.env.LANES_STATE_BACKEND;
+    else process.env.LANES_STATE_BACKEND = backend;
+  }
+});
+
+test("the Telegram bot prompts a group owner privately", async () => {
+  const h = harness({ OWNER_CHAT_ID: GROUP, OWNER_USER_ID: OWNER });
+  setLaneApprovals(h.approvals);
+  try {
+    const sent: Array<{ chatId?: string; text: string; extra?: Record<string, any> }> = [];
+    const actions: Array<[string, string]> = [];
+    const ctx = {
+      chat: { id: Number(GROUP), type: "supergroup" },
+      from: { id: Number(OWNER), is_bot: false },
+      message: { message_id: 10, text: "/lanes rollback" },
+      botInfo: { id: BOT },
+      reply: async (text: string, extra?: Record<string, any>) => {
+        sent.push({ text, extra });
+        return { message_id: 500 + sent.length };
+      },
+      telegram: {
+        sendChatAction: async (chatId: string, action: string) => {
+          actions.push([chatId, action]);
+          return true;
+        },
+        sendMessage: async (chatId: string, text: string, extra?: Record<string, any>) => {
+          sent.push({ chatId, text, extra });
+          return { message_id: 900 };
+        },
+        deleteMessage: async () => true,
+      },
+    };
+    const store = { createControl: async () => ({ kind: "rollback", lane_id: null }), close: async () => undefined } as unknown as LaneStateStore;
+    await handleDurableLanes(ctx as never, "rollback", { openStore: async () => store });
+    assert.deepEqual(actions, [[OWNER, "typing"]]);
+    assert.deepEqual(sent, [
+      { chatId: OWNER, text: PROMPT, extra: { reply_markup: { force_reply: true } } },
+      { text: APPROVAL_TEXT.promptSentPrivately, extra: undefined },
+    ]);
+  } finally {
+    setLaneApprovals(undefined);
   }
 });

@@ -16,7 +16,7 @@ import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import type { ConductorApiProject } from "../integrations/conductor-api.js";
 import type { RepoTopic, Workspace } from "../types/index.js";
 import type { LaneStateStore } from "../lanes/state-store.js";
-import { approvalMessageFrom, isWithheldApprovalMessage, laneApprovals, takeWithheldApprovalText, type ApprovalChat } from "../bot/lane-approvals.js";
+import { approvalMessageFrom, isRelayed, isWithheldApprovalMessage, laneApprovals, takeWithheldApprovalText, type ApprovalChat } from "../bot/lane-approvals.js";
 
 /** Telegram stamps `date` in seconds; one pasted list lands inside this window. */
 const BURST_SECONDS = 2;
@@ -122,18 +122,21 @@ export class CloudCommands {
     const msg = update.message ?? callback?.message;
     const from = callback?.from ?? msg?.from;
     if (!msg || (this.ownerUserId && String(from?.id) !== this.ownerUserId)) return;
+    // A possible lane approval code was stored without its text. Wherever the gateway reads it (the owner chat, the
+    // synced group, or the owner's private chat when the owner chat is a group) it goes to the approval flow and
+    // nowhere else. Anything else from that private chat is still ignored below.
+    if (!callback && isWithheldApprovalMessage(msg) && this.readsForApproval(msg)) {
+      const chatId = String(msg.chat.id);
+      const message = approvalMessageFrom(msg, this.store.get<number>("telegram-bot-id"),
+        { text: takeWithheldApprovalText(chatId, msg.message_id), withheld: true });
+      if (message) await laneApprovals().handleReply(this.approvalChat(row, msg, from, chatId, msg.message_thread_id), message);
+      return;
+    }
     const syncedTarget = this.syncChatId && String(msg.chat?.id) === this.syncChatId && msg.message_thread_id
       ? getWorkspaceByThreadId(this.syncChatId, msg.message_thread_id) : undefined;
     if (String(msg.chat?.id) !== this.ownerChatId && !(this.ownerUserId && syncedTarget && this.store.get(`cloud-synced:${syncedTarget.id}`))) return;
     const chatId = String(msg.chat.id);
     const threadId = msg.message_thread_id;
-    // A possible lane approval code was stored without its text. It goes to the approval flow and nowhere else.
-    if (!callback && isWithheldApprovalMessage(msg)) {
-      const message = approvalMessageFrom(msg, this.store.get<number>("telegram-bot-id"),
-        { text: takeWithheldApprovalText(chatId, msg.message_id), withheld: true });
-      if (message) await laneApprovals().handleReply(this.approvalChat(row, msg, from, chatId, threadId), message);
-      return;
-    }
     // An album is one message: its first update handles every file and the caption, wherever that caption sits.
     let messages: any[] = [msg];
     let late: { joined?: { trackedId: string; sessionId?: string } } | undefined;
@@ -503,6 +506,15 @@ export class CloudCommands {
     return {
       chatId,
       userId: from?.id === undefined ? undefined : String(from.id),
+      relayed: isRelayed(msg),
+      reachPrivately: async (userId: string) => {
+        await this.telegram("sendChatAction", { chat_id: userId, action: "typing" });
+      },
+      promptPrivately: async (userId: string, text: string) => {
+        const sent = await this.telegram("sendMessage", { chat_id: userId, text, reply_markup: { force_reply: true },
+          link_preview_options: { is_disabled: true } });
+        return Number(sent?.message_id);
+      },
       reply: async (text: string) => {
         enqueueText(this.store, `${row.id}:approval:${part++}`, chatId, text, { threadId, priority: 0, silent: true });
       },
@@ -516,6 +528,14 @@ export class CloudCommands {
         await this.telegram("deleteMessage", { chat_id: chatId, message_id: messageId });
       },
     };
+  }
+
+  /** Chats where a withheld approval message is answered: never a foreign chat, where the gateway stays silent. */
+  private readsForApproval(msg: any): boolean {
+    const chatId = String(msg.chat?.id);
+    if (chatId === this.ownerChatId || (this.syncChatId !== undefined && chatId === this.syncChatId)) return true;
+    // A group owner answers the prompt in their private chat with the bot, whose id is their own.
+    return this.ownerChatId.startsWith("-") && !!this.ownerUserId && msg.chat?.type === "private" && chatId === this.ownerUserId;
   }
 
   /** `/ping` is a liveness check in its own lane, so it reports only what an earlier command already learned. */

@@ -3,12 +3,15 @@
  * are approved with an emailed code: the standardized Belong OTP flow.
  *
  * A control from the owner with no live grant asks Command Center to email a
- * code, posts a prompt in the owner chat, and waits. Only the owner's reply to
- * that prompt consisting of exactly six digits is relayed for verification. The
- * code message is then deleted (best effort), the grant is kept in memory, and
- * the waiting controls run with the two approval headers. Later controls inside
- * the grant run directly; a 401 asking for a fresh code drops the grant and asks
- * again. Codes and grants are never written to disk or logs.
+ * code, posts a prompt in the owner chat (in the owner's private chat with the
+ * bot when the owner chat is a group, where other bots can read everything),
+ * and waits. Only the owner's own reply to that prompt consisting of exactly six
+ * digits is relayed for verification. The code message is then deleted (best
+ * effort), the grant is kept in memory, and the waiting controls run with the
+ * two approval headers. Later controls inside the grant run directly; a 401
+ * asking for a fresh code drops the grant and asks again. Anything shaped like
+ * a code is kept out of storage, routing and logs wherever the bot reads it.
+ * Codes and grants are never written to disk or logs.
  */
 import { createHash } from "node:crypto";
 import type { Context } from "telegraf";
@@ -30,11 +33,17 @@ const DELETE_RETRY_MS = 500;
 /** The chat a control or a code reply came from, as the approval flow needs it. */
 export interface ApprovalChat {
   chatId: string;
-  /** The Telegram user who sent the message. */
+  /** The account that sent the message. */
   userId?: string;
+  /** Forwarded, sent through an inline bot or on behalf of a chat: never the owner, whoever pressed send. */
+  relayed?: boolean;
   reply(text: string): Promise<void>;
   /** Posts the code prompt as a forced reply to the triggering message; returns its message id. */
   prompt(text: string): Promise<number>;
+  /** Fails unless the bot can write to this user's private chat, that is, the user has started it. */
+  reachPrivately?(userId: string): Promise<void>;
+  /** Posts the code prompt in this user's private chat with the bot; returns its message id. */
+  promptPrivately?(userId: string, text: string): Promise<number>;
   deleteMessage(messageId: number): Promise<void>;
 }
 
@@ -49,6 +58,8 @@ export interface ApprovalMessage {
   replyToMessageId?: number;
   /** It replies to one of this bot's approval prompts, current or not. */
   repliesToPrompt: boolean;
+  /** Forwarded, sent through an inline bot or on behalf of a chat. */
+  relayed?: boolean;
   /** Durable ingestion kept its text out of storage, so nothing else may handle it. */
   withheld?: boolean;
 }
@@ -113,6 +124,15 @@ export const APPROVAL_TEXT = {
   bareCode: "To approve, reply to the approval prompt with the code. That message was not used.",
   heldWhileWaiting:
     "Messages with digits are held while an approval code is awaited, so this one was not sent anywhere. Send it again after replying to the approval prompt with the code.",
+  bareCodeElsewhere:
+    "To approve, reply to the approval prompt in your private chat with this bot. That message was not used.",
+  sixDigits:
+    "That message holds six digits in a row, which could be an approval code, so it was removed and not sent anywhere. Send it again without six digits in a row.",
+  relayed: "A forwarded message, or one sent through another bot, never counts as an approval code. That message was not used.",
+  openPrivateChat: "To approve, open a private chat with this bot, send /start, then send the lane control again.",
+  privateChatUnavailable:
+    "Telegram did not let me reach your private chat just now. Nothing was applied; try again shortly.",
+  promptSentPrivately: "The approval prompt is in your private chat with this bot.",
   stale: "That approval request is no longer pending. Send the lane control again for a new code.",
   alreadyOpen: (until: string) => `Approvals are already open until ${until} UTC. No code is needed.`,
   deleteFailed: "Telegram did not let me delete your code message. Delete it yourself.",
@@ -149,7 +169,7 @@ export class LaneApprovals {
     await this.exclusive(async () => {
       const ready = this.ready();
       if ("problem" in ready) return say(chat, ready.problem);
-      if (chat.userId !== ready.ownerUserId) return say(chat, APPROVAL_TEXT.ownerOnly);
+      if (chat.userId !== ready.ownerUserId || chat.relayed) return say(chat, APPROVAL_TEXT.ownerOnly);
       if (chat.chatId !== ready.ownerChatId) return say(chat, APPROVAL_TEXT.ownerChatOnly);
       const approval = ready.client.approval();
       if (approval) return this.run(chat, ready, [control], approval, false);
@@ -165,24 +185,18 @@ export class LaneApprovals {
     if (message.withheld) return true;
     // A command is never a code, even sent as a reply to the prompt.
     if (message.text?.trimStart().startsWith("/")) return false;
-    // Anything that answers an approval prompt, of any kind, is the flow's.
+    // Anything that answers an approval prompt, of any kind and from anyone, is the flow's.
     if (message.repliesToPrompt) return true;
     const pending = this.pending;
-    if (pending && chat.chatId === pending.chatId) {
-      if (message.replyToMessageId === pending.promptMessageId) return true;
-      // While a code is awaited, any digits the owner sends may be that code in another shape.
-      if (chat.userId === pending.userId && message.text !== undefined && DIGIT.test(message.text)) return true;
-    }
-    // Six digits alone from the owner are a code, even after a restart forgot asking for one.
+    if (pending && chat.chatId === pending.chatId && message.replyToMessageId === pending.promptMessageId) return true;
+    // From here on only the owner's account counts, forwarded or relayed messages included: they can
+    // never approve, but a code they carry must not slip through either.
     const owner = ownerIdentity(this.env()).userId;
-    return (
-      owner !== undefined &&
-      chat.userId === owner &&
-      message.replyToMessageId === undefined &&
-      !message.media &&
-      message.text !== undefined &&
-      APPROVAL_CODE_PATTERN.test(message.text.trim())
-    );
+    if (owner === undefined || chat.userId !== owner || message.text === undefined) return false;
+    // Six digits in a row, alone or in a sentence, text or caption, in any chat, pending or not.
+    if (CODE_RUN.test(message.text)) return true;
+    // While a code is awaited, any digits the owner sends there may be that code in another shape.
+    return !!pending && chat.chatId === pending.chatId && DIGIT.test(message.text);
   }
 
   /** Handles a possible code reply. Returns false when the message is not the flow's. */
@@ -200,53 +214,59 @@ export class LaneApprovals {
 
   private async answer(chat: ApprovalChat, message: ApprovalMessage): Promise<void> {
     const owner = ownerIdentity(this.env());
-    // Only the owner's messages count. Anyone else's reply is dropped unread.
+    // Anyone else's message is dropped unread; it is not ours to delete.
     if (!owner.userId || chat.userId !== owner.userId) return;
+    const relayed = chat.relayed === true || message.relayed === true;
     const pending = this.pending;
     const text = message.text?.trim();
-    const bound =
+    const toCurrentPrompt =
       !!pending && chat.chatId === pending.chatId && message.replyToMessageId === pending.promptMessageId;
-    const answersPrompt = bound || message.repliesToPrompt;
-    // A reply to an approval prompt is removed whatever it holds; anything else only when it could hold a code.
-    const remove = (): Promise<boolean> =>
-      answersPrompt || couldHoldCode(text) ? this.removeCode(chat, message.messageId) : Promise.resolve(false);
-    if (!pending || !bound) {
-      await remove();
-      const exactCode = !message.media && text !== undefined && APPROVAL_CODE_PATTERN.test(text);
-      // Held only because it carried digits while a code was awaited.
-      if (!answersPrompt && !exactCode && text !== undefined) return say(chat, APPROVAL_TEXT.heldWhileWaiting);
-      // Typed without replying, or as a reply to an older prompt, while a code is awaited.
-      if (pending && chat.chatId === pending.chatId && this.now() < pending.expiresAt) {
-        return say(chat, APPROVAL_TEXT.bareCode);
+    const answersPrompt = toCurrentPrompt || message.repliesToPrompt;
+    // Removed: every reply to a prompt and anything that could hold a code. A message held only
+    // because it carried a digit or two while a code was awaited stays in the chat.
+    const removable = answersPrompt || couldHoldCode(text);
+    const finish = async (reply: string): Promise<void> => {
+      const removed = removable ? await this.removeCode(chat, message.messageId) : true;
+      await say(chat, reply);
+      if (!removed) await say(chat, APPROVAL_TEXT.deleteFailed);
+    };
+    if (relayed) return finish(APPROVAL_TEXT.relayed);
+    if (!pending || !toCurrentPrompt) {
+      const live = !!pending && this.now() < pending.expiresAt;
+      const codeShaped = text === undefined || CODE_RUN.test(text);
+      if (answersPrompt || codeShaped) {
+        if (live && chat.chatId === pending!.chatId) return finish(APPROVAL_TEXT.bareCode);
+        if (live) return finish(APPROVAL_TEXT.bareCodeElsewhere);
+        if (answersPrompt || text === undefined || APPROVAL_CODE_PATTERN.test(text)) {
+          const grantUntil = this.cached?.client.grantExpiresAt();
+          return finish(grantUntil ? APPROVAL_TEXT.alreadyOpen(clock(grantUntil)) : APPROVAL_TEXT.stale);
+        }
+        return finish(APPROVAL_TEXT.sixDigits);
       }
-      const live = this.cached?.client.grantExpiresAt();
-      return say(chat, live ? APPROVAL_TEXT.alreadyOpen(clock(live)) : APPROVAL_TEXT.stale);
+      // Held only because it carried digits while a code was awaited.
+      return finish(APPROVAL_TEXT.heldWhileWaiting);
     }
     if (this.now() >= pending.expiresAt) {
       this.pending = undefined;
-      await remove();
-      return say(chat, APPROVAL_TEXT.expired);
+      return finish(APPROVAL_TEXT.expired);
     }
     if (message.media || text === undefined || !APPROVAL_CODE_PATTERN.test(text)) {
       // A caption, a file, lost text or a code in another shape is never relayed.
-      await remove();
-      return say(chat, APPROVAL_TEXT.digitsOnly);
+      return finish(APPROVAL_TEXT.digitsOnly);
     }
     const ready = this.ready();
     if ("problem" in ready || this.pending !== pending) {
       // The key or owner changed under this code; it belongs to the old setup.
-      await this.removeCode(chat, message.messageId);
-      return say(chat, "problem" in ready ? ready.problem : APPROVAL_TEXT.stale);
+      return finish("problem" in ready ? ready.problem : APPROVAL_TEXT.stale);
     }
     let grantExpiresAt: number;
     try {
       ({ expiresAt: grantExpiresAt } = await ready.client.verifyCode(pending.challengeId, text));
     } catch (error) {
-      await this.removeCode(chat, message.messageId);
       if (error instanceof ApprovalChannelError && (error.reason === "expired" || error.reason === "attempts")) {
         this.pending = undefined;
       }
-      return say(chat, verifyRefusalText(error));
+      return finish(verifyRefusalText(error));
     }
     this.pending = undefined;
     const deleted = await this.removeCode(chat, message.messageId);
@@ -269,29 +289,43 @@ export class LaneApprovals {
       this.pending = undefined;
       if (pending.controls.length) await say(chat, APPROVAL_TEXT.expiredUnused(pending.controls.length));
     }
+    // Other bots in a group can read and keep every message, so a group owner gets the prompt,
+    // and answers it, in their private chat with this bot. That chat is checked before a code is spent.
+    const privately = ready.ownerChatId !== ready.ownerUserId;
+    if (privately) {
+      if (!chat.reachPrivately || !chat.promptPrivately) return say(chat, APPROVAL_TEXT.openPrivateChat);
+      try {
+        await chat.reachPrivately(ready.ownerUserId);
+      } catch (error) {
+        return say(chat, privateChatUnreachable(error) ? APPROVAL_TEXT.openPrivateChat : APPROVAL_TEXT.privateChatUnavailable);
+      }
+    }
     let challenge: ApprovalChallenge;
     try {
       challenge = await ready.client.sendCode();
     } catch (error) {
       return say(chat, sendRefusalText(error));
     }
+    const promptText = APPROVAL_TEXT.prompt(challenge.emailHint, Math.max(1, Math.round(challenge.expiresInSeconds / 60)));
     let promptMessageId: number;
     try {
-      promptMessageId = await chat.prompt(
-        APPROVAL_TEXT.prompt(challenge.emailHint, Math.max(1, Math.round(challenge.expiresInSeconds / 60)))
-      );
+      promptMessageId = privately
+        ? await chat.promptPrivately!(ready.ownerUserId, promptText)
+        : await chat.prompt(promptText);
       if (!Number.isSafeInteger(promptMessageId) || promptMessageId <= 0) throw new Error("no prompt id");
-    } catch {
-      return say(chat, APPROVAL_TEXT.promptFailed);
+    } catch (error) {
+      return say(chat, privately && privateChatUnreachable(error) ? APPROVAL_TEXT.openPrivateChat : APPROVAL_TEXT.promptFailed);
     }
     this.pending = {
-      chatId: chat.chatId,
+      // A user's private chat with the bot has the user's own id.
+      chatId: privately ? ready.ownerUserId : chat.chatId,
       userId: ready.ownerUserId,
       promptMessageId,
       challengeId: challenge.challengeId,
       expiresAt: challenge.expiresAt,
       controls: [...controls],
     };
+    if (privately) await say(chat, APPROVAL_TEXT.promptSentPrivately);
   }
 
   /** Submits controls in order. Each is applied at most once; a stale grant asks for a new code. */
@@ -422,8 +456,33 @@ export function approvalMessageFrom(
     media: typeof message.text !== "string",
     replyToMessageId: replyTarget(message),
     repliesToPrompt: isApprovalPrompt(message.reply_to_message, botId),
+    relayed: isRelayed(message),
     withheld: overrides.withheld,
   };
+}
+
+/** Forwarded, sent through an inline bot, or posted on behalf of a chat: never its sender's own words. */
+export function isRelayed(message: TelegramMessageLike | undefined): boolean {
+  if (!message) return false;
+  return (
+    ["forward_origin", "forward_from", "forward_from_chat", "forward_sender_name", "forward_date", "via_bot", "sender_chat"].some(
+      (field) => message[field] !== undefined && message[field] !== null
+    ) || message.is_automatic_forward === true
+  );
+}
+
+/** Telegram's refusals for a user who never started the bot, blocked it, or does not exist. */
+function privateChatUnreachable(error: unknown): boolean {
+  const failure = error as { code?: unknown; description?: unknown; message?: unknown; response?: { error_code?: unknown; description?: unknown } } | undefined;
+  const code = failure?.response?.error_code ?? failure?.code;
+  const description = String(failure?.response?.description ?? failure?.description ?? failure?.message ?? "");
+  return code === 403 || /chat not found|user not found|can't initiate conversation|blocked by the user|deactivated/i.test(description);
+}
+
+/** Whether the approval flow owns this Telegraf message; the owner's private chat lets only that through. */
+export function claimedForApproval(ctx: Context): boolean {
+  const message = approvalMessageFrom(ctx.message as TelegramMessageLike | undefined, ctx.botInfo?.id);
+  return !!message && laneApprovals().claims({ chatId: String(ctx.chat?.id ?? ""), userId: ctx.from?.id === undefined ? undefined : String(ctx.from.id) }, message);
 }
 
 function ownText(message: TelegramMessageLike): string | undefined {
@@ -446,8 +505,16 @@ export function telegrafApprovalChat(ctx: Context): ApprovalChat {
   return {
     chatId,
     userId: ctx.from?.id === undefined ? undefined : String(ctx.from.id),
+    relayed: isRelayed(ctx.message as TelegramMessageLike | undefined),
     reply: async (text) => {
       await ctx.reply(text);
+    },
+    reachPrivately: async (userId) => {
+      await ctx.telegram.sendChatAction(userId, "typing");
+    },
+    promptPrivately: async (userId, text) => {
+      const sent = await ctx.telegram.sendMessage(userId, text, { reply_markup: { force_reply: true } });
+      return sent.message_id;
     },
     prompt: async (text) => {
       const sent = await ctx.reply(text, {
@@ -509,6 +576,8 @@ export function loggableMessagePreview(message: TelegramMessageLike | undefined)
 }
 
 const DIGIT = /\p{Nd}/u;
+/** Exactly six digits in a row, in any script: the shape of an approval code, alone or in a sentence. */
+const CODE_RUN = /(?<!\p{Nd})\p{Nd}{6}(?!\p{Nd})/u;
 const DIGITS = /\p{Nd}/gu;
 
 /** Lost text, or six or more decimal digits in any script, may be a code worth deleting. */
