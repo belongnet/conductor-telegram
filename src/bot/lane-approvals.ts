@@ -41,8 +41,11 @@ export interface ApprovalChat {
 /** A message that may answer an approval prompt. */
 export interface ApprovalMessage {
   messageId: number;
-  /** Undefined when withheld text did not survive a restart. */
+  /** Its text or caption. Undefined when withheld text did not survive a restart. */
   text: string | undefined;
+  /** A photo, file, voice note or other attachment rather than plain text. */
+  media?: boolean;
+  /** The message it replies to; a forum topic's opening message does not count. */
   replyToMessageId?: number;
   /** It replies to one of this bot's approval prompts, current or not. */
   repliesToPrompt: boolean;
@@ -108,6 +111,8 @@ export const APPROVAL_TEXT = {
     "The approval service did not answer. Nothing was applied yet; reply to the approval prompt with the code again.",
   digitsOnly: "Reply with only the 6-digit code.",
   bareCode: "To approve, reply to the approval prompt with the code. That message was not used.",
+  heldWhileWaiting:
+    "Messages with digits are held while an approval code is awaited, so this one was not sent anywhere. Send it again after replying to the approval prompt with the code.",
   stale: "That approval request is no longer pending. Send the lane control again for a new code.",
   alreadyOpen: (until: string) => `Approvals are already open until ${until} UTC. No code is needed.`,
   deleteFailed: "Telegram did not let me delete your code message. Delete it yourself.",
@@ -117,7 +122,7 @@ export const APPROVAL_TEXT = {
   notSetUp: (problem: string) => `Lane approvals are not set up: ${problem}. Nothing was applied.`,
   controlRefused: (label: string) =>
     `Command Center refused the approval for lane control ${label}. Check BELONG_APPROVAL_CHANNEL_KEY. Nothing was applied.`,
-  controlFailed: (label: string, reason: string) => `Lane control ${label} was not applied: ${reason}`,
+  controlFailed: (label: string, reason: string) => `Lane control ${label} was not applied: ${reason}.`,
   freshRefused: (count: number) =>
     `Command Center asked for a fresh code again, so ${count} lane ${count === 1 ? "control was" : "controls were"} not applied. Send the lane control again.`,
   unexpected: "Lane approval stopped on an unexpected error. Check /lanes before trying again.",
@@ -160,13 +165,21 @@ export class LaneApprovals {
     if (message.withheld) return true;
     // A command is never a code, even sent as a reply to the prompt.
     if (message.text?.trimStart().startsWith("/")) return false;
+    // Anything that answers an approval prompt, of any kind, is the flow's.
     if (message.repliesToPrompt) return true;
     const pending = this.pending;
-    if (!pending || chat.chatId !== pending.chatId) return false;
-    if (message.replyToMessageId === pending.promptMessageId) return true;
-    // A code typed without replying while one is awaited is still a code.
+    if (pending && chat.chatId === pending.chatId) {
+      if (message.replyToMessageId === pending.promptMessageId) return true;
+      // While a code is awaited, any digits the owner sends may be that code in another shape.
+      if (chat.userId === pending.userId && message.text !== undefined && DIGIT.test(message.text)) return true;
+    }
+    // Six digits alone from the owner are a code, even after a restart forgot asking for one.
+    const owner = ownerIdentity(this.env()).userId;
     return (
-      chat.userId === pending.userId &&
+      owner !== undefined &&
+      chat.userId === owner &&
+      message.replyToMessageId === undefined &&
+      !message.media &&
       message.text !== undefined &&
       APPROVAL_CODE_PATTERN.test(message.text.trim())
     );
@@ -193,21 +206,30 @@ export class LaneApprovals {
     const text = message.text?.trim();
     const bound =
       !!pending && chat.chatId === pending.chatId && message.replyToMessageId === pending.promptMessageId;
-    if (!pending || !bound || text === undefined) {
-      if (mayHoldCode(text)) await this.removeCode(chat, message.messageId);
+    const answersPrompt = bound || message.repliesToPrompt;
+    // A reply to an approval prompt is removed whatever it holds; anything else only when it could hold a code.
+    const remove = (): Promise<boolean> =>
+      answersPrompt || couldHoldCode(text) ? this.removeCode(chat, message.messageId) : Promise.resolve(false);
+    if (!pending || !bound) {
+      await remove();
+      const exactCode = !message.media && text !== undefined && APPROVAL_CODE_PATTERN.test(text);
+      // Held only because it carried digits while a code was awaited.
+      if (!answersPrompt && !exactCode && text !== undefined) return say(chat, APPROVAL_TEXT.heldWhileWaiting);
       // Typed without replying, or as a reply to an older prompt, while a code is awaited.
-      if (pending && text !== undefined && this.now() < pending.expiresAt) return say(chat, APPROVAL_TEXT.bareCode);
+      if (pending && chat.chatId === pending.chatId && this.now() < pending.expiresAt) {
+        return say(chat, APPROVAL_TEXT.bareCode);
+      }
       const live = this.cached?.client.grantExpiresAt();
       return say(chat, live ? APPROVAL_TEXT.alreadyOpen(clock(live)) : APPROVAL_TEXT.stale);
     }
     if (this.now() >= pending.expiresAt) {
       this.pending = undefined;
-      if (mayHoldCode(text)) await this.removeCode(chat, message.messageId);
+      await remove();
       return say(chat, APPROVAL_TEXT.expired);
     }
-    if (!APPROVAL_CODE_PATTERN.test(text)) {
-      // It may still hold the code in some other shape.
-      if (mayHoldCode(text)) await this.removeCode(chat, message.messageId);
+    if (message.media || text === undefined || !APPROVAL_CODE_PATTERN.test(text)) {
+      // A caption, a file, lost text or a code in another shape is never relayed.
+      await remove();
       return say(chat, APPROVAL_TEXT.digitsOnly);
     }
     const ready = this.ready();
@@ -298,10 +320,7 @@ export class LaneApprovals {
           chat,
           error instanceof LaneStateStoreError && error.status === 401
             ? APPROVAL_TEXT.controlRefused(control.label)
-            : APPROVAL_TEXT.controlFailed(
-                control.label,
-                error instanceof LaneStateStoreError ? error.message : "unexpected error"
-              )
+            : APPROVAL_TEXT.controlFailed(control.label, controlFailureReason(error))
         );
         continue;
       }
@@ -372,6 +391,7 @@ export function setLaneApprovals(next: LaneApprovals | undefined): void {
 export interface TelegramMessageLike {
   message_id?: number;
   text?: unknown;
+  caption?: unknown;
   chat?: { id?: number | string };
   from?: { id?: number | string; is_bot?: boolean };
   reply_to_message?: TelegramMessageLike;
@@ -396,16 +416,27 @@ export function approvalMessageFrom(
   overrides: Partial<Pick<ApprovalMessage, "text" | "withheld">> = {}
 ): ApprovalMessage | undefined {
   if (!message || !Number.isSafeInteger(message.message_id)) return undefined;
-  const text = "text" in overrides ? overrides.text : typeof message.text === "string" ? message.text : undefined;
   return {
     messageId: message.message_id!,
-    text,
-    replyToMessageId: Number.isSafeInteger(message.reply_to_message?.message_id)
-      ? message.reply_to_message!.message_id
-      : undefined,
+    text: "text" in overrides ? overrides.text : ownText(message),
+    media: typeof message.text !== "string",
+    replyToMessageId: replyTarget(message),
     repliesToPrompt: isApprovalPrompt(message.reply_to_message, botId),
     withheld: overrides.withheld,
   };
+}
+
+function ownText(message: TelegramMessageLike): string | undefined {
+  return typeof message.text === "string" ? message.text : typeof message.caption === "string" ? message.caption : undefined;
+}
+
+/** In a forum topic every message points at the topic's opening message; that is not a reply. */
+function replyTarget(message: TelegramMessageLike): number | undefined {
+  const reply = message.reply_to_message;
+  if (!reply || !Number.isSafeInteger(reply.message_id)) return undefined;
+  if (reply.forum_topic_created !== undefined) return undefined;
+  if (message.is_topic_message === true && reply.message_id === message.message_thread_id) return undefined;
+  return reply.message_id;
 }
 
 /** The approval flow's view of a Telegraf chat. */
@@ -439,16 +470,22 @@ export const WITHHELD_APPROVAL_TEXT = "[approval reply withheld]";
 const withheld = new Map<string, { text: string; at: number }>();
 
 /**
- * Returns the update to persist. A message that may carry an approval code is
- * stored without its text, which stays in this process's memory for its handler.
+ * Returns the update to persist. A message that may carry an approval code, of
+ * any kind, is stored without its text or caption, which stay in this process's
+ * memory for its handler.
  */
 export function withholdApprovalText<T extends { [key: string]: unknown }>(update: T, botId?: number, now = Date.now()): T {
   const message = update.message as TelegramMessageLike | undefined;
-  if (!message || typeof message.text !== "string" || !laneApprovals().mayCarryCode(message, botId)) return update;
+  if (!message || !laneApprovals().mayCarryCode(message, botId)) return update;
   for (const [key, entry] of withheld) if (now - entry.at > WITHHELD_TTL_MS) withheld.delete(key);
-  withheld.set(withheldKey(message.chat?.id, message.message_id), { text: message.text, at: now });
+  const original = ownText(message);
+  if (original !== undefined) withheld.set(withheldKey(message.chat?.id, message.message_id), { text: original, at: now });
   while (withheld.size > WITHHELD_LIMIT) withheld.delete(withheld.keys().next().value!);
-  return { ...update, message: { ...message, text: WITHHELD_APPROVAL_TEXT, [WITHHELD_FIELD]: true } };
+  const { text, caption: _caption, entities: _entities, caption_entities: _captionEntities, ...rest } = message;
+  return {
+    ...update,
+    message: { ...rest, ...(typeof text === "string" ? { text: WITHHELD_APPROVAL_TEXT } : {}), [WITHHELD_FIELD]: true },
+  };
 }
 
 export function isWithheldApprovalMessage(message: unknown): boolean {
@@ -463,21 +500,33 @@ export function takeWithheldApprovalText(chatId: unknown, messageId: unknown, no
   return entry && now - entry.at <= WITHHELD_TTL_MS ? entry.text : undefined;
 }
 
-/** What the update log may show of a message: nothing that could be a code. */
+/** What the update log may show of a message: never a digit, so never a code in any shape. */
 export function loggableMessagePreview(message: TelegramMessageLike | undefined): string {
   if (!message) return "";
-  if (typeof message.text === "string") {
-    if (/(?:^|\D)\d{6}(?:\D|$)/.test(message.text) || isApprovalPrompt(message.reply_to_message)) {
-      return "[text withheld]";
-    }
-    return message.text.slice(0, 50);
-  }
+  if (isApprovalPrompt(message.reply_to_message)) return "[text withheld]";
+  if (typeof message.text === "string") return message.text.slice(0, 50).replace(DIGITS, "#");
   return message.photo ? "[photo]" : message.voice ? "[voice]" : "";
 }
 
-/** Lost text, or any decimal digit in any script, may be a code worth deleting. */
-function mayHoldCode(text: string | undefined): boolean {
-  return text === undefined || /\p{Nd}/u.test(text);
+const DIGIT = /\p{Nd}/u;
+const DIGITS = /\p{Nd}/gu;
+
+/** Lost text, or six or more decimal digits in any script, may be a code worth deleting. */
+function couldHoldCode(text: string | undefined): boolean {
+  return text === undefined || (text.match(DIGITS)?.length ?? 0) >= 6;
+}
+
+/** Fixed wording by status: Command Center's own words never reach the chat. */
+function controlFailureReason(error: unknown): string {
+  if (!(error instanceof LaneStateStoreError) || error.status === undefined) {
+    return "Command Center did not answer; try again";
+  }
+  if (error.status === 409) return "it conflicts with the current lane state; check /lanes";
+  if (error.status === 400 || error.status === 422) return "Command Center found the request invalid";
+  if (error.status === 403) return "Command Center refused it";
+  if (error.status === 404) return "Command Center did not find what it names";
+  if (error.status >= 500) return "Command Center is unavailable; try again shortly";
+  return `Command Center refused it (HTTP ${error.status})`;
 }
 
 function withheldKey(chatId: unknown, messageId: unknown): string {

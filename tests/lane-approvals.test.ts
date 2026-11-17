@@ -222,7 +222,8 @@ test("a control waits for the owner's six-digit reply to the prompt, then runs o
   const deletesBefore = owner.deletes.length;
   assert.equal(await h.approvals.handleReply(owner, words.view), true);
   assert.equal(owner.replies.at(-1), APPROVAL_TEXT.digitsOnly);
-  assert.equal(owner.deletes.length, deletesBefore, "a reply with no digit at all holds no code and stays");
+  assert.equal(owner.deletes.length, deletesBefore + 1);
+  assert.equal(owner.deletes.at(-1), words.raw.message_id, "any reply to the prompt is removed, whatever it holds");
 
   // Ordinary conversation and commands are not the flow's.
   assert.equal(await h.approvals.handleReply(owner, message("hello").view), false);
@@ -444,9 +445,10 @@ test("a reply to a prompt from before a restart is recognised and refused", asyn
   assert.equal(owner.replies.at(-1), APPROVAL_TEXT.stale);
   assert.equal(owner.deletes.at(-1), old.raw.message_id);
   assert.equal(h.cc.verifies.length, 0);
-  assert.equal(await h.approvals.handleReply(owner, message("ok", { id: 77 }).view), true);
+  const ok = message("ok", { id: 77 });
+  assert.equal(await h.approvals.handleReply(owner, ok.view), true);
   assert.equal(owner.replies.at(-1), APPROVAL_TEXT.stale);
-  assert.deepEqual(owner.deletes, [old.raw.message_id], "only a message that could hold a code is deleted");
+  assert.deepEqual(owner.deletes, [old.raw.message_id, ok.raw.message_id], "every reply to an approval prompt is removed");
 });
 
 test("possible codes are withheld from durable storage and from the update log", () => {
@@ -472,11 +474,93 @@ test("possible codes are withheld from durable storage and from the update log",
   } finally {
     setLaneApprovals(undefined);
   }
-  assert.equal(loggableMessagePreview({ text: "042317" }), "[text withheld]");
-  assert.equal(loggableMessagePreview({ text: "my code 042317 thanks" }), "[text withheld]");
+  assert.equal(loggableMessagePreview({ text: "042317" }), "######");
+  assert.equal(loggableMessagePreview({ text: "my code 04 23 17 thanks" }), "my code ## ## ## thanks");
+  assert.equal(loggableMessagePreview({ text: `code ${String.fromCharCode(0x661, 0x662, 0x663)}` }), "code ###", "any script's digits");
   assert.equal(loggableMessagePreview(message("abc", { id: 1 }).raw), "[text withheld]");
-  assert.equal(loggableMessagePreview({ text: "PR 12345 merged" }), "PR 12345 merged");
+  assert.equal(loggableMessagePreview({ photo: [{}], caption: "123456", reply_to_message: message("x", { id: 1 }).raw.reply_to_message }), "[text withheld]");
+  assert.equal(loggableMessagePreview({ text: "deploy the fix" }), "deploy the fix");
   assert.equal(loggableMessagePreview({ photo: [{}] }), "[photo]");
+});
+
+test("captions, files and codes in other shapes never leave the approval flow", async () => {
+  const h = harness();
+  const owner = chat();
+  const cutover = control();
+  await h.approvals.submit(owner, cutover);
+  const prompt = owner.promptIds[0];
+  const photo = message("", { id: prompt });
+  photo.raw = { ...photo.raw, text: undefined, photo: [{ file_id: "p" }], caption: "123456" } as never;
+  assert.equal(await h.approvals.handleReply(owner, photo.view), true, "a captioned photo answering the prompt is the flow's");
+  assert.equal(photo.view.media, true);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.digitsOnly);
+  assert.equal(owner.deletes.at(-1), photo.raw.message_id);
+  const file = message("", { id: prompt });
+  file.raw = { ...file.raw, text: undefined, document: { file_id: "d" } } as never;
+  assert.equal(await h.approvals.handleReply(owner, file.view), true);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.digitsOnly);
+  assert.equal(owner.deletes.at(-1), file.raw.message_id);
+  assert.equal(h.cc.verifies.length, 0, "no caption or file is ever relayed as a code");
+
+  // While the code is awaited, anything with digits is held; a message that could hold six of them is removed too.
+  const shaped = message("code: 123456");
+  assert.equal(await h.approvals.handleReply(owner, shaped.view), true);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.heldWhileWaiting);
+  assert.equal(owner.deletes.at(-1), shaped.raw.message_id);
+  const deletes = owner.deletes.length;
+  const ordinary = message("deploy v2 to staging");
+  assert.equal(await h.approvals.handleReply(owner, ordinary.view), true, "held: it carries a digit");
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.heldWhileWaiting);
+  const screenshot = message("");
+  screenshot.raw = { ...screenshot.raw, text: undefined, photo: [{ file_id: "s" }], caption: "screenshot 2" } as never;
+  assert.equal(await h.approvals.handleReply(owner, screenshot.view), true);
+  assert.equal(owner.deletes.length, deletes, "too few digits to be the code, so they stay in the chat");
+  assert.equal(await h.approvals.handleReply(owner, message("deploy now").view), false, "no digits, no hold");
+  assert.equal(await h.approvals.handleReply(chat({ userId: "777" }), message("deploy v2", undefined, "777").view), false, "only the owner's digits");
+
+  await h.approvals.handleReply(owner, message("042317", { id: prompt }).view);
+  assert.equal(cutover.submissions.length, 1);
+  assert.equal(await h.approvals.handleReply(owner, message("deploy v2 to staging").view), false, "nothing is awaited anymore");
+});
+
+test("six digits alone are never routed, even after a restart forgot the request", async () => {
+  const h = harness();
+  const owner = chat();
+  const bare = message("123456");
+  assert.equal(await h.approvals.handleReply(owner, bare.view), true);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.stale);
+  assert.equal(owner.deletes.at(-1), bare.raw.message_id);
+  const topic = message("654321");
+  topic.raw = { ...topic.raw, message_thread_id: 7, is_topic_message: true, reply_to_message: { message_id: 7, forum_topic_created: { name: "repo" } } } as never;
+  assert.equal(await h.approvals.handleReply(owner, topic.view), true, "a forum topic's opening message is not a reply");
+  assert.equal(await h.approvals.handleReply(chat({ userId: "777" }), message("123456", undefined, "777").view), false, "only the owner's");
+  assert.equal(await h.approvals.handleReply(owner, message("123456", { id: 42, prompt: false }).view), false, "an answer to other work stays with it");
+  assert.equal(await h.approvals.handleReply(owner, message("1234567").view), false);
+  const photo = message("");
+  photo.raw = { ...photo.raw, text: undefined, photo: [{ file_id: "p" }], caption: "123456" } as never;
+  assert.equal(await h.approvals.handleReply(owner, photo.view), false, "a captioned photo alone is not a code");
+  assert.equal(h.cc.verifies.length, 0);
+});
+
+test("a refused control is reported in fixed words, never Command Center's own", async () => {
+  const h = harness();
+  const owner = chat();
+  await h.approvals.submit(owner, control("rollback"));
+  await h.approvals.handleReply(owner, message("111111", { id: owner.promptIds[0] }).view);
+  const noisy = "x".repeat(5000);
+  for (const [error, wording] of [
+    [new LaneStateStoreError(`Command Center lane request rejected: ${noisy}`, 409, { detail: noisy }), "it conflicts with the current lane state; check /lanes"],
+    [new LaneStateStoreError("rejected", 400, { detail: noisy }), "Command Center found the request invalid"],
+    [new LaneStateStoreError("rejected", 503, { detail: noisy }), "Command Center is unavailable; try again shortly"],
+    [new LaneStateStoreError("Command Center lane request failed closed: fetch failed"), "Command Center did not answer; try again"],
+    [new LaneStateStoreError("redirect", 307), "Command Center refused it (HTTP 307)"],
+  ] as const) {
+    const cutover = control();
+    cutover.failNext(error);
+    await h.approvals.submit(owner, cutover);
+    assert.equal(owner.replies.at(-1), `Lane control cutover growth-v2-abc was not applied: ${wording}.`);
+  }
+  assert.ok(owner.replies.every((reply) => !reply.includes("xxxxx")), "no detail text reaches the chat");
 });
 
 test("the Telegram bot posts the prompt as a forced reply and intercepts the code before routing", async () => {
@@ -528,16 +612,23 @@ test("the Telegram bot posts the prompt as a forced reply and intercepts the cod
         handlers[event] = handler;
       },
     } as never);
+    // Media handlers are guarded too: a captioned photo answering the prompt is never downloaded or relayed.
+    await handlers.photo(
+      ctx({ message_id: 12, photo: [{ file_id: "secret-shot" }], caption: "042317", reply_to_message: { message_id: 901, from: { id: BOT, is_bot: true }, text: PROMPT } })
+    );
+    assert.deepEqual(h.cc.verifies, []);
+    assert.equal(sent.at(-1)?.text, APPROVAL_TEXT.digitsOnly);
     await handlers.text(
       ctx({ message_id: 11, text: "042317", reply_to_message: { message_id: 901, from: { id: BOT, is_bot: true }, text: PROMPT } })
     );
     assert.deepEqual(h.cc.verifies, [{ challenge_id: "ch_1", code: "042317" }]);
-    assert.deepEqual(deleted, [[OWNER, 11]]);
+    assert.deepEqual(deleted, [[OWNER, 12], [OWNER, 11]]);
     assert.equal(created.length, 1);
     assert.equal(created[0].kind, "rollback");
     assert.deepEqual(created[0].approval, { channelKey: KEY, grant: GRANT });
     assert.equal(created[0].requested_by, `telegram:${OWNER}`);
     assert.deepEqual(sent.slice(1).map((entry) => entry.text), [
+      APPROVAL_TEXT.digitsOnly,
       "Code accepted. Approvals open until 12:30 UTC.",
       "Lane control queued: rollback. The lease holder will apply it.",
     ]);
@@ -606,18 +697,33 @@ test("the cloud gateway never writes an approval code to its database", async ()
     assert.equal(store.row("update:2:action"), undefined);
     assert.match(JSON.parse(store.row("update:2:approval:0:0")!.payload).payload.text, /reply to the approval prompt/);
 
-    store.ingest([{ update_id: 3, message: { message_id: 12, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, text: "042317",
+    // A captioned photo answering the prompt is stored without its caption and never fetched or routed.
+    store.ingest([{ update_id: 3, message: { message_id: 13, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, photo: [{ file_id: "shot" }],
+      caption: "999999", caption_entities: [], reply_to_message: { message_id: 77, from: { id: BOT, is_bot: true }, text: PROMPT } } }]);
+    assert.doesNotMatch(store.row("update:3")!.payload, /999999|caption/);
+    // Ordinary words with a digit are held while the code is awaited, not routed.
+    store.ingest([{ update_id: 4, message: { message_id: 14, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, text: "deploy v2 now" } }]);
+    assert.doesNotMatch(store.row("update:4")!.payload, /deploy v2/);
+    await handle();
+    await handle(); // one update per conversation per pass, in order
+    assert.equal(store.row("update:3:media"), undefined, "the photo is never fetched");
+    assert.equal(store.row("update:4:route"), undefined, "held, not routed");
+    assert.equal(JSON.parse(store.row("update:3:approval:0:0")!.payload).payload.text, APPROVAL_TEXT.digitsOnly);
+    assert.match(JSON.parse(store.row("update:4:approval:0:0")!.payload).payload.text, /^Messages with digits are held/);
+
+    store.ingest([{ update_id: 5, message: { message_id: 12, chat: { id: 42, type: "private" }, from: { id: 9 }, date: 3, text: "042317",
       reply_to_message: { message_id: 77, from: { id: BOT, is_bot: true }, text: PROMPT } } }]);
-    assert.doesNotMatch(store.row("update:3")!.payload, /042317/, "the stored update has no code");
+    assert.doesNotMatch(store.row("update:5")!.payload, /042317/, "the stored update has no code");
     await handle();
     assert.deepEqual(h.cc.verifies, [{ challenge_id: "ch_1", code: "042317" }]);
     assert.deepEqual(calls.filter((call) => call.method === "deleteMessage").map((call) => call.payload), [
       { chat_id: "42", message_id: 11 },
+      { chat_id: "42", message_id: 13 },
       { chat_id: "42", message_id: 12 },
-    ]);
+    ], "the words with one digit stay in the chat; everything that could hold the code is removed");
     assert.equal(created.length, 1);
     assert.deepEqual(created[0].approval, { channelKey: KEY, grant: GRANT });
-    const texts = (store.db.prepare("SELECT id,payload FROM gateway_queue WHERE id LIKE 'update:3:approval:%' ORDER BY id").all() as Array<{ payload: string }>)
+    const texts = (store.db.prepare("SELECT id,payload FROM gateway_queue WHERE id LIKE 'update:5:approval:%' ORDER BY id").all() as Array<{ payload: string }>)
       .map((row) => JSON.parse(row.payload).payload.text);
     assert.deepEqual(texts, [
       "Code accepted. Approvals open until 12:30 UTC.",
@@ -627,7 +733,7 @@ test("the cloud gateway never writes an approval code to its database", async ()
       store.db.prepare("SELECT * FROM gateway_queue").all(),
       store.db.prepare("SELECT * FROM gateway_state").all(),
     ]);
-    assert.doesNotMatch(everything, /042317|555555/, "no code in any table");
+    assert.doesNotMatch(everything, /042317|555555|999999|deploy v2/, "no code, caption or held text in any table");
     assert.ok(!everything.includes(GRANT) && !everything.includes(KEY), "no grant or key in any table");
   } finally {
     setLaneApprovals(undefined);
