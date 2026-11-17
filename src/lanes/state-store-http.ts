@@ -17,9 +17,11 @@ import type {
   NotificationClaimInput,
   TransitionRunInput,
   UpdateAttemptInput,
+  LaneHumanApproval,
 } from "./state-store.js";
 import { LaneStateStoreError } from "./state-store.js";
 import type { LaneManifestV2 } from "./manifest.js";
+import { approvalHeaders } from "./approval-channel.js";
 
 type HttpStoreOptions = {
   baseUrl: string;
@@ -46,14 +48,15 @@ export class HttpLaneStateStore implements LaneStateStore {
     method: "GET" | "POST",
     endpoint: string,
     body?: Record<string, unknown>,
-    approvalKey?: string
+    approval?: LaneHumanApproval
   ): Promise<T> {
     const headers: Record<string, string> = {
       Accept: "application/json",
       "x-api-key": this.apiKey,
     };
     if (body !== undefined) headers["content-type"] = "application/json";
-    if (approvalKey) headers["x-belong-approval-key"] = approvalKey;
+    // Human proof travels only on human-gated controls, never on worker calls.
+    if (approval) Object.assign(headers, approvalHeaders(approval));
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.baseUrl}${endpoint}`, {
@@ -274,14 +277,14 @@ export class HttpLaneStateStore implements LaneStateStore {
     lane_id?: string;
     requested_by: string;
     payload?: Record<string, unknown>;
-    approvalKey?: string;
+    approval?: LaneHumanApproval;
   }): Promise<LaneControlRecord> {
-    const { approvalKey, ...payload } = input;
+    const { approval, ...control } = input;
     return this.request(
       "POST",
       "/api/conductor/lanes/controls",
-      { ...payload, payload: input.payload ?? {} },
-      approvalKey
+      { ...control, payload: input.payload ?? {} },
+      approval
     );
   }
 

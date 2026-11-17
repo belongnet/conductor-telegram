@@ -28,6 +28,7 @@ import {
   retirementEvidenceProvesCompletion,
 } from "../lanes/state-store.js";
 import { formatLaneStatus, runLaneWorker } from "../lanes/worker.js";
+import { withTerminalApproval } from "./terminal-approval.js";
 
 function flagValue(args: string[], flag: string): string | null {
   const index = args.indexOf(flag);
@@ -347,17 +348,20 @@ async function queueLaneControl(
       canonicalManifestJson(payload)
     );
     const human = ["release", "retire", "validate"].includes(command);
-    const created = await store.createControl({
+    const request = {
       control_id: idempotencyKey,
       idempotency_key: idempotencyKey,
       kind,
       lane_id: laneId,
       requested_by: `cli:${os.hostname()}`,
       payload,
-      approvalKey: human
-        ? process.env.BELONG_HUMAN_APPROVAL_KEY?.trim()
-        : undefined,
-    });
+    };
+    // Asked only after every local check passed, so a refused command costs no code.
+    const created = human
+      ? await withTerminalApproval(`lanes ${command}`, (approval) =>
+          store.createControl({ ...request, approval })
+        )
+      : await store.createControl(request);
     console.log(JSON.stringify(created, null, 2));
   } finally {
     await store.close();

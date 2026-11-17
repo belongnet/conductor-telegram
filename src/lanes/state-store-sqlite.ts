@@ -19,6 +19,7 @@ import type {
   LaneActionRecordV2,
   LaneAttemptRecord,
   LaneControlRecord,
+  LaneHumanApproval,
   LaneLease,
   LaneNotificationClaim,
   LaneRunRecord,
@@ -31,7 +32,7 @@ import type {
   TransitionRunInput,
   UpdateAttemptInput,
 } from "./state-store.js";
-import { LaneStateStoreError } from "./state-store.js";
+import { FRESH_APPROVAL_REQUIRED, LaneStateStoreError } from "./state-store.js";
 import { retirementEvidenceProvesCompletion } from "./state-store.js";
 
 const LEGACY_BOUNDED_PROVIDER_MODELS: Partial<
@@ -2463,7 +2464,7 @@ export class SqliteLaneStateStore implements LaneStateStore {
     lane_id?: string;
     requested_by: string;
     payload?: Record<string, unknown>;
-    approvalKey?: string;
+    approval?: LaneHumanApproval;
   }): Promise<LaneControlRecord> {
     return this.db.transaction(() => {
       const existing = this.db
@@ -2720,8 +2721,12 @@ export class SqliteLaneStateStore implements LaneStateStore {
       ) {
         throw new LaneStateStoreError("control requires revision_id", 400);
       }
-      if (human && !input.approvalKey) {
-        throw new LaneStateStoreError("human approval key required", 401);
+      // Standalone stand-in for Command Center: it cannot check a grant, but a
+      // human-gated control without both approval headers is refused the same way.
+      if (human && !(input.approval?.channelKey && input.approval.grant)) {
+        throw new LaneStateStoreError(FRESH_APPROVAL_REQUIRED, 401, {
+          detail: FRESH_APPROVAL_REQUIRED,
+        });
       }
       if (input.kind === "archive_approval") {
         const expiresAt = Date.parse(String(input.payload?.expires_at ?? ""));

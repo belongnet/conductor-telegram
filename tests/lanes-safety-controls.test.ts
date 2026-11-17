@@ -106,7 +106,7 @@ async function activate(store: SqliteLaneStateStore): Promise<LaneLease> {
     kind: "cutover",
     requested_by: "human:test",
     payload: { revision_id: "growth-safety" },
-    approvalKey: "human-key",
+    approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
   });
   await finish(store, lease, cutover);
   return lease;
@@ -253,7 +253,7 @@ test("lane hold and release are revision-scoped, atomic, and restart-persistent"
         manifest_revision_id: "growth-safety",
         expected_hold_control_id: "hold-l1",
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, release);
     snapshot = await store.snapshot();
@@ -301,7 +301,7 @@ test("lane validate is human-approved, one-run, and preserves the global pause",
         expected_run_id: "run-L1",
         merged_sha: MERGED_ONE,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, validate);
     const snapshot = await store.snapshot();
@@ -341,7 +341,7 @@ test("queued release and validate controls reject a replaced hold identity", asy
         manifest_revision_id: "growth-safety",
         expected_hold_control_id: "hold-one",
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     const holdTwo = await store.createControl({
       control_id: "hold-two",
@@ -377,7 +377,7 @@ test("queued release and validate controls reject a replaced hold identity", asy
         expected_run_id: "run-L1",
         merged_sha: MERGED_ONE,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     const holdThree = await store.createControl({
       control_id: "hold-three",
@@ -437,7 +437,7 @@ test("rejected bounded deterministic validation atomically holds the lane, settl
         expected_run_id: "run-L1",
         merged_sha: MERGED_ONE,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, validate);
     let run = (await store.snapshot()).runs[0]!;
@@ -516,7 +516,7 @@ test("legacy Sonnet manifest commissions bounded Claude validation on current Fa
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "growth-safety" },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, cutover);
     await validatingRun(store, lease, "L1", MERGED_ONE);
@@ -549,7 +549,7 @@ test("legacy Sonnet manifest commissions bounded Claude validation on current Fa
         expected_run_id: "run-L1",
         merged_sha: MERGED_ONE,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, validate);
     let run = (await store.snapshot()).runs[0]!;
@@ -706,7 +706,7 @@ test("legacy grok manifest commissions bounded Cursor validation on current Grok
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "growth-safety" },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, cutover);
     await validatingRun(store, lease, "L1", MERGED_ONE);
@@ -739,7 +739,7 @@ test("legacy grok manifest commissions bounded Cursor validation on current Grok
         expected_run_id: "run-L1",
         merged_sha: MERGED_ONE,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await finish(store, lease, validate);
     const run = (await store.snapshot()).runs[0]!;
@@ -830,7 +830,7 @@ test("lane retirement waits for recurring dependent containment and is restart-p
         merged_sha: MERGED_ONE,
         evidence_refs: sources,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await assert.rejects(finish(store, lease, retire), /recurring dependent R1/);
 
@@ -866,7 +866,7 @@ test("lane retirement waits for recurring dependent containment and is restart-p
         merged_sha: MERGED_ONE,
         evidence_refs: sources,
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     assert.equal(replayedRetire.status, "applied");
     snapshot = await store.snapshot();
@@ -915,7 +915,7 @@ test("lane retirement waits for recurring dependent containment and is restart-p
         merged_sha: MERGED_TWO,
         evidence_refs: [replayMerge, replayValidation],
       },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await assert.rejects(
       finish(store, lease, replayControl),
@@ -955,7 +955,7 @@ test("lane retirement rejects tampered hashes and cross-lane evidence identity",
           merged_sha: MERGED_ONE,
           evidence_refs: [{ ...valid, evidence_hash: "0".repeat(64) }],
         },
-        approvalKey: "human-key",
+        approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
       }),
       /immutable evidence id\/key\/hash triples/
     );
@@ -978,7 +978,7 @@ test("lane retirement rejects tampered hashes and cross-lane evidence identity",
           merged_sha: MERGED_ONE,
           evidence_refs: [wrongIdentity],
         },
-        approvalKey: "human-key",
+        approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
       }),
       /immutable evidence id\/key\/hash triples/
     );
@@ -1006,7 +1006,7 @@ test("lane retirement rejects tampered hashes and cross-lane evidence identity",
           merged_sha: MERGED_ONE,
           evidence_refs: [futureEvidence],
         },
-        approvalKey: "human-key",
+        approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
       }),
       /immutable evidence id\/key\/hash triples/
     );
@@ -1081,7 +1081,7 @@ test("lane retirement and CLI semantics reject empty, merge-only, and failed val
             merged_sha: MERGED_ONE,
             evidence_refs: refs,
           },
-          approvalKey: "human-key",
+          approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
         }),
         suffix === "empty"
           ? /immutable evidence id\/key\/hash triples/

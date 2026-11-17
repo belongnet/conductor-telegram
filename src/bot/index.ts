@@ -103,6 +103,7 @@ import {
 } from "./media.js";
 import { existsSync } from "node:fs";
 import { refreshWorkspacePr } from "./github.js";
+import { loggableMessagePreview } from "./lane-approvals.js";
 import { formatPrCard, prKeyboard } from "./pr-ui.js";
 import {
   advanceCloudSessionCycle,
@@ -174,8 +175,8 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Debug: log all incoming updates
 bot.use((ctx, next) => {
-  const msg = ctx.message as any;
-  const preview = msg?.text?.slice(0, 50) ?? (msg?.photo ? "[photo]" : msg?.voice ? "[voice]" : "");
+  // Never a lane approval code, so nothing that could be one is logged.
+  const preview = loggableMessagePreview(ctx.message as any);
   console.log(`[update] type=${ctx.updateType} chat=${ctx.chat?.id} ${preview}`);
   return next();
 });

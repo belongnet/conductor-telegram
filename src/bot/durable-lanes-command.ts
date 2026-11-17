@@ -1,11 +1,34 @@
 import type { Context } from "telegraf";
 import { randomUUID } from "node:crypto";
 import { escHtml, truncateHtml, TELEGRAM_MAX_TEXT } from "./format.js";
+import type { LaneControlRecord, LaneStateStore } from "../lanes/state-store.js";
+import {
+  laneApprovals,
+  telegrafApprovalChat,
+  type ApprovalChat,
+  type LaneApprovals,
+} from "./lane-approvals.js";
 
-export async function handleDurableLanes(ctx: Context, rawArg: string): Promise<void> {
+export interface DurableLanesOptions {
+  /** Where approval prompts and results go; defaults to the Telegraf chat. */
+  approvalChat?: ApprovalChat;
+  approvals?: LaneApprovals;
+  openStore?: () => Promise<LaneStateStore>;
+}
+
+function queuedText(created: LaneControlRecord): string {
+  return `Lane control queued: ${created.kind}${created.lane_id ? ` ${created.lane_id}` : ""}. The lease holder will apply it.`;
+}
+
+export async function handleDurableLanes(
+  ctx: Context,
+  rawArg: string,
+  options: DurableLanesOptions = {}
+): Promise<void> {
   const { createLaneStateStore } = await import("../lanes/state-store.js");
   const { deterministicLaneId } = await import("../lanes/controller-policy.js");
-  const store = await createLaneStateStore();
+  const openStore = options.openStore ?? (() => createLaneStateStore());
+  const store = await openStore();
   try {
     const [subcommand = "", first, ...rest] = rawArg.trim().split(/\s+/);
     const command = subcommand.toLowerCase();
@@ -148,20 +171,34 @@ export async function handleDurableLanes(ctx: Context, rawArg: string): Promise<
       const messageId = String((ctx.message as any)?.message_id ?? randomUUID());
       const actor = `telegram:${ctx.from?.id ?? "owner"}`;
       const idempotencyKey = `telegram:${ctx.chat?.id ?? "owner"}:${messageId}:${command}`;
-      const created = await store.createControl({
+      const request = {
         control_id: deterministicLaneId("control", idempotencyKey),
         idempotency_key: idempotencyKey,
         kind: control.kind,
         lane_id: control.laneId,
         requested_by: actor,
         payload: control.payload,
-        approvalKey: control.human
-          ? process.env.BELONG_HUMAN_APPROVAL_KEY?.trim()
-          : undefined,
-      });
-      await ctx.reply(
-        `Lane control queued: ${created.kind}${created.lane_id ? ` ${created.lane_id}` : ""}. The lease holder will apply it.`
-      );
+      };
+      if (control.human) {
+        // Needs the owner's emailed code. The control may run after this
+        // handler returns, once the code is accepted, so it opens its own store.
+        await (options.approvals ?? laneApprovals()).submit(
+          options.approvalChat ?? telegrafApprovalChat(ctx),
+          {
+            label: `${request.kind}${request.lane_id ? ` ${request.lane_id}` : ""}`,
+            submit: async (approval) => {
+              const approved = await openStore();
+              try {
+                return queuedText(await approved.createControl({ ...request, approval }));
+              } finally {
+                await approved.close();
+              }
+            },
+          }
+        );
+        return;
+      }
+      await ctx.reply(queuedText(await store.createControl(request)));
       return;
     }
 

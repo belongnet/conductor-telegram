@@ -59,7 +59,7 @@ test("HTTP state store carries fence/CAS fields and keeps human approval separat
     kind: "cutover",
     requested_by: "human:test",
     payload: { revision_id: "v2" },
-    approvalKey: "different-human-key",
+    approval: { channelKey: "approval-channel-key", grant: "emailed-code-grant" },
   });
   assert.match(requests[0].url, /runs\/run%2Fone\/transition$/);
   assert.deepEqual(
@@ -71,14 +71,45 @@ test("HTTP state store carries fence/CAS fields and keeps human approval separat
     },
     { ...lease, expected_version: 3 }
   );
-  const workerHeaders = new Headers(requests[0].init.headers);
-  assert.equal(workerHeaders.get("x-api-key"), "service-key");
-  assert.equal(workerHeaders.get("x-belong-approval-key"), null);
+  for (const request of requests.slice(0, 2)) {
+    const workerHeaders = new Headers(request.init.headers);
+    assert.equal(workerHeaders.get("x-api-key"), "service-key");
+    assert.equal(workerHeaders.get("x-belong-approval-channel-key"), null);
+    assert.equal(workerHeaders.get("x-belong-approval-grant"), null);
+  }
   assert.match(requests[1].url, /notifications\/claim$/);
   assert.equal(requests[1].body?.expected_controller_version, 7);
   const controlHeaders = new Headers(requests[2].init.headers);
   assert.equal(controlHeaders.get("x-api-key"), "service-key");
-  assert.equal(controlHeaders.get("x-belong-approval-key"), "different-human-key");
+  assert.equal(controlHeaders.get("x-belong-approval-channel-key"), "approval-channel-key");
+  assert.equal(controlHeaders.get("x-belong-approval-grant"), "emailed-code-grant");
+  assert.equal(controlHeaders.get("x-belong-approval-key"), null, "the retired header is never sent");
+  assert.equal(requests[2].body?.approval, undefined, "approval travels in headers, never in the body");
+  assert.doesNotMatch(String(requests[2].init.body), /emailed-code-grant|approval-channel-key/);
+});
+
+test("a control without a live grant surfaces Command Center's fresh-code refusal", async () => {
+  const store = new HttpLaneStateStore({
+    baseUrl: "https://command.example.test",
+    apiKey: "service-key",
+    fetchImpl: async () => jsonResponse({ detail: "A fresh approval code is required" }, 401),
+  });
+  const error = await store
+    .createControl({
+      control_id: "c",
+      idempotency_key: "c",
+      kind: "rollback",
+      requested_by: "telegram:1",
+      approval: { channelKey: "approval-channel-key", grant: "expired-grant" },
+    })
+    .catch((caught: unknown) => caught);
+  assert.ok(error instanceof LaneStateStoreError);
+  assert.equal(error.status, 401);
+  assert.equal(error.freshApprovalRequired, true);
+  const otherRefusal = new LaneStateStoreError("rejected", 401, {
+    detail: "The approval key is retired; approve with an emailed code",
+  });
+  assert.equal(otherRefusal.freshApprovalRequired, false);
 });
 
 test("HTTP lease contention returns standby while outages fail closed without retry", async () => {

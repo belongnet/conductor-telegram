@@ -1,4 +1,5 @@
 import { handleDurableLanes } from "./durable-lanes-command.js";
+import { approvalMessageFrom, laneApprovals, telegrafApprovalChat } from "./lane-approvals.js";
 import type { Context, Telegraf } from "telegraf";
 import {
   answerPendingStdinDecision,
@@ -3452,6 +3453,11 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
   const text = (ctx.message as any)?.text?.trim();
   if (!text || text.startsWith("/")) return;
+
+  // A reply to a lane approval prompt, or a code typed while one is awaited,
+  // belongs to the approval flow and must never reach a workspace or the router.
+  const approvalMessage = approvalMessageFrom(ctx.message as any, ctx.botInfo?.id);
+  if (approvalMessage && (await laneApprovals().handleReply(telegrafApprovalChat(ctx), approvalMessage))) return;
 
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;
