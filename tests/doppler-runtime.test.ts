@@ -51,6 +51,20 @@ test("Doppler runtime preserves the cloud workspace sync settings", () => {
   assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("TELEGRAM_CLOUD_SYNC_INPUT"), true);
 });
 
+test("Doppler runtime injects the approval channel key and never the retired approval key", () => {
+  assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("BELONG_APPROVAL_CHANNEL_KEY"), true);
+  assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("BELONG_HUMAN_APPROVAL_KEY"), false);
+  assert.throws(
+    () =>
+      buildDopplerRunArgs(
+        { project: "example-app", config: "production", secretNames: ["BELONG_HUMAN_APPROVAL_KEY"] },
+        ["node", "cli.js", "start"]
+      ),
+    DopplerRuntimeError,
+    "the retired name is no longer an allowed runtime secret"
+  );
+});
+
 test("a re-exec into the Doppler runtime is detected exactly once", () => {
   const runtime = { project: "Belong-Agents", config: "PRD" };
 

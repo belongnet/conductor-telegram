@@ -52,7 +52,10 @@ The control endpoint must accept revision-bound `lane_hold`, `lane_release`,
 `lane_validate`, and `lane_retire` controls. Hold requires a non-empty reason.
 Release binds `expected_hold_control_id`; validate binds that same exact current
 hold plus `expected_run_id` and `merged_sha`. A replaced hold/run/SHA invalidates
-the queued approval. Release, validate, and retire require the separate human approval credential.
+the queued approval. Release, validate, and retire require human approval: the
+`X-Belong-Approval-Channel-Key` and `X-Belong-Approval-Grant` headers from an
+emailed code. A missing or expired grant is refused with 401
+`"A fresh approval code is required"`.
 Finishing any of these controls must apply the lane-control record and run
 transition in the same transaction as the control status; the worker does not
 pre-apply either half. Hold preserves active attempts and bindings and stores

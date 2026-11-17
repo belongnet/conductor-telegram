@@ -59,7 +59,7 @@ test("bot program arguments default to the stable node path", () => {
   assert.equal(args[0], resolveLaunchdNodePath());
 });
 
-test("Mac lane worker is a separate HTTP-only launchd process without the human approval key", () => {
+test("Mac lane worker is a separate HTTP-only launchd process without any human approval key", () => {
   const argumentsList = buildLaneWorkerProgramArguments({
     doppler: {
       executable: "/usr/local/bin/doppler",
@@ -69,7 +69,7 @@ test("Mac lane worker is a separate HTTP-only launchd process without the human 
         "COMMAND_CENTER_API_BASE_URL",
         "COMMAND_CENTER_API_KEY",
         "CONDUCTOR_API_KEY",
-        "BELONG_HUMAN_APPROVAL_KEY",
+        "BELONG_APPROVAL_CHANNEL_KEY",
       ],
     },
     nodePath: "/usr/local/bin/node",
@@ -77,18 +77,38 @@ test("Mac lane worker is a separate HTTP-only launchd process without the human 
   });
   assert.ok(argumentsList.includes("lanes"));
   assert.ok(argumentsList.includes("worker"));
-  assert.deepEqual(argumentsList.slice(0, 3), [
+  assert.deepEqual(argumentsList.slice(0, 5), [
     "/usr/bin/env",
+    "-u",
+    "BELONG_APPROVAL_CHANNEL_KEY",
     "-u",
     "BELONG_HUMAN_APPROVAL_KEY",
   ]);
-  assert.equal(
-    argumentsList.filter(
-      (argument) => argument === "BELONG_HUMAN_APPROVAL_KEY"
-    ).length,
-    1,
-    "the approval key may appear only as env's removal target"
-  );
+  for (const name of ["BELONG_APPROVAL_CHANNEL_KEY", "BELONG_HUMAN_APPROVAL_KEY"]) {
+    assert.equal(
+      argumentsList.filter((argument) => argument === name).length,
+      1,
+      `${name} may appear only as env's removal target`
+    );
+  }
+  const onlySecrets = argumentsList[argumentsList.indexOf("--only-secrets") + 1];
+  assert.equal(onlySecrets, "COMMAND_CENTER_API_BASE_URL,COMMAND_CENTER_API_KEY,CONDUCTOR_API_KEY");
+  const direct = buildLaneWorkerProgramArguments({
+    nodePath: "/usr/local/bin/node",
+    cliPath: "/opt/conductor-telegram/index.js",
+  });
+  assert.deepEqual(direct, [
+    "/usr/bin/env",
+    "-u",
+    "BELONG_APPROVAL_CHANNEL_KEY",
+    "-u",
+    "BELONG_HUMAN_APPROVAL_KEY",
+    "/usr/local/bin/node",
+    "/opt/conductor-telegram/index.js",
+    "lanes",
+    "worker",
+    "--no-color",
+  ]);
   const plist = buildLaneWorkerPlist({
     nodePath: "/usr/local/bin/node",
     cliPath: "/opt/conductor-telegram/index.js",
@@ -121,9 +141,11 @@ test("Mac lane enrollment requires the complete independent-process credential s
         "CONDUCTOR_API_KEY",
         "COMMAND_CENTER_API_BASE_URL",
         "COMMAND_CENTER_API_KEY",
+        "BELONG_HUMAN_APPROVAL_KEY",
       ])
     ),
-    ["BELONG_HUMAN_APPROVAL_KEY"]
+    ["BELONG_APPROVAL_CHANNEL_KEY"],
+    "the retired key does not stand in for the channel key"
   );
   assert.deepEqual(
     missingLaneServiceSecrets(
@@ -133,7 +155,7 @@ test("Mac lane enrollment requires the complete independent-process credential s
         "CONDUCTOR_API_KEY",
         "COMMAND_CENTER_API_BASE_URL",
         "COMMAND_CENTER_API_KEY",
-        "BELONG_HUMAN_APPROVAL_KEY",
+        "BELONG_APPROVAL_CHANNEL_KEY",
       ])
     ),
     []
@@ -152,9 +174,9 @@ test("OVH standby systemd unit is headless and HTTP-only", () => {
   assert.match(unit, /conductor-telegram lanes worker/);
   assert.match(
     unit,
-    /ExecStart=\/usr\/bin\/env -u BELONG_HUMAN_APPROVAL_KEY LANES_SITE=ovh LANES_STATE_BACKEND=http /
+    /ExecStart=\/usr\/bin\/env -u BELONG_APPROVAL_CHANNEL_KEY -u BELONG_HUMAN_APPROVAL_KEY LANES_SITE=ovh LANES_STATE_BACKEND=http /
   );
-  assert.match(unit, /-u BELONG_HUMAN_APPROVAL_KEY/);
+  assert.doesNotMatch(unit.replace(/-u BELONG_[A-Z_]+_KEY/g, ""), /BELONG_[A-Z_]*APPROVAL/);
   assert.doesNotMatch(unit, /sqlite|fallback|telegram polling/i);
 });
 

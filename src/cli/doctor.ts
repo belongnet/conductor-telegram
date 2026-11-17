@@ -30,6 +30,11 @@ import {
   manifestNeedsGitlab,
   type LaneManifestV2,
 } from "../lanes/manifest.js";
+import {
+  APPROVAL_CHANNEL_KEY_ENV,
+  RETIRED_APPROVAL_KEY_ENV,
+  approvalChannelKeyProblem,
+} from "../lanes/approval-channel.js";
 
 const noColor =
   process.env.NO_COLOR !== undefined || process.argv.includes("--no-color");
@@ -423,8 +428,8 @@ export async function checkDurableLanes(
       !(env.OWNER_CHAT_ID?.trim() || config?.ownerChatId) &&
       "OWNER_CHAT_ID",
     !headlessStandby &&
-      !env.BELONG_HUMAN_APPROVAL_KEY?.trim() &&
-      "BELONG_HUMAN_APPROVAL_KEY",
+      !env[APPROVAL_CHANNEL_KEY_ENV]?.trim() &&
+      APPROVAL_CHANNEL_KEY_ENV,
     manifestNeedsGitlab(manifest) && !env.GITLAB_TOKEN?.trim() && "GITLAB_TOKEN",
   ].filter((value): value is string => Boolean(value));
   if (missing.length > 0) {
@@ -435,6 +440,22 @@ export async function checkDurableLanes(
       fix: "Add the missing names to the configured Doppler environment, then rerun doctor",
     };
   }
+  // The Telegram process asks Command Center for emailed approval codes with
+  // this key; the headless standby worker never holds it.
+  const channelKeyProblem = headlessStandby
+    ? null
+    : approvalChannelKeyProblem(env[APPROVAL_CHANNEL_KEY_ENV]?.trim(), env);
+  if (channelKeyProblem) {
+    return {
+      name: "Durable lanes",
+      ok: false,
+      detail: `Manifest v2 valid; ${channelKeyProblem}`,
+      fix: `Set ${APPROVAL_CHANNEL_KEY_ENV} to a new random value of at least 40 characters (48 recommended) that matches no other key, for both this service and Command Center`,
+    };
+  }
+  const retiredKeyNote = env[RETIRED_APPROVAL_KEY_ENV]?.trim()
+    ? `; ${RETIRED_APPROVAL_KEY_ENV} is retired and unused, delete it`
+    : "";
 
   let controllerMode: string;
   try {
@@ -525,7 +546,7 @@ export async function checkDurableLanes(
     ok: true,
     detail:
       `${laneManifestRevisionId(manifest)} valid; Command Center connected; ` +
-      `mode=${controllerMode}`,
+      `mode=${controllerMode}${retiredKeyNote}`,
   };
 }
 
