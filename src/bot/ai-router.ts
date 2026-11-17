@@ -3,6 +3,7 @@ import { existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Workspace } from "../types/index.js";
+import { buildHelperEnvironment } from "./child-env.js";
 
 const CLAUDE_BIN =
   process.env.CLAUDE_BIN ??
@@ -321,7 +322,8 @@ function runClaudeRouter(
     const child = spawn(CLAUDE_BIN, args, {
       cwd: process.env.HOME ?? "/tmp",
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, HOME: process.env.HOME },
+      // Never the bot's own credentials: approval, Command Center, Conductor or Telegram keys.
+      env: buildHelperEnvironment(),
     });
 
     let settled = false;
@@ -385,7 +387,7 @@ function runCommand(
     const child = spawn(command, args, {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, HOME: process.env.HOME },
+      env: buildHelperEnvironment(),
     });
 
     let stdout = "";

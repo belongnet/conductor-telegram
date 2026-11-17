@@ -305,3 +305,15 @@ test("gateway-update.sh parses under the system bash", () => {
   const check = spawnSync("/bin/bash", ["-n", script], { encoding: "utf8" });
   assert.equal(check.status, 0, check.stderr);
 });
+
+test("the OVH container lanes unit clears both approval keys after its env file", () => {
+  const unit = fs.readFileSync(
+    path.join(process.cwd(), "packaging", "cloud", "conductor-telegram-lanes.service"),
+    "utf8"
+  );
+  assert.match(
+    unit,
+    /--env-file \/etc\/conductor-telegram\/lanes\.env --env BELONG_APPROVAL_CHANNEL_KEY= --env BELONG_HUMAN_APPROVAL_KEY= /
+  );
+  assert.match(unit, / lanes worker --no-color/);
+});

@@ -7,6 +7,8 @@ import path from "node:path";
 import {
   buildServiceDopplerEnvironment,
   buildDopplerRunArgs,
+  dopplerChildEnvironment,
+  dopplerSecretsWithheldFor,
   DopplerRuntimeError,
   isDopplerRuntimeActive,
   stripDopplerManagedConfig,
@@ -260,3 +262,28 @@ test("config accepts paired Doppler references and rejects partial references", 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+test("lane commands other than release, validate and retire never receive an approval key from Doppler", () => {
+  const both = ["BELONG_APPROVAL_CHANNEL_KEY", "BELONG_HUMAN_APPROVAL_KEY"];
+  for (const argv of [
+    ["lanes", "worker"],
+    ["lanes", "reconcile"],
+    ["lanes"],
+    ["lanes", "status", "--json"],
+    ["--no-color", "lanes", "hold", "L1", "--reason", "x"],
+    ["lanes", "import-legacy", "--dry-run"],
+  ]) {
+    assert.deepEqual(dopplerSecretsWithheldFor(argv), both, argv.join(" "));
+  }
+  for (const argv of [["lanes", "release", "L1"], ["lanes", "validate", "L1"], ["lanes", "retire", "L1"], ["start"], ["doctor"]]) {
+    assert.deepEqual(dopplerSecretsWithheldFor(argv), [], argv.join(" "));
+  }
+  assert.deepEqual(
+    dopplerChildEnvironment(
+      { PATH: "/bin", BELONG_APPROVAL_CHANNEL_KEY: "k", BELONG_HUMAN_APPROVAL_KEY: "h" },
+      dopplerSecretsWithheldFor(["lanes", "worker"])
+    ),
+    { PATH: "/bin", [DOPPLER_RUNTIME_SENTINEL_ENV]: "1" },
+    "an inherited copy is removed too, not only Doppler's"
+  );
+});

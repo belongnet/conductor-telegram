@@ -31,6 +31,7 @@ import {
   type CLIFlags,
 } from "./config.js";
 import {
+  APPROVAL_SECRET_NAMES,
   DOPPLER_RUNTIME_SECRET_NAMES,
   buildServiceDopplerEnvironment,
   buildDopplerRunArgs,
@@ -64,10 +65,7 @@ const REQUIRED_LANE_SERVICE_SECRETS = Object.freeze([
  * Human-approval credentials the lane worker must never hold: the approval
  * channel key, and the retired key in case an old environment still has it.
  */
-const LANE_WORKER_WITHHELD_SECRETS = Object.freeze([
-  "BELONG_APPROVAL_CHANNEL_KEY",
-  "BELONG_HUMAN_APPROVAL_KEY",
-]);
+const LANE_WORKER_WITHHELD_SECRETS: readonly string[] = APPROVAL_SECRET_NAMES;
 const WATCHDOG_LOG = path.join(STATE_DIR, "watchdog.log");
 // scripts/gateway-update.sh caps this same file in place; its
 // CONDUCTOR_TELEGRAM_GATEWAY_LOG default must stay in sync with this path.
