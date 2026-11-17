@@ -36,6 +36,9 @@ const MAX_RESPONSE_BYTES = 16 * 1024;
 const MAX_LIFETIME_SECONDS = 24 * 60 * 60;
 /** A grant counts as expired this long before Command Center would say so. */
 const GRANT_MARGIN_MS = 10_000;
+/** Command Center's approval window; a grant is never held longer than this plus a little clock skew. */
+const MAX_GRANT_MS = 30 * 60_000;
+const GRANT_SKEW_MS = 60_000;
 const UNKNOWN_MAILBOX = "the approval mailbox";
 
 /** Command Center keys this one must never equal. */
@@ -204,24 +207,21 @@ export class ApprovalChannelClient {
     if (typeof grant !== "string" || !GRANT_PATTERN.test(grant)) {
       throw new ApprovalUnavailableError(response.status);
     }
-    // A grant issued to another channel or person is not this approver's proof.
-    if (
-      (body?.channel !== undefined && body.channel !== this.channel) ||
-      (body?.subject !== undefined && body.subject !== this.subject)
-    ) {
+    // A grant must name this channel and this approver: one issued to anyone else is not this approver's proof.
+    if (body?.channel !== this.channel || body?.subject !== this.subject) {
       throw new ApprovalUnavailableError(response.status);
     }
     const now = this.now();
     const expiresIn = seconds(body?.expires_in);
-    const candidates = [
-      expiresIn === undefined ? undefined : now + expiresIn * 1000,
-      instant(body?.expires_at),
-    ].filter((value): value is number => value !== undefined);
-    // The earlier of the two: a fast local clock then ends the window early, never late.
-    const expiresAt = candidates.length ? Math.min(...candidates) : undefined;
-    if (expiresAt === undefined || expiresAt <= now) {
-      throw new ApprovalUnavailableError(response.status);
-    }
+    if (expiresIn === undefined) throw new ApprovalUnavailableError(response.status);
+    // The earliest of the relative lifetime, the absolute expiry and the approval window: a fast
+    // local clock or an overlong answer then ends the grant early, never late.
+    const expiresAt = Math.min(
+      now + expiresIn * 1000,
+      instant(body?.expires_at) ?? Number.POSITIVE_INFINITY,
+      now + MAX_GRANT_MS + GRANT_SKEW_MS
+    );
+    if (expiresAt <= now) throw new ApprovalUnavailableError(response.status);
     this.#grant = { value: grant, expiresAt };
     return { expiresAt };
   }
@@ -307,7 +307,7 @@ export class ApprovalChannelClient {
       }
       let text: string;
       try {
-        text = await readBounded(response, MAX_RESPONSE_BYTES);
+        text = await readBoundedText(response, MAX_RESPONSE_BYTES);
       } catch {
         throw new ApprovalUnavailableError(response.status);
       }
@@ -398,7 +398,8 @@ function refusal(response: ChannelResponse, verifying: boolean): ApprovalChannel
   return new ApprovalUnavailableError(response.status);
 }
 
-async function readBounded(response: Response, limit: number): Promise<string> {
+/** Reads a response body, refusing one larger than `limit` bytes without buffering the rest. */
+export async function readBoundedText(response: Response, limit: number): Promise<string> {
   const declared = Number(response.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > limit) {
     await response.body?.cancel().catch(() => undefined);
@@ -471,6 +472,13 @@ const INVISIBLE = new RegExp(
     .join("")}]`,
   "g"
 );
+
+/** One short line of visible text from an untrusted value, for messages and logs. */
+export function visibleLine(value: unknown, max: number): string {
+  if (typeof value !== "string") return "";
+  const line = value.replace(INVISIBLE, " ").replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
 
 /** Shown in Telegram and on terminals, so it is one short line of visible text. */
 function mailboxHint(value: unknown): string {

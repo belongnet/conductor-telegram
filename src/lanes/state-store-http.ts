@@ -21,13 +21,21 @@ import type {
 } from "./state-store.js";
 import { LaneStateStoreError } from "./state-store.js";
 import type { LaneManifestV2 } from "./manifest.js";
-import { approvalHeaders } from "./approval-channel.js";
+import { approvalHeaders, readBoundedText, visibleLine } from "./approval-channel.js";
+
+/** A status snapshot carries every run and attempt plus up to 1000 events. */
+const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+/** A control echoes its payload, at most a 1 MiB retirement evidence packet. */
+const MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024;
+/** Command Center's own words are passed on, but never more than a line of them. */
+const MAX_DETAIL_CHARS = 200;
 
 type HttpStoreOptions = {
   baseUrl: string;
   apiKey: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  maxResponseBytes?: number;
 };
 
 export class HttpLaneStateStore implements LaneStateStore {
@@ -36,12 +44,14 @@ export class HttpLaneStateStore implements LaneStateStore {
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
 
   constructor(options: HttpStoreOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.apiKey = options.apiKey;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 30_000;
+    this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
   }
 
   private async request<T>(
@@ -63,14 +73,35 @@ export class HttpLaneStateStore implements LaneStateStore {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
+        // Every request carries the service key, and a control can carry the
+        // approval channel key and grant: none of them may follow a redirect.
+        redirect: "error",
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch (error) {
       throw new LaneStateStoreError(
-        `Command Center lane request failed closed: ${(error as Error).message}`
+        `Command Center lane request failed closed: ${visibleLine((error as Error).message, MAX_DETAIL_CHARS)}`
       );
     }
-    const text = await response.text();
+    if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new LaneStateStoreError(
+        `Command Center lane request failed closed: redirect refused (HTTP ${response.status})`,
+        response.status
+      );
+    }
+    let text: string;
+    try {
+      text = await readBoundedText(
+        response,
+        approval ? Math.min(MAX_CONTROL_RESPONSE_BYTES, this.maxResponseBytes) : this.maxResponseBytes
+      );
+    } catch {
+      throw new LaneStateStoreError(
+        "Command Center lane request failed closed: the response was unreadable or too large",
+        response.status
+      );
+    }
     let payload: unknown = null;
     if (text) {
       try {
@@ -82,10 +113,10 @@ export class HttpLaneStateStore implements LaneStateStore {
     if (!response.ok) {
       const detail =
         payload && typeof payload === "object" && "detail" in payload
-          ? String((payload as { detail: unknown }).detail)
-          : `HTTP ${response.status}`;
+          ? visibleLine(String((payload as { detail: unknown }).detail), MAX_DETAIL_CHARS)
+          : "";
       throw new LaneStateStoreError(
-        `Command Center lane request rejected: ${detail}`,
+        `Command Center lane request rejected: ${detail || `HTTP ${response.status}`}`,
         response.status,
         payload
       );

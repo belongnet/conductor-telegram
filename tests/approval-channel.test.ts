@@ -169,6 +169,14 @@ test("verifyCode keeps the grant in memory until the earlier of its two expiries
   assert.equal((await relative.client.verifyCode("ch", "123456")).expiresAt, NOW + 1800_000);
   const textual = client(() => json(verified({ expires_at: undefined, expires_in: "900" })));
   assert.equal((await textual.client.verifyCode("ch", "123456")).expiresAt, NOW + 900_000, "a numeric string is a lifetime too");
+  const overlong = client(() =>
+    json(verified({ expires_in: 86_400, expires_at: new Date(NOW + 86_400_000).toISOString() }))
+  );
+  assert.equal(
+    (await overlong.client.verifyCode("ch", "123456")).expiresAt,
+    NOW + 31 * 60_000,
+    "never held past the 30-minute approval window plus a minute of skew"
+  );
   relative.client.dropGrant();
   assert.equal(relative.client.approval(), null);
 });
@@ -184,6 +192,9 @@ test("verifyCode maps refusals by reason and never sends a malformed code", asyn
     [json({ detail: "down" }, 503), ApprovalUnavailableError],
     [json(verified({ subject: "telegram:1" })), ApprovalUnavailableError],
     [json(verified({ channel: "other-channel" })), ApprovalUnavailableError],
+    [json(verified({ subject: undefined })), ApprovalUnavailableError],
+    [json(verified({ channel: undefined })), ApprovalUnavailableError],
+    [json(verified({ expires_in: undefined })), ApprovalUnavailableError],
     [json(verified({ grant: "short" })), ApprovalUnavailableError],
     [json(verified({ expires_in: undefined, expires_at: undefined })), ApprovalUnavailableError],
     [json(verified({ expires_in: undefined, expires_at: new Date(NOW - 1000).toISOString() })), ApprovalUnavailableError],
