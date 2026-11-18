@@ -9,9 +9,9 @@
  * digits is relayed for verification. The code message is then deleted (best
  * effort), the grant is kept in memory, and the waiting controls run with the
  * two approval headers. Later controls inside the grant run directly; a 401
- * asking for a fresh code drops the grant and asks again. Anything shaped like
- * a code is kept out of storage, routing and logs wherever the bot reads it.
- * Codes and grants are never written to disk or logs.
+ * asking for a fresh code drops the grant and asks again. Anything the owner
+ * types that may hold a code is kept out of storage, routing and logs wherever
+ * the bot reads it. Codes and grants are never written to disk or logs.
  */
 import { createHash } from "node:crypto";
 import type { Context } from "telegraf";
@@ -60,6 +60,8 @@ export interface ApprovalMessage {
   repliesToPrompt: boolean;
   /** Forwarded, sent through an inline bot or on behalf of a chat. */
   relayed?: boolean;
+  /** Sent by a bot account. */
+  fromBot?: boolean;
   /** Durable ingestion kept its text out of storage, so nothing else may handle it. */
   withheld?: boolean;
 }
@@ -122,12 +124,10 @@ export const APPROVAL_TEXT = {
     "The approval service did not answer. Nothing was applied yet; reply to the approval prompt with the code again.",
   digitsOnly: "Reply with only the 6-digit code.",
   bareCode: "To approve, reply to the approval prompt with the code. That message was not used.",
-  heldWhileWaiting:
-    "Messages with digits are held while an approval code is awaited, so this one was not sent anywhere. Send it again after replying to the approval prompt with the code.",
   bareCodeElsewhere:
     "To approve, reply to the approval prompt in your private chat with this bot. That message was not used.",
   sixDigits:
-    "That message holds six digits in a row, which could be an approval code, so it was removed and not sent anywhere. Send it again without six digits in a row.",
+    "That message looks like an approval code, so it was removed and not sent anywhere. To send it, add words that say what the number is, without calling it a code.",
   relayed: "A forwarded message, or one sent through another bot, never counts as an approval code. That message was not used.",
   openPrivateChat: "To approve, open a private chat with this bot, send /start, then send the lane control again.",
   privateChatUnavailable:
@@ -180,23 +180,28 @@ export class LaneApprovals {
   /**
    * Whether the approval flow owns this message. When it does, the message is
    * handled here and must not be routed, stored or logged anywhere else.
+   *
+   * Only what the owner typed counts: sent from the owner's account, not by a
+   * bot, and not forwarded, sent through an inline bot or posted on behalf of a
+   * chat. Of that, the flow owns a reply to an approval prompt, a text or
+   * caption that holds a code (`holdsApprovalCode`) in any chat, pending or not,
+   * and, in the chat where a code is awaited and until it expires, digits with
+   * no letters, an attempt at that code. Everything else, every bot command and
+   * text with letters but no code word included, goes to its normal handling.
    */
   claims(chat: Pick<ApprovalChat, "chatId" | "userId">, message: ApprovalMessage): boolean {
     if (message.withheld) return true;
+    const owner = ownerIdentity(this.env()).userId;
+    if (owner === undefined || chat.userId !== owner || message.fromBot || message.relayed) return false;
     // A command is never a code, even sent as a reply to the prompt.
-    if (message.text?.trimStart().startsWith("/")) return false;
-    // Anything that answers an approval prompt, of any kind and from anyone, is the flow's.
+    if (message.text !== undefined && isBotCommand(message.text)) return false;
+    // Anything that answers an approval prompt, of any kind, is the flow's.
     if (message.repliesToPrompt) return true;
     const pending = this.pending;
     if (pending && chat.chatId === pending.chatId && message.replyToMessageId === pending.promptMessageId) return true;
-    // From here on only the owner's account counts, forwarded or relayed messages included: they can
-    // never approve, but a code they carry must not slip through either.
-    const owner = ownerIdentity(this.env()).userId;
-    if (owner === undefined || chat.userId !== owner || message.text === undefined) return false;
-    // Six digits in a row, alone or in a sentence, text or caption, in any chat, pending or not.
-    if (CODE_RUN.test(message.text)) return true;
-    // While a code is awaited, any digits the owner sends there may be that code in another shape.
-    return !!pending && chat.chatId === pending.chatId && DIGIT.test(message.text);
+    if (message.text === undefined) return false;
+    if (holdsApprovalCode(message.text)) return true;
+    return !!pending && chat.chatId === pending.chatId && this.now() < pending.expiresAt && isCodeAttempt(message.text);
   }
 
   /** Handles a possible code reply. Returns false when the message is not the flow's. */
@@ -222,29 +227,23 @@ export class LaneApprovals {
     const toCurrentPrompt =
       !!pending && chat.chatId === pending.chatId && message.replyToMessageId === pending.promptMessageId;
     const answersPrompt = toCurrentPrompt || message.repliesToPrompt;
-    // Removed: every reply to a prompt and anything that could hold a code. A message held only
-    // because it carried a digit or two while a code was awaited stays in the chat.
-    const removable = answersPrompt || couldHoldCode(text);
+    // Whatever the flow claims could be the code or hold it, so it is removed wherever it is.
     const finish = async (reply: string): Promise<void> => {
-      const removed = removable ? await this.removeCode(chat, message.messageId) : true;
+      const removed = await this.removeCode(chat, message.messageId);
       await say(chat, reply);
       if (!removed) await say(chat, APPROVAL_TEXT.deleteFailed);
     };
     if (relayed) return finish(APPROVAL_TEXT.relayed);
     if (!pending || !toCurrentPrompt) {
       const live = !!pending && this.now() < pending.expiresAt;
-      const codeShaped = text === undefined || CODE_RUN.test(text);
-      if (answersPrompt || codeShaped) {
-        if (live && chat.chatId === pending!.chatId) return finish(APPROVAL_TEXT.bareCode);
-        if (live) return finish(APPROVAL_TEXT.bareCodeElsewhere);
-        if (answersPrompt || text === undefined || APPROVAL_CODE_PATTERN.test(text)) {
-          const grantUntil = this.cached?.client.grantExpiresAt();
-          return finish(grantUntil ? APPROVAL_TEXT.alreadyOpen(clock(grantUntil)) : APPROVAL_TEXT.stale);
-        }
-        return finish(APPROVAL_TEXT.sixDigits);
+      // While a code is awaited, a code or an attempt that does not answer its prompt is not used.
+      if (live && chat.chatId === pending!.chatId) return finish(APPROVAL_TEXT.bareCode);
+      if (live) return finish(APPROVAL_TEXT.bareCodeElsewhere);
+      if (answersPrompt || text === undefined || APPROVAL_CODE_PATTERN.test(text)) {
+        const grantUntil = this.cached?.client.grantExpiresAt();
+        return finish(grantUntil ? APPROVAL_TEXT.alreadyOpen(clock(grantUntil)) : APPROVAL_TEXT.stale);
       }
-      // Held only because it carried digits while a code was awaited.
-      return finish(APPROVAL_TEXT.heldWhileWaiting);
+      return finish(APPROVAL_TEXT.sixDigits);
     }
     if (this.now() >= pending.expiresAt) {
       this.pending = undefined;
@@ -457,6 +456,7 @@ export function approvalMessageFrom(
     replyToMessageId: replyTarget(message),
     repliesToPrompt: isApprovalPrompt(message.reply_to_message, botId),
     relayed: isRelayed(message),
+    fromBot: message.from?.is_bot === true,
     withheld: overrides.withheld,
   };
 }
@@ -464,10 +464,11 @@ export function approvalMessageFrom(
 /** Forwarded, sent through an inline bot, or posted on behalf of a chat: never its sender's own words. */
 export function isRelayed(message: TelegramMessageLike | undefined): boolean {
   if (!message) return false;
-  return (
-    ["forward_origin", "forward_from", "forward_from_chat", "forward_sender_name", "forward_date", "via_bot", "sender_chat"].some(
-      (field) => message[field] !== undefined && message[field] !== null
-    ) || message.is_automatic_forward === true
+  return Object.entries(message).some(
+    ([field, value]) =>
+      value !== undefined &&
+      value !== null &&
+      (field.startsWith("forward_") || field === "via_bot" || field === "sender_chat" || field === "is_automatic_forward")
   );
 }
 
@@ -576,13 +577,42 @@ export function loggableMessagePreview(message: TelegramMessageLike | undefined)
 }
 
 const DIGIT = /\p{Nd}/u;
-/** Exactly six digits in a row, in any script: the shape of an approval code, alone or in a sentence. */
-const CODE_RUN = /(?<!\p{Nd})\p{Nd}{6}(?!\p{Nd})/u;
 const DIGITS = /\p{Nd}/gu;
+const LETTER = /\p{L}/u;
+/** Exactly six decimal digits in a row, in any script, with no digit on either side. */
+const CODE_RUN = /(?<!\p{Nd})\p{Nd}{6}(?!\p{Nd})/u;
+/** Six or more decimal digits in a row. */
+const DIGIT_RUN = /\p{Nd}{6}/u;
+const BARE_CODE = /^\p{Nd}{6}$/u;
+/** What may sit between the digits of a code: whitespace and . - _ , / */
+const CODE_SEPARATORS = /[\s._,\/-]/gu;
+/** A word that names a code, whole: no letter of any script right before or after it, so not "barcode". */
+const CODE_WORD = /(?<!\p{L})(?:codes?|otp|pin|passcode|verification)(?!\p{L})/iu;
 
-/** Lost text, or six or more decimal digits in any script, may be a code worth deleting. */
-function couldHoldCode(text: string | undefined): boolean {
-  return text === undefined || (text.match(DIGITS)?.length ?? 0) >= 6;
+/**
+ * Whether a text or caption holds an approval code, fullwidth forms folded (NFKC). A bot command never does.
+ * With no letters in any script: exactly six digits once whitespace and `. - _ , /` are removed ("482 913",
+ * "48-29-13"), or six or more digits in a row ("+44 4829137"). With letters: one of the words code, codes, otp,
+ * pin, passcode or verification, in any case, and exactly six digits in a row, as typed or once those separators
+ * are removed ("the code is 482913", "OTP: 482-913"). Other text, such as "Approve at 600000 USD", holds none.
+ */
+function holdsApprovalCode(text: string): boolean {
+  const folded = text.normalize("NFKC");
+  if (isBotCommand(folded)) return false;
+  const joined = folded.replace(CODE_SEPARATORS, "");
+  if (!LETTER.test(folded)) return BARE_CODE.test(joined) || DIGIT_RUN.test(folded);
+  return CODE_WORD.test(folded) && (CODE_RUN.test(folded) || CODE_RUN.test(joined));
+}
+
+/** Digits with no letters and no command, fullwidth forms folded: where a code is awaited, an attempt at it. */
+function isCodeAttempt(text: string): boolean {
+  const folded = text.normalize("NFKC");
+  return !isBotCommand(folded) && !LETTER.test(folded) && DIGIT.test(folded);
+}
+
+/** A bot command, such as "/status 482913", is never a code. */
+function isBotCommand(text: string): boolean {
+  return text.trimStart().startsWith("/");
 }
 
 /** Fixed wording by status: Command Center's own words never reach the chat. */
