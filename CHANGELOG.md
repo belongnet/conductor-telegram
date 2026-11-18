@@ -2,7 +2,7 @@
 
 All notable changes to conductor-telegram are documented here.
 
-## [0.17.0] - 2026-11-17
+## [0.17.0] - 2026-11-18
 
 ### Changed
 - Human lane controls are approved with an emailed code, the standardized Belong OTP flow, instead of the retired `BELONG_HUMAN_APPROVAL_KEY`. In Telegram, `/lanes cutover`, `rollback`, `archive-approval`, `release` and `validate` ask Command Center to email a code to the main Belong mailbox and answer "Approval code sent to <mailbox>. Reply to this message with the 6-digit code within 10 minutes." When the owner chat is a group, the prompt goes to the owner's private chat with the bot and the code is accepted only there; if the bot cannot write to it, the group is asked to open that chat and send /start, and nothing is applied. Only the owner's reply to the prompt, with only the six digits, is checked. The code message is then deleted, the bot answers "Code accepted. Approvals open until HH:MM UTC." and applies the control. Controls sent while a code is awaited wait behind it, up to five, and each runs once. Controls inside the approval window apply without a code, and Command Center's "A fresh approval code is required" asks for a new one. A refused code, an expired one, too many wrong codes and a hold on new codes each have fixed wording.
@@ -15,6 +15,13 @@ All notable changes to conductor-telegram are documented here.
 - Approval calls and lane-state calls refuse redirects, so neither the service key nor the approval channel key and grant can follow one to another origin. They cap the response size and time out, and pass on at most one line of Command Center's error text; the chat gets fixed wording. A grant must name this channel and approver and is held for at most 31 minutes.
 - The router's Claude CLI and voice transcription start with the same minimal environment as agents, so they no longer inherit the bot's Telegram, Conductor, Command Center or approval credentials.
 - A lanes worker refuses to start while it holds an approval key. Its container unit clears both keys after the env file, and lane commands other than release, validate and retire no longer receive one through the Doppler runtime.
+
+## [0.16.1] - 2026-11-18
+
+### Changed
+- Telegram cloud work falls back across the newest models only: Fable 5.2, GPT-6 Astra, Opus 5.5, GPT-6.1 Sol, then Grok 4.7. The founder-approved provider order is unchanged.
+- Lane manifests may name Fable 5.2, Opus 5.5 and GPT-6.1 Sol. The current models are still accepted, so the Command Center manifest can move to the new ones without another worker release.
+- The example gateway environment defaults to Fable 5.2.
 
 ## [0.16.0] - 2026-10-13
 

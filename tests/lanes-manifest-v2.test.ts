@@ -170,6 +170,24 @@ test("Manifest v2 rejects runtime bindings, unknown/swapped models, cap drift, a
   );
 });
 
+test("Manifest v2 accepts the newest Fable, Opus and Sol models", () => {
+  const base = validManifest("L1.md", "a".repeat(64));
+  for (const [provider, model] of [
+    ["claude", "fable-5-2"],
+    ["claude", "opus-5-5-1m"],
+    ["codex", "gpt-6.1-sol"],
+  ] as const) {
+    const manifest = structuredClone(base) as any;
+    manifest.global.provider_models[provider] = model;
+    assert.equal(
+      parseLaneManifest(manifest, "/tmp/manifest.json", {
+        verifyPrompts: false,
+      }).global.provider_models[provider],
+      model
+    );
+  }
+});
+
 test("Manifest v2 accepts Claude Opus and Codex Sol backups while rejecting legacy provider models", () => {
   const base = validManifest("L1.md", "a".repeat(64));
   const claudeBackup = structuredClone(base) as any;

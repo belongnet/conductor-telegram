@@ -12,6 +12,11 @@ const MODELS = [
   "gpt-6-astra",
   "gpt-6-sol",
   "grok-4.7",
+  // Newest models (2026-11-18). Accepted alongside the current primaries so a
+  // Command Center manifest can move to them without a worker release.
+  "fable-5-2",
+  "opus-5-5-1m",
+  "gpt-6.1-sol",
 ] as const;
 export const APPROVED_PROVIDER_MODELS = {
   claude: "fable-5-1",
@@ -19,8 +24,8 @@ export const APPROVED_PROVIDER_MODELS = {
   cursor: "grok-4.7",
 } as const;
 export const APPROVED_PROVIDER_MODEL_OPTIONS = {
-  claude: ["fable-5-1", "opus-5-1m"],
-  codex: ["gpt-6-astra", "gpt-6-sol"],
+  claude: ["fable-5-1", "opus-5-1m", "fable-5-2", "opus-5-5-1m"],
+  codex: ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"],
   cursor: ["grok-4.7"],
 } as const;
 export const APPROVED_PROVIDER_CAPACITY = {

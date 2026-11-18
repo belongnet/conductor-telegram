@@ -18,10 +18,11 @@ import type { Workspace } from "../types/index.js";
 
 export interface Provider { agent: "claude" | "codex" | "cursor"; model: string; effort: string }
 export const DEFAULT_PROVIDERS: Provider[] = [
-  { agent: "claude", model: "fable-5-1", effort: "high" },
+  // Newest model of each family only (Fable 5.2, Opus 5.5, GPT-6.1 Sol).
+  { agent: "claude", model: "fable-5-2", effort: "high" },
   { agent: "codex", model: "gpt-6-astra", effort: "high" },
-  { agent: "claude", model: "opus-5-1m", effort: "high" },
-  { agent: "codex", model: "gpt-6-sol", effort: "high" },
+  { agent: "claude", model: "opus-5-5-1m", effort: "high" },
+  { agent: "codex", model: "gpt-6.1-sol", effort: "high" },
   { agent: "cursor", model: "grok-4.7", effort: "high" },
 ];
 
@@ -134,7 +135,7 @@ export function recoverableProviderError(detail: string): boolean {
   return PROVIDER_STOPS.some(([pattern]) => pattern.test(detail));
 }
 
-/** Why a provider stopped, worded to follow its name: "claude (fable-5-1) ran out of usage credits". */
+/** Why a provider stopped, worded to follow its name: "claude (fable-5-2) ran out of usage credits". */
 export function stopReason(detail: string): string {
   return PROVIDER_STOPS.find(([pattern]) => pattern.test(detail))?.[1] ?? `stopped: ${safeDetail(detail, 120).replace(/[.!?\s]+$/, "")}`;
 }
