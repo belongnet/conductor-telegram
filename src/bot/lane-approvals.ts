@@ -183,18 +183,17 @@ export class LaneApprovals {
    *
    * Only what the owner typed counts: sent from the owner's account, not by a
    * bot, and not forwarded, sent through an inline bot or posted on behalf of a
-   * chat. Of that, the flow owns a reply to an approval prompt, a text or
-   * caption that holds a code (`holdsApprovalCode`) in any chat, pending or not,
-   * and, in the chat where a code is awaited and until it expires, digits with
-   * no letters, an attempt at that code. Everything else, every bot command and
-   * text with letters but no code word included, goes to its normal handling.
+   * chat. Of that, the flow owns a reply to an approval prompt, whatever it
+   * says, a command included; a text or caption that holds a code
+   * (`holdsApprovalCode`) in any chat, pending or not; and, in the chat where a
+   * code is awaited and until it expires, digits with no letters, an attempt at
+   * that code. Everything else, every other bot command and text with letters
+   * but no code word included, goes to its normal handling.
    */
   claims(chat: Pick<ApprovalChat, "chatId" | "userId">, message: ApprovalMessage): boolean {
     if (message.withheld) return true;
     const owner = ownerIdentity(this.env()).userId;
     if (owner === undefined || chat.userId !== owner || message.fromBot || message.relayed) return false;
-    // A command is never a code, even sent as a reply to the prompt.
-    if (message.text !== undefined && isBotCommand(message.text)) return false;
     // Anything that answers an approval prompt, of any kind, is the flow's.
     if (message.repliesToPrompt) return true;
     const pending = this.pending;

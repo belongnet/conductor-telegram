@@ -815,9 +815,9 @@ async function sendPromptToTarget(
 }
 
 /**
- * A reply to a lane approval prompt, or anything that may hold an awaited code,
- * belongs to the approval flow, whatever kind of message it is: it never reaches
- * a workspace, the router or a download.
+ * A reply to a lane approval prompt, or anything the owner types that may hold
+ * a code, belongs to the approval flow, whatever kind of message it is: it never
+ * reaches a command, a workspace, the router or a download.
  */
 async function heldForApproval(ctx: Context): Promise<boolean> {
   const message = approvalMessageFrom(ctx.message as any, ctx.botInfo?.id);
@@ -832,6 +832,12 @@ function approvalGuarded(handler: (ctx: Context) => Promise<void>): (ctx: Contex
 }
 
 export function registerCommands(bot: Telegraf<Context>): void {
+  // The approval flow reads every message first: a command typed as the reply to an approval prompt is
+  // its own, so no command handler runs it. The media and text handlers below keep their own guard.
+  bot.use(async (ctx, next) => {
+    if (await heldForApproval(ctx)) return;
+    await next();
+  });
   bot.start(handleSetup);
   bot.command("setup", handleSetup);
   bot.command("run", handleRun);

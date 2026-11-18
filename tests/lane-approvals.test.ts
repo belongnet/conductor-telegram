@@ -230,10 +230,16 @@ test("a control waits for the owner's six-digit reply to the prompt, then runs o
   assert.equal(owner.deletes.length, deletesBefore + 1);
   assert.equal(owner.deletes.at(-1), words.raw.message_id, "any reply to the prompt is removed, whatever it holds");
 
-  // Ordinary conversation and commands are not the flow's.
+  // A command typed as the reply is the flow's like any other reply: removed, never run.
+  const command = message("/lanes status", { id: prompt });
+  assert.equal(await h.approvals.handleReply(owner, command.view), true);
+  assert.equal(owner.replies.at(-1), APPROVAL_TEXT.digitsOnly);
+  assert.equal(owner.deletes.at(-1), command.raw.message_id);
+
+  // Ordinary conversation and other commands are not the flow's.
   assert.equal(await h.approvals.handleReply(owner, message("hello").view), false);
   assert.equal(await h.approvals.handleReply(owner, message("thanks", { id: 42, prompt: false }).view), false);
-  assert.equal(await h.approvals.handleReply(owner, message("/lanes status", { id: prompt }).view), false);
+  assert.equal(await h.approvals.handleReply(owner, message("/lanes status").view), false);
 
   const code = message(" 042317 ", { id: prompt });
   assert.equal(await h.approvals.handleReply(owner, code.view), true);
@@ -472,8 +478,10 @@ test("possible codes are withheld from durable storage and from the update log",
 
     const ordinary = { update_id: 10, message: message("deploy the fix").raw };
     assert.equal(withholdApprovalText(ordinary, BOT), ordinary);
-    const command = { update_id: 11, message: message("/lanes status", { id: 501 }).raw };
+    const command = { update_id: 11, message: message("/lanes status").raw };
     assert.equal(withholdApprovalText(command, BOT), command, "commands stay commands");
+    const commandReply = { update_id: 14, message: message("/lanes status 042317", { id: 501 }).raw };
+    assert.doesNotMatch(JSON.stringify(withholdApprovalText(commandReply, BOT)), /lanes|042317/, "unless typed as the reply to a prompt");
     const otherBot = { update_id: 12, message: { ...message("sure").raw, reply_to_message: { message_id: 3, from: { id: 1, is_bot: true }, text: PROMPT } } };
     assert.equal(withholdApprovalText(otherBot, BOT), otherBot, "another bot's look-alike prompt is not ours");
     const sixAnywhere = { update_id: 13, message: { ...message("123456").raw, reply_to_message: { message_id: 3, from: { id: 1, is_bot: true }, text: PROMPT } } };
@@ -827,6 +835,11 @@ test("the owner's private chat lets approval traffic through and nothing else", 
     assert.equal(await passes(OWNER, "private", OWNER, { text: "Approve at 600000 USD" }), false, "words with a number hold no code");
     assert.equal(await passes(OWNER, "private", OWNER, { text: "123456", forward_date: 1 }), false, "a forwarded code is not the owner typing");
     assert.equal(await passes(OWNER, "private", OWNER, { text: "/lanes cutover v2" }), false, "commands stay refused there");
+    assert.equal(
+      await passes(OWNER, "private", OWNER, { text: "/lanes cutover v2", reply_to_message: message("x", { id: 900 }).raw.reply_to_message }),
+      true,
+      "a command typed as the reply to a prompt is approval traffic, which the flow takes before any command runs"
+    );
     assert.equal(await passes("777", "private", "777", { text: "123456" }), false, "someone else's private chat");
     const withoutOption = authGuard(() => ({ ownerChatId: GROUP, ownerUserId: OWNER }));
     let passed = false;
@@ -878,7 +891,11 @@ test("the Telegram bot posts the prompt as a forced reply and intercepts the cod
 
     // The bot's own text handler hands the reply to the flow before decisions, topics or the router.
     const handlers: Record<string, (ctx: unknown) => Promise<void>> = {};
+    const middlewares: Array<(ctx: unknown, next: () => Promise<void>) => Promise<void>> = [];
     registerCommands({
+      use: (middleware: (ctx: unknown, next: () => Promise<void>) => Promise<void>) => {
+        middlewares.push(middleware);
+      },
       start: () => undefined,
       command: () => undefined,
       action: () => undefined,
@@ -886,6 +903,21 @@ test("the Telegram bot posts the prompt as a forced reply and intercepts the cod
         handlers[event] = handler;
       },
     } as never);
+    // Before any command handler: a command typed as the reply to the prompt is the flow's and never runs.
+    assert.equal(middlewares.length, 1, "the approval flow reads every message before the commands");
+    let reachedHandlers = 0;
+    const onward = async () => {
+      reachedHandlers++;
+    };
+    await middlewares[0](
+      ctx({ message_id: 13, text: "/lanes cutover growth-v2-abc", entities: [{ type: "bot_command", offset: 0, length: 6 }],
+        reply_to_message: { message_id: 901, from: { id: BOT, is_bot: true }, text: PROMPT } }),
+      onward
+    );
+    assert.equal(reachedHandlers, 0, "no command handler sees it");
+    assert.equal(sent.at(-1)?.text, APPROVAL_TEXT.digitsOnly);
+    await middlewares[0](ctx({ message_id: 14, text: "/lanes status", entities: [{ type: "bot_command", offset: 0, length: 6 }] }), onward);
+    assert.equal(reachedHandlers, 1, "any other command goes on to its handler");
     // Media handlers are guarded too: a captioned photo answering the prompt is never downloaded or relayed.
     await handlers.photo(
       ctx({ message_id: 12, photo: [{ file_id: "secret-shot" }], caption: "042317", reply_to_message: { message_id: 901, from: { id: BOT, is_bot: true }, text: PROMPT } })
@@ -896,12 +928,13 @@ test("the Telegram bot posts the prompt as a forced reply and intercepts the cod
       ctx({ message_id: 11, text: "042317", reply_to_message: { message_id: 901, from: { id: BOT, is_bot: true }, text: PROMPT } })
     );
     assert.deepEqual(h.cc.verifies, [{ challenge_id: "ch_1", code: "042317" }]);
-    assert.deepEqual(deleted, [[OWNER, 12], [OWNER, 11]]);
+    assert.deepEqual(deleted, [[OWNER, 13], [OWNER, 12], [OWNER, 11]]);
     assert.equal(created.length, 1);
     assert.equal(created[0].kind, "rollback");
     assert.deepEqual(created[0].approval, { channelKey: KEY, grant: GRANT });
     assert.equal(created[0].requested_by, `telegram:${OWNER}`);
     assert.deepEqual(sent.slice(1).map((entry) => entry.text), [
+      APPROVAL_TEXT.digitsOnly,
       APPROVAL_TEXT.digitsOnly,
       "Code accepted. Approvals open until 12:30 UTC.",
       "Lane control queued: rollback. The lease holder will apply it.",
@@ -1089,13 +1122,23 @@ test("the cloud gateway prompts a group owner privately and reads codes only the
       ["9", "Lane control queued: rollback. The lease holder will apply it."],
     ]);
 
+    // A command typed as the reply to the prompt, even with approvals open, is the flow's: stored without its text,
+    // removed, and never run from the private chat.
+    store.ingest([{ update_id: 5, message: { message_id: 15, chat: direct, from: { id: 9 }, date: 4, text: "/lanes cutover growth-v2-abc",
+      entities: [{ type: "bot_command", offset: 0, length: 6 }], reply_to_message: { message_id: 77, from: { id: BOT, is_bot: true }, text: PROMPT } } }]);
+    assert.doesNotMatch(store.row("update:5")!.payload, /cutover/);
+    await handle();
+    assert.deepEqual(calls.filter((call) => call.method === "deleteMessage").at(-1)!.payload, { chat_id: "9", message_id: 15 });
+    assert.deepEqual(text("update:5:approval:%").map((payload) => [payload.chat_id, payload.text]), [["9", APPROVAL_TEXT.alreadyOpen("12:30")]]);
+    assert.equal(created.length, 1, "nothing more is applied");
+
     // An owner who never started the bot is told how, and no code is spent.
     h.advance(31 * 60_000);
     unreachable = true;
     const sends = h.cc.sends.length;
-    store.ingest([{ update_id: 5, message: { message_id: 14, chat: group, from: { id: 9 }, date: 4, text: "/lanes rollback" } }]);
+    store.ingest([{ update_id: 6, message: { message_id: 14, chat: group, from: { id: 9 }, date: 4, text: "/lanes rollback" } }]);
     await handle();
-    assert.equal(text("update:5:approval:%")[0].text, APPROVAL_TEXT.openPrivateChat);
+    assert.equal(text("update:6:approval:%")[0].text, APPROVAL_TEXT.openPrivateChat);
     assert.equal(h.cc.sends.length, sends);
     assert.equal(created.length, 1);
     assert.doesNotMatch(JSON.stringify(store.db.prepare("SELECT * FROM gateway_queue").all()), /042317/);
