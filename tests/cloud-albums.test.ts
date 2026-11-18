@@ -63,7 +63,7 @@ function boundWorkspace(f: ReturnType<typeof createFixture>, threadId: number) {
   const ws = createWorkspace({ name: "task", prompt: "Fix", repoPath: "conductor-project:p1", telegramChatId: "-42" });
   updateWorkspaceThreadId(ws.id, threadId);
   f.store.bind(ws.id, { workspaceId: "w1", projectId: "p1", repoUrl: "git@github.com:org/long-events.git", repoSlug: "org/long-events",
-    branch: null, prUrl: null, sessionId: "s1", agent: "claude", model: "fable-5-1", effort: "high", stopped: false });
+    branch: null, prUrl: null, sessionId: "s1", agent: "claude", model: "fable-5-2", effort: "high", stopped: false });
   return ws;
 }
 
@@ -184,7 +184,7 @@ test("an album sent to a workspace topic is one follow-up with every photo", () 
   const ws = createWorkspace({ name: "task", prompt: "Fix", repoPath: "conductor-project:p1", telegramChatId: "-42" });
   updateWorkspaceThreadId(ws.id, 7);
   f.store.bind(ws.id, { workspaceId: "w1", projectId: "p1", repoUrl: "git@github.com:org/long-events.git", repoSlug: "org/long-events",
-    branch: null, prUrl: null, sessionId: "s1", agent: "claude", model: "fable-5-1", effort: "high", stopped: false });
+    branch: null, prUrl: null, sessionId: "s1", agent: "claude", model: "fable-5-2", effort: "high", stopped: false });
   f.album(1, 3, { 1: "the footer overlaps here" }, { message_thread_id: 7 });
   await f.updates();
   const action = f.payload("update:1:action");

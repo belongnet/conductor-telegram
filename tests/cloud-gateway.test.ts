@@ -46,7 +46,7 @@ function createFixture() {
     getWorkspaceStatus: async () => ({ workspaceId: "w1", status: "ready" }),
     listProjectWorkspaces: async () => [],
     listWorkspaceSessions: async () => sessions,
-    getSession: async (id: string) => ({...sessions.find(session => session.id === id), model: "fable-5-1"}),
+    getSession: async (id: string) => ({...sessions.find(session => session.id === id), model: "fable-5-2"}),
     createSession: async (input: any) => { const session = { id: `s${sessions.length + 1}`, name: input.name, deepLink: "conductor://session" }; sessions.push(session); return session; },
     getSessionStatus: async (sessionId: string) => ({ workspaceId: "w1", sessionId, status: sessionStatus, errorMessage }),
     getMessage: async (id: string) => { const message = messages.find(m => m.id === id); if (!message) throw new ConductorApiError("Not found", 404); return message; },
@@ -544,7 +544,7 @@ test("quota failure queues one fallback; an API outage never launches a replacem
   const notice = JSON.parse(f.store.row(noticeId)!.payload);
   assert.equal(notice.method, "editMessageText");
   assert.equal(notice.statusOf, "quota-ack:0", "provider fallback updates the existing turn card");
-  assert.equal(notice.payload.text, "claude (fable-5-1) hit a usage limit. Continuing in codex (gpt-6-astra); existing work is kept.");
+  assert.equal(notice.payload.text, "claude (fable-5-2) hit a usage limit. Continuing in codex (gpt-6-astra); existing work is kept.");
   assert.equal(f.store.row(`${noticeId}:topic:0`), undefined, "a fresh card in the workspace's own chat already says it");
   f.status("error"); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM gateway_queue WHERE id LIKE 'recover:%'").get() as any).n, 1);
@@ -648,7 +648,7 @@ test("provider recovery continues and completes on the original turn card", () =
   const continuation = JSON.parse(f.store.row(`${recovery.id}:sent`)!.payload);
   assert.equal(continuation.method, "editMessageText");
   assert.equal(continuation.statusOf, "recovery-ack:0");
-  assert.equal(continuation.payload.text, "Continuing in codex (gpt-6-astra) after claude (fable-5-1) stopped.",
+  assert.equal(continuation.payload.text, "Continuing in codex (gpt-6-astra) after claude (fable-5-2) stopped.",
     "the card's later state still names the model it replaced");
   const sessionId = f.sessions.at(-1).id as string;
   assert.equal(f.sessions.at(-1).name, "Recovery", "the replacement thread is named for what it is, not its creation key");
@@ -808,7 +808,7 @@ test("a fallback is also said in the workspace topic when its card is elsewhere,
   f.status("error", "You're out of usage credits. Switch to another model to continue.");
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   const id = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
-  const text = "claude (fable-5-1) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept.";
+  const text = "claude (fable-5-2) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept.";
   const card = JSON.parse(f.store.row(id)!.payload);
   assert.equal(card.statusOf, "general-ack:0");
   assert.equal(card.payload.text, text);
@@ -862,7 +862,7 @@ test("a fallback without a card is said once, in the workspace topic, linked to 
   const id = `recover-notice:s1:${f.store.get<any>("session:s1").sentMessageId}`;
   const line = JSON.parse(f.store.row(`${id}:0`)!.payload);
   assert.equal(line.method, "sendMessage");
-  assert.equal(line.payload.text, "claude (fable-5-1) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept.");
+  assert.equal(line.payload.text, "claude (fable-5-2) ran out of usage credits. Continuing in codex (gpt-6-astra); existing work is kept.");
   assert.equal(line.payload.message_thread_id, 7);
   assert.equal(line.payload.disable_notification, true);
   assert.equal(line.sessionId, undefined, "a reply to the notice must follow the replacement, not the thread that stopped");
@@ -879,7 +879,7 @@ test("a replacement refused before it starts is also said in the workspace topic
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   const recovery = f.store.db.prepare("SELECT id FROM gateway_queue WHERE kind='cloud' AND id LIKE 'recover:%'").get() as {id: string};
   const id = `provider-rejected:${recovery.id}:codex:gpt-6-astra`;
-  const text = "codex (gpt-6-astra) rejected the run before it started. Trying claude (opus-5-1m).";
+  const text = "codex (gpt-6-astra) rejected the run before it started. Trying claude (opus-5-5-1m).";
   const card = JSON.parse(f.store.row(id)!.payload);
   assert.equal(card.statusOf, "general-ack:0");
   assert.equal(card.payload.text, text);
@@ -897,10 +897,10 @@ test("a reconnect names the model it keeps, and its continuation's card says it 
   await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   const sent = f.store.get<any>("session:s1").sentMessageId;
   assert.equal(JSON.parse(f.store.row(`resume-notice:s1:${sent}`)!.payload).payload.text,
-    "Reconnecting the existing claude (fable-5-1) session before trying a fallback.");
+    "Reconnecting the existing claude (fable-5-2) session before trying a fallback.");
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   // The same thread carries on, so there is no model it replaced to name.
-  assert.equal(JSON.parse(f.store.row(`resume:s1:${sent}:sent`)!.payload).payload.text, "Continuing in claude (fable-5-1).");
+  assert.equal(JSON.parse(f.store.row(`resume:s1:${sent}:sent`)!.payload).payload.text, "Continuing in claude (fable-5-2).");
 }));
 
 test("/rename names the workspace everywhere: its record, its Conductor name and its topic", () => fixture(async f => {
@@ -1493,7 +1493,7 @@ test("a user turn edits its acknowledgement instead of posting sent and finished
   assert.deepEqual(calls.map(c => c.method), ["sendMessage", "editMessageText"]);
   assert.equal(calls[1].payload.message_id, 501);
   assert.equal(calls[1].payload.message_thread_id, undefined);
-  assert.equal(calls[1].payload.text, "Sent to claude (fable-5-1).");
+  assert.equal(calls[1].payload.text, "Sent to claude (fable-5-2).");
   assert.equal(getWorkspaceMessageTarget("42", "501")?.workspace.id, f.ws.id, "replying to the card targets the session");
   f.store.set(`poll-after:${f.ws.id}`, 0); await f.engine.pollWorkspace(f.ws.id, f.store.binding(f.ws.id)!);
   f.messages.push({id: "answer", sessionId: "s1", type: "assistant", content: "All green.", sessionIndex: f.messages.length, receivedAt: new Date().toISOString()});
@@ -1548,7 +1548,7 @@ test("thread and command actions carry their own silent acknowledgement as the s
 
 test("status edits wait behind a paced acknowledgement in the same lane", () => fixture(async f => {
   enqueueText(f.store, "ack", "42", "Task received and queued.", {threadId: 7, priority: 0, silent: true});
-  enqueueStatus(f.store, "ack-sent", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "ack-sent", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-2)."});
   assert.equal(f.store.row("ack-sent")!.conversation, f.store.row("ack:0")!.conversation);
   const calls: string[] = [];
   const delivery = new TelegramDelivery(f.store, async method => { calls.push(method); return {message_id: 9}; });
@@ -1577,7 +1577,7 @@ test("a status edit whose acknowledgement is gone becomes a silent message", () 
   const deliver = async () => { f.store.set("telegram-chat-after:42", 0); await delivery.tick(); };
   // Deleted by the user after delivery.
   enqueueText(f.store, "ack", "42", "Task received and queued.", {threadId: 7, priority: 0, silent: true});
-  enqueueStatus(f.store, "ack-sent", {anchorId: "ack:0", chatId: "42", workspaceId: f.ws.id, sessionId: "s1", text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "ack-sent", {anchorId: "ack:0", chatId: "42", workspaceId: f.ws.id, sessionId: "s1", text: "Sent to claude (fable-5-2)."});
   editError = {response: {error_code: 400, description: "Bad Request: message to edit not found"}};
   await deliver(); await deliver();
   assert.equal(f.store.row("ack-sent")!.state, "pending");
@@ -1588,22 +1588,22 @@ test("a status edit whose acknowledgement is gone becomes a silent message", () 
   assert.equal(fallback.payload.disable_notification, true);
   assert.equal(fallback.payload.message_id, undefined);
   assert.equal(fallback.payload.message_thread_id, 7, "the fallback is routed like any workspace message");
-  assert.equal(fallback.payload.text, "Sent to claude (fable-5-1).");
+  assert.equal(fallback.payload.text, "Sent to claude (fable-5-2).");
   assert.equal(f.store.row("ack-sent")!.state, "done");
   // Never delivered at all, or never queued.
   enqueueText(f.store, "blocked-ack", "42", "Queued for Conductor.", {threadId: 7, priority: 0, silent: true});
   f.store.retry("blocked-ack:0", "Bad Request: chat not found", 0, true);
-  enqueueStatus(f.store, "blocked-sent", {anchorId: "blocked-ack:0", chatId: "42", workspaceId: f.ws.id, text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "blocked-sent", {anchorId: "blocked-ack:0", chatId: "42", workspaceId: f.ws.id, text: "Sent to claude (fable-5-2)."});
   enqueueStatus(f.store, "orphan-sent", {anchorId: "missing-ack:0", chatId: "42", workspaceId: f.ws.id, text: "Conductor task finished."});
   for (let i = 0; i < 4; i++) await deliver();
-  assert.deepEqual(calls.filter(c => c.method === "sendMessage").map(c => c.payload.text).slice(-2), ["Sent to claude (fable-5-1).", "Conductor task finished."]);
+  assert.deepEqual(calls.filter(c => c.method === "sendMessage").map(c => c.payload.text).slice(-2), ["Sent to claude (fable-5-2).", "Conductor task finished."]);
   assert.equal(f.store.row("blocked-sent")!.state, "done"); assert.equal(f.store.row("orphan-sent")!.state, "done");
   assert.equal(f.store.get("telegram-not-before"), undefined, "an uneditable card never pauses delivery");
 }));
 
 test("identical status text counts as delivered and later states supersede undelivered ones", () => fixture(async f => {
   enqueueText(f.store, "ack", "42", "Task received and queued.", {threadId: 7, priority: 0, silent: true});
-  enqueueStatus(f.store, "first", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "first", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-2)."});
   enqueueStatus(f.store, "second", {anchorId: "ack:0", chatId: "42", workspaceId: f.ws.id, sessionId: "s1", text: "Conductor task finished."});
   assert.equal(f.store.row("first")!.state, "done");
   assert.deepEqual(JSON.parse(f.store.row("first")!.result!), {supersededBy: "second"});
@@ -1623,7 +1623,7 @@ test("identical status text counts as delivered and later states supersede undel
 
 test("re-enqueueing the same status id is an idempotent no-op", () => fixture(async f => {
   enqueueText(f.store, "ack", "42", "Task received and queued.", {silent: true});
-  enqueueStatus(f.store, "same", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "same", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-2)."});
   const original = f.store.row("same")!.payload;
   enqueueStatus(f.store, "same", {anchorId: "ack:0", chatId: "42", text: "A conflicting retry."});
   assert.equal(f.store.row("same")!.payload, original);
@@ -1632,7 +1632,7 @@ test("re-enqueueing the same status id is an idempotent no-op", () => fixture(as
 
 test("status replacement rolls back supersession when the new edit cannot be queued", () => fixture(async f => {
   enqueueText(f.store, "ack", "42", "Task received and queued.", {silent: true});
-  enqueueStatus(f.store, "first", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-1)."});
+  enqueueStatus(f.store, "first", {anchorId: "ack:0", chatId: "42", text: "Sent to claude (fable-5-2)."});
   f.store.db.exec(`CREATE TRIGGER fail_replacement BEFORE INSERT ON gateway_queue
     WHEN NEW.id='second' BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END`);
   assert.throws(() => enqueueStatus(f.store, "second", {anchorId: "ack:0", chatId: "42", text: "Conductor task finished."}),
@@ -1933,10 +1933,10 @@ test("all eligible providers are attempted once and a user stop prevents further
   }
   assert.equal(f.sessions.length, 5);
   assert.deepEqual(f.store.get("recovery-providers:launch"), [
-    "claude:fable-5-1",
+    "claude:fable-5-2",
     "codex:gpt-6-astra",
-    "claude:opus-5-1m",
-    "codex:gpt-6-sol",
+    "claude:opus-5-5-1m",
+    "codex:gpt-6.1-sol",
     "cursor:grok-4.7",
   ]);
   f.engine.queue("stop", {type: "stop", trackedId: f.ws.id});
@@ -2000,13 +2000,13 @@ test("an unavailable provider rejected before launch is skipped without an uncer
   enqueueText(f.store, "provider-ack", "42", "Task received and queued.", {silent: true});
   f.engine.queue("launch", {type: "launch", trackedId: f.ws.id, projectId: "p1", prompt: "Fix\nthe bug", statusId: "provider-ack:0"});
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
-  const rejected = JSON.parse(f.store.row("provider-rejected:launch:claude:fable-5-1")!.payload);
+  const rejected = JSON.parse(f.store.row("provider-rejected:launch:claude:fable-5-2")!.payload);
   assert.equal(rejected.method, "editMessageText"); assert.equal(rejected.statusOf, "provider-ack:0");
   f.store.retry("launch", "eligible fallback", 0);
   await processQueue(f.store, ["cloud"], row => f.engine.action(row));
   assert.equal(f.store.binding(f.ws.id)?.agent, "codex"); assert.equal(f.counts().sends, 1);
   assert.deepEqual(f.store.get("recovery-providers:launch"), [
-    "claude:fable-5-1",
+    "claude:fable-5-2",
     "codex:gpt-6-astra",
   ]);
 }));

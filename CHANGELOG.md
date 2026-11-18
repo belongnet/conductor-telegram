@@ -2,6 +2,13 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.16.1] - 2026-11-18
+
+### Changed
+- Telegram cloud work falls back across the newest models only: Fable 5.2, GPT-6 Astra, Opus 5.5, GPT-6.1 Sol, then Grok 4.7. The founder-approved provider order is unchanged.
+- Lane manifests may name Fable 5.2, Opus 5.5 and GPT-6.1 Sol. The current models are still accepted, so the Command Center manifest can move to the new ones without another worker release.
+- The example gateway environment defaults to Fable 5.2.
+
 ## [0.16.0] - 2026-10-13
 
 ### Added

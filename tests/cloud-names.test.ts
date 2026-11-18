@@ -25,7 +25,7 @@ test("a gateway thread's creation key reads as what the thread is for", () => {
   assert.equal(threadName("Review the auth module"), "Review the auth module");
   assert.equal(threadName(undefined, "Untitled"), "Untitled");
   assert.equal(threadLabel("Task recover:s1:m1", "gpt-6-astra"), "Recovery · gpt-6-astra");
-  assert.equal(threadLabel("Auxiliary LLM Error Fix", "fable-5-1"), "Auxiliary LLM Error Fix · fable-5-1");
+  assert.equal(threadLabel("Auxiliary LLM Error Fix", "fable-5-2"), "Auxiliary LLM Error Fix · fable-5-2");
   assert.equal(threadLabel(undefined, undefined), "Untitled");
   assert.equal(creationKey("b9bed051-9e94-41af-802b-fa5be3b58b9d"), "telegram-b9bed051-9e94-41af-802b-fa5be3b58b9d");
 });
