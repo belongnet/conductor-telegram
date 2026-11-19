@@ -1055,7 +1055,7 @@ test("legacy apply succeeds after cutover, when the controller is active", async
       kind: "cutover",
       requested_by: "test",
       payload: { revision_id: "legacy-import-v2" },
-      approvalKey: "human",
+      approval: { channelKey: "test-approval-channel-key", grant: "human" },
     });
     const beforeCutover = await store.snapshot();
     await store.finishControl(lease, control.control_id, {

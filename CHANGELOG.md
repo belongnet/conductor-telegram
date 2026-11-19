@@ -2,6 +2,21 @@
 
 All notable changes to conductor-telegram are documented here.
 
+## [0.17.0] - 2026-11-18
+
+### Changed
+- Human lane controls are approved with an emailed code, the standardized Belong OTP flow, instead of the retired `BELONG_HUMAN_APPROVAL_KEY`. In Telegram, `/lanes cutover`, `rollback`, `archive-approval`, `release` and `validate` ask Command Center to email a code to the main Belong mailbox and answer "Approval code sent to <mailbox>. Reply to this message with the 6-digit code within 10 minutes." When the owner chat is a group, the prompt goes to the owner's private chat with the bot and the code is accepted only there; if the bot cannot write to it, the group is asked to open that chat and send /start, and nothing is applied. Only the owner's reply to the prompt, with only the six digits, is checked. The code message is then deleted, the bot answers "Code accepted. Approvals open until HH:MM UTC." and applies the control. Controls sent while a code is awaited wait behind it, up to five, and each runs once. Controls inside the approval window apply without a code, and Command Center's "A fresh approval code is required" asks for a new one. A refused code, an expired one, too many wrong codes and a hold on new codes each have fixed wording.
+- `conductor-telegram lanes release`, `validate` and `retire` ask for the code on the terminal and refuse to run without one. The grant is revoked when the command ends.
+- A standalone SQLite lanes install needs a Command Center approval channel for human-gated controls; it cannot approve them on its own.
+- `BELONG_APPROVAL_CHANNEL_KEY` replaces `BELONG_HUMAN_APPROVAL_KEY` in the Doppler allowlist, the durable lanes launchd requirements and `doctor`, which also checks that the key has at least 40 characters, no whitespace and matches no other key. The lane worker never receives either key: its launchd and systemd launches strip both. Create the new key before deploying, deploy Command Center first, then this release, and delete the old key once both are live.
+
+### Security
+- Approval codes and grants stay in process memory. Every reply to an approval prompt, of any kind, and every owner message that may hold a code, in any chat the bot reads and whether or not a code is pending, is kept out of the gateway database and never reaches a workspace, the AI router or a download. Replies to a prompt and anything that could hold the code are deleted, with a failed delete reported, and the update log masks every digit. Forwarded messages, messages sent through an inline bot and messages posted on behalf of a chat never count as the owner.
+- Only what the owner types is claimed as a possible code: a reply to the approval prompt, a message with no letters that is six digits apart from spaces and `. - _ , /` or has six or more in a row, exactly six digits beside the word code, OTP, PIN, passcode or verification, and, while a code is awaited, digits with no letters in that chat. Other text, such as "Approve at 600000 USD", and other bot commands keep their normal handling.
+- Approval calls and lane-state calls refuse redirects, so neither the service key nor the approval channel key and grant can follow one to another origin. They cap the response size and time out, and pass on at most one line of Command Center's error text; the chat gets fixed wording. A grant must name this channel and approver and is held for at most 31 minutes.
+- The router's Claude CLI and voice transcription start with the same minimal environment as agents, so they no longer inherit the bot's Telegram, Conductor, Command Center or approval credentials.
+- A lanes worker refuses to start while it holds an approval key. Its container unit clears both keys after the env file, and lane commands other than release, validate and retire no longer receive one through the Doppler runtime.
+
 ## [0.16.1] - 2026-11-18
 
 ### Changed

@@ -1,6 +1,9 @@
 import path from "node:path";
 import os from "node:os";
 import type { LaneManifestV2, ManifestProvider } from "./manifest.js";
+import { FRESH_APPROVAL_REQUIRED, type LaneHumanApproval } from "./approval-channel.js";
+
+export { FRESH_APPROVAL_REQUIRED, type LaneHumanApproval };
 
 export type LeaseCredentials = {
   lease_name: string;
@@ -417,7 +420,7 @@ export interface LaneStateStore {
     lane_id?: string;
     requested_by: string;
     payload?: Record<string, unknown>;
-    approvalKey?: string;
+    approval?: LaneHumanApproval;
   }): Promise<LaneControlRecord>;
   finishControl(
     lease: LeaseCredentials,
@@ -444,6 +447,16 @@ export class LaneStateStoreError extends Error {
 
   get conflict(): boolean {
     return this.status === 409;
+  }
+
+  /** The grant is gone or expired; the approver needs a new emailed code. */
+  get freshApprovalRequired(): boolean {
+    return (
+      this.status === 401 &&
+      typeof this.body === "object" &&
+      this.body !== null &&
+      (this.body as { detail?: unknown }).detail === FRESH_APPROVAL_REQUIRED
+    );
   }
 }
 

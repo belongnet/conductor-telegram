@@ -314,6 +314,47 @@ test("notification claims are durably deduplicated across worker processes", asy
   }
 });
 
+test("human-gated controls need both approval headers, like Command Center", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lane-control-approval-"));
+  const store = new SqliteLaneStateStore(path.join(root, "state.db"));
+  try {
+    const rollback = (id: string, approval?: { channelKey: string; grant: string }) =>
+      store.createControl({
+        control_id: id,
+        idempotency_key: id,
+        kind: "rollback",
+        requested_by: "telegram:test",
+        ...(approval ? { approval } : {}),
+      });
+    for (const [id, approval] of [
+      ["rollback-none", undefined],
+      ["rollback-no-grant", { channelKey: "channel-key", grant: "" }],
+      ["rollback-no-key", { channelKey: "", grant: "grant" }],
+    ] as const) {
+      const error = await rollback(id, approval).catch((caught: unknown) => caught);
+      assert.ok(error instanceof LaneStateStoreError, id);
+      assert.equal(error.status, 401, id);
+      assert.equal(error.freshApprovalRequired, true, id);
+      assert.equal(error.message, "A fresh approval code is required");
+    }
+    const approved = await rollback("rollback-approved", { channelKey: "channel-key", grant: "grant" });
+    assert.equal(approved.human_approved, true);
+    assert.equal(JSON.stringify(approved).includes("grant\""), false, "the grant is not stored");
+    const pause = await store.createControl({
+      control_id: "pause",
+      idempotency_key: "pause",
+      kind: "pause",
+      requested_by: "telegram:test",
+    });
+    assert.equal(pause.human_approved, false, "non-human controls need no approval");
+    const rows = store["db"].prepare("SELECT payload_json FROM lane_v2_controls").all() as Array<{ payload_json: string }>;
+    assert.ok(rows.every((row) => !row.payload_json.includes("channel-key")), "approval never reaches storage");
+  } finally {
+    await store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("control requests reject unsupported kinds and incomplete durable targets", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lane-control-validation-"));
   const store = new SqliteLaneStateStore(path.join(root, "state.db"));
@@ -401,7 +442,7 @@ test("resume cannot bypass cutover from shadow or rollback", async () => {
       kind: "cutover",
       requested_by: "telegram:test",
       payload: { revision_id: "growth-test" },
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await apply(cutover);
     const pause = await store.createControl({
@@ -425,7 +466,7 @@ test("resume cannot bypass cutover from shadow or rollback", async () => {
       idempotency_key: "control-boundary-rollback",
       kind: "rollback",
       requested_by: "telegram:test",
-      approvalKey: "human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "human-key" },
     });
     await apply(rollback);
     const rollbackResume = await store.createControl({
@@ -1067,7 +1108,7 @@ test("SQLite standalone archive policy requires an exact unexpired human batch",
           workspace_ids: [],
           expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
         },
-        approvalKey: "separate-human-key",
+        approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
       }),
       /exact workspace_ids/
     );
@@ -1082,7 +1123,7 @@ test("SQLite standalone archive policy requires an exact unexpired human batch",
         workspace_ids: ["workspace-someone-else"],
         expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, wrongWorkspaceControl.control_id, {
@@ -1114,7 +1155,7 @@ test("SQLite standalone archive policy requires an exact unexpired human batch",
         workspace_ids: ["workspace-untagged"],
         expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {

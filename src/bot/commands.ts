@@ -1,4 +1,5 @@
 import { handleDurableLanes } from "./durable-lanes-command.js";
+import { approvalMessageFrom, laneApprovals, telegrafApprovalChat } from "./lane-approvals.js";
 import type { Context, Telegraf } from "telegraf";
 import {
   answerPendingStdinDecision,
@@ -813,7 +814,30 @@ async function sendPromptToTarget(
   );
 }
 
+/**
+ * A reply to a lane approval prompt, or anything the owner types that may hold
+ * a code, belongs to the approval flow, whatever kind of message it is: it never
+ * reaches a command, a workspace, the router or a download.
+ */
+async function heldForApproval(ctx: Context): Promise<boolean> {
+  const message = approvalMessageFrom(ctx.message as any, ctx.botInfo?.id);
+  return !!message && (await laneApprovals().handleReply(telegrafApprovalChat(ctx), message));
+}
+
+function approvalGuarded(handler: (ctx: Context) => Promise<void>): (ctx: Context) => Promise<void> {
+  return async (ctx) => {
+    if (await heldForApproval(ctx)) return;
+    await handler(ctx);
+  };
+}
+
 export function registerCommands(bot: Telegraf<Context>): void {
+  // The approval flow reads every message first: a command typed as the reply to an approval prompt is
+  // its own, so no command handler runs it. The media and text handlers below keep their own guard.
+  bot.use(async (ctx, next) => {
+    if (await heldForApproval(ctx)) return;
+    await next();
+  });
   bot.start(handleSetup);
   bot.command("setup", handleSetup);
   bot.command("run", handleRun);
@@ -857,12 +881,12 @@ export function registerCommands(bot: Telegraf<Context>): void {
   bot.action(/^archive:(.+)$/, handleArchiveCallback);
 
   // Media and text handlers
-  bot.on("photo", handlePhotoMessage);
-  bot.on("voice", handleVoiceMessage);
-  bot.on("document", (ctx) => handleAttachmentMessage(ctx, "document"));
-  bot.on("audio", (ctx) => handleAttachmentMessage(ctx, "audio"));
-  bot.on("video", (ctx) => handleAttachmentMessage(ctx, "video"));
-  bot.on("animation", (ctx) => handleAttachmentMessage(ctx, "animation"));
+  bot.on("photo", approvalGuarded(handlePhotoMessage));
+  bot.on("voice", approvalGuarded(handleVoiceMessage));
+  bot.on("document", approvalGuarded((ctx) => handleAttachmentMessage(ctx, "document")));
+  bot.on("audio", approvalGuarded((ctx) => handleAttachmentMessage(ctx, "audio")));
+  bot.on("video", approvalGuarded((ctx) => handleAttachmentMessage(ctx, "video")));
+  bot.on("animation", approvalGuarded((ctx) => handleAttachmentMessage(ctx, "animation")));
   bot.on("text", handleTextMessage);
 }
 
@@ -3452,6 +3476,8 @@ async function handleTextMessage(ctx: Context): Promise<void> {
 
   const text = (ctx.message as any)?.text?.trim();
   if (!text || text.startsWith("/")) return;
+
+  if (await heldForApproval(ctx)) return;
 
   // Check if this is a reply to a decision question
   if (await tryAnswerDecisionReply(ctx, text)) return;

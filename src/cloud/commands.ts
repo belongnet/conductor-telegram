@@ -15,6 +15,8 @@ import { taskTitle, threadLabel, threadName } from "./names.js";
 import { repositoryRemoteIdentity } from "../lanes/repository-identity.js";
 import type { ConductorApiProject } from "../integrations/conductor-api.js";
 import type { RepoTopic, Workspace } from "../types/index.js";
+import type { LaneStateStore } from "../lanes/state-store.js";
+import { approvalMessageFrom, isRelayed, isWithheldApprovalMessage, laneApprovals, takeWithheldApprovalText, type ApprovalChat } from "../bot/lane-approvals.js";
 
 /** Telegram stamps `date` in seconds; one pasted list lands inside this window. */
 const BURST_SECONDS = 2;
@@ -107,6 +109,8 @@ export class CloudCommands {
   albumSettleMs = 300;
   /** Whisper runs as a local binary; tests replace it. */
   transcribe: (voicePath: string) => Promise<string | null> = transcribeVoiceMessage;
+  /** The durable lanes state connection; tests replace it. */
+  openLaneStore: (() => Promise<LaneStateStore>) | undefined;
 
   constructor(readonly store: GatewayStore, readonly engine: CloudEngine, readonly telegram: TelegramCall,
     readonly ownerChatId: string, readonly ownerUserId?: string, readonly syncChatId?: string,
@@ -118,6 +122,16 @@ export class CloudCommands {
     const msg = update.message ?? callback?.message;
     const from = callback?.from ?? msg?.from;
     if (!msg || (this.ownerUserId && String(from?.id) !== this.ownerUserId)) return;
+    // A possible lane approval code was stored without its text. Wherever the gateway reads it (the owner chat, the
+    // synced group, or the owner's private chat when the owner chat is a group) it goes to the approval flow and
+    // nowhere else. Anything else from that private chat is still ignored below.
+    if (!callback && isWithheldApprovalMessage(msg) && this.readsForApproval(msg)) {
+      const chatId = String(msg.chat.id);
+      const message = approvalMessageFrom(msg, this.store.get<number>("telegram-bot-id"),
+        { text: takeWithheldApprovalText(chatId, msg.message_id), withheld: true });
+      if (message) await laneApprovals().handleReply(this.approvalChat(row, msg, from, chatId, msg.message_thread_id), message);
+      return;
+    }
     const syncedTarget = this.syncChatId && String(msg.chat?.id) === this.syncChatId && msg.message_thread_id
       ? getWorkspaceByThreadId(this.syncChatId, msg.message_thread_id) : undefined;
     if (String(msg.chat?.id) !== this.ownerChatId && !(this.ownerUserId && syncedTarget && this.store.get(`cloud-synced:${syncedTarget.id}`))) return;
@@ -273,7 +287,7 @@ export class CloudCommands {
       await handleDurableLanes({message: msg, from, chat: msg.chat, reply: async (text: string, extra?: Record<string, unknown>) => {
         enqueueTelegram(this.store, `${row.id}:lanes:${part++}`, {method: "sendMessage", payload: {chat_id: chatId,
           ...(threadId ? {message_thread_id: threadId} : {}), text, ...extra}}); return {};
-      }} as any, args); return;
+      }} as any, args, {approvalChat: this.approvalChat(row, msg, from, chatId, threadId), openStore: this.openLaneStore}); return;
     }
     if (command === "fleet") {
       const hours = args ? Number(args) : 24;
@@ -480,6 +494,48 @@ export class CloudCommands {
       try { const access = await this.engine.repoAccess(slug); if (!access.ok) denied.set(slug, access.status); } catch { /* Not checked. */ }
     }));
     return denied;
+  }
+
+  /**
+   * The approval flow's view of this chat. The code prompt is sent at once rather than queued, because the owner's
+   * reply is bound to its message id. A code message is deleted directly: a queued delete Telegram refuses would
+   * block delivery for good.
+   */
+  private approvalChat(row: QueueRow, msg: any, from: any, chatId: string, threadId?: number): ApprovalChat {
+    let part = 0;
+    return {
+      chatId,
+      userId: from?.id === undefined ? undefined : String(from.id),
+      relayed: isRelayed(msg),
+      reachPrivately: async (userId: string) => {
+        await this.telegram("sendChatAction", { chat_id: userId, action: "typing" });
+      },
+      promptPrivately: async (userId: string, text: string) => {
+        const sent = await this.telegram("sendMessage", { chat_id: userId, text, reply_markup: { force_reply: true },
+          link_preview_options: { is_disabled: true } });
+        return Number(sent?.message_id);
+      },
+      reply: async (text: string) => {
+        enqueueText(this.store, `${row.id}:approval:${part++}`, chatId, text, { threadId, priority: 0, silent: true });
+      },
+      prompt: async (text: string) => {
+        const sent = await this.telegram("sendMessage", { chat_id: chatId, text, ...(threadId ? { message_thread_id: threadId } : {}),
+          reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+          reply_markup: { force_reply: true, selective: true }, link_preview_options: { is_disabled: true } });
+        return Number(sent?.message_id);
+      },
+      deleteMessage: async (messageId: number) => {
+        await this.telegram("deleteMessage", { chat_id: chatId, message_id: messageId });
+      },
+    };
+  }
+
+  /** Chats where a withheld approval message is answered: never a foreign chat, where the gateway stays silent. */
+  private readsForApproval(msg: any): boolean {
+    const chatId = String(msg.chat?.id);
+    if (chatId === this.ownerChatId || (this.syncChatId !== undefined && chatId === this.syncChatId)) return true;
+    // A group owner answers the prompt in their private chat with the bot, whose id is their own.
+    return this.ownerChatId.startsWith("-") && !!this.ownerUserId && msg.chat?.type === "private" && chatId === this.ownerUserId;
   }
 
   /** `/ping` is a liveness check in its own lane, so it reports only what an earlier command already learned. */

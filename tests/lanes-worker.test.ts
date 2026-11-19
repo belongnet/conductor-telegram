@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { missingLaneWorkerAlertConfig, runLaneWorker } from "../src/lanes/worker.js";
+import { heldApprovalKeys, missingLaneWorkerAlertConfig, runLaneWorker } from "../src/lanes/worker.js";
 
 test("every lease worker requires send-only Telegram alert credentials", () => {
   assert.deepEqual(missingLaneWorkerAlertConfig({}), [
@@ -81,4 +81,27 @@ test("the worker refuses GitLab-proven lanes without GITLAB_TOKEN before claimin
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a lane worker holding an approval key refuses to start", async () => {
+  for (const name of ["BELONG_APPROVAL_CHANNEL_KEY", "BELONG_HUMAN_APPROVAL_KEY"]) {
+    await assert.rejects(
+      runLaneWorker({ env: { [name]: "k".repeat(48), LANES_SITE: "ovh" }, signal: AbortSignal.abort(), log: () => undefined }),
+      new RegExp(`refuses to start while it holds ${name}; remove it`)
+    );
+  }
+  assert.deepEqual(
+    heldApprovalKeys({ BELONG_APPROVAL_CHANNEL_KEY: "", BELONG_HUMAN_APPROVAL_KEY: "  " }),
+    [],
+    "the container's cleared values count as absent"
+  );
+  await assert.rejects(
+    runLaneWorker({
+      env: { BELONG_APPROVAL_CHANNEL_KEY: "", BELONG_HUMAN_APPROVAL_KEY: "" },
+      signal: AbortSignal.abort(),
+      log: () => undefined,
+    }),
+    (error: Error) => !/refuses to start/.test(error.message) && /LANES_SITE/.test(error.message),
+    "empty keys pass the refusal and fail on the next missing setting"
+  );
 });

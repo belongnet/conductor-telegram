@@ -2,7 +2,24 @@ import {existsSync} from "node:fs";
 import {createConductorApiClientFromEnv} from "../integrations/conductor-api.js";
 import type {Config} from "../cli/config.js";
 import {CloudGitHub, githubSlug} from "./catalog.js";
+import {APPROVAL_CHANNEL_KEY_ENV, RETIRED_APPROVAL_KEY_ENV, approvalChannelKeyProblem} from "../lanes/approval-channel.js";
 export interface CloudCheck {name: string; ok: boolean; detail: string; fix?: string}
+
+/**
+ * A gateway that serves /lanes asks Command Center for emailed approval codes before owner controls, so it needs the
+ * approval channel key. Without the durable lanes connection it serves no lane controls and needs nothing.
+ */
+export function laneApprovalCheck(env: NodeJS.ProcessEnv): CloudCheck | null {
+  if (env.LANES_STATE_BACKEND?.trim() !== "http") return null;
+  const problem = !env.COMMAND_CENTER_API_BASE_URL?.trim()
+    ? "COMMAND_CENTER_API_BASE_URL is not set"
+    : approvalChannelKeyProblem(env[APPROVAL_CHANNEL_KEY_ENV]?.trim(), env);
+  const retired = env[RETIRED_APPROVAL_KEY_ENV]?.trim() ? `; ${RETIRED_APPROVAL_KEY_ENV} is retired and unused, delete it` : "";
+  return problem
+    ? {name: "Lane approvals", ok: false, detail: problem,
+      fix: `Set ${APPROVAL_CHANNEL_KEY_ENV} (48 random characters, matching no other key) here and in Command Center; keep it out of the lanes worker`}
+    : {name: "Lane approvals", ok: true, detail: `Owner lane controls ask Command Center for an emailed code${retired}`};
+}
 
 /**
  * An authenticated token proves nothing about a repository: a fine-grained token reads only the
@@ -56,5 +73,7 @@ export async function cloudPreflight(config: Config, fetcher: typeof fetch = fet
   } catch { checks.push({name: "Bridge HTTPS", ok: false, detail: "Approved HTTPS bridge origin is missing or unreachable"}); }
   checks.push({name: "Linux voice", ok: [process.env.FFMPEG_BIN ?? "/usr/bin/ffmpeg", process.env.TELEGRAM_WHISPER_BIN ?? "", process.env.TELEGRAM_WHISPER_MODEL ?? ""].every(p => !!p && existsSync(p)), detail: "FFmpeg, Whisper executable, and model must be present in the release"});
   checks.push({name: "Native review policy", ok: config.cloudReviewPolicy === "native", detail: config.cloudReviewPolicy === "native" ? "Dedicated findings session with normal Conductor permissions" : "Native reviews disabled"});
+  const approvals = laneApprovalCheck(process.env);
+  if (approvals) checks.push(approvals);
   return checks;
 }

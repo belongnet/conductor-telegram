@@ -183,7 +183,7 @@ test("doctor validates the durable manifest, credentials, and Command Center con
       CONDUCTOR_API_KEY: "con",
       BOT_TOKEN: "bot",
       OWNER_CHAT_ID: "42",
-      BELONG_HUMAN_APPROVAL_KEY: "human-key",
+      BELONG_APPROVAL_CHANNEL_KEY: "a".repeat(48),
     };
     const calls: string[] = [];
     const fakeFetch = (async (url: string | URL | Request) => {
@@ -216,11 +216,41 @@ test("doctor validates the durable manifest, credentials, and Command Center con
         LANES_SITE: "ovh",
         BOT_TOKEN: "",
         OWNER_CHAT_ID: "",
-        BELONG_HUMAN_APPROVAL_KEY: "",
+        BELONG_APPROVAL_CHANNEL_KEY: "",
       },
       fakeFetch
     );
-    assert.equal(headlessStandby.ok, true);
+    assert.equal(headlessStandby.ok, true, "the headless worker never holds the approval channel key");
+
+    const withoutChannelKey = await checkDurableLanes(
+      null,
+      { ...env, BELONG_APPROVAL_CHANNEL_KEY: "", BELONG_HUMAN_APPROVAL_KEY: "h".repeat(48) },
+      fakeFetch
+    );
+    assert.equal(withoutChannelKey.ok, false);
+    assert.match(withoutChannelKey.detail, /missing runtime credential\(s\): BELONG_APPROVAL_CHANNEL_KEY/);
+    for (const [value, problem] of [
+      ["too-short-key", /BELONG_APPROVAL_CHANNEL_KEY must be at least 40 characters/],
+      [`${"a".repeat(30)} ${"a".repeat(30)}`, /must not contain whitespace/],
+      ["s".repeat(48), /must differ from COMMAND_CENTER_API_KEY/],
+    ] as const) {
+      const result = await checkDurableLanes(
+        null,
+        { ...env, COMMAND_CENTER_API_KEY: "s".repeat(48), BELONG_APPROVAL_CHANNEL_KEY: value },
+        fakeFetch
+      );
+      assert.equal(result.ok, false, value);
+      assert.match(result.detail, problem);
+      assert.ok(!result.detail.includes(value.slice(0, 20)), "doctor never prints the key");
+    }
+    const retiredStillSet = await checkDurableLanes(
+      null,
+      { ...env, BELONG_HUMAN_APPROVAL_KEY: "h".repeat(48) },
+      fakeFetch
+    );
+    assert.equal(retiredStillSet.ok, true);
+    assert.match(retiredStillSet.detail, /BELONG_HUMAN_APPROVAL_KEY is retired and unused, delete it$/);
+    assert.ok(!retiredStillSet.detail.includes("h".repeat(20)));
 
     const sqlite = await checkDurableLanes(
       null,

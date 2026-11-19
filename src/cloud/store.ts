@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { workspaceName } from "./names.js";
+import { withholdApprovalText } from "../bot/lane-approvals.js";
 
 export interface QueueRow {
   id: string;
@@ -111,13 +112,15 @@ export class GatewayStore {
   ingest(updates: Array<{ update_id: number; [key: string]: unknown }>): void {
     this.db.transaction(() => {
       let offset = this.get<number>("telegram-offset") ?? 0;
+      const botId = this.get<number>("telegram-bot-id");
       for (const update of [...updates].sort((a, b) => a.update_id - b.update_id)) {
         if (update.update_id < offset) continue;
         const msg = (update.message ?? (update.callback_query as any)?.message) as any;
         const conversation = `${msg?.chat?.id ?? "unknown"}:${msg?.message_thread_id ?? 0}`;
         // A read-only liveness check must not wait for a slow command in its topic.
         const kind = /^\/ping(?:@\w+)?\s*$/i.test(msg?.text ?? "") ? "health-update" : "update";
-        this.enqueue(kind, conversation, update, `update:${update.update_id}`);
+        // A message that may carry a lane approval code is stored without its text.
+        this.enqueue(kind, conversation, withholdApprovalText(update, botId), `update:${update.update_id}`);
         offset = Math.max(offset, update.update_id + 1);
       }
       this.set("telegram-offset", offset);

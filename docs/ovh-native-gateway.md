@@ -52,7 +52,7 @@ Install [the gateway unit](../packaging/systemd/conductor-telegram-gateway.servi
 
 The service binds the bridge to `127.0.0.1:8787`. Merge the supplied [Caddy site](../packaging/cloud/Caddyfile) into the approved HTTPS proxy; preserve existing sites. Do not log signed attachment URLs. Expose only HTTPS externally. The bridge serves private, expiring, file-specific downloads; uploads, event reports, and decision reads require a workspace-scoped token. It never shares SQLite or Telegram download URLs with cloud agents.
 
-If durable lanes are already enabled, retain their manifest and HTTP state and use [the separate container unit](../packaging/cloud/conductor-telegram-lanes.service). Keep human-approval credentials in the gateway for explicit owner controls; exclude them from the worker environment. Do not enable a previously disabled controller or change its cutover revision as part of moving Telegram.
+If durable lanes are already enabled, retain their manifest and HTTP state and use [the separate container unit](../packaging/cloud/conductor-telegram-lanes.service). Keep `BELONG_APPROVAL_CHANNEL_KEY` in the gateway, which asks Command Center for an emailed approval code before an owner control; exclude it, and the retired `BELONG_HUMAN_APPROVAL_KEY`, from the worker environment. Do not enable a previously disabled controller or change its cutover revision as part of moving Telegram.
 
 ## Cloud MCP setup
 

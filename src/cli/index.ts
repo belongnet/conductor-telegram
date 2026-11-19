@@ -105,18 +105,19 @@ async function main(): Promise<void> {
     command === "lanes"
   ) {
     const { tryLoadConfig } = await import("./config.js");
-    const { isDopplerRuntimeActive, resolveDopplerRuntime, runWithDoppler } =
+    const { dopplerSecretsWithheldFor, isDopplerRuntimeActive, resolveDopplerRuntime, runWithDoppler } =
       await import("./doppler.js");
     const runtimeConfig = tryLoadConfig(flags);
     if (runtimeConfig) {
       try {
         const doppler = resolveDopplerRuntime(runtimeConfig);
         if (doppler && !isDopplerRuntimeActive(doppler)) {
-          const status = runWithDoppler(doppler, [
-            process.execPath,
-            fileURLToPath(import.meta.url),
-            ...args,
-          ]);
+          // A lane worker, reconcile or status run never receives an approval key.
+          const status = runWithDoppler(
+            doppler,
+            [process.execPath, fileURLToPath(import.meta.url), ...args],
+            { withhold: command === "lanes" ? dopplerSecretsWithheldFor(args) : [] }
+          );
           process.exit(status);
         }
       } catch (error) {

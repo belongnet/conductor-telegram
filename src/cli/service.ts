@@ -31,6 +31,7 @@ import {
   type CLIFlags,
 } from "./config.js";
 import {
+  APPROVAL_SECRET_NAMES,
   DOPPLER_RUNTIME_SECRET_NAMES,
   buildServiceDopplerEnvironment,
   buildDopplerRunArgs,
@@ -58,8 +59,13 @@ const REQUIRED_LANE_SERVICE_SECRETS = Object.freeze([
   "CONDUCTOR_API_KEY",
   "COMMAND_CENTER_API_BASE_URL",
   "COMMAND_CENTER_API_KEY",
-  "BELONG_HUMAN_APPROVAL_KEY",
+  "BELONG_APPROVAL_CHANNEL_KEY",
 ]);
+/**
+ * Human-approval credentials the lane worker must never hold: the approval
+ * channel key, and the retired key in case an old environment still has it.
+ */
+const LANE_WORKER_WITHHELD_SECRETS: readonly string[] = APPROVAL_SECRET_NAMES;
 const WATCHDOG_LOG = path.join(STATE_DIR, "watchdog.log");
 // scripts/gateway-update.sh caps this same file in place; its
 // CONDUCTOR_TELEGRAM_GATEWAY_LOG default must stay in sync with this path.
@@ -299,15 +305,19 @@ export function buildLaneWorkerProgramArguments(
             ...options.doppler,
             secretNames: (
               options.doppler.secretNames ?? [...DOPPLER_RUNTIME_SECRET_NAMES]
-            ).filter((name) => name !== "BELONG_HUMAN_APPROVAL_KEY"),
+            ).filter((name) => !LANE_WORKER_WITHHELD_SECRETS.includes(name)),
           },
           directCommand
         ),
       ]
     : directCommand;
   // Strip even a launchd-global ambient copy before Doppler starts. Doppler's
-  // lane allowlist above cannot reintroduce the human-only approval secret.
-  return ["/usr/bin/env", "-u", "BELONG_HUMAN_APPROVAL_KEY", ...command];
+  // lane allowlist above cannot reintroduce a human-only approval secret.
+  return [
+    "/usr/bin/env",
+    ...LANE_WORKER_WITHHELD_SECRETS.flatMap((name) => ["-u", name]),
+    ...command,
+  ];
 }
 
 export function buildLaneWorkerPlist(options: BotPlistOptions = {}): string {

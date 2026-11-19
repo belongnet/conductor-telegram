@@ -709,7 +709,7 @@ test("a lost pause-control response is recovered with one stable safety-alert id
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     await store.finishControl(lease, cutover.control_id, {
       expected_version: cutover.row_version,
@@ -811,7 +811,7 @@ test("disposable canary traverses create → review → two finals → merge →
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     const snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -1071,7 +1071,7 @@ test("archive rechecks sessions after intent and recovers with fresh evidence", 
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, cutover.control_id, {
@@ -1147,7 +1147,7 @@ test("prompt bytes are rehashed immediately before commissioned delivery", async
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, cutover.control_id, {
@@ -1211,7 +1211,7 @@ test("a PR URL is not bound until the author session is idle", async () => {
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, cutover.control_id, {
@@ -1327,7 +1327,7 @@ test("active full reconciliation pauses on duplicate live managed workspaces", a
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, cutover.control_id, {
@@ -1410,7 +1410,7 @@ test("validation summary without exact raw execution receipts cannot complete", 
           kind: "cutover",
           requested_by: "human:test",
           payload: { revision_id: "canary-v2" },
-          approvalKey: "separate-human-key",
+          approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
         });
         let snapshot = await store.snapshot();
         await store.finishControl(lease, control.control_id, {
@@ -1482,7 +1482,7 @@ test("Claude/Cursor Bash tool receipts can prove deterministic validation", asyn
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -1544,7 +1544,7 @@ test("hard provider failure opens one breaker and rotates before workspace creat
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -1628,7 +1628,7 @@ test("two ineffective cursor-scoped nudges replace only the session in the bound
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -1714,7 +1714,7 @@ test("two unanswered cursor-scoped nudges replace a dead session without replaci
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -1852,7 +1852,7 @@ test("ambiguous attestation reconciliation requires the exact published body", a
           kind: "cutover",
           requested_by: "human:test",
           payload: { revision_id: "canary-v2" },
-          approvalKey: "separate-human-key",
+          approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
         });
         let snapshot = await store.snapshot();
         await store.finishControl(lease, control.control_id, {
@@ -1971,7 +1971,7 @@ test("unresolved external intent takes precedence over pending controls", async 
     const cutover = await store.createControl({
       control_id: "priority-cutover", idempotency_key: "priority-cutover",
       kind: "cutover", requested_by: "human:test",
-      payload: { revision_id: "canary-v2" }, approvalKey: "separate-human-key",
+      payload: { revision_id: "canary-v2" }, approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     await store.finishControl(lease, cutover.control_id, {
       expected_version: cutover.row_version,
@@ -2076,7 +2076,7 @@ test(`a pre-upgrade ambiguous merge is never reconciled against a different ${dr
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -2160,7 +2160,7 @@ test("structured deterministic validation failure creates a repair transition", 
       kind: "cutover",
       requested_by: "human:test",
       payload: { revision_id: "canary-v2" },
-      approvalKey: "separate-human-key",
+      approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     let snapshot = await store.snapshot();
     await store.finishControl(lease, control.control_id, {
@@ -2226,7 +2226,7 @@ test("retry control creates a fresh generation for a terminal run", async () => 
     const cutover = await store.createControl({
       control_id: "retry-cutover", idempotency_key: "retry-cutover",
       kind: "cutover", requested_by: "human:test",
-      payload: { revision_id: "canary-v2" }, approvalKey: "separate-human-key",
+      payload: { revision_id: "canary-v2" }, approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
     });
     await store.finishControl(lease, cutover.control_id, {
       expected_version: cutover.row_version,
@@ -2303,7 +2303,7 @@ async function activateCanary(
     kind: "cutover",
     requested_by: "human:test",
     payload: { revision_id: "canary-v2" },
-    approvalKey: "separate-human-key",
+    approval: { channelKey: "test-approval-channel-key", grant: "separate-human-key" },
   });
   const snapshot = await store.snapshot();
   await store.finishControl(lease, cutover.control_id, {

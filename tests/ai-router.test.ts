@@ -1,5 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { buildHelperEnvironment, CHILD_ENV_ALLOWLIST } from "../src/bot/child-env.js";
 import {
   parseCliOutput,
   parseCliOutputDetailed,
@@ -174,4 +179,80 @@ test("CLI envelope reports malformed result shape", () => {
   });
 
   assertParseFailure(parseCliOutputDetailed(output), "invalid_cli_envelope");
+});
+
+const BOT_SECRETS = [
+  "BELONG_APPROVAL_CHANNEL_KEY",
+  "BELONG_HUMAN_APPROVAL_KEY",
+  "COMMAND_CENTER_API_KEY",
+  "CONDUCTOR_API_KEY",
+  "BOT_TOKEN",
+  "GITLAB_TOKEN",
+];
+
+test("the bot's helper processes get the agent allowlist and HOME, never its credentials", () => {
+  const source = Object.fromEntries([
+    ...BOT_SECRETS.map((name) => [name, "secret"]),
+    ...CHILD_ENV_ALLOWLIST.map((name) => [name, `value-${name}`]),
+    ["HOME", "/Users/operator"],
+    ["CLAUDE_CONFIG_DIR", "/Users/operator/.claude-alt"],
+    ["DOPPLER_TOKEN", "dp.st.secret"],
+  ]);
+  const env = buildHelperEnvironment(source);
+  for (const name of BOT_SECRETS) assert.equal(env[name], undefined, name);
+  assert.equal(env.DOPPLER_TOKEN, undefined);
+  assert.equal(env.HOME, "/Users/operator");
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/Users/operator/.claude-alt");
+  assert.deepEqual(Object.keys(env).sort(), [...CHILD_ENV_ALLOWLIST, "HOME", "CLAUDE_CONFIG_DIR"].sort());
+});
+
+test("the router's Claude CLI and the voice tools are started without the bot's credentials", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "ct-router-env-"));
+  try {
+    // Each stand-in records only the names of the variables it was given.
+    const tool = (name: string, output = ""): string => {
+      const file = path.join(dir, name);
+      writeFileSync(file, `#!/bin/sh\n/usr/bin/env | /usr/bin/cut -d= -f1 > "${path.join(dir, `${name}.names`)}"\n${output ? `echo ${output}\n` : ""}`);
+      chmodSync(file, 0o755);
+      return file;
+    };
+    const claude = tool("claude");
+    const convert = tool("convert");
+    const whisper = tool("whisper", "hello");
+    const model = path.join(dir, "model.bin");
+    const voice = path.join(dir, "voice.ogg");
+    writeFileSync(model, "");
+    writeFileSync(voice, "");
+    const output = execFileSync(
+      process.execPath,
+      ["--import", "tsx", "-e", `
+        const router = await import("./src/bot/ai-router.ts");
+        await router.routeTextMessage("hello", [], []);
+        console.log("TRANSCRIPT=" + await router.transcribeVoiceMessage(process.env.TEST_VOICE_PATH));
+      `],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...Object.fromEntries(BOT_SECRETS.map((name) => [name, `secret-${name}`])),
+          CLAUDE_BIN: claude,
+          AFCONVERT_BIN: convert,
+          FFMPEG_BIN: convert,
+          TELEGRAM_WHISPER_BIN: whisper,
+          TELEGRAM_WHISPER_MODEL: model,
+          TELEGRAM_WHISPER_CPP_DIR: dir,
+          TEST_VOICE_PATH: voice,
+        },
+      }
+    );
+    assert.match(output, /TRANSCRIPT=hello/, "the voice tools really ran");
+    for (const name of ["claude", "convert", "whisper"]) {
+      const names = readFileSync(path.join(dir, `${name}.names`), "utf8").split("\n").filter(Boolean);
+      assert.ok(names.includes("PATH") && names.includes("HOME"), `${name} keeps PATH and HOME`);
+      for (const secret of BOT_SECRETS) assert.equal(names.includes(secret), false, `${name} must not inherit ${secret}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

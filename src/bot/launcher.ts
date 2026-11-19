@@ -59,6 +59,7 @@ import {
   type PendingCloudLaunch,
 } from "../store/queries.js";
 import { getConductorSetting } from "../store/conductor-settings.js";
+import { CHILD_ENV_ALLOWLIST } from "./child-env.js";
 import {
   cloudCycleIsInFlight,
   cloudSessionCycleKey,
@@ -628,20 +629,8 @@ const TELEGRAM_INLINE_MEDIA_SYSTEM_PROMPT = [
   "- Use absolute paths inside the workspace.",
 ].join("\n");
 
-const AGENT_ENV_ALLOWLIST = [
-  "USER",
-  "LOGNAME",
-  "PATH",
-  "SHELL",
-  "TMPDIR",
-  "TMP",
-  "TEMP",
-  "LANG",
-  "LC_ALL",
-  "TERM",
-  "COLORTERM",
-  "NO_COLOR",
-] as const;
+/** Shared with the bot's own helpers (router, transcription) so the lists cannot drift. */
+const AGENT_ENV_ALLOWLIST = CHILD_ENV_ALLOWLIST;
 
 /**
  * Build the environment visible to an autonomous agent.

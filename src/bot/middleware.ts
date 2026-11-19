@@ -12,7 +12,13 @@ interface AuthConfig {
  * In a supergroup (forum topics mode), also checks the sender's user ID
  * against OWNER_USER_ID so other group members are ignored.
  */
-export function authGuard(getConfig: () => AuthConfig): MiddlewareFn<Context> {
+export function authGuard(
+  getConfig: () => AuthConfig,
+  options: {
+    /** The lane approval flow owns this message (a code, or a reply to an approval prompt). */
+    approvalTraffic?: (ctx: Context) => boolean;
+  } = {}
+): MiddlewareFn<Context> {
   return (ctx, next) => {
     const { ownerChatId = "", ownerUserId } = getConfig();
     const chatId = ctx.chat?.id?.toString();
@@ -45,6 +51,19 @@ export function authGuard(getConfig: () => AuthConfig): MiddlewareFn<Context> {
 
     // Direct chat: match on chat ID only.
     if (chatType === "private" && chatId === ownerChatId) {
+      return next();
+    }
+
+    // A group owner answers lane approval prompts in their private chat with
+    // the bot. Only approval traffic gets through there; everything else is
+    // still refused, so that chat never becomes a second control channel.
+    if (
+      chatType === "private" &&
+      !!effectiveOwnerUserId &&
+      userId === effectiveOwnerUserId &&
+      chatId === userId &&
+      options.approvalTraffic?.(ctx) === true
+    ) {
       return next();
     }
 

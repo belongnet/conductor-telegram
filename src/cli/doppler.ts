@@ -7,6 +7,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import type { Config } from "./config.js";
+import { APPROVAL_CHANNEL_KEY_ENV, RETIRED_APPROVAL_KEY_ENV } from "../lanes/approval-channel.js";
 
 export const DOPPLER_RUNTIME_SECRET_NAMES = Object.freeze([
   "BOT_TOKEN",
@@ -19,11 +20,34 @@ export const DOPPLER_RUNTIME_SECRET_NAMES = Object.freeze([
   "CONDUCTOR_CLOUD_BACKEND",
   "COMMAND_CENTER_API_BASE_URL",
   "COMMAND_CENTER_API_KEY",
-  "BELONG_HUMAN_APPROVAL_KEY",
+  "BELONG_APPROVAL_CHANNEL_KEY",
   "GITLAB_TOKEN",
   "LANES_MANIFEST",
   "LANES_MANIFEST_SOURCE_REF",
 ]);
+
+/** Held only by the Telegram process and the human lane-control CLI, never by a lane worker. */
+export const APPROVAL_SECRET_NAMES = Object.freeze([APPROVAL_CHANNEL_KEY_ENV, RETIRED_APPROVAL_KEY_ENV]);
+
+/** Lane commands that ask the operator for an emailed approval code. */
+const HUMAN_LANE_COMMANDS = new Set(["release", "retire", "validate"]);
+
+/** Secrets a re-exec under Doppler must not hand to this command line. */
+export function dopplerSecretsWithheldFor(argv: readonly string[]): string[] {
+  const index = argv.indexOf("lanes");
+  if (index < 0) return [];
+  return HUMAN_LANE_COMMANDS.has(argv[index + 1] ?? "status") ? [] : [...APPROVAL_SECRET_NAMES];
+}
+
+/** The environment a Doppler re-exec starts from: marked active, without withheld names. */
+export function dopplerChildEnvironment(
+  env: NodeJS.ProcessEnv,
+  withhold: readonly string[] = []
+): NodeJS.ProcessEnv {
+  const child: NodeJS.ProcessEnv = { ...env, [DOPPLER_RUNTIME_SENTINEL_ENV]: "1" };
+  for (const name of withhold) delete child[name];
+  return child;
+}
 
 export interface DopplerRuntime {
   executable: string;
@@ -281,13 +305,15 @@ export function readAvailableDopplerRuntimeSecretNames(
 
 export function runWithDoppler(
   runtime: DopplerRuntime,
-  command: string[]
+  command: string[],
+  options: { withhold?: readonly string[] } = {}
 ): number {
+  const withhold = options.withhold ?? [];
   const availableNames = readAvailableDopplerRuntimeSecretNames(runtime);
   const scopedRuntime: DopplerRuntime = {
     ...runtime,
-    secretNames: DOPPLER_RUNTIME_SECRET_NAMES.filter((name) =>
-      availableNames.has(name)
+    secretNames: DOPPLER_RUNTIME_SECRET_NAMES.filter(
+      (name) => availableNames.has(name) && !withhold.includes(name)
     ),
   };
   const result = spawnSync(
@@ -295,7 +321,7 @@ export function runWithDoppler(
     buildDopplerRunArgs(scopedRuntime, command),
     {
       stdio: "inherit",
-      env: { ...process.env, [DOPPLER_RUNTIME_SENTINEL_ENV]: "1" },
+      env: dopplerChildEnvironment(process.env, withhold),
     }
   );
   if (result.error) {

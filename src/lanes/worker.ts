@@ -21,6 +21,7 @@ import {
   manifestNeedsGitlab,
   type LaneManifestV2,
 } from "./manifest.js";
+import { APPROVAL_CHANNEL_KEY_ENV, RETIRED_APPROVAL_KEY_ENV } from "./approval-channel.js";
 import {
   createLaneStateStore,
   LaneStateStoreError,
@@ -45,6 +46,11 @@ export function missingLaneWorkerAlertConfig(
   return ["BOT_TOKEN", "OWNER_CHAT_ID"].filter(
     (name) => !env[name]?.trim()
   );
+}
+
+/** Approval keys a lane worker was handed; it must hold none. */
+export function heldApprovalKeys(env: NodeJS.ProcessEnv): string[] {
+  return [APPROVAL_CHANNEL_KEY_ENV, RETIRED_APPROVAL_KEY_ENV].filter((name) => env[name]?.trim());
 }
 
 function parseSite(env: NodeJS.ProcessEnv): WorkerSite {
@@ -218,6 +224,14 @@ async function stageManifest(
 
 export async function runLaneWorker(options: LaneWorkerOptions = {}): Promise<void> {
   const env = options.env ?? process.env;
+  // Only the Telegram process and the human-control CLI ask for emailed codes.
+  // A worker that holds an approval key is misconfigured, and it fails closed.
+  const held = heldApprovalKeys(env);
+  if (held.length > 0) {
+    throw new Error(
+      `lanes worker refuses to start while it holds ${held.join(" and ")}; remove it from the worker's environment`
+    );
+  }
   const log = options.log ?? ((line: string) => console.log(line));
   const site = parseSite(env);
   const missingAlerts = missingLaneWorkerAlertConfig(env);

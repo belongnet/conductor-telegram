@@ -7,6 +7,8 @@ import path from "node:path";
 import {
   buildServiceDopplerEnvironment,
   buildDopplerRunArgs,
+  dopplerChildEnvironment,
+  dopplerSecretsWithheldFor,
   DopplerRuntimeError,
   isDopplerRuntimeActive,
   stripDopplerManagedConfig,
@@ -49,6 +51,20 @@ test("Doppler runtime injects only the explicit conductor-telegram allowlist", (
 test("Doppler runtime preserves the cloud workspace sync settings", () => {
   assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("TELEGRAM_CLOUD_SYNC_CHAT_ID"), true);
   assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("TELEGRAM_CLOUD_SYNC_INPUT"), true);
+});
+
+test("Doppler runtime injects the approval channel key and never the retired approval key", () => {
+  assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("BELONG_APPROVAL_CHANNEL_KEY"), true);
+  assert.equal(DOPPLER_RUNTIME_SECRET_NAMES.includes("BELONG_HUMAN_APPROVAL_KEY"), false);
+  assert.throws(
+    () =>
+      buildDopplerRunArgs(
+        { project: "example-app", config: "production", secretNames: ["BELONG_HUMAN_APPROVAL_KEY"] },
+        ["node", "cli.js", "start"]
+      ),
+    DopplerRuntimeError,
+    "the retired name is no longer an allowed runtime secret"
+  );
 });
 
 test("a re-exec into the Doppler runtime is detected exactly once", () => {
@@ -246,3 +262,28 @@ test("config accepts paired Doppler references and rejects partial references", 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+test("lane commands other than release, validate and retire never receive an approval key from Doppler", () => {
+  const both = ["BELONG_APPROVAL_CHANNEL_KEY", "BELONG_HUMAN_APPROVAL_KEY"];
+  for (const argv of [
+    ["lanes", "worker"],
+    ["lanes", "reconcile"],
+    ["lanes"],
+    ["lanes", "status", "--json"],
+    ["--no-color", "lanes", "hold", "L1", "--reason", "x"],
+    ["lanes", "import-legacy", "--dry-run"],
+  ]) {
+    assert.deepEqual(dopplerSecretsWithheldFor(argv), both, argv.join(" "));
+  }
+  for (const argv of [["lanes", "release", "L1"], ["lanes", "validate", "L1"], ["lanes", "retire", "L1"], ["start"], ["doctor"]]) {
+    assert.deepEqual(dopplerSecretsWithheldFor(argv), [], argv.join(" "));
+  }
+  assert.deepEqual(
+    dopplerChildEnvironment(
+      { PATH: "/bin", BELONG_APPROVAL_CHANNEL_KEY: "k", BELONG_HUMAN_APPROVAL_KEY: "h" },
+      dopplerSecretsWithheldFor(["lanes", "worker"])
+    ),
+    { PATH: "/bin", [DOPPLER_RUNTIME_SENTINEL_ENV]: "1" },
+    "an inherited copy is removed too, not only Doppler's"
+  );
+});
